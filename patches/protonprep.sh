@@ -236,9 +236,7 @@
     patch -Np1 < ../patches/wine-hotfixes/D3D12CreateVersionedRootSignatureDeserializer.patch
 
     echo "guy's media foundation alpha patches"
-    for _f in ../patches/wine-hotfixes/guy_mediafoundation_alpha/*.patch; do
-        patch -Np1 < "${_f}"
-    done
+    patch -Np1 < ../patches/wine-hotfixes/media_foundation_alpha.patch
 
     echo "proton-specific manual mfplat dll register patch"
     patch -Np1 < ../patches/wine-hotfixes/proton_mediafoundation_dllreg.patch
