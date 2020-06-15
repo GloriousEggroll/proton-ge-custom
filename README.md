@@ -109,8 +109,12 @@ Full patches can be viewed in [protonprep.sh](patches/protonprep.sh).
 This section is for those that use the native version of Steam.
 
 1. Download a release from the [Releases](https://github.com/GloriousEggroll/proton-ge-custom/releases) page.
-2. Create a `~/.steam/root/compatibilitytools.d` directory if it does not exist.
-3. Extract the release tarball into `~/.steam/root/compatibilitytools.d/`.
+2. Either create a directory in one of the following locations, if missing:
+   - `~/.steam/root/compatibilitytools.d` -- single-user installation;
+   - `/usr/share/steam/compatibilitytools.d` -- system wide installation (will probably need root permissions);
+   - `/usr/local/share/steam/compatibilitytools.d` -- system wide installation (will probably need root permissions);
+   - one of the directories specified in the `STEAM_EXTRA_COMPAT_TOOLS_PATHS` environment variable, if used.
+3. Extract the release tarball into one of the previous paths, i.e. `~/.steam/root/compatibilitytools.d/` or `/usr/share/steam/compatibilitytools.d/` or `/usr/local/share/steam/compatibilitytools.d` or a path in `STEAM_EXTRA_COMPAT_TOOLS_PATHS`.
 4. Restart Steam.
 5. [Enable proton-ge-custom](#enabling).
 
