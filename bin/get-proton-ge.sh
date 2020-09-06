@@ -34,6 +34,13 @@ FILE="Proton-${VERSION}.tar.gz"
 FOLDER="Proton-${VERSION}"
 URL="${GIT_URL}/releases/download/${VERSION}/${FILE}"
 
+# Ensure proper user if running SteamOS
+THIS_USER=$(whoami)
+if [[ ${steamos} -eq 0 ]] && [[ ${USER} != "steam" ]]; then
+    echo "ERROR: Please run this script as user 'steam'"
+    exit 1
+fi
+
 # Prepare dir(s)
 # Avoid any symlinked path jankiness
 # Do not quote path (issues on some systems such as SteamOS)
