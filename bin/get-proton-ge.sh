@@ -70,7 +70,7 @@ else
 	echo ${FILE} already exists!
 fi
 
-if [[ -d ${target_abs_path}/${FOLDER} ]]; then
+if [[ -d ${target_abs_path}/compatibilitytools.d/${FOLDER} ]]; then
 	echo "${FOLDER} already exists in target_abs_path ${target_abs_path}!"
     read -erp "Reset installation? (y/N): " reset_install
     if [[ ${reset_install} == "y" || ${reset_install} == "Y" ]]; then
