@@ -28,7 +28,7 @@ case ${steam_type} in
 esac
 
 GIT_REPO="GloriousEggroll/proton-ge-custom"
-GIT_URL="https://github.com/GloriousEggroll/proton-ge-custom"
+GIT_URL="https://github.com/${GIT_REPO}"
 VERSION=$(curl --silent "https://api.github.com/repos/${GIT_REPO}/releases/latest" | grep '"tag_name":' |  sed -E 's/.*"([^"]+)".*/\1/')
 FILE="Proton-${VERSION}.tar.gz"
 FOLDER="Proton-${VERSION}"
