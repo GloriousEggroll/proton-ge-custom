@@ -50,16 +50,25 @@ else
 	steam_root="${HOME}/.steam/root"
 fi
 
-target_abs_path=$(readlink -f ${steam_root})
+steam_root_abs_path=$(readlink -f ${steam_root})
 if [[ ! -d ${target_abs_path} ]]; then
-    echo "ERROR: Steam root does not exist! Path: ${target_abs_path}"
+    echo "ERROR: Steam root does not exist! Expected path: ${steam_root}"
     exit 1
 fi
 
 # Check for compat folder
-if [[ ! -d "${target_abs_path}/compatibilitytools.d" ]]; then
+if [[ ! -d "${steam_root_abs_path}/compatibilitytools.d" ]]; then
     echo "WARNING: compatibilitytools.d folder mising, creating..."
-    mkdir -p "${target_abs_path}/compatibilitytools.d"
+    if ! mkdir -p "${steam_root_abs_path}/compatibilitytools.d"; then
+        echo "ERROR: Could not create compatibilitytools.d in Steam root: ${steam_root_abs_path}"
+        exit 1
+    fi
+fi
+target_abs_path=$(readlink -f "${steam_root}/compatibilitytools.d")
+
+if [[ ! -d ${target_abs_path} ]]; then
+    echo "ERROR: Could not validate target absolute path to: ${steam_root}/compatibilitytools.d"
+    exit 1
 fi
 
 # Download
