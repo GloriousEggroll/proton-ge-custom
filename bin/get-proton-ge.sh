@@ -77,7 +77,7 @@ if [[ -d ${target_abs_path}/${FOLDER} ]]; then
         rm -r ${target_abs_path}
     else
         exit 1
-	exit 1
+    fi
 fi
 
 echo "Extracting Proton GE to target_abs_path: ${target_abs_path}"
