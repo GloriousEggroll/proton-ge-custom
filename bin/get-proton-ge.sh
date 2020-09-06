@@ -51,7 +51,7 @@ else
 fi
 
 steam_root_abs_path=$(readlink -f ${steam_root})
-if [[ ! -d ${target_abs_path} ]]; then
+if [[ ! -d ${steam_root_abs_path} ]]; then
     echo "ERROR: Steam root does not exist! Expected path: ${steam_root}"
     exit 1
 fi
