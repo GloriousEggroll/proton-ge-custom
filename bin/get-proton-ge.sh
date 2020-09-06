@@ -34,6 +34,22 @@ FILE="Proton-${VERSION}.tar.gz"
 FOLDER="Proton-${VERSION}"
 URL="${GIT_URL}/releases/download/${VERSION}/${FILE}"
 
+# Prepare dir(s)
+# Avoid any symlinked path jankiness
+# Do not quote path (issues on some systems such as SteamOS)
+if [[ ${flatpak} -eq 0 ]]; then
+	target="${HOME}/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d"
+else
+	target="${HOME}/.steam/root/compatibilitytools.d"
+fi
+
+target_abs_path=$(readlink -f ${target})
+if [[ ! -d ${target_abs_path} ]]; then
+    echo "ERROR: Target path does not exist! Path: ${target_abs_path}"
+    exit 1
+fi
+
+
 # Download
 echo "Downloading ${FILE}"
 if [[ ! -f ${FILE} ]]; then
@@ -42,24 +58,15 @@ else
 	echo ${FILE} already exists!
 fi
 
-# Prepare dir(s)
-# Avoid any symlinked path jankiness
-# Do not quote path (issues on some systems such as SteamOS)
-if [[ ${flatpak} -eq 0 ]]; then
-	target=$(readlink -f ~/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d)
-else
-	target=$(readlink -f ~/.steam/root/compatibilitytools.d)
-fi
-
-mkdir -pv ${target}
-if [[ ! -d ${target}/${FOLDER} ]]; then
-	echo "Extracting Proton GE to target: ${target}"
+mkdir -pv ${target_abs_path}
+if [[ ! -d ${target_abs_path}/${FOLDER} ]]; then
+	echo "Extracting Proton GE to target_abs_path: ${target_abs_path}"
 	tar -xf ${FILE} -C ~/.steam/root/compatibilitytools.d
 
-elif [[ -d ${target}/${FOLDER} ]]; then
-	echo "${FOLDER} already exists in target ${target}!"
+elif [[ -d ${target_abs_path}/${FOLDER} ]]; then
+	echo "${FOLDER} already exists in target_abs_path ${target_abs_path}!"
 	exit 1
 fi
 
-echo "${FOLDER} Installed to ${target}!"
-ls -la ${target}
+echo "${FOLDER} Installed to ${target_abs_path}!"
+ls -la ${target_abs_path}
