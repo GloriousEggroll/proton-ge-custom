@@ -41,21 +41,26 @@ if [[ ${steamos} -eq 0 ]] && [[ ${USER} != "steam" ]]; then
     exit 1
 fi
 
-# Prepare dir(s)
+# Check for Steam directory root
 # Avoid any symlinked path jankiness
 # Do not quote path (issues on some systems such as SteamOS)
 if [[ ${flatpak} -eq 0 ]]; then
-	target="${HOME}/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d"
+	steam_root="${HOME}/.var/app/com.valvesoftware.Steam/data/Steam"
 else
-	target="${HOME}/.steam/root/compatibilitytools.d"
+	steam_root="${HOME}/.steam/root"
 fi
 
-target_abs_path=$(readlink -f ${target})
+target_abs_path=$(readlink -f ${steam_root})
 if [[ ! -d ${target_abs_path} ]]; then
-    echo "ERROR: Target path does not exist! Path: ${target_abs_path}"
+    echo "ERROR: Steam root does not exist! Path: ${target_abs_path}"
     exit 1
 fi
 
+# Check for compat folder
+if [[ ! -d "${target_abs_path}/compatibilitytools.d" ]]; then
+    echo "WARNING: compatibilitytools.d folder mising, creating..."
+    mkdir -p "${target_abs_path}/compatibilitytools.d"
+fi
 
 # Download
 echo "Downloading ${FILE}"
@@ -65,14 +70,20 @@ else
 	echo ${FILE} already exists!
 fi
 
-mkdir -pv ${target_abs_path}
-if [[ ! -d ${target_abs_path}/${FOLDER} ]]; then
-	echo "Extracting Proton GE to target_abs_path: ${target_abs_path}"
-	tar -xf ${FILE} -C ~/.steam/root/compatibilitytools.d
-
-elif [[ -d ${target_abs_path}/${FOLDER} ]]; then
+if [[ -d ${target_abs_path}/${FOLDER} ]]; then
 	echo "${FOLDER} already exists in target_abs_path ${target_abs_path}!"
+    read -erp "Reset installation? (y/N): " reset_install
+    if [[ ${reset_install} == "y" || ${reset_install} == "Y" ]]; then
+        rm -r ${target_abs_path}
+    else
+        exit 1
 	exit 1
+fi
+
+echo "Extracting Proton GE to target_abs_path: ${target_abs_path}"
+if ! tar -xf ${FILE} -C "${target_abs_path}/compatibilitytools.d"; then
+    echo "ERROR: Could not extact contents of ${FILE}"
+    exit 1
 fi
 
 echo "${FOLDER} Installed to ${target_abs_path}!"
