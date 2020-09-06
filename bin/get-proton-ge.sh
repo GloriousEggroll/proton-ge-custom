@@ -79,7 +79,7 @@ else
 	echo ${FILE} already exists!
 fi
 
-if [[ -d ${target_abs_path}/compatibilitytools.d/${FOLDER} ]]; then
+if [[ -d ${target_abs_path}/${FOLDER} ]]; then
 	echo "${FOLDER} already exists in target_abs_path ${target_abs_path}!"
     read -erp "Reset installation? (y/N): " reset_install
     if [[ ${reset_install} == "y" || ${reset_install} == "Y" ]]; then
@@ -90,7 +90,7 @@ if [[ -d ${target_abs_path}/compatibilitytools.d/${FOLDER} ]]; then
 fi
 
 echo "Extracting Proton GE to target_abs_path: ${target_abs_path}"
-if ! tar -xf ${FILE} -C "${target_abs_path}/compatibilitytools.d"; then
+if ! tar -xf ${FILE} -C "${target_abs_path}"; then
     echo "ERROR: Could not extact contents of ${FILE}"
     exit 1
 fi
