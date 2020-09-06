@@ -83,7 +83,7 @@ if [[ -d ${target_abs_path}/${FOLDER} ]]; then
 	echo "${FOLDER} already exists in target_abs_path ${target_abs_path}!"
     read -erp "Reset installation? (y/N): " reset_install
     if [[ ${reset_install} == "y" || ${reset_install} == "Y" ]]; then
-        rm -r ${target_abs_path}
+        rm -r ${target_abs_path}/${FOLDER}
     else
         exit 1
     fi
