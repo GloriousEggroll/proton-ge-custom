@@ -88,6 +88,7 @@ This is my build of Proton with the most recent releases of vanilla WINE. It has
 - BlazBlue Centralfiction
 - Bloodstained: Ritual of the Night
 - Crazy Machines 3
+- Wasteland 3
 
 ### Notes
 
