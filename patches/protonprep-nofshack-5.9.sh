@@ -37,8 +37,6 @@
     
     # lsteamclient
     cd lsteamclient
-    git reset --hard HEAD
-    git clean -xdf
     # path of exile and alyx fixes
     patch -Np1 < ../patches/proton-hotfixes/proton-lsteamclient-path-of-exile-and-alyx-fixes.patch
     # warframe controller fix
@@ -48,8 +46,6 @@
     
     # vrclient
     cd vrclient_x64
-    git reset --hard HEAD
-    git clean -xdf
     patch -Np1 < ../patches/proton-hotfixes/vrclient-use_standard_dlopen_instead_of_the_libwine_wrappers.patch
     cd ..
 
