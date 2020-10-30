@@ -9,7 +9,6 @@
 	- [Manual](#manual)
 		- [Native](#native)
 		- [Flatpak](#flatpak)
-	- [Automatic](#automatic)
 - [Building](#building)
 - [Enabling](#enabling)
 - [Modification](#modification)
