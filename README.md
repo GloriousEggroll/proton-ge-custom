@@ -126,6 +126,12 @@ Full patches can be viewed in [protonprep.sh](patches/protonprep.sh).
 
 ## Installation
 
+> **Very Quick Start** If you want to get started as fast as possible, this will install all the pre-requisites, and should get you going: 
+
+```
+curl https://raw.githubusercontent.com/GloriousEggroll/proton-ge-custom/master/setup.sh|bash
+```
+
 PLEASE NOTE: There are prerequisites for using this version of proton:
 
 1. You must have wine installed on your system
