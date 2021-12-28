@@ -144,7 +144,7 @@ PLEASE NOTE: There are prerequisites for using this version of proton:
 This section is for those that use the native version of Steam.
 
 1. Download a release from the [Releases](https://github.com/GloriousEggroll/proton-ge-custom/releases) page.
-2. Create a `~/.steam/root/compatibilitytools.d` directory if it does not exist.
+2. Create a `~/.steam/root/compatibilitytools.d` directory if it does not exist. (If this path doesn't make Steam detect Proton-GE on debian based distros, try this path instead: `~/.steam/steam/compatibilitytools.d/`.
 3. Extract the release tarball into `~/.steam/root/compatibilitytools.d/`.
    * `tar -xf Proton-VERSION.tar.gz -C ~/.steam/root/compatibilitytools.d/`
 4. Restart Steam.
