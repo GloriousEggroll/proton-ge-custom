@@ -319,6 +319,9 @@
     echo "WINE: -GAME FIXES- add file search workaround hack for Phantasy Star Online 2"
     patch -Np1 < ../patches/game-patches/pso2_hack.patch
 
+    echo "WINE: -GAME FIXES- persona 5 royal write file fix"
+    patch -Np1 < ../patches/game-patches/persona-5-royal-fix.patch
+
 ### END GAME PATCH SECTION ###
 
 ### (2-4) PROTON PATCH SECTION ###
