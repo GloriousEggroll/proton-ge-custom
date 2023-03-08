@@ -326,6 +326,9 @@
     echo "WINE: -GAME FIXES- add file search workaround hack for Phantasy Star Online 2"
     patch -Np1 < ../patches/game-patches/pso2_hack.patch
 
+    echo "WINE: -GAME FIXES- Enhance Anno 1800 multiplayer compatbility, added ECDH_P384 handling"
+    patch -Np1 < ../patches/game-patches/Anno-1800-Multiplayer_fix.patch
+
 ### END GAME PATCH SECTION ###
 
 ### (2-4) PROTON PATCH SECTION ###
