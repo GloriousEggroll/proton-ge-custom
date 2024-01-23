@@ -29,12 +29,6 @@
     #patch -Np1 < ../patches/proton/82-nv_low_latency_dxvk_nvapi.patch
     popd
 
-    pushd wineopenxr
-    git checkout openxr.c
-    echo "WINEOPENXR: -GAME FIXES- BeamNG.Drive VR Fix"
-    patch -Np1 < ../patches/game-patches/beamng-vr-fix.patch
-    popd
-
 ### END PREP SECTION ###
 
 ### (2) WINE PATCHING ###
