@@ -185,12 +185,6 @@ vkd3d-proton: any
 	cp -f $(BUILD_DIR)/dist/files/lib/wine/vkd3d-proton/*.dll $(BUILD_ROOT)/vkd3d-proton/lib/wine/vkd3d-proton/ && \
 	cp -f $(BUILD_DIR)/dist/files/lib64/wine/vkd3d-proton/*.dll $(BUILD_ROOT)/vkd3d-proton/lib64/wine/vkd3d-proton/
 
-d8vk: | $(BUILD_ROOT)/d8vk/lib/wine/d8vk
-d8vk: | $(BUILD_ROOT)/d8vk/lib64/wine/d8vk
-d8vk: any
-	cp -f $(BUILD_DIR)/dist/files/lib/wine/d8vk/*.dll $(BUILD_ROOT)/d8vk/lib/wine/d8vk/ && \
-	cp -f $(BUILD_DIR)/dist/files/lib64/wine/d8vk/*.dll $(BUILD_ROOT)/d8vk/lib64/wine/d8vk/
-
 lsteamclient: | $(BUILD_ROOT)/lsteamclient/lib/wine/i386-windows
 lsteamclient: | $(BUILD_ROOT)/lsteamclient/lib/wine/i386-unix
 lsteamclient: | $(BUILD_ROOT)/lsteamclient/lib64/wine/x86_64-windows
