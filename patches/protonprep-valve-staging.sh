@@ -297,6 +297,9 @@
     echo "WINE: -GAME FIXES- add xinput support to Dragon Age Inquisition"
     patch -Np1 < ../patches/game-patches/dai_xinput.patch
 
+    echo "WINE: -GAME FIXES- add set current directory workaround for Vanguard Saga of Heroes"
+    patch -Np1 < ../patches/game-patches/vgsoh.patch
+
     echo "WINE: -GAME FIXES- add __TRY/__EXCEPT_PAGE_FAULT wnsprintfA xDefiant patch because of a bad arg passed by the game that would exit to desktop"
     patch -Np1 < ../patches/game-patches/xdefiant.patch
 
