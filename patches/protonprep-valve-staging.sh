@@ -339,6 +339,10 @@
     echo "WINE: -CUSTOM- Add PROTON_PREFER_SDL option to make it not prefer hidraw and instead expose both sdl and hidraw"
     patch -Np1 < ../patches/proton/PREFER_SDL.patch
 
+    # https://github.com/ValveSoftware/wine/pull/269
+    echo "WINE: -PENDING- Hid multi TLC and Fanatec wheel-bases hidraw white-list"
+    patch -Np1 < ../patches/wine-hotfixes/pending/hid-multi-tlc-and-ftec-hidraw-269.patch
+
     popd
 
 ### END PROTON-GE ADDITIONAL CUSTOM PATCHES ###

@@ -1,0 +1,858 @@
+From a83269252f9794e5adc0b82b20995e4c59c52e18 Mon Sep 17 00:00:00 2001
+From: Matthias Gorzellik <matthias.gorzellik@gmail.com>
+Date: Mon, 3 Feb 2025 21:35:12 +0100
+Subject: [PATCH 1/2] hidclass: Implement multiple TLC support.
+
+Cherry-pick changes of https://gitlab.winehq.org/wine/wine/-/merge_requests/6206
+---
+ dlls/dinput/tests/hid.c    |  44 ++++++-
+ dlls/hidclass.sys/device.c |  14 ++-
+ dlls/hidclass.sys/hid.h    |   9 +-
+ dlls/hidclass.sys/pnp.c    | 247 ++++++++++++++++++++-----------------
+ dlls/hidparse.sys/main.c   | 162 ++++++++++++++++--------
+ dlls/winebus.sys/main.c    |  27 ++--
+ 6 files changed, 318 insertions(+), 185 deletions(-)
+
+diff --git a/dlls/dinput/tests/hid.c b/dlls/dinput/tests/hid.c
+index 0a28fda6f99..b69aec62802 100644
+--- a/dlls/dinput/tests/hid.c
++++ b/dlls/dinput/tests/hid.c
+@@ -730,7 +730,6 @@ void hid_device_stop( struct hid_device_desc *desc, UINT count )
+     for (i = 0; i < count; ++i)
+     {
+         ret = WaitForSingleObject( device_removed, i > 0 ? 500 : 5000 );
+-        todo_wine_if(i > 0)
+         ok( !ret, "WaitForSingleObject returned %#lx\n", ret );
+     }
+ }
+@@ -4017,8 +4016,27 @@ static void test_hid_multiple_tlc(void)
+             .usage_page = 0x01,
+         },
+     };
++    struct hid_expect input[] =
++    {
++        {
++            .code = IOCTL_HID_READ_REPORT,
++            .report_len = desc.caps.InputReportByteLength,
++            .report_buf = {1,0x01,0x02,0x03,0x04,0x05,0x06},
++            .ret_length = 6,
++            .ret_status = STATUS_SUCCESS,
++        },
++        {
++            .code = IOCTL_HID_READ_REPORT,
++            .report_len = desc.caps.InputReportByteLength,
++            .report_buf = {2,0x11,0x12,0x13,0x14,0x15,0x16},
++            .ret_length = 6,
++            .ret_status = STATUS_SUCCESS,
++        },
++    };
+ 
+     WCHAR device_path[MAX_PATH];
++    char report[16];
++    ULONG value;
+     HANDLE file;
+     BOOL ret;
+ 
+@@ -4031,15 +4049,24 @@ static void test_hid_multiple_tlc(void)
+     swprintf( device_path, MAX_PATH, L"\\\\?\\hid#vid_%04x&pid_%04x&col01", desc.attributes.VendorID,
+               desc.attributes.ProductID );
+     ret = find_hid_device_path( device_path );
+-    todo_wine
+     ok( ret, "Failed to find HID device matching %s\n", debugstr_w( device_path ) );
+-    if (!ret) goto done;
+ 
+     file = CreateFileW( device_path, FILE_READ_ACCESS | FILE_WRITE_ACCESS,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL );
+     ok( file != INVALID_HANDLE_VALUE, "got error %lu\n", GetLastError() );
+     check_preparsed_data( file, &expect_kdr_joystick, ARRAY_SIZE(expect_caps_joystick), expect_caps_joystick,
+                           ARRAY_SIZE(expect_nodes_joystick), expect_nodes_joystick );
++
++    send_hid_input( file, input, sizeof(input) );
++
++    memset( report, 0xcd, sizeof(report) );
++    SetLastError( 0xdeadbeef );
++    ret = ReadFile( file, report, desc.caps.InputReportByteLength, &value, NULL );
++    ok( ret, "ReadFile failed, last error %lu\n", GetLastError() );
++    ok( value == 6, "ReadFile returned %lx\n", value );
++    ok( report[0] == 1, "unexpected report data\n" );
++    ok( report[1] == 0x01, "unexpected report data\n" );
++
+     CloseHandle( file );
+ 
+     swprintf( device_path, MAX_PATH, L"\\\\?\\hid#vid_%04x&pid_%04x&col02", desc.attributes.VendorID,
+@@ -4052,6 +4079,17 @@ static void test_hid_multiple_tlc(void)
+     ok( file != INVALID_HANDLE_VALUE, "got error %lu\n", GetLastError() );
+     check_preparsed_data( file, &expect_kdr_gamepad, ARRAY_SIZE(expect_caps_gamepad), expect_caps_gamepad,
+                           ARRAY_SIZE(expect_nodes_gamepad), expect_nodes_gamepad );
++
++    send_hid_input( file, input, sizeof(input) );
++
++    memset( report, 0xcd, sizeof(report) );
++    SetLastError( 0xdeadbeef );
++    ret = ReadFile( file, report, desc.caps.InputReportByteLength, &value, NULL );
++    ok( ret, "ReadFile failed, last error %lu\n", GetLastError() );
++    ok( value == 6, "ReadFile returned %lx\n", value );
++    ok( report[0] == 2, "unexpected report data\n" );
++    ok( report[1] == 0x11, "unexpected report data\n" );
++
+     CloseHandle( file );
+ 
+     swprintf( device_path, MAX_PATH, L"\\\\?\\hid#vid_%04x&pid_%04x&col03", desc.attributes.VendorID,
+diff --git a/dlls/hidclass.sys/device.c b/dlls/hidclass.sys/device.c
+index 135e58bf587..495a520eb35 100644
+--- a/dlls/hidclass.sys/device.c
++++ b/dlls/hidclass.sys/device.c
+@@ -219,7 +219,7 @@ static struct hid_report *hid_queue_pop_report( struct hid_queue *queue )
+ static void hid_device_queue_input( DEVICE_OBJECT *device, HID_XFER_PACKET *packet )
+ {
+     BASE_DEVICE_EXTENSION *ext = device->DeviceExtension;
+-    HIDP_COLLECTION_DESC *desc = ext->u.pdo.device_desc.CollectionDesc;
++    HIDP_COLLECTION_DESC *desc = ext->u.pdo.collection_desc;
+     const BOOL polled = ext->u.pdo.information.Polled;
+     ULONG size, report_len = polled ? packet->reportBufferLen : desc->InputLength;
+     struct hid_report *last_report, *report;
+@@ -303,11 +303,13 @@ static void hid_device_queue_input( DEVICE_OBJECT *device, HID_XFER_PACKET *pack
+ 
+ static HIDP_REPORT_IDS *find_report_with_type_and_id( BASE_DEVICE_EXTENSION *ext, BYTE type, BYTE id, BOOL any_id )
+ {
+-    HIDP_REPORT_IDS *report, *reports = ext->u.pdo.device_desc.ReportIDs;
+-    ULONG report_count = ext->u.pdo.device_desc.ReportIDsLength;
++    BASE_DEVICE_EXTENSION *fdo_ext = ext->u.pdo.parent_fdo->DeviceExtension;
++    HIDP_REPORT_IDS *report, *reports = fdo_ext->u.fdo.device_desc.ReportIDs;
++    ULONG report_count = fdo_ext->u.fdo.device_desc.ReportIDsLength;
+ 
+     for (report = reports; report != reports + report_count; report++)
+     {
++        if (ext->u.pdo.collection_desc->CollectionNumber != report->CollectionNumber) continue;
+         if (!any_id && report->ReportID && report->ReportID != id) continue;
+         if (type == HidP_Input && report->InputLength) return report;
+         if (type == HidP_Output && report->OutputLength) return report;
+@@ -321,7 +323,7 @@ static DWORD CALLBACK hid_device_thread(void *args)
+ {
+     DEVICE_OBJECT *device = (DEVICE_OBJECT*)args;
+     BASE_DEVICE_EXTENSION *ext = device->DeviceExtension;
+-    HIDP_COLLECTION_DESC *desc = ext->u.pdo.device_desc.CollectionDesc;
++    HIDP_COLLECTION_DESC *desc = ext->u.pdo.collection_desc;
+     BOOL polled = ext->u.pdo.information.Polled;
+     HIDP_REPORT_IDS *report;
+     HID_XFER_PACKET *packet;
+@@ -627,7 +629,7 @@ NTSTATUS WINAPI pdo_ioctl(DEVICE_OBJECT *device, IRP *irp)
+         }
+         case IOCTL_HID_GET_COLLECTION_DESCRIPTOR:
+         {
+-            HIDP_COLLECTION_DESC *desc = ext->u.pdo.device_desc.CollectionDesc;
++            HIDP_COLLECTION_DESC *desc = ext->u.pdo.collection_desc;
+ 
+             irp->IoStatus.Information = desc->PreparsedDataLength;
+             if (irpsp->Parameters.DeviceIoControl.OutputBufferLength < desc->PreparsedDataLength)
+@@ -699,7 +701,7 @@ NTSTATUS WINAPI pdo_read(DEVICE_OBJECT *device, IRP *irp)
+ {
+     struct hid_queue *queue = irp->Tail.Overlay.OriginalFileObject->FsContext;
+     BASE_DEVICE_EXTENSION *ext = device->DeviceExtension;
+-    HIDP_COLLECTION_DESC *desc = ext->u.pdo.device_desc.CollectionDesc;
++    HIDP_COLLECTION_DESC *desc = ext->u.pdo.collection_desc;
+     IO_STACK_LOCATION *irpsp = IoGetCurrentIrpStackLocation(irp);
+     struct hid_report *report;
+     BOOL removed;
+diff --git a/dlls/hidclass.sys/hid.h b/dlls/hidclass.sys/hid.h
+index e9bd85612fa..21e1fb2e58b 100644
+--- a/dlls/hidclass.sys/hid.h
++++ b/dlls/hidclass.sys/hid.h
+@@ -47,15 +47,20 @@ typedef struct _BASE_DEVICE_EXTENSION
+             /* this must be the first member */
+             HID_DEVICE_EXTENSION hid_ext;
+ 
+-            DEVICE_OBJECT *child_pdo;
++            HID_DEVICE_ATTRIBUTES attrs;
++            HIDP_DEVICE_DESC device_desc;
++            WCHAR serial[256];
++
++            DEVICE_OBJECT **child_pdos;
++            UINT child_count;
+         } fdo;
+ 
+         struct
+         {
+             DEVICE_OBJECT *parent_fdo;
+ 
++            HIDP_COLLECTION_DESC *collection_desc;
+             HID_COLLECTION_INFORMATION information;
+-            HIDP_DEVICE_DESC device_desc;
+ 
+             ULONG poll_interval;
+             HANDLE halt_event;
+diff --git a/dlls/hidclass.sys/pnp.c b/dlls/hidclass.sys/pnp.c
+index 317bee640d7..81efcc30be9 100644
+--- a/dlls/hidclass.sys/pnp.c
++++ b/dlls/hidclass.sys/pnp.c
+@@ -113,7 +113,7 @@ C_ASSERT(offsetof(RAWINPUT, data.hid.bRawData[2 * sizeof(USAGE)]) < sizeof(RAWIN
+ 
+ static void send_wm_input_device_change(BASE_DEVICE_EXTENSION *ext, LPARAM param)
+ {
+-    HIDP_COLLECTION_DESC *desc = ext->u.pdo.device_desc.CollectionDesc;
++    HIDP_COLLECTION_DESC *desc = ext->u.pdo.collection_desc;
+     RAWINPUT rawinput;
+     INPUT input;
+ 
+@@ -199,115 +199,145 @@ static NTSTATUS WINAPI driver_add_device(DRIVER_OBJECT *driver, DEVICE_OBJECT *b
+     return STATUS_SUCCESS;
+ }
+ 
+-static void create_child(minidriver *minidriver, DEVICE_OBJECT *fdo)
++static NTSTATUS get_hid_device_desc( minidriver *minidriver, DEVICE_OBJECT *device, HIDP_DEVICE_DESC *desc )
+ {
+-    BASE_DEVICE_EXTENSION *fdo_ext = fdo->DeviceExtension, *pdo_ext;
+-    HID_DEVICE_ATTRIBUTES attr = {0};
+     HID_DESCRIPTOR descriptor = {0};
+-    HIDP_COLLECTION_DESC *desc;
+-    DEVICE_OBJECT *child_pdo;
+-    BYTE *reportDescriptor;
+-    UNICODE_STRING string;
+-    WCHAR pdo_name[255];
+     IO_STATUS_BLOCK io;
+-    USAGE page, usage;
+-    NTSTATUS status;
++    BYTE *report_desc;
+     INT i;
+ 
+-    call_minidriver( IOCTL_HID_GET_DEVICE_ATTRIBUTES, fdo, NULL, 0, &attr, sizeof(attr), &io );
++    call_minidriver( IOCTL_HID_GET_DEVICE_DESCRIPTOR, device, NULL, 0, &descriptor, sizeof(descriptor), &io );
++    if (io.Status) return io.Status;
++
++    for (i = 0; i < descriptor.bNumDescriptors; i++)
++        if (descriptor.DescriptorList[i].bReportType == HID_REPORT_DESCRIPTOR_TYPE)
++            break;
++    if (i >= descriptor.bNumDescriptors) return STATUS_NOT_FOUND;
++
++    if (!(report_desc = malloc( descriptor.DescriptorList[i].wReportLength ))) return STATUS_NO_MEMORY;
++    call_minidriver( IOCTL_HID_GET_REPORT_DESCRIPTOR, device, NULL, 0, report_desc,
++                     descriptor.DescriptorList[i].wReportLength, &io );
++    if (!io.Status) io.Status = HidP_GetCollectionDescription( report_desc, descriptor.DescriptorList[i].wReportLength,
++                                                               PagedPool, desc );
++    free( report_desc );
++
++    if (io.Status && io.Status != HIDP_STATUS_SUCCESS) return STATUS_INVALID_PARAMETER;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS initialize_device( minidriver *minidriver, DEVICE_OBJECT *device )
++{
++    BASE_DEVICE_EXTENSION *ext = device->DeviceExtension;
++    ULONG index = HID_STRING_ID_ISERIALNUMBER;
++    IO_STATUS_BLOCK io;
++    NTSTATUS status;
++
++    call_minidriver( IOCTL_HID_GET_DEVICE_ATTRIBUTES, device, NULL, 0, &ext->u.fdo.attrs,
++                     sizeof(ext->u.fdo.attrs), &io );
+     if (io.Status != STATUS_SUCCESS)
+     {
+         ERR( "Minidriver failed to get attributes, status %#lx.\n", io.Status );
+-        return;
++        return io.Status;
+     }
+ 
+-    swprintf(pdo_name, ARRAY_SIZE(pdo_name), L"\\Device\\HID#%p&%p", fdo->DriverObject,
+-            fdo_ext->u.fdo.hid_ext.PhysicalDeviceObject);
+-    RtlInitUnicodeString(&string, pdo_name);
+-    if ((status = IoCreateDevice(fdo->DriverObject, sizeof(*pdo_ext), &string, 0, 0, FALSE, &child_pdo)))
+-    {
+-        ERR( "Failed to create child PDO, status %#lx.\n", io.Status );
+-        return;
+-    }
+-    fdo_ext->u.fdo.child_pdo = child_pdo;
+-
+-    pdo_ext = child_pdo->DeviceExtension;
+-    pdo_ext->u.pdo.parent_fdo = fdo;
+-    list_init( &pdo_ext->u.pdo.queues );
+-    KeInitializeSpinLock( &pdo_ext->u.pdo.queues_lock );
+-    wcscpy(pdo_ext->device_id, fdo_ext->device_id);
+-    wcscpy(pdo_ext->instance_id, fdo_ext->instance_id);
+-    wcscpy(pdo_ext->container_id, fdo_ext->container_id);
+-    pdo_ext->class_guid = fdo_ext->class_guid;
+-
+-    pdo_ext->u.pdo.information.VendorID = attr.VendorID;
+-    pdo_ext->u.pdo.information.ProductID = attr.ProductID;
+-    pdo_ext->u.pdo.information.VersionNumber = attr.VersionNumber;
+-    pdo_ext->u.pdo.information.Polled = minidriver->minidriver.DevicesArePolled;
+-
+-    pdo_ext->steam_overlay_event = minidriver->steam_overlay_event;
+-    pdo_ext->steam_keyboard_event = minidriver->steam_keyboard_event;
+-
+-    call_minidriver( IOCTL_HID_GET_DEVICE_DESCRIPTOR, fdo, NULL, 0, &descriptor, sizeof(descriptor), &io );
++    call_minidriver( IOCTL_HID_GET_STRING, device, ULongToPtr(index), sizeof(index),
++                     &ext->u.fdo.serial, sizeof(ext->u.fdo.serial), &io );
+     if (io.Status != STATUS_SUCCESS)
+     {
+-        ERR( "Cannot get Device Descriptor, status %#lx\n", status );
+-        IoDeleteDevice(child_pdo);
+-        return;
++        ERR( "Minidriver failed to get serial number, status %#lx.\n", io.Status );
++        return io.Status;
+     }
+-    for (i = 0; i < descriptor.bNumDescriptors; i++)
+-        if (descriptor.DescriptorList[i].bReportType == HID_REPORT_DESCRIPTOR_TYPE)
+-            break;
+ 
+-    if (i >= descriptor.bNumDescriptors)
++    if ((status = get_hid_device_desc( minidriver, device, &ext->u.fdo.device_desc )))
+     {
+-        ERR("No Report Descriptor found in reply\n");
+-        IoDeleteDevice(child_pdo);
+-        return;
++        ERR( "Failed to get HID device description, status %#lx\n", status );
++        return status;
+     }
+ 
+-    reportDescriptor = malloc(descriptor.DescriptorList[i].wReportLength);
+-    call_minidriver( IOCTL_HID_GET_REPORT_DESCRIPTOR, fdo, NULL, 0, reportDescriptor,
+-                     descriptor.DescriptorList[i].wReportLength, &io );
+-    if (io.Status != STATUS_SUCCESS)
++    if (!(ext->u.fdo.child_pdos = malloc( ext->u.fdo.device_desc.CollectionDescLength * sizeof(ext->u.fdo.child_pdos) )))
+     {
+-        ERR( "Cannot get Report Descriptor, status %#lx\n", status );
+-        free(reportDescriptor);
+-        IoDeleteDevice(child_pdo);
+-        return;
++        ERR( "Cannot allocate child PDOs array\n" );
++        return STATUS_NO_MEMORY;
+     }
+ 
+-    io.Status = HidP_GetCollectionDescription( reportDescriptor, descriptor.DescriptorList[i].wReportLength,
+-                                               PagedPool, &pdo_ext->u.pdo.device_desc );
+-    free(reportDescriptor);
+-    if (io.Status != HIDP_STATUS_SUCCESS)
+-    {
+-        ERR("Cannot parse Report Descriptor\n");
+-        IoDeleteDevice(child_pdo);
+-        return;
+-    }
++    return STATUS_SUCCESS;
++}
+ 
+-    desc = pdo_ext->u.pdo.device_desc.CollectionDesc;
+-    pdo_ext->u.pdo.information.DescriptorSize = desc->PreparsedDataLength;
++static NTSTATUS create_child_pdos( minidriver *minidriver, DEVICE_OBJECT *device )
++{
++    BASE_DEVICE_EXTENSION *fdo_ext = device->DeviceExtension, *pdo_ext;
++    DEVICE_OBJECT *child_pdo;
++    UNICODE_STRING string;
++    WCHAR pdo_name[255];
++    USAGE page, usage;
++    NTSTATUS status;
++    INT i;
+ 
+-    page = desc->UsagePage;
+-    usage = desc->Usage;
+-    if (page == HID_USAGE_PAGE_GENERIC && usage == HID_USAGE_GENERIC_MOUSE)
+-        pdo_ext->u.pdo.rawinput_handle = WINE_MOUSE_HANDLE;
+-    else if (page == HID_USAGE_PAGE_GENERIC && usage == HID_USAGE_GENERIC_KEYBOARD)
+-        pdo_ext->u.pdo.rawinput_handle = WINE_KEYBOARD_HANDLE;
+-    else
+-        pdo_ext->u.pdo.rawinput_handle = alloc_rawinput_handle();
++    for (i = 0; i < fdo_ext->u.fdo.device_desc.CollectionDescLength; ++i)
++    {
++        if (fdo_ext->u.fdo.device_desc.CollectionDescLength > 1)
++            swprintf( pdo_name, ARRAY_SIZE(pdo_name), L"\\Device\\HID#%p&%p&%d", device->DriverObject,
++                      fdo_ext->u.fdo.hid_ext.PhysicalDeviceObject, i );
++        else
++            swprintf( pdo_name, ARRAY_SIZE(pdo_name), L"\\Device\\HID#%p&%p", device->DriverObject,
++                      fdo_ext->u.fdo.hid_ext.PhysicalDeviceObject );
++
++        RtlInitUnicodeString(&string, pdo_name);
++        if ((status = IoCreateDevice( device->DriverObject, sizeof(*pdo_ext), &string, 0, 0, FALSE, &child_pdo )))
++        {
++            ERR( "Failed to create child PDO, status %#lx.\n", status );
++            return status;
++        }
+ 
+-    IoInvalidateDeviceRelations(fdo_ext->u.fdo.hid_ext.PhysicalDeviceObject, BusRelations);
++        fdo_ext->u.fdo.child_pdos[i] = child_pdo;
++        fdo_ext->u.fdo.child_count++;
+ 
+-    pdo_ext->u.pdo.poll_interval = DEFAULT_POLL_INTERVAL;
++        pdo_ext = child_pdo->DeviceExtension;
++        pdo_ext->u.pdo.parent_fdo = device;
++        list_init( &pdo_ext->u.pdo.queues );
++        KeInitializeSpinLock( &pdo_ext->u.pdo.queues_lock );
+ 
+-    HID_StartDeviceThread(child_pdo);
++        pdo_ext->u.pdo.collection_desc = fdo_ext->u.fdo.device_desc.CollectionDesc + i;
+ 
+-    send_wm_input_device_change(pdo_ext, GIDC_ARRIVAL);
++        if (fdo_ext->u.fdo.device_desc.CollectionDescLength > 1)
++        {
++            swprintf( pdo_ext->device_id, ARRAY_SIZE(pdo_ext->device_id), L"%s&Col%02d",
++                      fdo_ext->device_id, pdo_ext->u.pdo.collection_desc->CollectionNumber );
++            swprintf( pdo_ext->instance_id, ARRAY_SIZE(pdo_ext->instance_id), L"%u&%s&%x&%u&%04u",
++                      fdo_ext->u.fdo.attrs.VersionNumber, fdo_ext->u.fdo.serial, 0, 0, i );
++        }
++        else
++        {
++            wcscpy( pdo_ext->device_id, fdo_ext->device_id );
++            wcscpy( pdo_ext->instance_id, fdo_ext->instance_id );
++        }
++        wcscpy(pdo_ext->container_id, fdo_ext->container_id);
++        pdo_ext->class_guid = fdo_ext->class_guid;
++
++        pdo_ext->steam_overlay_event = minidriver->steam_overlay_event;
++        pdo_ext->steam_keyboard_event = minidriver->steam_keyboard_event;
++
++        pdo_ext->u.pdo.information.VendorID = fdo_ext->u.fdo.attrs.VendorID;
++        pdo_ext->u.pdo.information.ProductID = fdo_ext->u.fdo.attrs.ProductID;
++        pdo_ext->u.pdo.information.VersionNumber = fdo_ext->u.fdo.attrs.VersionNumber;
++        pdo_ext->u.pdo.information.Polled = minidriver->minidriver.DevicesArePolled;
++        pdo_ext->u.pdo.information.DescriptorSize = pdo_ext->u.pdo.collection_desc->PreparsedDataLength;
++
++        page = pdo_ext->u.pdo.collection_desc->UsagePage;
++        usage = pdo_ext->u.pdo.collection_desc->Usage;
++        if (page == HID_USAGE_PAGE_GENERIC && usage == HID_USAGE_GENERIC_MOUSE)
++            pdo_ext->u.pdo.rawinput_handle = WINE_MOUSE_HANDLE;
++        else if (page == HID_USAGE_PAGE_GENERIC && usage == HID_USAGE_GENERIC_KEYBOARD)
++            pdo_ext->u.pdo.rawinput_handle = WINE_KEYBOARD_HANDLE;
++        else
++            pdo_ext->u.pdo.rawinput_handle = alloc_rawinput_handle();
++        pdo_ext->u.pdo.poll_interval = DEFAULT_POLL_INTERVAL;
++
++        TRACE( "created device %p, rawinput handle %#x\n", pdo_ext, pdo_ext->u.pdo.rawinput_handle );
++    }
+ 
+-    TRACE( "created device %p, rawinput handle %#x\n", pdo_ext, pdo_ext->u.pdo.rawinput_handle );
++    IoInvalidateDeviceRelations( fdo_ext->u.fdo.hid_ext.PhysicalDeviceObject, BusRelations );
++    return STATUS_SUCCESS;
+ }
+ 
+ static NTSTATUS fdo_pnp(DEVICE_OBJECT *device, IRP *irp)
+@@ -315,6 +345,7 @@ static NTSTATUS fdo_pnp(DEVICE_OBJECT *device, IRP *irp)
+     minidriver *minidriver = find_minidriver(device->DriverObject);
+     IO_STACK_LOCATION *stack = IoGetCurrentIrpStackLocation(irp);
+     BASE_DEVICE_EXTENSION *ext = device->DeviceExtension;
++    NTSTATUS status;
+ 
+     TRACE("irp %p, minor function %#x.\n", irp, stack->MinorFunction);
+ 
+@@ -323,27 +354,23 @@ static NTSTATUS fdo_pnp(DEVICE_OBJECT *device, IRP *irp)
+         case IRP_MN_QUERY_DEVICE_RELATIONS:
+         {
+             DEVICE_RELATIONS *devices;
+-            DEVICE_OBJECT *child;
++            UINT32 i;
+ 
+             if (stack->Parameters.QueryDeviceRelations.Type != BusRelations)
+                 return minidriver->PNPDispatch(device, irp);
+ 
+-            if (!(devices = ExAllocatePool(PagedPool, offsetof(DEVICE_RELATIONS, Objects[1]))))
++            if (!(devices = ExAllocatePool(PagedPool, offsetof(DEVICE_RELATIONS, Objects[ext->u.fdo.child_count]))))
+             {
+                 irp->IoStatus.Status = STATUS_NO_MEMORY;
+                 IoCompleteRequest(irp, IO_NO_INCREMENT);
+                 return STATUS_NO_MEMORY;
+             }
+ 
+-            if ((child = ext->u.fdo.child_pdo))
+-            {
+-                devices->Objects[0] = ext->u.fdo.child_pdo;
+-                call_fastcall_func1(ObfReferenceObject, ext->u.fdo.child_pdo);
+-                devices->Count = 1;
+-            }
+-            else
++            for (i = 0, devices->Count = 0; i < ext->u.fdo.child_count; ++i)
+             {
+-                devices->Count = 0;
++                devices->Objects[i] = ext->u.fdo.child_pdos[i];
++                call_fastcall_func1(ObfReferenceObject, ext->u.fdo.child_pdos[i]);
++                devices->Count++;
+             }
+ 
+             irp->IoStatus.Information = (ULONG_PTR)devices;
+@@ -353,25 +380,18 @@ static NTSTATUS fdo_pnp(DEVICE_OBJECT *device, IRP *irp)
+         }
+ 
+         case IRP_MN_START_DEVICE:
+-        {
+-            NTSTATUS ret;
+-
+-            if ((ret = minidriver->PNPDispatch(device, irp)))
+-                return ret;
+-            create_child(minidriver, device);
+-            return STATUS_SUCCESS;
+-        }
++            status = minidriver->PNPDispatch( device, irp );
++            if (!status) status = initialize_device( minidriver, device );
++            if (!status) status = create_child_pdos( minidriver, device );
++            return status;
+ 
+         case IRP_MN_REMOVE_DEVICE:
+-        {
+-            NTSTATUS ret;
+-
+-            ret = minidriver->PNPDispatch(device, irp);
+-
+-            IoDetachDevice(ext->u.fdo.hid_ext.NextDeviceObject);
+-            IoDeleteDevice(device);
+-            return ret;
+-        }
++            status = minidriver->PNPDispatch( device, irp );
++            HidP_FreeCollectionDescription( &ext->u.fdo.device_desc );
++            free( ext->u.fdo.child_pdos );
++            IoDetachDevice( ext->u.fdo.hid_ext.NextDeviceObject );
++            IoDeleteDevice( device );
++            return status;
+ 
+         default:
+             return minidriver->PNPDispatch(device, irp);
+@@ -382,7 +402,7 @@ static NTSTATUS pdo_pnp(DEVICE_OBJECT *device, IRP *irp)
+ {
+     IO_STACK_LOCATION *irpsp = IoGetCurrentIrpStackLocation(irp);
+     BASE_DEVICE_EXTENSION *ext = device->DeviceExtension;
+-    HIDP_COLLECTION_DESC *desc = ext->u.pdo.device_desc.CollectionDesc;
++    HIDP_COLLECTION_DESC *desc = ext->u.pdo.collection_desc;
+     NTSTATUS status = irp->IoStatus.Status;
+     struct hid_queue *queue, *next;
+     KIRQL irql;
+@@ -461,6 +481,9 @@ static NTSTATUS pdo_pnp(DEVICE_OBJECT *device, IRP *irp)
+         }
+ 
+         case IRP_MN_START_DEVICE:
++            HID_StartDeviceThread(device);
++            send_wm_input_device_change(ext, GIDC_ARRIVAL);
++
+             if ((status = IoRegisterDeviceInterface(device, ext->class_guid, NULL, &ext->u.pdo.link_name)))
+             {
+                 ERR( "Failed to register interface, status %#lx.\n", status );
+@@ -510,8 +533,6 @@ static NTSTATUS pdo_pnp(DEVICE_OBJECT *device, IRP *irp)
+                 hid_queue_destroy( queue );
+             KeReleaseSpinLock( &ext->u.pdo.queues_lock, irql );
+ 
+-            HidP_FreeCollectionDescription(&ext->u.pdo.device_desc);
+-
+             RtlFreeUnicodeString(&ext->u.pdo.link_name);
+ 
+             irp->IoStatus.Status = STATUS_SUCCESS;
+diff --git a/dlls/hidparse.sys/main.c b/dlls/hidparse.sys/main.c
+index feb5b3531a4..8a497e53227 100644
+--- a/dlls/hidparse.sys/main.c
++++ b/dlls/hidparse.sys/main.c
+@@ -644,79 +644,126 @@ struct hid_preparsed_data *parse_descriptor( BYTE *descriptor, unsigned int leng
+     return data;
+ }
+ 
++static BYTE **parse_top_level_collections( BYTE *descriptor, unsigned int length, ULONG *count )
++{
++    BYTE *ptr, *end, **tmp, **tlcs;
++    UINT32 size, depth = 0;
++
++    if (!(tlcs = malloc( sizeof(*tlcs) ))) return NULL;
++    tlcs[0] = descriptor;
++    *count = 0;
++
++    for (ptr = descriptor, end = descriptor + length; ptr != end; ptr += size + 1)
++    {
++        size = (*ptr & 0x03);
++        if (size == 3) size = 4;
++        if (ptr + size > end)
++        {
++            ERR( "Need %d bytes to read item value\n", size );
++            break;
++        }
++
++#define SHORT_ITEM( tag, type ) (((tag) << 4) | ((type) << 2))
++        switch (*ptr & SHORT_ITEM( 0xf, 0x3 ))
++        {
++        case SHORT_ITEM( TAG_MAIN_COLLECTION, TAG_TYPE_MAIN ):
++            if (depth++) break;
++            break;
++        case SHORT_ITEM( TAG_MAIN_END_COLLECTION, TAG_TYPE_MAIN ):
++            if (--depth) break;
++            *count = *count + 1;
++            if (!(tmp = realloc( tlcs, (*count + 1) * sizeof(*tlcs) )))
++            {
++                ERR( "Failed to allocate memory for TLCs\n" );
++                return tlcs;
++            }
++            tlcs = tmp;
++            tlcs[*count] = ptr + size + 1;
++            break;
++        }
++#undef SHORT_ITEM
++    }
++
++    TRACE( "Found %lu TLCs\n", *count );
++    return tlcs;
++}
++
+ NTSTATUS WINAPI HidP_GetCollectionDescription( PHIDP_REPORT_DESCRIPTOR report_desc, ULONG report_desc_len,
+                                                POOL_TYPE pool_type, HIDP_DEVICE_DESC *device_desc )
+ {
+-    ULONG i, len, report_count = 0, input_len[256] = {0}, output_len[256] = {0}, feature_len[256] = {0};
++    ULONG i, len, tlc_count, report_count = 0, input_len[256] = {0}, output_len[256] = {0}, feature_len[256] = {0}, collection[256] = {0};
+     struct hid_value_caps *caps, *caps_end;
+     struct hid_preparsed_data *preparsed;
++    BYTE **tlcs;
+ 
+     TRACE( "report_desc %p, report_desc_len %lu, pool_type %u, device_desc %p.\n",
+             report_desc, report_desc_len, pool_type, device_desc );
+ 
+     memset( device_desc, 0, sizeof(*device_desc) );
+ 
+-    if (!(preparsed = parse_descriptor( report_desc, report_desc_len, pool_type )))
+-        return HIDP_STATUS_INTERNAL_ERROR;
++    if (!(tlcs = parse_top_level_collections( report_desc, report_desc_len, &tlc_count ))) goto failed;
+ 
+-    if (!(device_desc->CollectionDesc = ExAllocatePool( pool_type, sizeof(*device_desc->CollectionDesc) )))
+-    {
+-        free( preparsed );
+-        return STATUS_NO_MEMORY;
+-    }
++    len = sizeof(*device_desc->CollectionDesc) * tlc_count;
++    if (!(device_desc->CollectionDesc = ExAllocatePool( pool_type, len ))) goto failed;
+ 
+-    len = preparsed->caps_size + FIELD_OFFSET(struct hid_preparsed_data, value_caps[0]) +
+-          preparsed->number_link_collection_nodes * sizeof(struct hid_collection_node);
+-
+-    device_desc->CollectionDescLength = 1;
+-    device_desc->CollectionDesc[0].UsagePage = preparsed->usage_page;
+-    device_desc->CollectionDesc[0].Usage = preparsed->usage;
+-    device_desc->CollectionDesc[0].CollectionNumber = 1;
+-    device_desc->CollectionDesc[0].InputLength = preparsed->input_report_byte_length;
+-    device_desc->CollectionDesc[0].OutputLength = preparsed->output_report_byte_length;
+-    device_desc->CollectionDesc[0].FeatureLength = preparsed->feature_report_byte_length;
+-    device_desc->CollectionDesc[0].PreparsedDataLength = len;
+-    device_desc->CollectionDesc[0].PreparsedData = (PHIDP_PREPARSED_DATA)preparsed;
+-
+-    caps = HID_INPUT_VALUE_CAPS( preparsed );
+-    caps_end = caps + preparsed->input_caps_end - preparsed->input_caps_start;
+-    for (; caps != caps_end; ++caps)
++    for (i = 0; i < tlc_count; ++i)
+     {
+-        len = caps->start_byte * 8 + caps->start_bit + caps->bit_size * caps->report_count;
+-        if (!input_len[caps->report_id]) report_count++;
+-        input_len[caps->report_id] = max(input_len[caps->report_id], len);
+-    }
++        TRACE( "parsing TLC %lu, start %p, end %p\n", i, tlcs[i], tlcs[i + 1] );
++
++        if (!(preparsed = parse_descriptor( tlcs[i], tlcs[i + 1] - tlcs[i], pool_type ))) goto failed;
++
++        len = preparsed->caps_size + FIELD_OFFSET(struct hid_preparsed_data, value_caps[0]) +
++              preparsed->number_link_collection_nodes * sizeof(struct hid_collection_node);
++
++        device_desc->CollectionDescLength++;
++        device_desc->CollectionDesc[i].UsagePage = preparsed->usage_page;
++        device_desc->CollectionDesc[i].Usage = preparsed->usage;
++        device_desc->CollectionDesc[i].CollectionNumber = i + 1;
++        device_desc->CollectionDesc[i].InputLength = preparsed->input_report_byte_length;
++        device_desc->CollectionDesc[i].OutputLength = preparsed->output_report_byte_length;
++        device_desc->CollectionDesc[i].FeatureLength = preparsed->feature_report_byte_length;
++        device_desc->CollectionDesc[i].PreparsedDataLength = len;
++        device_desc->CollectionDesc[i].PreparsedData = (PHIDP_PREPARSED_DATA)preparsed;
++
++        caps = HID_INPUT_VALUE_CAPS( preparsed );
++        caps_end = caps + preparsed->input_caps_end - preparsed->input_caps_start;
++        for (; caps != caps_end; ++caps)
++        {
++            len = caps->start_byte * 8 + caps->start_bit + caps->bit_size * caps->report_count;
++            if (!input_len[caps->report_id]) report_count++;
++            input_len[caps->report_id] = max(input_len[caps->report_id], len);
++            collection[caps->report_id] = i;
++        }
+ 
+-    caps = HID_OUTPUT_VALUE_CAPS( preparsed );
+-    caps_end = caps + preparsed->output_caps_end - preparsed->output_caps_start;
+-    for (; caps != caps_end; ++caps)
+-    {
+-        len = caps->start_byte * 8 + caps->start_bit + caps->bit_size * caps->report_count;
+-        if (!input_len[caps->report_id] && !output_len[caps->report_id]) report_count++;
+-        output_len[caps->report_id] = max(output_len[caps->report_id], len);
+-    }
++        caps = HID_OUTPUT_VALUE_CAPS( preparsed );
++        caps_end = caps + preparsed->output_caps_end - preparsed->output_caps_start;
++        for (; caps != caps_end; ++caps)
++        {
++            len = caps->start_byte * 8 + caps->start_bit + caps->bit_size * caps->report_count;
++            if (!input_len[caps->report_id] && !output_len[caps->report_id]) report_count++;
++            output_len[caps->report_id] = max(output_len[caps->report_id], len);
++            collection[caps->report_id] = i;
++        }
+ 
+-    caps = HID_FEATURE_VALUE_CAPS( preparsed );
+-    caps_end = caps + preparsed->feature_caps_end - preparsed->feature_caps_start;
+-    for (; caps != caps_end; ++caps)
+-    {
+-        len = caps->start_byte * 8 + caps->start_bit + caps->bit_size * caps->report_count;
+-        if (!input_len[caps->report_id] && !output_len[caps->report_id] && !feature_len[caps->report_id]) report_count++;
+-        feature_len[caps->report_id] = max(feature_len[caps->report_id], len);
++        caps = HID_FEATURE_VALUE_CAPS( preparsed );
++        caps_end = caps + preparsed->feature_caps_end - preparsed->feature_caps_start;
++        for (; caps != caps_end; ++caps)
++        {
++            len = caps->start_byte * 8 + caps->start_bit + caps->bit_size * caps->report_count;
++            if (!input_len[caps->report_id] && !output_len[caps->report_id] && !feature_len[caps->report_id]) report_count++;
++            feature_len[caps->report_id] = max(feature_len[caps->report_id], len);
++            collection[caps->report_id] = i;
++        }
+     }
+ 
+-    if (!(device_desc->ReportIDs = ExAllocatePool( pool_type, sizeof(*device_desc->ReportIDs) * report_count )))
+-    {
+-        free( preparsed );
+-        ExFreePool( device_desc->CollectionDesc );
+-        return STATUS_NO_MEMORY;
+-    }
++    len = sizeof(*device_desc->ReportIDs) * report_count;
++    if (!(device_desc->ReportIDs = ExAllocatePool( pool_type, len ))) goto failed;
+ 
+     for (i = 0, report_count = 0; i < 256; ++i)
+     {
+         if (!input_len[i] && !output_len[i] && !feature_len[i]) continue;
+         device_desc->ReportIDs[report_count].ReportID = i;
+-        device_desc->ReportIDs[report_count].CollectionNumber = 1;
++        device_desc->ReportIDs[report_count].CollectionNumber = collection[i] + 1;
+         device_desc->ReportIDs[report_count].InputLength = (input_len[i] + 7) / 8;
+         device_desc->ReportIDs[report_count].OutputLength = (output_len[i] + 7) / 8;
+         device_desc->ReportIDs[report_count].FeatureLength = (feature_len[i] + 7) / 8;
+@@ -724,13 +771,28 @@ NTSTATUS WINAPI HidP_GetCollectionDescription( PHIDP_REPORT_DESCRIPTOR report_de
+     }
+     device_desc->ReportIDsLength = report_count;
+ 
++    free( tlcs );
+     return HIDP_STATUS_SUCCESS;
++
++failed:
++    if (device_desc->CollectionDesc)
++    {
++        for (i = 0; i < device_desc->CollectionDescLength; ++i)
++            ExFreePool( device_desc->CollectionDesc[i].PreparsedData );
++        ExFreePool( device_desc->CollectionDesc );
++    }
++    free( tlcs );
++    return HIDP_STATUS_INTERNAL_ERROR;
+ }
+ 
+ void WINAPI HidP_FreeCollectionDescription( HIDP_DEVICE_DESC *device_desc )
+ {
++    UINT i;
++
+     TRACE( "device_desc %p.\n", device_desc );
+ 
++    for (i = 0; i < device_desc->CollectionDescLength; ++i)
++        ExFreePool( device_desc->CollectionDesc[i].PreparsedData );
+     ExFreePool( device_desc->CollectionDesc );
+     ExFreePool( device_desc->ReportIDs );
+ }
+diff --git a/dlls/winebus.sys/main.c b/dlls/winebus.sys/main.c
+index 6dd8e98ed61..cbbd51073c3 100644
+--- a/dlls/winebus.sys/main.c
++++ b/dlls/winebus.sys/main.c
+@@ -85,7 +85,7 @@ struct device_extension
+ 
+     struct hid_report *last_reports[256];
+     struct list reports;
+-    IRP *pending_read;
++    IRP *pending_reads[256];
+ 
+     UINT64 unix_device;
+ };
+@@ -262,13 +262,13 @@ static WCHAR *get_compatible_ids(DEVICE_OBJECT *device)
+     return dst;
+ }
+ 
+-static IRP *pop_pending_read(struct device_extension *ext)
++static IRP *pop_pending_read(struct device_extension *ext, ULONG report_id)
+ {
+     IRP *pending;
+ 
+     RtlEnterCriticalSection(&ext->cs);
+-    pending = ext->pending_read;
+-    ext->pending_read = NULL;
++    pending = ext->pending_reads[report_id];
++    ext->pending_reads[report_id] = NULL;
+     RtlLeaveCriticalSection(&ext->cs);
+ 
+     return pending;
+@@ -278,12 +278,16 @@ static void remove_pending_irps(DEVICE_OBJECT *device)
+ {
+     struct device_extension *ext = device->DeviceExtension;
+     IRP *pending;
++    UINT i;
+ 
+-    if ((pending = pop_pending_read(ext)))
++    for (i = 0; i < ARRAY_SIZE(ext->pending_reads); ++i)
+     {
+-        pending->IoStatus.Status = STATUS_DELETE_PENDING;
+-        pending->IoStatus.Information = 0;
+-        IoCompleteRequest(pending, IO_NO_INCREMENT);
++        if ((pending = pop_pending_read(ext, i)))
++        {
++            pending->IoStatus.Status = STATUS_DELETE_PENDING;
++            pending->IoStatus.Information = 0;
++            IoCompleteRequest(pending, IO_NO_INCREMENT);
++        }
+     }
+ }
+ 
+@@ -463,7 +467,7 @@ static void process_hid_report(DEVICE_OBJECT *device, BYTE *report_buf, DWORD re
+     else last_report = ext->last_reports[report_buf[0]];
+     memcpy(last_report->buffer, report_buf, report_len);
+ 
+-    if ((irp = pop_pending_read(ext)))
++    if ((irp = pop_pending_read(ext, report_buf[0])))
+     {
+         deliver_next_report(ext, irp);
+         IoCompleteRequest(irp, IO_NO_INCREMENT);
+@@ -1100,9 +1104,10 @@ static NTSTATUS WINAPI hid_internal_dispatch(DEVICE_OBJECT *device, IRP *irp)
+         {
+             if (!deliver_next_report(ext, irp))
+             {
++                BYTE *report_buf = (BYTE *)irp->UserBuffer;
+                 /* hidclass.sys should guarantee this */
+-                assert(!ext->pending_read);
+-                ext->pending_read = irp;
++                assert(!ext->pending_reads[report_buf[0]]);
++                ext->pending_reads[report_buf[0]] = irp;
+                 IoMarkIrpPending(irp);
+                 irp->IoStatus.Status = STATUS_PENDING;
+             }
+
+From 0e6f1802f6d67f0d191b2f1c6a9dc8ceae977b51 Mon Sep 17 00:00:00 2001
+From: Matthias Gorzellik <matthias.gorzellik@gmail.com>
+Date: Mon, 3 Feb 2025 21:36:49 +0100
+Subject: [PATCH 2/2] hidraw: add function to identify fanatec wheel-bases and
+ enable hidraw for them
+
+---
+ dlls/winebus.sys/unixlib.c | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/dlls/winebus.sys/unixlib.c b/dlls/winebus.sys/unixlib.c
+index c3407e39b3f..45bd7f06a4c 100644
+--- a/dlls/winebus.sys/unixlib.c
++++ b/dlls/winebus.sys/unixlib.c
+@@ -107,6 +107,21 @@ static BOOL is_fanatec_pedals(WORD vid, WORD pid)
+     return FALSE;
+ }
+ 
++static BOOL is_fanatec_wheelbase(WORD vid, WORD pid)
++{
++    if (vid != 0x0EB7) return FALSE;
++    if (pid == 0x0E03) return TRUE; /* Fanatec CSL Elite */
++    if (pid == 0x0005) return TRUE; /* Fanatec CSL Elite PS4 */
++    if (pid == 0x0020) return TRUE; /* Fanatec CSL DD / DD Pro / ClubSport DD */
++    if (pid == 0x0001) return TRUE; /* Fanatec ClubSport V2 */
++    if (pid == 0x0004) return TRUE; /* Fanatec ClubSport V2.5 */
++    if (pid == 0x0006) return TRUE; /* Fanatec Podium DD1 */
++    if (pid == 0x0007) return TRUE; /* Fanatec Podium DD2 */
++    if (pid == 0x0011) return TRUE; /* Fanatec CSR Elite / Forza Motorsport */
++    if (pid == 0xE0FE) return TRUE; /* CS-WB-DD (FW update mode) */
++    return FALSE;
++}
++
+ static BOOL is_vkb_controller(WORD vid, WORD pid, INT buttons)
+ {
+     if (vid != 0x231D) return FALSE;
+@@ -157,6 +172,7 @@ BOOL is_hidraw_enabled(WORD vid, WORD pid, INT axes, INT buttons)
+     if (is_thrustmaster_hotas(vid, pid)) return TRUE;
+     if (is_simucube_wheel(vid, pid)) return TRUE;
+     if (is_fanatec_pedals(vid, pid)) return TRUE;
++    if (is_fanatec_wheelbase(vid, pid)) return TRUE;
+     if (is_vkb_controller(vid, pid, buttons)) return TRUE;
+     if (is_virpil_controller(vid, pid, buttons)) return TRUE;
+ 
