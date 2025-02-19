@@ -309,8 +309,6 @@ usage() {
   "$1" ""
   "$1" "    --relabel-volumes Bind-mounted volumes will be relabeled. Use with caution."
   "$1" ""
-  "$1" "    --enable-ccache Mount \$CCACHE_DIR or \$HOME/.ccache inside of the container and use ccache for the build."
-  "$1" ""
   "$1" "    --enable-bear Invokes make via bear creating compile_commands.json."
   "$1" ""
   "$1" "  Steam Runtime"
