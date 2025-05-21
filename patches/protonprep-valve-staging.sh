@@ -362,6 +362,8 @@
     patch -Np1 < ../patches/wine-hotfixes/pending/wine-wayland/cursor_and_launchers/0008-winewayland-Use-unaccelerated-relative-motion.patch
     patch -Np1 < ../patches/wine-hotfixes/pending/wine-wayland/cursor_and_launchers/0009-winewayland-Use-discrete-event-when-possible.patch
 
+    # Fix for joystick without axis
+    patch -Np1 < ../patches/wine-hotfixes/pending/winebus-joystick-no-axis-detection.patch
     popd
 
 ### END PROTON-GE ADDITIONAL CUSTOM PATCHES ###
