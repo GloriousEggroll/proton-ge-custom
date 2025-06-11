@@ -185,7 +185,7 @@ This section is for those that use the Steam flatpak.
 5. [Enable proton-ge-custom](#enabling).   
 
     
-*Terminal example based on Latest Release*
+*Terminal example based on Latest Release* (For user installations only)
 ```bash
 # make temp working directory
 echo "Creating temporary working directory..."
