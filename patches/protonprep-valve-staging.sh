@@ -448,6 +448,7 @@
     patch -Np1 < ../patches/wine-hotfixes/pending/wine-wayland/0161-winewayland-Add-error-message-for-cross-process-rend.patch
     patch -Np1 < ../patches/wine-hotfixes/pending/wine-wayland/0162-HACK-win32u-Place-windows-on-the-vscreen.patch
     patch -Np1 < ../patches/wine-hotfixes/pending/wine-wayland/0163-HACK-winewayland-Always-create-a-new-client-surface-.patch
+    patch -Np1 < ../patches/wine-hotfixes/pending/wine-wayland/0164-fixup-flickering.patch
     patch -Np1 < ../patches/wine-hotfixes/pending/wine-wayland/ac97b117bd8fb3bd6b08d48d8808471189c1e9d5.patch
 
     echo "WINE: -CUSTOM- General fixes to help meet certain Anti-cheat engines' requirements"
