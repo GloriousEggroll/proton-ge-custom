@@ -1,26 +1,34 @@
-# MYSELF (GLORIOUSEGGROLL) AND THIS PROJECT (PROTON-GE) ARE NOT AFFILIATED WITH `hxxps[://]protonge[.]com`. THAT IS A SPAM/FAKE WEBSITE. THERE IS NO EXISTING WEBSITE FOR PROTON-GE OTHER THAN THIS GITHUB REPOSITORY. PROTON-GE DOES NOT COLLECT ANY USER DATA WHAT SO EVER AND IS NOT A COMPANY OR ORGANIZATION OF ANY TYPE.
+> [!CAUTION]
+>  **MYSELF (GLORIOUSEGGROLL) AND THIS PROJECT (PROTON-GE) ARE NOT AFFILIATED WITH `hxxps[://]protonge[.]com`. THAT IS A SPAM/FAKE WEBSITE. THERE IS NO EXISTING WEBSITE FOR PROTON-GE OTHER THAN THIS GITHUB REPOSITORY. PROTON-GE DOES NOT COLLECT ANY USER DATA WHAT SO EVER AND IS NOT A COMPANY OR ORGANIZATION OF ANY TYPE.**
 
 # proton-ge-custom
 
-## (1) RUNNING NON-STEAM GAMES WITH GE-PROTON OUTSIDE OF STEAM IS ONLY SUPPORTED USING [UMU](https://github.com/Open-Wine-Components/umu-launcher):
+> [!WARNING]
+> **RUNNING NON-STEAM GAMES WITH GE-PROTON OUTSIDE OF STEAM IS ONLY SUPPORTED USING [UMU](https://github.com/Open-Wine-Components/umu-launcher):**
+> 
+> Proton runs in a container, which uses a runtime environment and libraries specifically built for use within that container. Not running it as intended results in the container and therefore its runtime not being used, and severely breaks library compatibility. It causes wine to search for libraries on your system instead of those it was built with/intended for within proton. It may work, if enough libraries match, but it is not correct and not supportable due to library differences across distros.
+> 
+> If you want proton functionality -outside- of proton for non-steam games, umu-launcher is a cli tool that was designed to be able to mimic steam in running the entire containerized runtime environment it needs in order to run proton exactly as steam does without needing steam. Any other method is not supported.
+>
+>[Lutris](https://lutris.net/) has already integrated UMU as the default backend used when `GE-Proton(Latest)` is selected as a wine runner either globally or for any specific game.
+> 
+>[Heroic](https://heroicgameslauncher.com/) has also enabled UMU by default when using `GE-Proton`.
 
-Proton runs in a container, which uses a runtime environment and libraries specifically built for use within that container. Not running it as intended results in the container and therefore its runtime not being used, and severely breaks library compatibility. It causes wine to search for libraries on your system instead of those it was built with/intended for within proton. It may work, if enough libraries match, but it is not correct and not supportable due to library differences across distros.
+> [!IMPORTANT]
+> **If you have an issue that happens with my proton-GE build, provided FROM this repository, that does -not- happen on Valve's proton, please DO NOT open a bug report on Valve's bug tracker.**
+>
+> Instead, open an issue: https://github.com/GloriousEggroll/proton-ge-custom/issues
+>
+> or contact me on Discord about the issue: https://discord.gg/6y3BdzC
 
-If you want proton functionality -outside- of proton for non-steam games, umu-launcher is a cli tool that was designed to be able to mimic steam in running the entire containerized runtime environment it needs in order to run proton exactly as steam does without needing steam. Any other method is not supported. 
-
-[Lutris](https://lutris.net/) has already integrated UMU as the default backend used when `GE-Proton(Latest)` is selected as a wine runner either globally or for any specific game.  
-[Heroic](https://heroicgameslauncher.com/) has also enabled UMU by default when using `GE-Proton`.
-
-## (2) If you have an issue that happens with my proton-GE build, provided FROM this repository, that does -not- happen on Valve's proton, please DO NOT open a bug report on Valve's bug tracker. 
-
-## Instead, open an issue: https://github.com/GloriousEggroll/proton-ge-custom/issues 
-
-## or contact me on Discord about the issue: https://discord.gg/6y3BdzC
-
-## (3)  Please note, this is a custom build of proton, and is -not- affiliated with Valve's proton.
-## (4) Please also note I do not provide the flatpak of proton-GE, and I do not provide the AUR version of proton-GE. I will not assist with those.
-## (5) The only version of proton-GE that I provide and will assist with builds of is the one provided within this repository, using the build system documented here.
-## (6) I cannot validate the accuracy or functionality of other builds that have not been built using the build system included here.
+> [!NOTE]
+> (1)  Please note, this is a custom build of proton, and is -not- affiliated with Valve's proton.
+> 
+> (2) Please also note I do not provide the flatpak of proton-GE, and I do not provide the AUR version of proton-GE. I will not assist with those.
+> 
+> (3) The only version of proton-GE that I provide and will assist with builds of is the one provided within this repository, using the build system documented here.
+> 
+> (4) I cannot validate the accuracy or functionality of other builds that have not been built using the build system included here.
 
 ## Table of contents
 
