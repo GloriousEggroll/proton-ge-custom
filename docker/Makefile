@@ -2,7 +2,7 @@ STEAMRT_VERSION = 3.0.20250519.130773
 STEAMRT_URLBASE = registry.gitlab.steamos.cloud
 
 PROTONSDK_URLBASE = $(STEAMRT_URLBASE)/proton/sniper/sdk
-PROTONSDK_VERSION = $(STEAMRT_VERSION)-0-dev
+PROTONSDK_VERSION = @sha256:645281cd6ea1799820f534deda9a56584478fe1f67d08bb69a7d416a71566990
 
 # this is just for building toolchain, as we do static builds it should
 # not have any impact on the end result, but changing it will invalidate
