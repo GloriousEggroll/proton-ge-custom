@@ -118,8 +118,15 @@ $(2)_$(3)-unix_LIBFLAGS = $$(foreach d,$$($(2)_$(3)_DEPS),-Wl,-rpath-link=$$($$(
 # RC and WIDL are intentionally always using windows target, as their
 # unix version doesn't exist.
 
+# HACK: forcing cargo to use gcc-10 as a linker because it's very unhappy about
+# Sniper's gcc-14 and lack of libgcc_s. The only version we have guarantee for
+# with SteamRT Sniper is the one from gcc 10.
+#
+# We also always need to specify the linker for the host architecture - a bunch
+# of crates build host-native bits via build.rs.
+
 $(2)_$(3)_ENV = \
-    CARGO_TARGET_$$(call toupper,$$($(3)-$(4)_CARGO_TARGET))_LINKER="$$($(3)-$(4)_TARGET)-gcc" \
+    $$(CARGO_LINKERS) \
     CCACHE_BASEDIR="$$(CCACHE_BASEDIR)" \
     STRIP="$$(STRIP)" \
     AR="$$($(3)-$(4)_TARGET)-ar" \
