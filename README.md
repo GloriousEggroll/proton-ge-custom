@@ -313,6 +313,9 @@ To enable both Wayland and HDR together:
 PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1 %command%
 ```
 
+> [!NOTE]
+> As of right now, in-game Steam overlay WILL NOT work with Wayland enabled.
+
 
 ## Building
 
