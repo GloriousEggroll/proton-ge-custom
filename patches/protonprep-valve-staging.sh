@@ -712,6 +712,7 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/d3dx-cur-ico-bounds-and-cursor-alpha-for-le-mans-ultimate.patch"
     # Le Mans Ultimate: online key derivation and wheel reconnection (#777, #944)
     apply_patch "../patches/wine-hotfixes/pending/bcrypt-kdf-secret-append-for-le-mans-ultimate.patch"
+    apply_patch "../patches/wine-hotfixes/pending/dinput-find-hotplugged-devices-for-le-mans-ultimate.patch"
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
