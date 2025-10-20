@@ -1,34 +1,32 @@
-> [!CAUTION]
->  **MYSELF (GLORIOUSEGGROLL) AND THIS PROJECT (PROTON-GE) ARE NOT AFFILIATED WITH `hxxps[://]protonge[.]com`. THAT IS A SPAM/FAKE WEBSITE. THERE IS NO EXISTING WEBSITE FOR PROTON-GE OTHER THAN THIS GITHUB REPOSITORY. PROTON-GE DOES NOT COLLECT ANY USER DATA WHAT SO EVER AND IS NOT A COMPANY OR ORGANIZATION OF ANY TYPE.**
+> [!Caution]
+>  **Myself (GloriousEggroll) and this project (GE-Proton) are not affiliated with any other websites related to GE-Proton. There is no existing website for GE-Proton other than this GitHub repository.**
 
-# proton-ge-custom
-
-> [!WARNING]
-> **RUNNING NON-STEAM GAMES WITH GE-PROTON OUTSIDE OF STEAM IS ONLY SUPPORTED USING [UMU](https://github.com/Open-Wine-Components/umu-launcher):**
-> 
-> Proton runs in a container, which uses a runtime environment and libraries specifically built for use within that container. Not running it as intended results in the container and therefore its runtime not being used, and severely breaks library compatibility. It causes wine to search for libraries on your system instead of those it was built with/intended for within proton. It may work, if enough libraries match, but it is not correct and not supportable due to library differences across distros.
-> 
-> If you want proton functionality -outside- of proton for non-steam games, umu-launcher is a cli tool that was designed to be able to mimic steam in running the entire containerized runtime environment it needs in order to run proton exactly as steam does without needing steam. Any other method is not supported.
+> [!Important]
+> **If you have an issue that happens with my GE-Proton build, provided from this repository, that does bot happen on Valve's Proton, please do not open a bug report on Valve's bug tracker.**
 >
->[Lutris](https://lutris.net/) has already integrated UMU as the default backend used when `GE-Proton(Latest)` is selected as a wine runner either globally or for any specific game.
-> 
->[Heroic](https://heroicgameslauncher.com/) has also enabled UMU by default when using `GE-Proton`.
-
-> [!IMPORTANT]
-> **If you have an issue that happens with my proton-GE build, provided FROM this repository, that does -not- happen on Valve's proton, please DO NOT open a bug report on Valve's bug tracker.**
->
-> Instead, open an issue: https://github.com/GloriousEggroll/proton-ge-custom/issues
+> Instead, open an issue on this repository's issue tracker: https://github.com/GloriousEggroll/proton-ge-custom/issues
 >
 > or contact me on Discord about the issue: https://discord.gg/6y3BdzC
 
-> [!NOTE]
-> (1)  Please note, this is a custom build of proton, and is -not- affiliated with Valve's proton.
+# GE-Proton
+
+> [!Warning]
+> **Running non-Steam games with GE-Proton outside of Steam is only supported using [umu](https://github.com/Open-Wine-Components/umu-launcher):**
 > 
-> (2) Please also note I do not provide the flatpak of proton-GE, and I do not provide the AUR version of proton-GE. I will not assist with those.
+> Proton runs in a container, which uses a runtime environment and libraries specifically built for use within that container. Not running it as intended results in the container and therefore its runtime not being used, which severely breaks library compatibility. It causes Wine to attempt to search for libraries on your system instead of those it was built with or intended for use with Proton. It may work if enough libraries match, but it is not the expected environment and not supported due to library differences across Linux distributions.
 > 
-> (3) The only version of proton-GE that I provide and will assist with builds of is the one provided within this repository, using the build system documented here.
+> If you want Proton functionality outside of Steam, umu-launcher is a command-line tool that was designed to be able to mimic Steam in running the entire containerized runtime environment it needs in order to run Proton exactly as Steam does without needing Steam. Any other method is not supported.
+>
+>[Heroic](https://heroicgameslauncher.com/) has also enabled umu by default when using `GE-Proton`.
+>
+>[Lutris](https://lutris.net/) has integrated umu as the default backend used when `GE-Proton (Latest)` is selected as a Wine runner either globally or for any specific game.
+
+> [!Note]
+> (1) Please note, this is a custom build of Proton, and is not affiliated with Valve's Proton.
 > 
-> (4) I cannot validate the accuracy or functionality of other builds that have not been built using the build system included here.
+> (2) Please also note I will not assist with unofficial builds of GE-Proton. The only version of GE-Proton that I provide and will assist with builds of is the one provided within this repository, using the build system documented here.
+> 
+> (3) I cannot validate the accuracy or functionality of other builds that have not been built using the build system included here.
 
 ## Table of contents
 
@@ -41,7 +39,7 @@
 		- [Manual](#manual)
 - [Building](#building)
 - [Enabling](#enabling)
-- [Modification](#modification)
+- [Options](#options)
 - [Credits](#credits)
 	- [TKG (Etienne Juvigny)](#tkg-etienne-juvigny)
 	- [Guy1524 (Derek Lesho)](#guy1524-derek-lesho)
@@ -59,55 +57,51 @@
 
 ## Overview
 
-This is my build of Proton with the most recent bleeding-edge Proton Experimental WINE.
+This is my build of Proton with the most recent bleeding-edge Proton Experimental Wine.
 
-Things it contains that Valve's Proton does not:
+Things it contains that Valve's Proton currently does not:
 
 - Additional media foundation patches for better video playback support
 - AMD FSR patches added directly to fullscreen hack that can be toggled with WINE_FULLSCREEN_FSR=1
-- FSR Fake resolution patch details [here](https://github.com/GloriousEggroll/proton-ge-custom/pull/52)
-- Nvidia CUDA support for PhysX and NVAPI
+- FSR fake resolution patch details [here](https://github.com/GloriousEggroll/proton-ge-custom/pull/52)
+- NVIDIA CUDA support for PhysX and NVAPI
 - Raw input mouse support
-- 'protonfixes' system -- this is an automated system that applies per-game fixes (such as winetricks, envvars, EAC workarounds, overrides, etc).
-- Various upstream WINE patches backported
+- 'protonfixes' system -- this is an automated system that applies per-game fixes (such as winetricks changes, environment variables, Easy Anti-Cheat workarounds, overrides, etc)
+- Various upstream Wine patches backported
 - Various wine-staging patches applied as they become needed
 - NTSync enablement if the kernel supports it.
 
 ## Notes
 
 - Warframe is problematic with VSync. Turn it off or on in game, do not set to `Auto`
-- Warframe needs a set a frame limit in game. Unlimited framerate can cause slowdowns
-- Warframe on NVIDIA: you may need to disable GPU Particles in game otherwise the game can freeze randomly. On AMD they work fine
+- Warframe should have a frame limit set in the game. An unlimited framerate may cause slowdowns
+- Warframe on NVIDIA: you may need to disable GPU particles in game otherwise the game can freeze randomly. On AMD they should work fine.
 
 Full patches can be viewed in [protonprep-valve-staging.sh](patches/protonprep-valve-staging.sh).
 
 ## Installation
 
-PLEASE NOTE: There are prerequisites for using this version of proton:
-
-1. You must have the proper Vulkan drivers/packages installed on your system. VKD3D on AMD requires Mesa 22.0.0 or higher for the VK_KHR_dynamic_rendering extension. Check [here ](https://github.com/lutris/docs/blob/master/InstallingDrivers.md) for general driver installation guidance.
+You must have the proper Vulkan drivers and packages installed on your system. VKD3D on AMD requires Mesa 22.0.0 or higher for the VK_KHR_dynamic_rendering extension. Check [here](https://github.com/lutris/docs/blob/master/InstallingDrivers.md) for general driver installation guidance.
 
 ### Manual
 
 #### Via [`asdf`, the version manager](https://asdf-vm.com/)
 
-There is an unofficial [plugin for installing and managing ProtonGE versions](https://github.com/augustobmoura/asdf-protonge)
+There is an unofficial [plugin for installing and managing GE-Proton versions](https://github.com/augustobmoura/asdf-protonge)
 with [`asdf` (the universal version manager)](https://asdf-vm.com/), it follows
 the same process as the manual installation but makes it a lot easier. Managing
 versions by removing and updating to newer versions also becomes easier.
 
 To install by it first [install `asdf`](https://asdf-vm.com/guide/getting-started.html),
-and then proceed to add the ProtonGE plugin and install the version you want.
+and then proceed to add the 'asdf-protonge' plugin and install the version you want.
 ``` bash
 asdf plugin add protonge
 
-# Or install a version from a tag (Eg.: GE-Proton8-25)
+# Or install a version from a tag
 asdf install protonge latest
 ```
 
-It's also possible to use the asdf plugin in Flatpak installations, by
-customizing the target `compatibilitytools.d` path. For more settings check the
-[plugin's official documentation](https://github.com/augustobmoura/asdf-protonge)
+It's also possible to use the asdf plugin in Flatpak installations, by customizing the target `compatibilitytools.d` path. For more settings check the [plugin's official documentation](https://github.com/augustobmoura/asdf-protonge).
 
 After every install you need to restart Steam, and [enable proton-ge-custom](#enabling).
 
@@ -118,126 +112,135 @@ This section is for those that use the native version of Steam.
 1. Download a release from the [Releases](https://github.com/GloriousEggroll/proton-ge-custom/releases) page.
 2. Create a `~/.steam/steam/compatibilitytools.d` directory if it does not exist.
 3. Extract the release tarball into `~/.steam/steam/compatibilitytools.d/`.
-   * `tar -xf GE-Proton*.tar.gz -C ~/.steam/steam/compatibilitytools.d/`
+   * `tar -xf GE-Proton*.tar.gz -C ~/.steam/steam/compatibilitytools.d/`.
 4. Restart Steam.
-5. [Enable proton-ge-custom](#enabling).
+5. [Enable proton-ge-custom in Steam](#enabling).
   
     
-*Terminal example based on Latest Release*
+*Get the latest release of GE-Proton through your terminal. It is assumed that you have all of the necessary software to use these commands installed:*
 ```bash
-# make temp working directory
+# Make a temporary working directory
 echo "Creating temporary working directory..."
 rm -rf /tmp/proton-ge-custom
 mkdir /tmp/proton-ge-custom
 cd /tmp/proton-ge-custom
 
-# download tarball
+# Download the tarball for the latest release
 echo "Fetching tarball URL..."
 tarball_url=$(curl -s https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest | grep browser_download_url | cut -d\" -f4 | grep .tar.gz)
 tarball_name=$(basename $tarball_url)
 echo "Downloading tarball: $tarball_name..."
 curl -# -L $tarball_url -o $tarball_name --no-progress-meter
 
-# download checksum
+# Download the checksum for the latest release
 echo "Fetching checksum URL..."
 checksum_url=$(curl -s https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest | grep browser_download_url | cut -d\" -f4 | grep .sha512sum)
 checksum_name=$(basename $checksum_url)
 echo "Downloading checksum: $checksum_name..."
 curl -# -L $checksum_url -o $checksum_name --no-progress-meter
 
-# check tarball with checksum
+# Verify the downloaded tarball with the downloaded checksum
 echo "Verifying tarball $tarball_name with checksum $checksum_name..."
 sha512sum -c $checksum_name
-# if result is ok, continue
+# If result the verification succeeds, continue
 
-# make steam directory if it does not exist
-echo "Creating Steam directory if it does not exist..."
+# Make a Steam compatibility tools folder if it does not exist
+echo "Creating a Steam compatibility tools folder if it does not exist..."
 mkdir -p ~/.steam/steam/compatibilitytools.d
 
-# extract proton tarball to steam directory
-echo "Extracting $tarball_name to Steam directory..."
+# Extract the GE-Proton tarball to the Steam compatibility tools folder
+echo "Extracting $tarball_name to the Steam compatibility tools folder..."
 tar -xf $tarball_name -C ~/.steam/steam/compatibilitytools.d/
-echo "All done :)"
+echo "Done"
 ```
 
-The shell code above can be run as a script by pasting the commands in a file and adding the following to the top of the file:
+The shell commands above can be run as a script by pasting the commands in a file and adding the following to the top of the file assuming you have 'bash' installed:
 ```bash
 #!/bin/bash
 set -euo pipefail
 ```
 
-Save the file and make the script runnable by adding the executable bit:
+Save the file and make the script executable by adding the executable bit:
 ```bash
 chmod +x file.sh
 ```
 
 #### Flatpak
 
-This section is for those that use the Steam flatpak.
+This section is for those that use the Steam Flatpak.
 
 ##### Flathub
 
-[The unofficial build provided by Flathub](https://github.com/flathub/com.valvesoftware.Steam.CompatibilityTool.Proton-GE) isn't supported by GloriousEggroll nor Valve and wasn't tested with all possible games and cases. It can behave differently from upstream builds. Use at your own risk.
+The Steam Flatpak and [the unofficial build of GE-Proton provided by Flathub](https://github.com/flathub/com.valvesoftware.Steam.CompatibilityTool.Proton-GE) are not supported by GloriousEggroll nor Valve and were not tested with all possible games and cases. They can behave differently from the upstream builds. Use at your own risk.
 
 1. [Add the Flathub repository](https://flatpak.org/setup/).
 2. Run:
 	```bash
 	flatpak install com.valvesoftware.Steam.CompatibilityTool.Proton-GE
 	```
-3. [Enable proton-ge-custom](#enabling).
+3. [Enable proton-ge-custom in Steam](#enabling).
 
 ##### Manual
 
 1. Download a release from the [Releases](https://github.com/GloriousEggroll/proton-ge-custom/releases) page.
-2. Create a `~/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d/` directory if it does not exist.
+2. Create a Steam compatibility tools directory at `~/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d/` if it does not exist.
 3. Extract the release tarball into `~/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d/`.
    * `tar -xf GE-ProtonVERSION.tar.gz -C ~/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d/`
 4. Restart Steam.
-5. [Enable proton-ge-custom](#enabling).   
+5. [Enable proton-ge-custom in Steam](#enabling).   
 
-    
-*Terminal example based on Latest Release*
+*Get the latest GE-Proton release through your terminal. It is assumed that you have all of the necessary software to use these commands installed:*
 ```bash
-# make temp working directory
-echo "Creating temporary working directory..."
+# Make a temporary working directory
+echo "Creating a temporary working directory..."
 rm -rf /tmp/proton-ge-custom
 mkdir /tmp/proton-ge-custom
 cd /tmp/proton-ge-custom
 
-# download tarball
+# Download the tarball for the latest release
 echo "Fetching tarball URL..."
 tarball_url=$(curl -s https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest | grep browser_download_url | cut -d\" -f4 | grep .tar.gz)
 tarball_name=$(basename $tarball_url)
 echo "Downloading tarball: $tarball_name..."
 curl -# -L $tarball_url -o $tarball_name --no-progress-meter
 
-# download checksum
+# Download the checksum for the latest release 
 echo "Fetching checksum URL..."
 checksum_url=$(curl -s https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest | grep browser_download_url | cut -d\" -f4 | grep .sha512sum)
 checksum_name=$(basename $checksum_url)
 echo "Downloading checksum: $checksum_name..."
 curl -# -L $checksum_url -o $checksum_name --no-progress-meter
 
-# check tarball with checksum
+# Verify the downloaded tarball with the downloaded checksum
 echo "Verifying tarball $tarball_name with checksum $checksum_name..."
 sha512sum -c $checksum_name
-# if result is ok, continue
+# If result the verification succeeds, continue
 
-# make steam directory if it does not exist
-echo "Creating Steam directory if it does not exist..."
+# Make a Steam compatibility tools folder if it does not exist
+echo "Creating a Steam directory if it does not exist..."
 mkdir -p ~/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d
 
-# extract proton tarball to steam directory
-echo "Extracting $tarball_name to Steam directory..."
+# Extract the GE-Proton tarball to the Steam compatibility tools folder
+echo "Extracting $tarball_name to the Steam compatibility tools folder..."
 tar -xf $tarball_name -C ~/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d/
 echo "All done :)"
+```
+The shell commands above can be run as a script by pasting the commands in a file and adding the following to the top of the file assuming you have 'bash' installed:
+```bash
+#!/bin/bash
+set -euo pipefail
+```
+
+Save the file and make the script executable by adding the executable bit:
+```bash
+chmod +x file.sh
 ```
 
 #### Snap
 
-This section is for those that use the Steam [snap](https://snapcraft.io/steam).
+This section is for those that use the Steam [Snap](https://snapcraft.io/steam).
 
-This unofficial build isn't supported by GloriousEggroll nor Valve and wasn't tested with all possible games and cases. It can behave differently from upstream builds. Use at your own risk.
+This unofficial build isn't supported by GloriousEggroll nor Valve and wasn't tested with all possible games and cases. It can behave differently from the upstream builds. Use at your own risk.
 
 ##### Manual
 
@@ -246,77 +249,11 @@ This unofficial build isn't supported by GloriousEggroll nor Valve and wasn't te
 3. Extract the release tarball into `~/snap/steam/common/.steam/steam/compatibilitytools.d/`.
    * `tar -xf GE-ProtonVERSION.tar.gz -C ~/snap/steam/common/.steam/steam/compatibilitytools.d/`
 4. Restart Steam.
-5. [Enable proton-ge-custom](#enabling).
-
-
-##### Enabling NTSync
-For NTSync to work, your kernel must be version 6.14 or newer and built with `CONFIG_NTSYNC=y` -OR- `CONFIG_NTSYNC=m`.
-If using `CONFIG_NTSYNC=m`, a module loading configuration is required followed by a reboot:
-
-/etc/modules-load.d/ntsync.conf
-```
-ntsync
-```
-You can also manually enable the module without reboot, just keep in mind the above configuration is needed for it to persist reboot:
-```
-sudo modprobe ntsync
-```
-After this, a device `/dev/ntsync` should now exist on your system.
-
-Once NTSYNC is enabled on the system, if you launch a game with GE-Proton10-10 or newer using PROTON_LOG=1, steam will generate a log for the game in your home folder `steam-XXXXXX.log`. Inside that log you should see `wineserver: NTSync up and running!`
-
-
-##### Enabling Native Wayland
-
-Proton GE includes support for Wine’s **Wayland driver** (`winewayland.drv`). By default Proton uses X11/XWayland.
-
-###### Minimum Versions
-
-* **AMD / Intel:** Mesa **≥ 25.x**
-* **NVIDIA (proprietary):** **≥ 575.x**
-
-###### How to Enable
-
-Add to a game’s Launch Options:
-
-```bash
-PROTON_ENABLE_WAYLAND=1 %command%
-```
-
-Verify with logging:
-
-```bash
-PROTON_LOG=1 %command%
-```
-
-Check `steam-XXXX.log` for:
-
-```
-Loaded L"C:\windows\system32\winewayland.drv"
-```
-
-###### Optional: Enable HDR
-
-You can enable it if you have:
-
-- HDR-capable monitor.
-- Compositor/Gamescope with HDR support.
-- Game supports HDR.
-
-```bash
-PROTON_ENABLE_HDR=1 %command%
-```
-
-To enable both Wayland and HDR together:
-
-```bash
-PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1 %command%
-```
-
+5. [Enable proton-ge-custom in Steam](#enabling).
 
 ## Building
 
-1. Clone this repo by executing:
+1. Clone this repository by executing:
 
 ```sh
 git clone --recurse-submodules http://github.com/gloriouseggroll/proton-ge-custom
@@ -347,7 +284,7 @@ mkdir build && cd build
 make redist &> log
 ```
 
-Build will be placed within the build directory as SOME-BUILD-NAME-HERE.tar.gz.
+The build will be placed within the build directory as SOME-BUILD-NAME-HERE.tar.gz.
 
 ## Enabling
 
@@ -355,7 +292,65 @@ Build will be placed within the build directory as SOME-BUILD-NAME-HERE.tar.gz.
 2. At the bottom of the `Compatibility` tab, Check `Force the use of a specific Steam Play compatibility tool`, then select the desired Proton version.
 3. Launch the game.
 
-## Modification
+## Options
+
+
+###### Enable HDR
+
+It should work if you have:
+
+- A compositor with HDR support
+- A game with HDR support.
+- A monitor with HDR support.
+
+```bash
+PROTON_ENABLE_HDR=1 %command%
+```
+
+##### Enabling NTSync
+For NTSync to work, your kernel must be version 6.14 or newer and built with `CONFIG_NTSYNC=y` or `CONFIG_NTSYNC=m`.
+If using `CONFIG_NTSYNC=m`, a module loading configuration is required followed by a reboot:
+
+/etc/modules-load.d/ntsync.conf
+```
+ntsync
+```
+You can also manually enable the module without reboot, just keep in mind the above configuration is needed for it to persist after reboots:
+```
+sudo modprobe ntsync
+```
+After this, a device `/dev/ntsync` should now exist on your system.
+
+Once NTSync is enabled on the system, if you launch a game with GE-Proton10-10 or newer using PROTON_LOG=1, a log will be generated for the game in your home folder with the filename `steam-XXXXXX.log`. Inside that log you should see `wineserver: NTSync up and running!`
+
+##### Enabling Wayland
+
+GE-Proton includes support for Wine's Wayland driver (`winewayland.drv`). By default, Proton uses X11 or XWayland.
+
+###### Required graphics driver versions for Wayland
+
+* **AMD / Intel:** Mesa **≥ 25.x**
+* **NVIDIA:** **≥ 575.x**
+
+###### How to enable
+
+Add to a game’s launch options:
+
+```bash
+PROTON_ENABLE_WAYLAND=1 %command%
+```
+
+Verify with logging:
+
+```bash
+PROTON_LOG=1 %command%
+```
+
+Check `steam-XXXX.log` for:
+
+```
+Loaded L"C:\windows\system32\winewayland.drv"
+```
 
 Environment variable options:
 
@@ -371,7 +366,7 @@ Environment variable options:
 | <tt>nod3d9</tt>      | <tt>PROTON_NO_D3D9</tt>        | Disables DX9.  |
 | <tt>noesync</tt>      | <tt>PROTON_NO_ESYNC</tt>       | Do not use eventfd-based in-process synchronization primitives. |
 | <tt>nofsync</tt>      | <tt>PROTON_NO_FSYNC</tt>       | Do not use futex-based in-process synchronization primitives. (Automatically disabled on systems with no `FUTEX_WAIT_MULTIPLE` support.) |
-| <tt>nontsync</tt>      | <tt>PROTON_NO_NTSYNC</tt>       | Do not use ntsync kernel module for in-process synchronization primitives. |
+| <tt>nontsync</tt>      | <tt>PROTON_NO_NTSYNC</tt>       | Do not use the ntsync kernel module for in-process synchronization primitives. |
 | <tt>forcelgadd</tt>   | <tt>PROTON_FORCE_LARGE_ADDRESS_AWARE</tt> | Force Wine to enable the LARGE_ADDRESS_AWARE flag for all executables. |
 | <tt>heapdelayfree</tt>| <tt>PROTON_HEAP_DELAY_FREE</tt>| Delay freeing some memory, to work around application use-after-free bugs. |
 | <tt>noxim</tt>        | <tt>PROTON_NO_XIM</tt>         | Enabled by default. Do not attempt to use XIM (X Input Methods) support. XIM support is known to cause crashes with libx11 older than version 1.7. |
@@ -381,28 +376,33 @@ Environment variable options:
 | <tt>cmdlineappend:</tt>|                               | Append the string after the colon as an argument to the game command. May be specified more than once. Escape commas and backslashes with a backslash. |
 | <tt>xalia or noxalia</tt>               | <tt>PROTON_USE_XALIA</tt>                 | Enable Xalia, a program that can add a gamepad UI for some keyboard/mouse interfaces, or set to 0 to disable. The default is to enable it dynamically based on window contents. |
 | <tt>seccomp</tt>      | <tt>PROTON_USE_SECCOMP</tt>    | Enable seccomp-bpf filter to emulate native syscalls, required for some DRM protections to work. |
-| <tt>nowritewatch</tt> | <tt>PROTON_NO_WRITE_WATCH</tt> | Disable support for memory write watches in ntdll. This is a very dangerous hack and should only be applied if you have verified that the game can operate without write watches. This improves performance for some very specific games (e.g. CoreRT-based games). |
-|                       | <tt>WINE_FULLSCREEN_FSR</tt>   | Enable AMD FidelityFX Super Resolution (FSR) 1, use in conjunction with `WINE_FULLSCREEN_FSR_STRENGTH`. Only works in Vulkan games (DXVK and VKD3D-Proton included). |
+| <tt>nowritewatch</tt> | <tt>PROTON_NO_WRITE_WATCH</tt> | Disable support for memory write watches in ntdll. This should only be applied if you have verified that the game can operate without write watches. This can improves performance for some very specific games. |
+|                       | <tt>WINE_FULLSCREEN_FSR</tt>   | Enable AMD FidelityFX Super Resolution (FSR), use in conjunction with `WINE_FULLSCREEN_FSR_STRENGTH`. Only works in Vulkan games (DXVK and VKD3D-Proton included). |
 |                       | <tt>WINE_FULLSCREEN_FSR_STRENGTH</tt> | AMD FidelityFX Super Resolution (FSR) strength, the default sharpening of 5 is enough without needing modification, but can be changed with 0-5 if wanted. 0 is the maximum sharpness, higher values mean less sharpening. 2 is the AMD recommended default and is set by GE-Proton by default. |
 |                       | <tt>WINE_FULLSCREEN_FSR_CUSTOM_MODE</tt> | Set fake resolution of the screen. This can be useful in games that render in native resolution regardless of the selected resolution. Parameter `WIDTHxHEIGHT` |
-|                       | <tt>WINE_DO_NOT_CREATE_DXGI_DEVICE_MANAGER</tt> | Set to 1 to enable. Required for video playback in some games to not be miscolored (usually tinted pink) |
-|                       | <tt>COPYPREFIX</tt> | Set to 1 to enable. If -steamdeck is used on steam (or SteamDeck=1 is set), copies the game's prefix and shader cache from the game partition to the local steam steamapps folder. Logic is reversed if -steamdeck not enabled (or SteamDeck=0) |
+|                       | <tt>WINE_DO_NOT_CREATE_DXGI_DEVICE_MANAGER</tt> | Set to 1 to enable. Required for video playback in some games to not be miscolored |
+|                       | <tt>COPYPREFIX</tt> | Set to 1 to enable. If -steamdeck is used as a Steam launch option or if SteamDeck=1 is set as an environment variable, copies the game's prefix and shader cache from the game partition to the local Steam 'steamapps' folder. The Logic is reversed if the -steamdeck is not used as a Steam launch option or if SteamDeck=0 is set as an environment variable |
+
 ## Credits
 
-As many of you may or may not already know, there is a Credits section in the README for this Git repository. My proton-ge project contains some of my personal tweaks to Proton, but a large amount of the patches, rebases and fixes come from numerous people's projects. While I tend to get credited for my builds, a lot of the work that goes into it are from other people as well. I'd like to take some time to point a few of these people out of recognition. In future builds, I plan to make clearer and more informative Git commits, as well as attempt to give these people further crediting, as my README may not be sufficient in doing so.
+The GE-Proton project contains some of my personal tweaks to Proton, but a large amount of the patches, rebases and fixes come from numerous people's projects. 
+
+While I tend to get credited for my builds, a lot of the work that goes into it are from other people as well. I'd like to take some time to point a few of these people out of recognition. 
+
+In future builds, I plan to make clearer and more informative Git commits, as well as attempt to give these people further crediting, as my README may not be sufficient in doing so.
 
 ### TKG (Etienne Juvigny)
 
 - https://www.patreon.com/tkglitch
 - https://github.com/Frogging-Family/wine-tkg-git
 
-I and many others owe TKG. In regards to both WINE and Proton. He has dedicated a lot of time (2+ years at least) to rebasing WINE and Proton patches, as well as making his own contributions. Before he came along, I did some rebasing work, and mainly only released things for Arch. These days he almost always beats me to rebasing, and it saves myself and others a **lot** of work.
+I and many others owe TKG. In regards to both Wind and Proton. He has dedicated a lot of time (2+ years at least) to rebasing Wine and Proton patches, as well as making his own contributions. Before he came along, I did some rebasing work, and mainly only released things for Arch. These days he almost always beats me to rebasing, and it saves myself and others a **lot** of work.
 
 ### Guy1524 (Derek Lesho)
 
 - https://github.com/Guy1524
 
-Derek was responsible for the original rawinput patches, as well as several various game fixes in the past, just to name a few: MK11, FFXV, MHW, Steep, AC Odyssey FS fix. He has also done a massive amount of work on media foundation/mfplat, which should be hopefully working very soon.
+Derek was responsible for the original raw input patches, as well as several various game fixes in the past, just to name a few: MK11, FFXV, MHW, Steep, AC Odyssey FS fix. He has also done a massive amount of work on Media Foundation/MFPlat, which should be hopefully working very soon.
 
 ### Joshie (Joshua Ashton)
 
@@ -414,7 +414,7 @@ Joshua is the creator of D9VK and also a huge contributor of DXVK. He is also kn
 
 - https://github.com/doitsujin/dxvk
 
-Philip is the creator of DXVK and a heavy contributor of VKD3D. He also put up a lot of my bug reporting for Warframe years ago, when DXVK started.
+Philip is the creator of DXVK and a heavy contributor of VKD3D. He also put up a lot of my bug reporting for Warframe years ago when DXVK started.
 
 ### HansKristian/themaister (Hans-Kristian Arntzen)
 
@@ -433,29 +433,29 @@ Ethan is the creator of FAudio, and he also listened to my Warframe bug reports 
 
 - https://github.com/simons-public
 
-Chris is the creator of the original Protonfixes project. The portions of Protonfixes I've imported are what allow customizations to be made to prefixes for various Proton games. without Proton fixes many games would still be broken and/or require manual prefix modification. Huge thanks to Chris.
+Chris is the creator of the original 'protonfixes' project. The portions of 'protonfixes' I've imported are what allow customizations to be made to prefixes for various Proton games. Without 'protonfixes' many games would still be broken and/or require manual prefix modification.
 
 ### Sporif (Amine Hassane)
 
 - https://github.com/Sporif
 
-Amine is the current maintainer of dxvk-async. This is a feature that was originally removed from dxvk as it happened around the same time a few overwatch bans happened. It was thought, but never confirmed whether or not this feature caused the bans, so the feature was removed as a safety precaution. It is still safe to use in many single player games, and games that do not have competitive anti-cheats. It has also been confirmed to work safely in Warframe and Path of Exile.
+Amine is the current maintainer of dxvk-async. This is a feature that was originally removed from DXVK as it happened around the same time a few Overwatch bans happened. It was thought, but never confirmed whether or not this feature caused the bans, so the feature was removed as a safety precaution. It is still safe to use in many single player games, and games that do not have competitive anti-cheats. It has also been confirmed to work safely in Warframe and Path of Exile.
 
 ### wine-staging maintainers
 
-I also of course need to thank my fellow wine-staging maintainers: Alistair Leslie-Hughes, Zebediah Figura and Paul Gofman
+I also of course need to thank the wine-staging maintainers: Alistair Leslie-Hughes, Zebediah Figura and Paul Gofman
 
-They have contributed MANY patches to staging, far beyond what I have done, as well as kept up with regular rebasing. A lot of times when bug reports come to me, if it has to do with staging I end up testing and relaying information to these guys in order to get issues resolved.
+They have contributed many patches to staging, far beyond what I have done, as well as kept up with regular rebasing. A lot of times when bug reports come to me, if it has to do with staging I end up testing and relaying information to these guys in order to get issues resolved.
 
 ### Reporters
 
-Additionally, a thank you is owed to Andrew Aeikum (aeikum), and kisak (kisak-valve) for regularly keeping me in the loop with Proton and fsync patches, as well as accepting PRs I've made to fix Proton build system issues, or listening to bug reports on early Proton patches before they reach Proton release.
+Additionally, a thank you is owed to Andrew Aeikum (aeikum), and kisak (kisak-valve) for regularly keeping me in the loop with Proton and fsync patches, as well as accepting pull requests I've made to fix Proton build system issues, or listening to bug reports on early Proton patches before they reach a Proton release.
 
 ### Patrons
 
-And finally - To all of my patrons that have supported me, thank you so much. It's because of you that I've been able to keep this project going, getting bug fixes reported, getting Proton/WINE issues fixed, getting various hardware and/or game fixes handled, and so on. Thanks to you, I have been able to use the spare budget in order to both help support the other people that make my project possible, as well as get things necessary for testing such as new game releases or specific hardware that hits odd issues. It's had a huge effect not just for this project, but a large trickle down effect.
+And finally - to all of my patrons that have supported me, thank you so much. It's because of you that I've been able to keep this project going, getting bug fixes reported, getting Proton/Wine issues fixed, getting various hardware and/or game fixes handled, and so on. Thanks to you, I have been able to use the spare budget in order to both help support the other people that make my project possible, as well as get things necessary for testing such as new game releases or specific hardware that hits odd issues. It's had a huge effect not just for this project, but a large trickle down effect.
 
-My wine-staging co-maintainers are often able to ask me for testing games, or testing on different hardware if they don't have access to it. This also trickles into both Proton bug reporting AND Lutris bug reporting, as I'm able to provide bug testing and feedback and custom builds and upgrades to them as well. I'm also able to test driver related issues for things such as mesa and getting things reported + patched. This in turn leads to early patches for Mesa, the kernel, VKD3D, and other packages on my copr repos as well. The trickle down effect is just one gigantic awesome rabbit hole for getting things fixed. Thank you once again.
+My wine-staging co-maintainers are often able to ask me for testing games, or testing on different hardware if they don't have access to it. This also trickles into both Proton bug reporting and Lutris bug reporting, as I'm able to provide bug testing and feedback and custom builds and upgrades to them as well. I'm also able to test driver related issues for things such as mesa and getting things reported + patched. This in turn leads to early patches for Mesa, the kernel, VKD3D, and other packages on my copr repositories as well. The trickle down effect is just one gigantic awesome rabbit hole for getting things fixed. Thank you once again.
 
 ## Donations
 
@@ -464,9 +464,9 @@ For anyone else interested, my Patreon can be found here:
 https://www.patreon.com/gloriouseggroll
 
 
-## Tested Games
+## Tested games
 
-| Name                                                | SteamDB Link                                 | ProtonDB Link                               | Steambase                                   | Has Protonfixes    | Has Media Foundation fixes |
+| Name                                                | SteamDB link                                 | ProtonDB link                               | Steambase                                   | Has protonfixes    | Has Media Foundation fixes |
 | --------------------------------------------------- | -------------------------------------------- | -------------------------------------------- | -------------------------------------------- | ------------------ | -------------------------- |
 | Acceleration of SUGURI 2                            | [SteamDB](https://steamdb.info/app/390710)   | [ProtonDB](https://protondb.com/app/390710)  | [Steambase](https://steambase.io/apps/390710) | :heavy_check_mark: | :heavy_check_mark:         |
 | Age of Empires: Definitive Edition                  | [SteamDB](https://steamdb.info/app/1017900)  | [ProtonDB](https://protondb.com/app/1017900) | [Steambase](https://steambase.io/apps/1017900) | :x:                | :heavy_check_mark:         |
