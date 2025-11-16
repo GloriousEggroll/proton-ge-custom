@@ -54,19 +54,12 @@
 
 #include <msi.h>
 
-WINE_DEFAULT_DEBUG_CHANNEL(steam);
+WINE_DEFAULT_DEBUG_CHANNEL(umu);
 
 static bool env_nonzero(const char *env)
 {
     const char *v = getenv(env);
     return v != NULL && *v && v[0] != '0';
-}
-
-static void set_active_process_pid(void)
-{
-    DWORD pid = GetCurrentProcessId();
-    RegSetKeyValueW( HKEY_CURRENT_USER, L"Software\\Valve\\Steam\\ActiveProcess", L"pid",
-                     REG_DWORD, &pid, sizeof(pid) );
 }
 
 /* XBox Game Studios titles run GamingRepair.exe unless it has previously succeeded and set a registry value
@@ -87,64 +80,6 @@ static void set_gamingrepair_succeeded(const char *sgi)
     }
 
     RegCloseKey(appkey);
-}
-
-static DWORD WINAPI create_steam_windows(void *arg)
-{
-    static WNDCLASSEXW wndclass = { sizeof(WNDCLASSEXW) };
-    MSG msg;
-
-    wndclass.lpfnWndProc = DefWindowProcW;
-    wndclass.lpszClassName = L"vguiPopupWindow";
-
-    RegisterClassExW(&wndclass);
-    CreateWindowW( wndclass.lpszClassName, L"Steam", WS_POPUP, 40, 40, 400, 300, NULL, NULL, NULL, NULL );
-    CreateWindowA("static", "SteamVR Status", WS_POPUP, 0, 0, 0, 0, NULL, NULL, NULL, NULL);
-
-    while (GetMessageW(&msg, NULL, 0, 0))
-    {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-    }
-
-    return 0;
-}
-
-static void write_file( const WCHAR *filename, const char *data, size_t len )
-{
-    DWORD written;
-    HANDLE file;
-
-    file = CreateFileW( filename, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL );
-    if (file == INVALID_HANDLE_VALUE) ERR( "Could not open %s.\n", debugstr_w(filename) );
-    else
-    {
-        if (!WriteFile( file, data, len, &written, NULL )) ERR( "Could not write to %s.\n", debugstr_w(filename) );
-        CloseHandle( file );
-    }
-}
-
-static char *escape_path_unix_to_dos( const char *path )
-{
-    WCHAR *dos, *tmp = NULL, *src, *dst;
-    char *escaped = NULL;
-    UINT len;
-
-    if (!(dos = wine_get_dos_file_name( path )) || !(len = wcslen( dos ))) goto done;
-    if (!(tmp = malloc( (len * 2 + 1) * sizeof(*tmp) ))) goto done;
-    for (src = dos, dst = tmp; *src; src++, dst++) if ((*dst = *src) == '\\') *++dst = '\\';
-
-    if (!(len = WideCharToMultiByte( CP_UTF8, 0, tmp, (dst - tmp), NULL, 0, NULL, NULL ))) goto done;
-    if ((escaped = malloc( len + 1 )))
-    {
-        WideCharToMultiByte( CP_UTF8, 0, tmp, (dst - tmp), escaped, len, NULL, NULL );
-        escaped[len] = '\0';
-    }
-
-done:
-    HeapFree( GetProcessHeap(), 0, dos );
-    free( tmp );
-    return escaped;
 }
 
 size_t strappend( char **buf, size_t *buf_size, size_t pos, const char *fmt, ... )
@@ -201,23 +136,6 @@ static void setup_vr_registry(void)
 
     TRACE( "Queued VR info initialization.\n" );
     FreeLibrary(vrclient);
-}
-
-static void setup_steam_registry(void)
-{
-    BOOL (CDECL *init)(void);
-    HMODULE steamclient;
-
-    if (!(steamclient = LoadLibraryW( L"lsteamclient" )))
-    {
-        ERR( "Failed to load lsteamclient module, skipping initialization\n" );
-        return;
-    }
-
-    if ((init = (void *)GetProcAddress( steamclient, "steamclient_init_registry" ))) init();
-    else ERR( "Failed to find steamclient_init_registry export\n" );
-
-    FreeLibrary( steamclient );
 }
 
 static WCHAR *strchrW(WCHAR *h, WCHAR n)
@@ -542,258 +460,9 @@ run:
     }
 }
 
-/* Forward stub steam.exe commands to the native steam client */
-static BOOL steam_command_handler(int argc, char *argv[])
-{
-    typedef NTSTATUS (WINAPI *__WINE_UNIX_SPAWNVP)(char *const argv[], int wait);
-    static __WINE_UNIX_SPAWNVP p__wine_unix_spawnvp;
-    NTSTATUS status = STATUS_UNSUCCESSFUL;
-    BOOL restart_self = FALSE;
-    char **unix_argv;
-    HMODULE module;
-    const char *sgi;
-    int i, j;
-    static char *unix_steam[] =
-    {
-        (char *)"steam-runtime-steam-remote",
-        (char *)"steam",
-        NULL,
-    };
-
-    /* If there are command line options, only forward steam:// and options start with - */
-    if (argc > 1 && StrStrIA(argv[1], "steam://") != argv[1] && argv[1][0] != '-')
-        return FALSE;
-
-    if (argc > 2 && !strcmp(argv[1], "--") && (sgi = getenv("SteamGameId")))
-    {
-        char s[64];
-
-        snprintf(s, sizeof(s), "steam://launch/%s", sgi);
-        if (!(restart_self = !strcmp(argv[2], s)))
-        {
-            snprintf(s, sizeof(s), "steam://rungameid/%s", sgi);
-            restart_self = !strcmp(argv[2], s);
-        }
-    }
-    if (restart_self)
-    {
-        HANDLE event;
-
-        event = OpenEventW( SYNCHRONIZE, FALSE, L"PROTON_STEAM_EXE_RESTART_APP" );
-        if (event)
-        {
-            SetEvent(event);
-            CloseHandle(event);
-            WINE_TRACE("Signalled app restart.\n");
-        }
-        else
-            WINE_ERR("Restart event not found.\n");
-        return TRUE;
-    }
-
-    if (!p__wine_unix_spawnvp)
-    {
-        module = GetModuleHandleW( L"ntdll" );
-        p__wine_unix_spawnvp = (void *)GetProcAddress(module, "__wine_unix_spawnvp");
-        if (!p__wine_unix_spawnvp)
-        {
-            WINE_ERR("Failed to load __wine_unix_spawnvp().\n");
-            return FALSE;
-        }
-    }
-
-    if (!(unix_argv = malloc((argc + 1) * sizeof(*unix_argv))))
-    {
-        WINE_ERR("Out of memory.\n");
-        return FALSE;
-    }
-
-    for (i = 1; i < argc; ++i)
-        unix_argv[i] = argv[i];
-    unix_argv[argc] = NULL;
-
-    for (i = 0; i < ARRAY_SIZE(unix_steam); ++i)
-    {
-        unix_argv[0] = unix_steam[i];
-
-        WINE_TRACE("Trying");
-        for (j = 0; j < argc; ++j)
-            WINE_TRACE(" %s", wine_dbgstr_a(unix_argv[j]));
-        WINE_TRACE("\n");
-
-        status = p__wine_unix_spawnvp(unix_argv, TRUE);
-        if (status == STATUS_SUCCESS)
-            break;
-    }
-    free(unix_argv);
-
-    if (status == STATUS_SUCCESS)
-    {
-        WINE_TRACE("Forwarded command to native steam.\n");
-    }
-    else
-    {
-        WINE_ERR("Forwarding");
-        for (i = 0; i < argc; ++i)
-            WINE_ERR(" %s", wine_dbgstr_a(argv[i]));
-        WINE_ERR(" to native steam failed, status %#lx.\n", status);
-    }
-    return TRUE;
-}
-
-static void setup_steam_files(void)
-{
-    const char *steam_install_path = getenv("STEAM_COMPAT_CLIENT_INSTALL_PATH");
-    const char *steam_library_paths = getenv("STEAM_COMPAT_LIBRARY_PATHS");
-    const char *start, *end, *next;
-    size_t buf_size = 0, pos = 0;
-    char *buf = NULL, *str;
-    unsigned int index = 0;
-
-    if (!CreateDirectoryW( L"C:\\Program Files (x86)\\Steam\\config", NULL ) && GetLastError() != ERROR_ALREADY_EXISTS)
-    {
-        WINE_ERR("Failed to create config directory, GetLastError() %lu.\n", GetLastError());
-        return;
-    }
-
-    if (!CreateDirectoryW( L"C:\\Program Files (x86)\\Steam\\steamapps", NULL ) && GetLastError() != ERROR_ALREADY_EXISTS)
-    {
-        WINE_ERR("Failed to create steamapps directory, GetLastError() %lu.\n", GetLastError());
-        return;
-    }
-
-    pos += strappend( &buf, &buf_size, pos, "\"LibraryFolders\"\n{\n" );
-
-    TRACE( "steam_install_path %s.\n", debugstr_a(steam_install_path) );
-    if (steam_install_path)
-    {
-        if (!(str = escape_path_unix_to_dos( steam_install_path )))
-            ERR( "Could not convert %s to win path.\n", debugstr_a(steam_install_path) );
-        else
-        {
-            pos += strappend( &buf, &buf_size, pos, "\t\"%u\"\n\t{\n\t\t\"path\"\t\t\"%s\"\n\t}\n", index, str );
-            ++index;
-            free( str );
-        }
-    }
-
-    TRACE( "steam_library_paths %s.\n", debugstr_a(steam_library_paths) );
-    start = steam_library_paths;
-    while (start && *start)
-    {
-        char *path;
-
-        if (!(next = strchr( start, ':' ))) next = start + strlen( start );
-        end = next;
-
-        if (end != start && end[-1] == '/') --end;
-        while (end != start && end[-1] != '/') --end;
-
-        path = malloc( end - start + 1 );
-        lstrcpynA( path, start, end - start );
-        if (!(str = escape_path_unix_to_dos( path )))
-            ERR( "Could not convert %s to win path.\n", debugstr_a(path) );
-        else
-        {
-            pos += strappend( &buf, &buf_size, pos, "\t\"%u\"\n\t{\n\t\t\"path\"\t\t\"%s\"\n\t}\n", index, str );
-            ++index;
-            free( str );
-        }
-        free( path );
-
-        if (*next == ':') ++next;
-        start = next;
-    }
-
-    pos += strappend( &buf, &buf_size, pos, "}\n" );
-    write_file( L"C:\\Program Files (x86)\\Steam\\steamapps\\libraryfolders.vdf", buf, pos );
-}
-
 #ifndef DIRECTORY_QUERY
 #define DIRECTORY_QUERY 0x0001
 #endif
-
-static HANDLE find_ack_event(void)
-{
-    UNICODE_STRING str = RTL_CONSTANT_STRING( L"\\BaseNamedObjects\\Session\\1" );
-    DIRECTORY_BASIC_INFORMATION *di;
-    OBJECT_ATTRIBUTES attr;
-    HANDLE dir, ret = NULL;
-    ULONG context, size;
-    char buffer[1024];
-    NTSTATUS status;
-
-    di = (DIRECTORY_BASIC_INFORMATION *)buffer;
-
-    InitializeObjectAttributes(&attr, &str, 0, 0, NULL);
-    status = NtOpenDirectoryObject( &dir, DIRECTORY_QUERY, &attr );
-    if (status)
-    {
-        WINE_WARN( "Failed to open directory, status %#lx.\n", status );
-        return NULL;
-    }
-
-    status = NtQueryDirectoryObject(dir, di, sizeof(buffer), TRUE, TRUE, &context, &size);
-    while (!status)
-    {
-        if (!strncmpW( di->ObjectName.Buffer, L"STEAM_START_ACK_EVENT", 21 ))
-        {
-            WINE_TRACE("Found event %s.\n", wine_dbgstr_w(di->ObjectName.Buffer));
-            ret = OpenEventW(SYNCHRONIZE, FALSE, di->ObjectName.Buffer);
-            if (!ret)
-                WINE_WARN("Failed to create event, err %lu.\n", GetLastError());
-            break;
-        }
-        status = NtQueryDirectoryObject(dir, di, sizeof(buffer), TRUE, FALSE, &context, &size);
-    }
-    if (status && status != STATUS_NO_MORE_ENTRIES)
-        WINE_WARN("NtQueryDirectoryObject failed, status %#lx.\n", status);
-    WINE_TRACE("ret %p.\n", ret);
-
-    CloseHandle(dir);
-    return ret;
-}
-
-static DWORD WINAPI steam_drm_thread(void *arg)
-{
-    HANDLE consume, produce;
-    HANDLE start_ack = NULL;
-    HANDLE child = arg;
-    DWORD pid;
-    LONG prev;
-
-    consume = CreateSemaphoreW( NULL, 0, 512, L"STEAM_DIPC_CONSUME" );
-    if (!consume)
-    {
-        WINE_ERR("Failed to create consume semaphore, err %lu.\n", GetLastError());
-        return -1;
-    }
-    produce = CreateSemaphoreW( NULL, 1, 512, L"SREAM_DIPC_PRODUCE" );
-    if (!produce)
-    {
-        CloseHandle(consume);
-        WINE_ERR("Failed to create produce semaphore, err %lu.\n", GetLastError());
-        return -1;
-    }
-
-    pid = GetProcessId(child);
-
-    WINE_TRACE("Child pid %04lx.\n", pid);
-
-    while (WaitForSingleObject(consume, INFINITE) == WAIT_OBJECT_0)
-    {
-        WINE_TRACE("Got event.\n");
-
-        if (!start_ack)
-            start_ack = find_ack_event();
-        if (start_ack)
-            SetEvent(start_ack);
-        ReleaseSemaphore(produce, 1, &prev);
-        WINE_TRACE("prev %ld.\n", prev);
-    }
-
-    return 0;
-}
 
 BOOL is_ptraced(void)
 {
@@ -810,8 +479,6 @@ BOOL is_ptraced(void)
 int main(int argc, char *argv[])
 {
     HANDLE wait_handle = INVALID_HANDLE_VALUE;
-    HANDLE event2 = INVALID_HANDLE_VALUE;
-    HANDLE event = INVALID_HANDLE_VALUE;
     HANDLE child = INVALID_HANDLE_VALUE;
     BOOL game_process = FALSE;
     const char *sgi;
@@ -819,37 +486,11 @@ int main(int argc, char *argv[])
 
     WINE_TRACE("\n");
 
-    if (steam_command_handler(argc, argv))
-        return 0;
-
     if ((sgi = getenv("SteamGameId")))
     {
         WCHAR path[MAX_PATH], *p;
 
-        /* do setup only for game process */
-        event = CreateEventW( NULL, FALSE, FALSE, L"Steam3Master_SharedMemLock" );
-
-        /* For 2K Launcher. */
-        event2 = CreateEventW( NULL, FALSE, FALSE, L"Global\\Valve_SteamIPC_Class" );
-
-        CreateThread(NULL, 0, create_steam_windows, NULL, 0, NULL);
-
-        set_active_process_pid();
         set_gamingrepair_succeeded(sgi);
-
-        SetEnvironmentVariableW(L"SteamPath", L"C:\\Program Files (x86)\\Steam");
-        *path = 0;
-        GetModuleFileNameW(NULL, path, ARRAY_SIZE(path));
-        p = path;
-        while (*p)
-        {
-            if (*p == '\\') *p = '/';
-            ++p;
-        }
-        SetEnvironmentVariableW(L"ValvePlatformMutex", path);
-
-        setup_steam_registry();
-        setup_steam_files();
 
         if (env_nonzero("PROTON_WAIT_ATTACH"))
         {
@@ -886,9 +527,6 @@ int main(int argc, char *argv[])
 
             wait_handle = child;
         }
-
-        if (game_process)
-            CreateThread(NULL, 0, steam_drm_thread, child, 0, NULL);
     }
 
     if (game_process)
@@ -938,11 +576,6 @@ int main(int argc, char *argv[])
         }
         CloseHandle(waits[1]);
     }
-
-    if (event != INVALID_HANDLE_VALUE)
-        CloseHandle(event);
-    if (event2 != INVALID_HANDLE_VALUE)
-        CloseHandle(event2);
 
     if (child != INVALID_HANDLE_VALUE)
     {
