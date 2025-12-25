@@ -1,14 +1,13 @@
 diff --git a/dlls/winealsa.drv/alsa.c b/dlls/winealsa.drv/alsa.c
-index 046b447aafd..6b63340f9f3 100644
+index 046b447aafd..555eee57f87 100644
 --- a/dlls/winealsa.drv/alsa.c
 +++ b/dlls/winealsa.drv/alsa.c
-@@ -42,9 +42,16 @@
+@@ -42,8 +42,31 @@
  #include "wine/unixlib.h"
  
  #include "unixlib.h"
 -
  WINE_DEFAULT_DEBUG_CHANNEL(alsa);
--
 +static int get_max_channels_override(void)
 +{
 +    const char *env = getenv("WINEALSA_CHANNELS");
@@ -18,34 +17,235 @@ index 046b447aafd..6b63340f9f3 100644
 +    }
 +    return 0;
 +}
++
++static int get_spatial_override(void)
++{
++    const char *env = getenv("WINEALSA_SPATIAL");
++    if (env && *env == '1') return 1;
++    return 0;
++}
++
++
++struct mix_instruction {
++    int target1;  
++    float vol1;   
++    int target2; 
++    float vol2;  
++};
+ 
  struct alsa_stream
  {
-     snd_pcm_t *pcm_handle;
-@@ -807,7 +814,7 @@ static NTSTATUS alsa_create_stream(void *args)
+@@ -80,6 +103,10 @@ struct alsa_stream
+     float *vols;
+ 
+     pthread_mutex_t lock;
++
++    struct mix_instruction mix_ops[64];
++    int mix_write_idx[32];
++    BOOL mix_active;
+ };
+ 
+ #define EXTRA_SAFE_RT 40000
+@@ -797,6 +824,101 @@ static void silence_buffer(struct alsa_stream *stream, BYTE *buffer, UINT32 fram
+         memset(buffer, 0, frames * stream->fmt->nBlockAlign);
+ }
+ 
++static void init_downmix_map(struct alsa_stream *stream)
++{
++    int limit, channels, i, c, bit, t1, t2;
++    float v1, v2;
++    int O_FL=0, O_FR=1, O_RL=-1, O_RR=-1, O_FC=-1, O_LFE=-1, O_SL=-1, O_SR=-1;
++    WAVEFORMATEXTENSIBLE *fmtex = (WAVEFORMATEXTENSIBLE*)stream->fmt;
++    uint32_t mask;
++
++    limit = get_max_channels_override();
++
++    channels = stream->fmt->nChannels;
++    mask = (stream->fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE) ? fmtex->dwChannelMask : 0;
++
++    stream->mix_active = FALSE;
++
++    if (limit == 0 || channels <= limit) return;
++
++    stream->mix_active = TRUE;
++
++    if (limit >= 4) { O_RL=2; O_RR=3; }
++    if (limit >= 6) { O_FC=4; O_LFE=5; }
++    if (limit >= 8) { O_SL=6; O_SR=7; }
++
++    memset(stream->mix_ops, 0, sizeof(stream->mix_ops));
++    for (i = 0; i < 32; i++) stream->mix_write_idx[i] = -1;
++
++    for (i = 0; i < channels; i++) {
++        int alsa_idx = stream->alsa_channel_map[i];
++        if (alsa_idx >= 0 && alsa_idx < 32) stream->mix_write_idx[alsa_idx] = i;
++    }
++
++    c = 0;
++    for (bit = 0; bit < 32 && c < channels; bit++) {
++        if (mask & (1 << bit)) {
++            t1 = -1; t2 = -1; v1 = 0.0f; v2 = 0.0f;
++
++            switch (1 << bit) {
++                case SPEAKER_FRONT_LEFT:
++                    t1 = O_FL; v1 = 1.0f;
++                    break;
++                case SPEAKER_FRONT_RIGHT:
++                    t1 = O_FR; v1 = 1.0f;
++                    break;
++                case SPEAKER_FRONT_CENTER:
++                    if (O_FC != -1) { t1 = O_FC; v1 = 1.0f; }
++                    else { t1 = O_FL; v1 = 0.707106781f; t2 = O_FR; v2 = 0.707106781f; }
++                    break;
++                case SPEAKER_LOW_FREQUENCY:
++                    if (O_LFE != -1) { t1 = O_LFE; v1 = 1.0f; }
++                    else { t1 = O_FL; v1 = 0.3535533905f; t2 = O_FR; v2 = 0.3535533905f; }
++                    break;
++                case SPEAKER_BACK_LEFT:
++                    if (O_RL != -1) { t1 = O_RL; v1 = 1.0f; }
++                    else { t1 = O_FL; v1 = 0.707106781f; }
++                    break;
++                case SPEAKER_BACK_RIGHT:
++                    if (O_RR != -1) { t1 = O_RR; v1 = 1.0f; }
++                    else { t1 = O_FR; v1 = 0.707106781f; }
++                    break;
++                case SPEAKER_SIDE_LEFT:
++                    if (O_SL != -1) { t1 = O_SL; v1 = 1.0f; }
++                    else { t1 = (O_RL != -1) ? O_RL : O_FL; v1 = 0.707106781f; }
++                    break;
++                case SPEAKER_SIDE_RIGHT:
++                    if (O_SR != -1) { t1 = O_SR; v1 = 1.0f; }
++                    else { t1 = (O_RR != -1) ? O_RR : O_FR; v1 = 0.707106781f; }
++                    break;
++                case SPEAKER_BACK_CENTER:
++                    if (O_RL != -1 && O_RR != -1) { t1 = O_RL; v1 = 0.707106781f; t2 = O_RR; v2 = 0.707106781f; }
++                    else if (O_SL != -1 && O_SR != -1) { t1 = O_SL; v1 = 0.707106781f; t2 = O_SR; v2 = 0.707106781f; }
++                    else { t1 = O_FL; v1 = 0.707106781f; t2 = O_FR; v2 = 0.707106781f; }
++                    break;
++
++
++                default: t1 = O_FL; v1 = 0.0f; t2 = O_FR; v2 = 0.0f; break;
++            }
++
++            stream->mix_ops[c].target1 = t1; stream->mix_ops[c].vol1 = v1;
++            stream->mix_ops[c].target2 = t2; stream->mix_ops[c].vol2 = v2;
++
++
++        TRACE("Starting Downmix: Full Mask 0x%08X, Input Channels: %d, Cap: %d\n",
++          (unsigned int)mask, channels, limit);
++
++             if (t2 != -1 || (t1 != -1 && v1 != 1.0f)) {
++                 TRACE("Map: Input Ch %d (0x%x) -> Target1: %d (%.2f), Target2: %d (%.2f)\n",
++                       c, (1<<bit), t1, v1, t2, v2);
++            }
++
++
++            c++;
++        }
++    }
++}
++
+ static NTSTATUS alsa_create_stream(void *args)
+ {
+     struct create_stream_params *params = args;
+@@ -807,7 +929,8 @@ static NTSTATUS alsa_create_stream(void *args)
      WAVEFORMATEXTENSIBLE *fmtex = (WAVEFORMATEXTENSIBLE *)params->fmt;
      int err;
      SIZE_T size;
 -
 +    int limit;
++    int spatial;
      params->result = S_OK;
  
      stream = calloc(1, sizeof(*stream));
-@@ -863,6 +870,14 @@ static NTSTATUS alsa_create_stream(void *args)
+@@ -863,6 +986,15 @@ static NTSTATUS alsa_create_stream(void *args)
          goto exit;
      }
  
-+   limit = get_max_channels_override(); /* Value assigned here, declared at top */
-+    if (limit > 0 && stream->alsa_channels > limit) {
-+        WARN("Application requested %d channels, but user capped at %d via WINEALSA_CHANNELS.\n",
-+             stream->alsa_channels, limit);
-+        params->result = AUDCLNT_E_UNSUPPORTED_FORMAT;
-+        goto exit;
++   limit = get_max_channels_override();
++   spatial = get_spatial_override();
++    if (limit > 0 && stream->alsa_channels > limit && spatial != 1) {
++            WARN("Application requested %d channels, but user capped at %d.\n",
++                 stream->alsa_channels, limit);
++            params->result = AUDCLNT_E_UNSUPPORTED_FORMAT;
++            goto exit;
 +    }
 +
      if((err = snd_pcm_hw_params_set_channels(stream->pcm_handle, stream->hw_params,
                 stream->alsa_channels)) < 0){
          WARN("Unable to set channels to %u: %d (%s)\n", params->fmt->nChannels, err,
-@@ -1872,6 +1887,7 @@ static NTSTATUS alsa_is_format_supported(void *args)
+@@ -1008,6 +1140,8 @@ static NTSTATUS alsa_create_stream(void *args)
+ 
+     pthread_mutex_init(&stream->lock, NULL);
+ 
++    init_downmix_map(stream);
++
+     TRACE("ALSA period: %lu frames\n", stream->alsa_period_frames);
+     TRACE("ALSA buffer: %lu frames\n", stream->alsa_bufsize_frames);
+     TRACE("MMDevice period: %u frames\n", stream->mmdev_period_frames);
+@@ -1144,11 +1278,15 @@ static BYTE *remap_channels(struct alsa_stream *stream, BYTE *buf, snd_pcm_ufram
+ static void adjust_buffer_volume(const struct alsa_stream *stream, BYTE *buf, snd_pcm_uframes_t frames)
+ {
+     BOOL adjust = FALSE;
+-    UINT32 i, channels, mute = 0;
++    UINT32 i, k, channels, mute = 0;
+     BYTE *end;
+-
++    int limit;
++    float *p_float;
++    float val, sample;
+     if (stream->vol_adjusted_frames >= frames)
+         return;
++
++    limit = get_max_channels_override();
+     channels = stream->fmt->nChannels;
+ 
+     /* Adjust the buffer based on the volume for each channel */
+@@ -1166,12 +1304,42 @@ static void adjust_buffer_volume(const struct alsa_stream *stream, BYTE *buf, sn
+             WARN("Setting buffer to silence failed: %d (%s)\n", err, snd_strerror(err));
+         return;
+     }
+-    if (!adjust) return;
++    if (!adjust && !stream->mix_active) return;
+ 
+     /* Skip the frames we've already adjusted before */
+     end = buf + frames * stream->fmt->nBlockAlign;
+     buf += stream->vol_adjusted_frames * stream->fmt->nBlockAlign;
+ 
++      /* Downmixing*/
++    if (stream->alsa_format == SND_PCM_FORMAT_FLOAT_LE && stream->mix_active) {
++        p_float = (float*)buf;
++
++        while ((BYTE*)p_float < end) {
++            float out_acc[8] = {0.0f};
++
++            for (k = 0; k < channels; k++) {
++                val = p_float[k] * stream->vols[k];
++
++                if (stream->mix_ops[k].target1 != -1)
++                    out_acc[stream->mix_ops[k].target1] += val * stream->mix_ops[k].vol1;
++                if (stream->mix_ops[k].target2 != -1)
++                    out_acc[stream->mix_ops[k].target2] += val * stream->mix_ops[k].vol2;
++            }
++
++            memset(p_float, 0, channels * sizeof(float));
++            for (k = 0; k < (UINT32)limit; k++) {
++                int src_idx = stream->mix_write_idx[k];
++                if (src_idx == -1) continue;
++
++                sample = out_acc[k];
++
++                p_float[src_idx] = sample;
++            }
++            p_float += channels;
++        }
++        return;
++    }
++
+     switch (stream->alsa_format)
+     {
+ #ifndef WORDS_BIGENDIAN
+@@ -1872,6 +2040,7 @@ static NTSTATUS alsa_is_format_supported(void *args)
      unsigned int max = 0, min = 0;
      int err;
      int alsa_channels, alsa_channel_map[32];
@@ -53,7 +253,7 @@ index 046b447aafd..6b63340f9f3 100644
  
      params->result = S_OK;
  
-@@ -1951,6 +1967,13 @@ static NTSTATUS alsa_is_format_supported(void *args)
+@@ -1951,6 +2120,13 @@ static NTSTATUS alsa_is_format_supported(void *args)
          WARN("Unable to get max channels: %d (%s)\n", err, snd_strerror(err));
          goto exit;
      }
@@ -67,7 +267,7 @@ index 046b447aafd..6b63340f9f3 100644
      if(params->fmt_in->nChannels > max){
          params->result = S_FALSE;
          closest->Format.nChannels = max;
-@@ -2008,7 +2031,7 @@ static NTSTATUS alsa_get_mix_format(void *args)
+@@ -2008,7 +2184,7 @@ static NTSTATUS alsa_get_mix_format(void *args)
      snd_pcm_format_mask_t *formats;
      unsigned int max_rate, max_channels;
      int err;
@@ -76,7 +276,7 @@ index 046b447aafd..6b63340f9f3 100644
      params->result = alsa_open_device(params->device, params->flow, &pcm_handle, &hw_params);
      if(FAILED(params->result))
          return STATUS_SUCCESS;
-@@ -2057,7 +2080,12 @@ static NTSTATUS alsa_get_mix_format(void *args)
+@@ -2057,7 +2233,12 @@ static NTSTATUS alsa_get_mix_format(void *args)
          goto exit;
      }
  
@@ -90,7 +290,7 @@ index 046b447aafd..6b63340f9f3 100644
          fmt->Format.nChannels = 2;
      else
          fmt->Format.nChannels = max_channels;
-@@ -2310,7 +2338,7 @@ static unsigned int alsa_probe_num_speakers(char *name)
+@@ -2310,7 +2491,7 @@ static unsigned int alsa_probe_num_speakers(char *name)
      snd_pcm_hw_params_t *params;
      int err;
      unsigned int max_channels = 0;
@@ -99,7 +299,7 @@ index 046b447aafd..6b63340f9f3 100644
      if ((err = snd_pcm_open(&handle, name, SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK)) < 0) {
          WARN("The device \"%s\" failed to open: %d (%s).\n",
                  name, err, snd_strerror(err));
-@@ -2336,6 +2364,11 @@ static unsigned int alsa_probe_num_speakers(char *name)
+@@ -2336,6 +2517,11 @@ static unsigned int alsa_probe_num_speakers(char *name)
          goto exit;
      }
  
@@ -111,7 +311,7 @@ index 046b447aafd..6b63340f9f3 100644
  exit:
      free(params);
      snd_pcm_close(handle);
-@@ -2440,6 +2473,7 @@ static NTSTATUS alsa_get_prop_value(void *args)
+@@ -2440,6 +2626,7 @@ static NTSTATUS alsa_get_prop_value(void *args)
      } else if (flow != eCapture && IsEqualPropertyKey(*prop, PKEY_AudioEndpoint_PhysicalSpeakers)) {
          unsigned int num_speakers, card, device;
          char hwname[255];
@@ -119,7 +319,7 @@ index 046b447aafd..6b63340f9f3 100644
  
          if (sscanf(name, "plughw:%u,%u", &card, &device))
              sprintf(hwname, "hw:%u,%u", card, device); /* must be hw rather than plughw to work */
-@@ -2452,8 +2486,10 @@ static NTSTATUS alsa_get_prop_value(void *args)
+@@ -2452,8 +2639,10 @@ static NTSTATUS alsa_get_prop_value(void *args)
              return STATUS_SUCCESS;
          }
          out->vt = VT_UI4;
