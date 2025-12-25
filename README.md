@@ -318,6 +318,7 @@ ntsync
 You can also manually enable the module without reboot, just keep in mind the above configuration is needed for it to persist after reboots:
 ```
 sudo modprobe ntsync
+```
 
 > [!NOTE]
 > As of right now, in-game Steam overlay WILL NOT work with Wayland enabled.
