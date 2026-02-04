@@ -320,6 +320,47 @@ static BOOL should_use_shell_execute(WCHAR *cmdline)
     return use_shell_execute;
 }
 
+static BOOL try_recover_eadesktop_symlink(void)
+{
+    WIN32_FIND_DATAA ff;
+    HANDLE handle, file;
+    char path[MAX_PATH];
+
+    handle = CreateFileA( "C:\\Program Files\\Electronic Arts\\EA Desktop\\EA Desktop", GENERIC_READ,
+                          FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0 );
+    if (handle != INVALID_HANDLE_VALUE || GetLastError() != ERROR_FILE_NOT_FOUND)
+    {
+        TRACE( "directory handle %p, err %ld.\n", handle, GetLastError() );
+        if (handle != INVALID_HANDLE_VALUE) CloseHandle( handle );
+        return FALSE;
+    }
+
+    if ((handle = FindFirstFileA( "C:\\Program Files\\Electronic Arts\\EA Desktop\\*.*", &ff )) == INVALID_HANDLE_VALUE)
+        return FALSE;
+
+    do
+    {
+        if (!(ff.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        if (!strcmp( ff.cFileName, "." ) || !strcmp( ff.cFileName, ".." )) continue;
+        sprintf( path, "C:\\Program Files\\Electronic Arts\\EA Desktop\\%s\\EA Desktop\\Link2EA.exe", ff.cFileName );
+        file = CreateFileA( path, GENERIC_READ,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, 0 );
+        if (file == INVALID_HANDLE_VALUE) continue;
+        CloseHandle( file );
+        sprintf( path, "%s\\EA Desktop", ff.cFileName );
+        if (CreateSymbolicLinkA( "C:\\Program Files\\Electronic Arts\\EA Desktop\\EA Desktop", path,
+                                 SYMBOLIC_LINK_FLAG_DIRECTORY | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE ))
+        {
+            TRACE( "linked to %s.\n", debugstr_a(path) );
+            FindClose( handle );
+            return TRUE;
+        }
+        else TRACE( "CreateSymbolicLinkA to %s failed, err %ld.\n", debugstr_a(path), GetLastError() );
+    } while (FindNextFileA( handle, &ff ));
+    FindClose( handle );
+    return FALSE;
+}
+
 static HANDLE run_process(BOOL *should_await, BOOL game_process)
 {
     WCHAR *cmdline = GetCommandLineW();
@@ -496,6 +537,7 @@ run:
         WCHAR *param = NULL;
         WCHAR *executable_name_end = get_end_of_excutable_name(cmdline);
         static const WCHAR verb[] = { 'o', 'p', 'e', 'n', 0 };
+        unsigned int retry_count = 0;
         INT_PTR ret;
 
         if (*executable_name_end != '\0')
@@ -504,9 +546,15 @@ run:
             param = executable_name_end+1;
         }
 
-        if ((ret = (INT_PTR)ShellExecuteW(NULL, verb, cmdline, param, NULL, hide_window ? SW_HIDE : SW_SHOWNORMAL)) < 32)
+        while ((ret = (INT_PTR)ShellExecuteW(NULL, verb, cmdline, param, NULL, hide_window ? SW_HIDE : SW_SHOWNORMAL)) < 32)
         {
             WINE_ERR("Failed to execute %s, ret %Iu.\n", wine_dbgstr_w(cmdline), ret);
+            if (game_process && ret == SE_ERR_FNF && link2ea)
+            {
+                if (!try_recover_eadesktop_symlink()) break;
+                if (retry_count++) break;
+                continue;
+            }
             if (game_process && ret == SE_ERR_NOASSOC && link2ea)
             {
                 /* Try to uninstall EA desktop so it is set up from prerequisites on the next run. */
@@ -519,6 +567,7 @@ run:
                 RegDeleteTreeW( HKEY_LOCAL_MACHINE, L"Software\\Electronic Arts\\EA Desktop" );
                 RegDeleteTreeW( HKEY_LOCAL_MACHINE, L"Software\\Electronic Arts\\EA Core" );
             }
+            break;
         }
         return INVALID_HANDLE_VALUE;
     }
