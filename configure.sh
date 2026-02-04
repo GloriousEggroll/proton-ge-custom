@@ -106,12 +106,6 @@ function configure() {
     die "Create a subdirectory in build/ or outside of the tree and run configure.sh from there."
   fi
 
-  # nothing specified, getting the default value from the Makefile to test the
-  # container engine
-  if [[ -z $steamrt_image ]]; then
-    steamrt_image="$(sed -n 's/STEAMRT_IMAGE ?= //p' $SRCDIR/Makefile.in)"
-  fi
-
   # Build name
   local build_name="$arg_build_name"
   if [[ -n $build_name ]]; then
@@ -132,6 +126,12 @@ function configure() {
     target_arch="$arg_target_arch"
   fi
   info "Build targetting: $target_arch"
+
+  # nothing specified, getting the default value from the Makefile to test the
+  # container engine
+  if [[ -z $steamrt_image ]]; then
+    steamrt_image="$(make --silent "SRCDIR=$srcdir" --file "$srcdir/Makefile.in" "TARGET_ARCH=$target_arch" get-steamrt-image)"
+  fi
 
   dependency_command make "GNU Make"
 

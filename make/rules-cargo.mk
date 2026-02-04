@@ -41,4 +41,6 @@ aarch64-unix_CARGO_ARGS := --target $(aarch64-unix_CARGO_TARGET)
 #
 # HACK: forced to gcc-10 because Sniper's (SteamRT) gcc-14 doesn't come with
 # shared libgcc_s.so and cargo/rustc (?) forces shared linking with that lib.
-CARGO_LINKERS :=  $(foreach a,$(unix_ARCHS),CARGO_TARGET_$(call toupper,$($(a)-unix_CARGO_TARGET))_LINKER="$($(a)-unix_TARGET)-gcc-10")
+ifeq ($(TARGET_ARCH),x86_64)
+	CARGO_LINKERS :=  $(foreach a,$(unix_ARCHS),CARGO_TARGET_$(call toupper,$($(a)-unix_CARGO_TARGET))_LINKER="$($(a)-unix_TARGET)-gcc-10")
+endif

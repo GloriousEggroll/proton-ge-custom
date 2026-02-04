@@ -61,8 +61,6 @@ $$(OBJ)/.$(1)-$(3)-configure: $$(OBJ)/.wine-$$(HOST_ARCH)-tools
 	    -e '/^arm64ec_CPPFLAGS/c arm64ec_CPPFLAGS = $$($(2)_arm64ec_INCFLAGS) $$($(2)_CFLAGS) $$(arm64ec_CFLAGS) $$(CFLAGS)' \
 	    -e '/^arm64ec_CXXFLAGS/c arm64ec_CXXFLAGS = $$($(2)_arm64ec_INCFLAGS) -std=c++17 $$($(2)_CFLAGS) $$(arm64ec_CFLAGS) $$(CFLAGS)' \
 	    -e '/^arm64ec_LDFLAGS/c arm64ec_LDFLAGS = $$($(2)_arm64ec_LIBFLAGS) $$(arm64ec_LDFLAGS) $$(LDFLAGS)' \
-	    \
-	    -e '/^PE_ARCHS/s/aarch64//' \
 	    $$(WINE_$(3)_OBJ)/Makefile > $$($(2)_$(3)_OBJ)/Makefile
 
 	cd "$$($(2)_$(3)_OBJ)" && env $$($(2)_$(3)_ENV) \
