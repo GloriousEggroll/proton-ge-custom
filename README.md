@@ -363,6 +363,12 @@ Environment variable options:
 | `dlss`               | `PROTON_DLSS_UPGRADE`          | Automatically download and use newer versions of `nvngx_dlss(d\|g).dll` DLLs. Version to download can be specified by supplying it as a value, like so `PROTON_DLSS_UPGRADE="310.2"`, instead of `1`, to download version `310.2.1.0`. This option also sets `DXVK_NVAPI_DRS_SETTINGS` to use the latest preset. If you provide your own config for it through this environment variable, your configuration is going to be applied.. |
 | `dlsshud`            | `PROTON_DLSS_INDICATOR`        | Enable the DLSS overlay at the bottom left portion of the screen. This is exactly the same as `FSR4_WATERMARK=1`                                                                                                                                                                                                                                                                                                                      |
 | `xess`               | `PROTON_XESS_UPGRADE`          |                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `sdlinput`           | `PROTON_USE_SDL` or `PROTON_PREFER_SDL` | Uses SDL input instead of HIDRAW/Steam Input. |
+| `wayland`            | `PROTON_USE_WAYLAND` or `PROTON_ENABLE_WAYLAND` | Enables the Wayland driver. |
+| `wow64`              | `PROTON_USE_WOW64`             | Enables wow64. |
+|                      | `WAYLANDDRV_PRIMARY_MONITOR`   | Specify primary monitor where the value is something like `eDP-1`. Requires the Wayland driver. |
+|                      | `PROTON_ENABLE_MEDIACONV`      | Enable media converter for winegstreamer. This is not needed for winedmo, since the mediaconverter implementation of the codecs doesn't override the underlying implementation. |
+|                      | `WAYLANDDRV_RAWINPUT`          | A value of 0 disables unaccelerated input and uses accelerated input. Any positive real number (like 0.5) adjusts the sensitivity of rawinput. Requires the Wayland driver. |
 
 ## Credits
 
