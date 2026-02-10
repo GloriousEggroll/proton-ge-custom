@@ -278,6 +278,7 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/0002-HACK-kernelbase-add-redirection-for-libxess_dx11.dll.patch"
 
     # https://github.com/GloriousEggroll/proton-ge-custom/issues/433
+    echo "WINE: -PENDING- add arknights endfield fixes"
     apply_patch "../patches/wine-hotfixes/pending/0008-wintrust-Prevent-checking-if-winex11-winewayland-are.patch"
     apply_patch "../patches/wine-hotfixes/pending/0009-HACK-kernel32-Spoof-GetProcAddress-of-KiUserApcDispa.patch"
     apply_patch "../patches/wine-hotfixes/pending/0010-HACK-kernel32-Lock-GetProcAddress-hack-to-when-neede.patch"
@@ -285,6 +286,11 @@ apply_all_in_dir() {
 
     # https://gitlab.winehq.org/wine/wine/-/merge_requests/2808
     apply_patch "../patches/wine-hotfixes/pending/2808.patch"
+
+    # https://github.com/StephenCWills/wine/commits/akiba/
+    # https://github.com/ValveSoftware/Proton/issues/651#issuecomment-3564552601
+    echo "WINE: -PENDING- add akibas trip undead & undressed patches"
+    apply_patch "../patches/wine-hotfixes/pending/akibastrip-video-voice.patch"
 
 ### END WINE PENDING UPSTREAM SECTION ###
 

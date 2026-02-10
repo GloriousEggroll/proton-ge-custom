@@ -1,0 +1,427 @@
+From 7f9418d2d0e3479242790899caebb6ace8a09e9c Mon Sep 17 00:00:00 2001
+From: staphen <staphen@gmail.com>
+Date: Sun, 8 Feb 2026 14:47:53 -0500
+Subject: [PATCH] Apply patch to fall back on async bytestream read calls in
+ mfplat
+
+---
+ dlls/mfplat/main.c                |   4 +-
+ dlls/mfsrcsnk/media_source.c      |   4 +-
+ dlls/winegstreamer/media_source.c |   4 +-
+ include/Makefile.in               |   1 +
+ include/imfbytestream_read_hack.h | 158 ++++++++++++++++++++++++++++++
+ 5 files changed, 168 insertions(+), 3 deletions(-)
+ create mode 100644 include/imfbytestream_read_hack.h
+
+diff --git a/dlls/mfplat/main.c b/dlls/mfplat/main.c
+index 01d9d2ddd898..df5baa1f0f95 100644
+--- a/dlls/mfplat/main.c
++++ b/dlls/mfplat/main.c
+@@ -55,6 +55,8 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(mfplat);
+ 
++#include "imfbytestream_read_hack.h"
++
+ struct local_handler
+ {
+     struct list entry;
+@@ -6265,7 +6267,7 @@ static HRESULT resolver_get_bytestream_url_hint(IMFByteStream *stream, WCHAR con
+         return hr;
+     if (position && FAILED(hr = IMFByteStream_SetCurrentPosition(stream, 0)))
+         return hr;
+-    if (FAILED(hr = IMFByteStream_Read(stream, buffer, sizeof(buffer), &length)))
++    if (FAILED(hr = IMFByteStream_Read_Hack(stream, buffer, sizeof(buffer), &length)))
+         return hr;
+ 
+     if (length < sizeof(buffer))
+diff --git a/dlls/mfsrcsnk/media_source.c b/dlls/mfsrcsnk/media_source.c
+index b084db6ee6bd..760b05dc1389 100644
+--- a/dlls/mfsrcsnk/media_source.c
++++ b/dlls/mfsrcsnk/media_source.c
+@@ -69,6 +69,8 @@ WINE_DEFAULT_DEBUG_CHANNEL(mfplat);
+         return object;                                                                             \
+     }
+ 
++#include "imfbytestream_read_hack.h"
++
+ #define DEFINE_MF_ASYNC_CALLBACK_(type, name, impl_from, pfx, mem, expr)                           \
+     static struct type *impl_from(IMFAsyncCallback *iface)                                         \
+     {                                                                                              \
+@@ -1739,7 +1741,7 @@ static NTSTATUS CDECL media_source_read_cb(struct winedmo_stream *stream, BYTE *
+     struct media_source *source = CONTAINING_RECORD(stream, struct media_source, winedmo_stream);
+     TRACE("stream %p, buffer %p, size %p\n", stream, buffer, size);
+ 
+-    if (FAILED(IMFByteStream_Read(source->stream, buffer, *size, size)))
++    if (FAILED(IMFByteStream_Read_Hack(source->stream, buffer, *size, size)))
+         return STATUS_UNSUCCESSFUL;
+     return STATUS_SUCCESS;
+ }
+diff --git a/dlls/winegstreamer/media_source.c b/dlls/winegstreamer/media_source.c
+index 05166d78cdb7..0cb68ff33c0a 100644
+--- a/dlls/winegstreamer/media_source.c
++++ b/dlls/winegstreamer/media_source.c
+@@ -27,6 +27,8 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(mfplat);
+ 
++#include "imfbytestream_read_hack.h"
++
+ struct object_context
+ {
+     IUnknown IUnknown_iface;
+@@ -924,7 +926,7 @@ static DWORD CALLBACK read_thread(void *arg)
+         ret_size = 0;
+ 
+         if (SUCCEEDED(hr = IMFByteStream_SetCurrentPosition(byte_stream, offset)))
+-            hr = IMFByteStream_Read(byte_stream, data, size, &ret_size);
++            hr = IMFByteStream_Read_Hack(byte_stream, data, size, &ret_size);
+         if (FAILED(hr))
+             ERR("Failed to read %u bytes at offset %I64u, hr %#lx.\n", size, offset, hr);
+         else if (ret_size != size)
+diff --git a/include/Makefile.in b/include/Makefile.in
+index 9a4a00ceed8f..51f053ad3184 100644
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -391,6 +391,7 @@ SOURCES = \
+ 	iimgctx.idl \
+ 	imagehlp.h \
+ 	ime.h \
++	imfbytestream_read_hack.h \
+ 	imm.h \
+ 	immdev.h \
+ 	imnact.idl \
+diff --git a/include/imfbytestream_read_hack.h b/include/imfbytestream_read_hack.h
+new file mode 100644
+index 000000000000..e5950ea5a0d4
+--- /dev/null
++++ b/include/imfbytestream_read_hack.h
+@@ -0,0 +1,158 @@
++#ifndef READ_HACK_INCLUDED
++#define READ_HACK_INCLUDED
++
++#include "mfobjects.h"
++#include "winternl.h"
++
++struct read_hack_callback
++{
++    IMFAsyncCallback IMFAsyncCallback_iface;
++    LONG refcount;
++    HANDLE event;
++    DWORD param;
++    IMFMediaEvent *media_event;
++    IMFAsyncResult *result;
++};
++
++static struct read_hack_callback *read_hack_callback_from_IMFAsyncCallback(IMFAsyncCallback *iface)
++{
++    return CONTAINING_RECORD(iface, struct read_hack_callback, IMFAsyncCallback_iface);
++}
++
++static HRESULT WINAPI read_hack_callback_QueryInterface(IMFAsyncCallback *iface, REFIID riid, void **obj)
++{
++    if (IsEqualIID(riid, &IID_IMFAsyncCallback) ||
++            IsEqualIID(riid, &IID_IUnknown))
++    {
++        *obj = iface;
++        IMFAsyncCallback_AddRef(iface);
++        return S_OK;
++    }
++
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI read_hack_callback_AddRef(IMFAsyncCallback *iface)
++{
++    struct read_hack_callback *callback;
++
++    callback = read_hack_callback_from_IMFAsyncCallback(iface);
++    return InterlockedIncrement(&callback->refcount);
++}
++
++static ULONG WINAPI read_hack_callback_Release(IMFAsyncCallback *iface)
++{
++    struct read_hack_callback *callback;
++    ULONG refcount;
++
++    callback = read_hack_callback_from_IMFAsyncCallback(iface);
++    refcount = InterlockedDecrement(&callback->refcount);
++
++    if (!refcount)
++    {
++        CloseHandle(callback->event);
++        free(callback);
++    }
++
++    return refcount;
++}
++
++static HRESULT WINAPI read_hack_callback_GetParameters(IMFAsyncCallback *iface, DWORD *flags, DWORD *queue)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI read_hack_async_callback_result_Invoke(IMFAsyncCallback *iface, IMFAsyncResult *result)
++{
++    struct read_hack_callback *callback;
++
++    callback = read_hack_callback_from_IMFAsyncCallback(iface);
++
++    callback->result = result;
++    IMFAsyncResult_AddRef(callback->result);
++    SetEvent(callback->event);
++
++    return S_OK;
++}
++
++static const IMFAsyncCallbackVtbl read_hack_async_callback_result_vtbl =
++{
++    read_hack_callback_QueryInterface,
++    read_hack_callback_AddRef,
++    read_hack_callback_Release,
++    read_hack_callback_GetParameters,
++    read_hack_async_callback_result_Invoke,
++};
++
++static struct read_hack_callback * create_read_hack_callback(const IMFAsyncCallbackVtbl *vtbl)
++{
++    struct read_hack_callback *callback;
++
++    callback = calloc(1, sizeof(*callback));
++
++    callback->IMFAsyncCallback_iface.lpVtbl = vtbl;
++    callback->refcount = 1;
++    callback->event = CreateEventA(NULL, FALSE, FALSE, NULL);
++
++    return callback;
++}
++
++static inline HRESULT IMFByteStream_Read_Hack(IMFByteStream *stream, BYTE *pb, ULONG cb, ULONG *pcbRead) {
++    /* HACK: Use the async BeginRead/EndRead interface due to buggy 
++     * sync Read implementation on the game's end. */
++    static int cached = -1;
++    HRESULT hr;
++
++    if (cached == -1)
++    {
++        const char *sgi;
++        WARN("HACK: Enabled using async BeginRead instead of sync Read.\n");
++        sgi = getenv("SteamGameId");
++        cached = !strcmp(sgi, "333980");
++    }
++
++    hr = IMFByteStream_Read(stream, pb, cb, pcbRead);
++
++    if (cached && *pcbRead == 0xffffffff)
++    {
++        DWORD res;
++        IMFAsyncResult *result = NULL;
++        struct read_hack_callback *read_callback;
++
++        TRACE("HACK: Using async BeginRead instead of sync Read.\n");
++
++        read_callback = create_read_hack_callback(&read_hack_async_callback_result_vtbl);
++
++        if (FAILED(hr = IMFByteStream_BeginRead(stream, pb, cb, &read_callback->IMFAsyncCallback_iface, NULL)))
++        {
++            WARN("BeginRead failed with %#lx, falling back to Read.\n", hr);
++            hr = IMFByteStream_Read(stream, pb, cb, pcbRead);
++            goto end;
++        }
++
++        if ((res = WaitForSingleObject(read_callback->event, 500)) != WAIT_OBJECT_0)
++        {
++            ERR("Waiting for BeginRead result failed with %#lx.\n", res);
++            hr = E_INVALIDARG;
++            goto end;
++        }
++
++        result = read_callback->result;
++        read_callback->result = NULL;
++
++        if (FAILED(hr = IMFByteStream_EndRead(stream, result, pcbRead)))
++        {
++            WARN("EndRead failed with %#lx.\n", hr);
++        }
++
++end:
++        if (result)
++            IMFAsyncResult_Release(result);
++        IMFAsyncCallback_Release(&read_callback->IMFAsyncCallback_iface);
++    }
++
++    return hr;
++}
++
++#endif /* READ_HACK_INCLUDED */
+From 363cdd148e779710874b0175a9b6c5a6d90aad9a Mon Sep 17 00:00:00 2001
+From: staphen <staphen@gmail.com>
+Date: Sun, 8 Feb 2026 15:58:33 -0500
+Subject: [PATCH] Accumulate data in wg media source
+
+---
+ dlls/winegstreamer/media_source.c | 88 +++++++++++++++++++++++--------
+ 1 file changed, 65 insertions(+), 23 deletions(-)
+
+diff --git a/dlls/winegstreamer/media_source.c b/dlls/winegstreamer/media_source.c
+index 0cb68ff33c0a..74421a1ebefa 100644
+--- a/dlls/winegstreamer/media_source.c
++++ b/dlls/winegstreamer/media_source.c
+@@ -132,6 +132,8 @@ struct media_stream
+ 
+     wg_parser_stream_t wg_stream;
+ 
++    CRITICAL_SECTION sample_cs;
++
+     IUnknown **token_queue;
+     LONG token_queue_count;
+     LONG token_queue_cap;
+@@ -714,9 +716,8 @@ static HRESULT media_source_stop(struct media_source *source)
+     return IMFMediaEventQueue_QueueEventParamVar(source->event_queue, MESourceStopped, &GUID_NULL, S_OK, NULL);
+ }
+ 
+-static HRESULT media_stream_send_sample(struct media_stream *stream, const struct wg_parser_buffer *wg_buffer, IUnknown *token)
++static HRESULT media_stream_add_sample_buffer(struct media_stream *stream, IMFSample *sample, const struct wg_parser_buffer *wg_buffer)
+ {
+-    IMFSample *sample = NULL;
+     IMFMediaBuffer *buffer;
+     HRESULT hr;
+     BYTE *data;
+@@ -740,23 +741,9 @@ static HRESULT media_stream_send_sample(struct media_stream *stream, const struc
+     if (FAILED(hr = IMFMediaBuffer_Unlock(buffer)))
+         goto out;
+ 
+-    if (FAILED(hr = MFCreateSample(&sample)))
+-        goto out;
+-    if (FAILED(hr = IMFSample_AddBuffer(sample, buffer)))
+-        goto out;
+-    if (FAILED(hr = IMFSample_SetSampleTime(sample, wg_buffer->pts)))
+-        goto out;
+-    if (FAILED(hr = IMFSample_SetSampleDuration(sample, wg_buffer->duration)))
+-        goto out;
+-    if (token && FAILED(hr = IMFSample_SetUnknown(sample, &MFSampleExtension_Token, token)))
+-        goto out;
+-
+-    hr = IMFMediaEventQueue_QueueEventParamUnk(stream->event_queue, MEMediaSample,
+-            &GUID_NULL, S_OK, (IUnknown *)sample);
++    hr = IMFSample_AddBuffer(sample, buffer);
+ 
+ out:
+-    if (sample)
+-        IMFSample_Release(sample);
+     IMFMediaBuffer_Release(buffer);
+     return hr;
+ }
+@@ -801,22 +788,70 @@ static bool stream_get_buffer(struct media_stream *stream, struct wg_parser_buff
+ 
+ static HRESULT wait_on_sample(struct media_stream *stream, IUnknown *token)
+ {
++    UINT64 minimum_sample_duration = 0;
+     struct media_source *source = impl_from_IMFMediaSource(stream->media_source);
+     struct wg_parser_buffer buffer;
++    struct wg_format format;
++    IMFSample *sample;
++    UINT64 sample_duration;
++    HRESULT hr = S_OK;
+ 
+     TRACE("%p, %p\n", stream, token);
+ 
+-    while (stream_get_buffer(stream, &buffer))
++    LeaveCriticalSection(&source->cs);
++    EnterCriticalSection(&stream->sample_cs);
++    EnterCriticalSection(&source->cs);
++
++    if (!stream_get_buffer(stream, &buffer))
+     {
+-        HRESULT hr = media_stream_send_sample(stream, &buffer, token);
+-        if (hr != S_FALSE)
+-            return hr;
++        if (source->state == SOURCE_SHUTDOWN)
++            goto out;
++        hr = media_stream_send_eos(source, stream);
++        goto out;
+     }
+ 
++    if (FAILED(hr = MFCreateSample(&sample)))
++        goto out;
++    if (FAILED(hr = IMFSample_SetSampleTime(sample, buffer.pts)))
++        goto release;
++    if (FAILED(hr = media_stream_add_sample_buffer(stream, sample, &buffer)))
++        goto release;
++    sample_duration = buffer.duration;
++
++    if (SUCCEEDED(hr = wg_format_from_stream_descriptor(stream->descriptor, &format)))
++    {
++        if (format.major_type == WG_MAJOR_TYPE_AUDIO)
++            minimum_sample_duration = 500000llu;
++    }
++
++    while (sample_duration < minimum_sample_duration)
++    {
++        if (!stream_get_buffer(stream, &buffer))
++            break;
++        if (source->state == SOURCE_SHUTDOWN)
++            goto release;
++        if (FAILED(hr = media_stream_add_sample_buffer(stream, sample, &buffer)))
++            goto release;
++        sample_duration += buffer.duration;
++    }
+     if (source->state == SOURCE_SHUTDOWN)
+-        return S_OK;
++        goto release;
++
++    if (FAILED(hr = IMFSample_SetSampleDuration(sample, sample_duration)))
++        goto release;
++    if (token && FAILED(hr = IMFSample_SetUnknown(sample, &MFSampleExtension_Token, token)))
++        goto release;
++    hr = IMFMediaEventQueue_QueueEventParamUnk(stream->event_queue, MEMediaSample,
++            &GUID_NULL, S_OK, (IUnknown *)sample);
+ 
+-    return media_stream_send_eos(source, stream);
++release:
++    IMFSample_Release(sample);
++
++out:
++    LeaveCriticalSection(&source->cs);
++    LeaveCriticalSection(&stream->sample_cs);
++    EnterCriticalSection(&source->cs);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI source_async_commands_Invoke(IMFAsyncCallback *iface, IMFAsyncResult *result)
+@@ -985,6 +1020,8 @@ static ULONG WINAPI media_stream_Release(IMFMediaStream *iface)
+         IMFStreamDescriptor_Release(stream->descriptor);
+         IMFMediaEventQueue_Release(stream->event_queue);
+         flush_token_queue(stream, FALSE);
++        stream->sample_cs.DebugInfo->Spare[0] = 0;
++        DeleteCriticalSection(&stream->sample_cs);
+         free(stream);
+     }
+ 
+@@ -1083,6 +1120,7 @@ static HRESULT WINAPI media_stream_RequestSample(IMFMediaStream *iface, IUnknown
+ 
+     TRACE("%p, %p.\n", iface, token);
+ 
++    EnterCriticalSection(&stream->sample_cs);
+     EnterCriticalSection(&source->cs);
+ 
+     if (source->state == SOURCE_SHUTDOWN)
+@@ -1104,6 +1142,7 @@ static HRESULT WINAPI media_stream_RequestSample(IMFMediaStream *iface, IUnknown
+     }
+ 
+     LeaveCriticalSection(&source->cs);
++    LeaveCriticalSection(&stream->sample_cs);
+ 
+     return hr;
+ }
+@@ -1151,6 +1190,9 @@ static HRESULT media_stream_create(IMFMediaSource *source, IMFStreamDescriptor *
+     object->eos = FALSE;
+     object->wg_stream = wg_stream;
+ 
++    InitializeCriticalSectionEx(&object->sample_cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
++    object->sample_cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": sample_cs");
++
+     TRACE("Created stream object %p.\n", object);
+ 
+     *out = object;
