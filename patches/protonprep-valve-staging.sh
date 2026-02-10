@@ -277,6 +277,14 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/0001-HACK-kernelbase-allow-overriding-dlls-for-DLSS-XeSS-.patch"
     apply_patch "../patches/wine-hotfixes/pending/0002-HACK-kernelbase-add-redirection-for-libxess_dx11.dll.patch"
 
+    # https://github.com/GloriousEggroll/proton-ge-custom/issues/433
+    apply_patch "../patches/wine-hotfixes/pending/0008-wintrust-Prevent-checking-if-winex11-winewayland-are.patch"
+    apply_patch "../patches/wine-hotfixes/pending/0009-HACK-kernel32-Spoof-GetProcAddress-of-KiUserApcDispa.patch"
+    apply_patch "../patches/wine-hotfixes/pending/0010-HACK-kernel32-Lock-GetProcAddress-hack-to-when-neede.patch"
+    apply_patch "../patches/wine-hotfixes/pending/0011-ntdll-Implement-NtDelayExecution-relative-wait-using.patch"
+
+    # https://gitlab.winehq.org/wine/wine/-/merge_requests/2808
+    apply_patch "../patches/wine-hotfixes/pending/2808.patch"
 
 ### END WINE PENDING UPSTREAM SECTION ###
 
