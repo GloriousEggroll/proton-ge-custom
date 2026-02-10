@@ -1,0 +1,75 @@
+From 9d1f8104d0fac07da4352c967cac004d2333407f Mon Sep 17 00:00:00 2001
+From: William Horvath <william@horvath.blog>
+Date: Wed, 22 Jan 2025 02:18:09 -0800
+Subject: [PATCH 264/486] ntdll: Fix the return value of NtDelayExecution.
+
+The key change is to never return STATUS_TIMEOUT, and to instead return the result of
+NtYieldExecution() if zero timeout was passed, or STATUS_SUCCESS otherwise.
+
+An overview of the correct values for each combination, copied from the test commit:
+ - Non-alertable, zero timeout: STATUS_SUCCESS or STATUS_NO_YIELD_PERFORMED
+ - Non-alertable, non-zero timeout: STATUS_SUCCESS
+ - Alertable, zero timeout: STATUS_SUCCESS, STATUS_NO_YIELD_PERFORMED, or STATUS_USER_APC
+ - Alertable, non-zero timeout: STATUS_SUCCESS or STATUS_USER_APC
+ - Sleep/SleepEx don't modify LastError, no matter what
+---
+ dlls/ntdll/tests/sync.c |  1 -
+ dlls/ntdll/unix/sync.c  | 16 +++++++++++-----
+ 2 files changed, 11 insertions(+), 6 deletions(-)
+
+diff --git a/dlls/ntdll/tests/sync.c b/dlls/ntdll/tests/sync.c
+index 0a4e72f6ad2..8bc7837b3b7 100644
+--- a/dlls/ntdll/tests/sync.c
++++ b/dlls/ntdll/tests/sync.c
+@@ -1382,7 +1382,6 @@ static void test_delayexecution(void)
+         }
+         else
+         {
+-            todo_wine_if(status == STATUS_TIMEOUT)
+             ok( status == STATUS_SUCCESS || (!tests[i].timeout && status == STATUS_NO_YIELD_PERFORMED),
+                 "got status %#lx.\n", status );
+         }
+diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+index 6b722634ed7..5e1b6de7009 100644
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -2725,6 +2725,8 @@ NTSTATUS WINAPI NtYieldExecution(void)
+  */
+ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeout )
+ {
++    unsigned int status = STATUS_SUCCESS;
++
+     /* if alertable, we need to query the server */
+     if (alertable)
+     {
+@@ -2741,8 +2743,11 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
+             if (ret != STATUS_NOT_IMPLEMENTED)
+                 return ret;
+         }
+-
+-        return server_wait( NULL, 0, SELECT_INTERRUPTIBLE | SELECT_ALERTABLE, timeout );
++        /* Since server_wait will result in an unconditional implicit yield,
++           we never return STATUS_NO_YIELD_PERFORMED */
++        if ((status = server_wait( NULL, 0, SELECT_INTERRUPTIBLE | SELECT_ALERTABLE, timeout )) == STATUS_TIMEOUT)
++            status = STATUS_SUCCESS;
++        return status;
+     }
+ 
+     if (!timeout || timeout->QuadPart == TIMEOUT_INFINITE)  /* sleep forever */
+@@ -2760,9 +2765,10 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
+             when = now.QuadPart - when;
+         }
+ 
+-        /* Note that we yield after establishing the desired timeout */
+-        NtYieldExecution();
+-        if (!when) return STATUS_SUCCESS;
++        /* Note that we yield after establishing the desired timeout, but
++           we only care about the result of the yield for zero timeouts */
++        status = NtYieldExecution();
++        if (!when) return status;
+ 
+         for (;;)
+         {
+-- 
+2.53.0
+

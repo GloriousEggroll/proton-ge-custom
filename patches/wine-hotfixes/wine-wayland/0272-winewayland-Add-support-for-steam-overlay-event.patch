@@ -1,0 +1,161 @@
+From 371c1977a659dfff6957fdb43b977ed9463b889d Mon Sep 17 00:00:00 2001
+From: Etaash Mathamsetty
+ <45927311+Etaash-mathamsetty@users.noreply.github.com>
+Date: Fri, 15 Aug 2025 14:44:28 -0400
+Subject: [PATCH 272/486] winewayland: Add support for steam overlay event.
+
+---
+ dlls/winewayland.drv/wayland.c          | 26 +++++++++++++++++++++++++
+ dlls/winewayland.drv/wayland_keyboard.c |  5 +++++
+ dlls/winewayland.drv/wayland_pointer.c  |  6 ++++++
+ dlls/winewayland.drv/waylanddrv.h       | 15 ++++++++++++++
+ 4 files changed, 52 insertions(+)
+
+diff --git a/dlls/winewayland.drv/wayland.c b/dlls/winewayland.drv/wayland.c
+index 2514ba7877d..30603eccdae 100644
+--- a/dlls/winewayland.drv/wayland.c
++++ b/dlls/winewayland.drv/wayland.c
+@@ -275,6 +275,30 @@ static const struct wl_registry_listener registry_listener = {
+     registry_handle_global_remove
+ };
+ 
++static void init_overlay_event(void)
++{
++    OBJECT_ATTRIBUTES attr;
++    WCHAR buffer[MAX_PATH];
++    char path[MAX_PATH];
++    UNICODE_STRING str;
++
++    RtlInitUnicodeString( &str, buffer );
++    str.MaximumLength = sizeof(buffer);
++    InitializeObjectAttributes( &attr, &str, OBJ_CASE_INSENSITIVE | OBJ_OPENIF, 0, NULL );
++
++    str.Length = sprintf( path, "\\Sessions\\%u\\BaseNamedObjects\\__wine_steamclient_GameOverlayActivated",
++                          (int)NtCurrentTeb()->Peb->SessionId );
++    ascii_to_unicode( buffer, path, str.Length + 1 );
++    str.Length *= sizeof(WCHAR);
++    NtCreateEvent( &process_wayland.overlay_event, EVENT_ALL_ACCESS, &attr, NotificationEvent, FALSE );
++}
++
++BOOL wayland_is_overlay_active(void)
++{
++    LARGE_INTEGER timeout = {0};
++    return NtWaitForSingleObject(process_wayland.overlay_event, FALSE, &timeout) == WAIT_OBJECT_0;
++}
++
+ /**********************************************************************
+  *          wayland_process_init
+  *
+@@ -321,6 +345,8 @@ BOOL wayland_process_init(void)
+     wl_display_roundtrip_queue(process_wayland.wl_display, process_wayland.wl_event_queue);
+     wl_display_roundtrip_queue(process_wayland.wl_display, process_wayland.wl_event_queue);
+ 
++    init_overlay_event();
++
+     /* Check for required protocol globals. */
+     if (!process_wayland.wl_compositor)
+     {
+diff --git a/dlls/winewayland.drv/wayland_keyboard.c b/dlls/winewayland.drv/wayland_keyboard.c
+index a26915c412c..34b95d48800 100644
+--- a/dlls/winewayland.drv/wayland_keyboard.c
++++ b/dlls/winewayland.drv/wayland_keyboard.c
+@@ -828,6 +828,11 @@ static void keyboard_handle_key(void *data, struct wl_keyboard *wl_keyboard,
+     InterlockedExchange(&process_wayland.input_serial, serial);
+ 
+     if (!(hwnd = wayland_keyboard_get_focused_hwnd())) return;
++    if (wayland_is_overlay_active())
++    {
++        release_all_keys(hwnd);
++        return;
++    }
+ 
+     TRACE_(key)("serial=%u hwnd=%p key=%d scan=%#x state=%#x\n", serial, hwnd, key, scan, state);
+ 
+diff --git a/dlls/winewayland.drv/wayland_pointer.c b/dlls/winewayland.drv/wayland_pointer.c
+index 782f54a0c87..6aa9a3e224e 100644
+--- a/dlls/winewayland.drv/wayland_pointer.c
++++ b/dlls/winewayland.drv/wayland_pointer.c
+@@ -155,6 +155,8 @@ static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy, BOOL se
+ 
+     wayland_win_data_release(data);
+ 
++    if (wayland_is_overlay_active()) return;
++
+     if (!send_input)
+     {
+         pthread_mutex_lock(&pointer->mutex);
+@@ -258,6 +260,7 @@ static void pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
+     InterlockedExchange(&process_wayland.input_serial, serial);
+ 
+     if (!(hwnd = wayland_pointer_get_focused_hwnd())) return;
++    if (wayland_is_overlay_active()) return;
+ 
+     input.type = INPUT_MOUSE;
+ 
+@@ -315,6 +318,7 @@ static void pointer_handle_axis(void *data, struct wl_pointer *wl_pointer,
+ 
+     if (!(hwnd = wayland_pointer_get_focused_hwnd())) return;
+     if (InterlockedCompareExchange(&pointer->pointer_frame.discrete_event_handled, FALSE, TRUE)) return;
++    if (wayland_is_overlay_active()) return;
+ 
+     pthread_mutex_lock(&pointer->mutex);
+ 
+@@ -456,6 +460,7 @@ static void pointer_handle_axis_discrete(void *data, struct wl_pointer *wl_point
+     struct wayland_pointer *pointer = &process_wayland.pointer;
+ 
+     if (!(hwnd = wayland_pointer_get_focused_hwnd())) return;
++    if (wayland_is_overlay_active()) return;
+ 
+     InterlockedExchange(&pointer->pointer_frame.discrete_event_handled, TRUE);
+ 
+@@ -537,6 +542,7 @@ static void relative_pointer_v1_relative_motion(void *private,
+ 
+     if (!(hwnd = wayland_pointer_get_focused_hwnd())) return;
+     if (!(data = wayland_win_data_get(hwnd))) return;
++    if (wayland_is_overlay_active()) return;
+ 
+     f_dxu = wl_fixed_to_double(dx_unaccel);
+     f_dyu = wl_fixed_to_double(dy_unaccel);
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index a9988149170..eb07bfa104b 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -225,6 +225,8 @@ struct wayland
+     /* Protects the output_list and the wayland_output.current states. */
+     pthread_mutex_t output_mutex;
+     LONG input_serial;
++    /* Steam overlay active event */
++    HANDLE overlay_event;
+ };
+ 
+ struct wayland_output_mode
+@@ -363,6 +365,7 @@ struct wayland_surface
+  */
+ 
+ BOOL wayland_process_init(void);
++BOOL wayland_is_overlay_active(void);
+ 
+ /**********************************************************************
+  *          Wayland output
+@@ -514,6 +517,18 @@ static inline LRESULT send_message(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
+     return NtUserMessageCall(hwnd, msg, wparam, lparam, NULL, NtUserSendMessage, FALSE);
+ }
+ 
++static inline void ascii_to_unicode(WCHAR *dst, const char *src, size_t len)
++{
++    while (len--) *dst++ = (unsigned char)*src++;
++}
++
++static inline UINT asciiz_to_unicode(WCHAR *dst, const char *src)
++{
++    WCHAR *p = dst;
++    while ((*p++ = *src++));
++    return (p - dst) * sizeof(WCHAR);
++}
++
+ RGNDATA *get_region_data(HRGN region);
+ 
+ /**********************************************************************
+-- 
+2.53.0
+

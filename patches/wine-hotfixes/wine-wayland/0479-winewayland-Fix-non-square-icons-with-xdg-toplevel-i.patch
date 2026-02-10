@@ -1,0 +1,167 @@
+From 3ed98927591813dc7ed8b352c4c532b0e7b5576b Mon Sep 17 00:00:00 2001
+From: Alex Schwartz <alexschwartz01@gmail.com>
+Date: Sun, 18 Jan 2026 11:12:05 -0500
+Subject: [PATCH 479/486] winewayland: Fix non-square icons with
+ xdg-toplevel-icon protocol.
+
+---
+ dlls/winewayland.drv/wayland_pointer.c |  2 +-
+ dlls/winewayland.drv/wayland_surface.c | 69 ++++++++++++++++++++++----
+ dlls/winewayland.drv/waylanddrv.h      |  2 +-
+ 3 files changed, 61 insertions(+), 12 deletions(-)
+
+diff --git a/dlls/winewayland.drv/wayland_pointer.c b/dlls/winewayland.drv/wayland_pointer.c
+index 4b3908e9c20..f3d9410f40e 100644
+--- a/dlls/winewayland.drv/wayland_pointer.c
++++ b/dlls/winewayland.drv/wayland_pointer.c
+@@ -771,7 +771,7 @@ static void wayland_pointer_update_cursor_buffer(HCURSOR hcursor, double scale)
+     {
+         HDC hdc = NtGdiCreateCompatibleDC(0);
+         cursor->shm_buffer =
+-            wayland_shm_buffer_from_color_bitmaps(hdc, info.hbmColor, info.hbmMask);
++            wayland_shm_buffer_from_color_bitmaps(hdc, info.hbmColor, info.hbmMask, FALSE);
+         NtGdiDeleteObjectApp(hdc);
+     }
+     else
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index c3bcad39c4a..709f6111ad2 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -1010,6 +1010,32 @@ err:
+     return NULL;
+ }
+ 
++/***********************************************************************
++ *           copy_rectangle_into_center_of_square
++ *
++ * Copies non-square rectangle src to the center of square dest.
++ */
++static void copy_rectangle_into_center_of_square(const unsigned int *src,
++                                                 int src_w, int src_h,
++                                                 unsigned int *dest)
++{
++    int dest_length;
++
++    if (src_w > src_h)
++    {
++        dest += src_w * (src_w - src_h) / 2;
++        dest_length = src_w;
++    }
++    else
++    {
++        dest += (src_h - src_w) / 2;
++        dest_length = src_h;
++    }
++
++    for (int h = 0; h < src_h; h++, dest += dest_length, src += src_w)
++        memcpy(dest, src, src_w * 4);
++}
++
+ /***********************************************************************
+  *           wayland_shm_buffer_from_color_bitmaps
+  *
+@@ -1018,7 +1044,8 @@ err:
+  * Adapted from wineandroid.drv code.
+  */
+ struct wayland_shm_buffer *wayland_shm_buffer_from_color_bitmaps(HDC hdc, HBITMAP color,
+-                                                                 HBITMAP mask)
++                                                                 HBITMAP mask,
++                                                                 BOOL allow_padding)
+ {
+     struct wayland_shm_buffer *shm_buffer = NULL;
+     char buffer[FIELD_OFFSET(BITMAPINFO, bmiColors[256])];
+@@ -1026,16 +1053,11 @@ struct wayland_shm_buffer *wayland_shm_buffer_from_color_bitmaps(HDC hdc, HBITMA
+     BITMAP bm;
+     unsigned int *ptr, *bits = NULL;
+     unsigned char *mask_bits = NULL;
+-    int i, j;
+-    BOOL has_alpha = FALSE;
++    int i, j, square_length;
++    BOOL has_alpha = FALSE, use_padding = FALSE;
+ 
+     if (!NtGdiExtGetObjectW(color, sizeof(bm), &bm)) goto failed;
+ 
+-    shm_buffer = wayland_shm_buffer_create(bm.bmWidth, bm.bmHeight,
+-                                           WL_SHM_FORMAT_ARGB8888);
+-    if (!shm_buffer) goto failed;
+-    bits = shm_buffer->map_data;
+-
+     info->bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+     info->bmiHeader.biWidth = bm.bmWidth;
+     info->bmiHeader.biHeight = -bm.bmHeight;
+@@ -1048,6 +1070,24 @@ struct wayland_shm_buffer *wayland_shm_buffer_from_color_bitmaps(HDC hdc, HBITMA
+     info->bmiHeader.biClrUsed = 0;
+     info->bmiHeader.biClrImportant = 0;
+ 
++    use_padding = allow_padding && bm.bmWidth != bm.bmHeight;
++
++    if (use_padding)
++    {
++        square_length = max(bm.bmWidth, bm.bmHeight);
++        shm_buffer = wayland_shm_buffer_create(square_length, square_length,
++                                               WL_SHM_FORMAT_ARGB8888);
++        if (!shm_buffer) goto failed;
++        if (!(bits = malloc(info->bmiHeader.biSizeImage))) goto failed;
++    }
++    else
++    {
++        shm_buffer = wayland_shm_buffer_create(bm.bmWidth, bm.bmHeight,
++                                               WL_SHM_FORMAT_ARGB8888);
++        if (!shm_buffer) goto failed;
++        bits = shm_buffer->map_data;
++    }
++
+     if (!NtGdiGetDIBitsInternal(hdc, color, 0, bm.bmHeight, bits, info,
+                                 DIB_RGB_COLORS, 0, 0))
+         goto failed;
+@@ -1077,8 +1117,16 @@ struct wayland_shm_buffer *wayland_shm_buffer_from_color_bitmaps(HDC hdc, HBITMA
+         free(mask_bits);
+     }
+ 
++    if (use_padding)
++    {
++        copy_rectangle_into_center_of_square(bits, bm.bmWidth,
++                                             bm.bmHeight, shm_buffer->map_data);
++        free(bits);
++        bits = shm_buffer->map_data;
++    }
++
+     /* Wayland requires pre-multiplied alpha values */
+-    for (ptr = bits, i = 0; i < bm.bmWidth * bm.bmHeight; ptr++, i++)
++    for (ptr = bits, i = 0; i < shm_buffer->width * shm_buffer->height; ptr++, i++)
+     {
+         unsigned char alpha = *ptr >> 24;
+         if (alpha == 0)
+@@ -1098,6 +1146,7 @@ struct wayland_shm_buffer *wayland_shm_buffer_from_color_bitmaps(HDC hdc, HBITMA
+ 
+ failed:
+     if (shm_buffer) wayland_shm_buffer_unref(shm_buffer);
++    if (use_padding) free(bits);
+     free(mask_bits);
+     return NULL;
+ }
+@@ -1359,7 +1408,7 @@ void wayland_surface_set_icon(struct wayland_surface *surface, UINT type, ICONIN
+     assert(wayland_surface_is_toplevel(surface));
+ 
+     hDC = NtGdiCreateCompatibleDC(0);
+-    icon_buf = wayland_shm_buffer_from_color_bitmaps(hDC, ii->hbmColor, ii->hbmMask);
++    icon_buf = wayland_shm_buffer_from_color_bitmaps(hDC, ii->hbmColor, ii->hbmMask, TRUE);
+     NtGdiDeleteObjectApp(hDC);
+ 
+     if (surface->xdg_toplevel_icon)
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index a6a3cf76b83..509ab945df2 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -441,7 +441,7 @@ static inline BOOL wayland_surface_is_toplevel(struct wayland_surface *surface)
+ struct wayland_shm_buffer *wayland_shm_buffer_create(int width, int height,
+                                                      enum wl_shm_format format);
+ struct wayland_shm_buffer *wayland_shm_buffer_from_color_bitmaps(HDC hdc, HBITMAP color,
+-                                                                 HBITMAP mask);
++                                                                 HBITMAP mask, BOOL allow_padding);
+ void wayland_shm_buffer_ref(struct wayland_shm_buffer *shm_buffer);
+ void wayland_shm_buffer_unref(struct wayland_shm_buffer *shm_buffer);
+ 
+-- 
+2.53.0
+

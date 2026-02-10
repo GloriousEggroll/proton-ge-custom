@@ -1,0 +1,126 @@
+From 8c0c3bf1ed2e8299c2a0763319a2e9dd615374e8 Mon Sep 17 00:00:00 2001
+From: Tobias Gruetzmacher <tobias-git@23.gs>
+Date: Thu, 3 Apr 2025 18:06:31 +0200
+Subject: [PATCH 291/486] winhttp: Handle HTTP status code 308 (Permanent
+ Redirect).
+
+---
+ dlls/winhttp/request.c       |  6 ++++--
+ dlls/winhttp/tests/winhttp.c | 29 ++++++++++++++++++++---------
+ 2 files changed, 24 insertions(+), 11 deletions(-)
+
+diff --git a/dlls/winhttp/request.c b/dlls/winhttp/request.c
+index cd3e4200e73..b63fd69c969 100644
+--- a/dlls/winhttp/request.c
++++ b/dlls/winhttp/request.c
+@@ -2871,7 +2871,8 @@ static DWORD handle_redirect( struct request *request, DWORD status )
+         else request->path = wcsdup( L"/" );
+     }
+ 
+-    if (status != HTTP_STATUS_REDIRECT_KEEP_VERB && !wcscmp( request->verb, L"POST" ))
++    if (status != HTTP_STATUS_REDIRECT_KEEP_VERB && status != HTTP_STATUS_PERMANENT_REDIRECT &&
++        !wcscmp( request->verb, L"POST" ))
+     {
+         free( request->verb );
+         request->verb = wcsdup( L"GET" );
+@@ -3002,7 +3003,8 @@ static DWORD receive_response( struct request *request )
+         ret = handle_passport_redirect( request );
+         goto done;
+     }
+-    if (status == HTTP_STATUS_MOVED || status == HTTP_STATUS_REDIRECT || status == HTTP_STATUS_REDIRECT_KEEP_VERB)
++    if (status == HTTP_STATUS_MOVED || status == HTTP_STATUS_REDIRECT ||
++        status == HTTP_STATUS_REDIRECT_KEEP_VERB || status == HTTP_STATUS_PERMANENT_REDIRECT)
+     {
+         if (request->hdr.disable_flags & WINHTTP_DISABLE_REDIRECTS ||
+             request->hdr.redirect_policy == WINHTTP_OPTION_REDIRECT_POLICY_NEVER) goto done;
+diff --git a/dlls/winhttp/tests/winhttp.c b/dlls/winhttp/tests/winhttp.c
+index 1588a2b1261..7d5e22c51a0 100644
+--- a/dlls/winhttp/tests/winhttp.c
++++ b/dlls/winhttp/tests/winhttp.c
+@@ -2285,12 +2285,18 @@ static const char switchprotocols[] =
+ "Upgrade: websocket\r\n"
+ "Connection: Upgrade\r\n";
+ 
+-static const char redirectmsg[] =
++static const char temp_redirectmsg[] =
+ "HTTP/1.1 307 Temporary Redirect\r\n"
+ "Content-Length: 0\r\n"
+ "Location: /temporary\r\n"
+ "Connection: close\r\n\r\n";
+ 
++static const char perm_redirectmsg[] =
++"HTTP/1.1 308 Permanent Redirect\r\n"
++"Content-Length: 0\r\n"
++"Location: /permanent\r\n"
++"Connection: close\r\n\r\n";
++
+ static const char badreplyheadermsg[] =
+ "HTTP/1.1 200 OK\r\n"
+ "Server: winetest\r\n"
+@@ -2542,11 +2548,15 @@ static DWORD CALLBACK server_thread(LPVOID param)
+             }
+             else send(c, notokmsg, sizeof(notokmsg) - 1, 0);
+         }
+-        else if (strstr(buffer, "POST /redirect"))
++        else if (strstr(buffer, "POST /redirect-temp"))
++        {
++            send(c, temp_redirectmsg, sizeof temp_redirectmsg - 1, 0);
++        }
++        else if (strstr(buffer, "POST /redirect-perm"))
+         {
+-            send(c, redirectmsg, sizeof redirectmsg - 1, 0);
++            send(c, perm_redirectmsg, sizeof perm_redirectmsg - 1, 0);
+         }
+-        else if (strstr(buffer, "POST /temporary"))
++        else if (strstr(buffer, "POST /temporary") || strstr(buffer, "POST /permanent"))
+         {
+             char buf[32];
+             recv(c, buf, sizeof(buf), 0);
+@@ -3299,7 +3309,7 @@ static void test_head_request(int port)
+     WinHttpCloseHandle(ses);
+ }
+ 
+-static void test_redirect(int port)
++static void test_redirect(int port, const WCHAR *path, const WCHAR *target)
+ {
+     HINTERNET ses, con, req;
+     char buf[128];
+@@ -3313,14 +3323,14 @@ static void test_redirect(int port)
+     con = WinHttpConnect(ses, L"localhost", port, 0);
+     ok(con != NULL, "failed to open a connection %lu\n", GetLastError());
+ 
+-    req = WinHttpOpenRequest(con, L"POST", L"/redirect", NULL, NULL, NULL, 0);
++    req = WinHttpOpenRequest(con, L"POST", path, NULL, NULL, NULL, 0);
+     ok(req != NULL, "failed to open a request %lu\n", GetLastError());
+ 
+     url[0] = 0;
+     size = sizeof(url);
+     ret = WinHttpQueryOption(req, WINHTTP_OPTION_URL, url, &size);
+     ok(ret, "got %lu\n", GetLastError());
+-    swprintf(expected, ARRAY_SIZE(expected), L"http://localhost:%u/redirect", port);
++    swprintf(expected, ARRAY_SIZE(expected), L"http://localhost:%u%s", port, path);
+     ok(!wcscmp(url, expected), "expected %s got %s\n", wine_dbgstr_w(expected), wine_dbgstr_w(url));
+ 
+     ret = WinHttpSendRequest(req, NULL, 0, (void *)"data", sizeof("data"), sizeof("data"), 0);
+@@ -3346,7 +3356,7 @@ static void test_redirect(int port)
+     size = sizeof(url);
+     ret = WinHttpQueryOption(req, WINHTTP_OPTION_URL, url, &size);
+     ok(ret, "got %lu\n", GetLastError());
+-    swprintf(expected, ARRAY_SIZE(expected), L"http://localhost:%u/temporary", port);
++    swprintf(expected, ARRAY_SIZE(expected), L"http://localhost:%u/%s", port, target);
+     ok(!wcscmp(url, expected), "expected %s got %s\n", wine_dbgstr_w(expected), wine_dbgstr_w(url));
+ 
+     status = 0xdeadbeef;
+@@ -6300,7 +6310,8 @@ START_TEST (winhttp)
+     test_request_path_escapes(si.port);
+     test_passport_auth(si.port);
+     test_websocket(si.port);
+-    test_redirect(si.port);
++    test_redirect(si.port, L"/redirect-temp", L"temporary");
++    test_redirect(si.port, L"/redirect-perm", L"permanent");
+     test_WinHttpGetProxyForUrl(si.port);
+     test_connection_cache(si.port);
+ 
+-- 
+2.53.0
+

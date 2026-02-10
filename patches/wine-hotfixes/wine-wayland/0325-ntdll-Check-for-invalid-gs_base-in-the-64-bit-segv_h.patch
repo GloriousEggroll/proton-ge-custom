@@ -1,0 +1,150 @@
+From 56b6f58ab38e18c0cfd09f12e9d507d15511d0ca Mon Sep 17 00:00:00 2001
+From: William Horvath <william@horvath.blog>
+Date: Tue, 21 Jan 2025 17:07:11 -0800
+Subject: [PATCH 325/486] ntdll: Check for invalid gs_base in the 64-bit
+ segv_handler.
+
+Adapted from check_invalid_gs in signal_i386.c. PE-side code can
+manipulate %gs and cause the next call to NtCurrentTeb to segfault, as
+the gs_base may be cleared with writes to %gs on x86_64 [1].
+
+This would cause a recursive exception loop, as any PE-side code in the
+exception handling chain after the segv_handler would run into the same
+problem. So, catch this early, and manually repair the thread's gs_base
+with the pthread TEB from the Unix side.
+
+The 32-bit game "Alice: Madness Returns" is one example of this problem
+occurring in the real world, when running under WoW64. However, this is
+currently handled in Windows under both WoW64 and native 64-bit, so we should
+handle both architectures as well.
+
+[1]: https://bugs.winehq.org/show_bug.cgi?id=51152
+
+Wine-Bug: https://bugs.winehq.org/show_bug.cgi?id=57444
+---
+ dlls/ntdll/tests/exception.c    |  6 +++
+ dlls/ntdll/unix/signal_x86_64.c | 84 ++++++++++++++++++++++++++++++++-
+ 2 files changed, 89 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/ntdll/tests/exception.c b/dlls/ntdll/tests/exception.c
+index 8d4ba7ec0e4..51a0414ae4a 100644
+--- a/dlls/ntdll/tests/exception.c
++++ b/dlls/ntdll/tests/exception.c
+@@ -2852,6 +2852,12 @@ static const struct exception
+     { { 0xb8, 0x01, 0x00, 0x00, 0x00,          /* mov $0x01, %eax */
+         0xcd, 0x2d, 0xfa, 0xc3 },              /* int $0x2d; cli; ret */
+       8, 0, STATUS_SUCCESS, 0 },
++    { { 0x66, 0x0f, 0xa8,                      /* push %gs */
++        0x66, 0x0f, 0xa9,                      /* pop  %gs */
++        0x65, 0x48, 0x8b, 0x04, 0x25,          /* movq %gs:0x30,%rax (NtCurrentTeb) */
++        0x30, 0x00, 0x00, 0x00,
++        0xc3 },                                /* ret */
++      8, 0, STATUS_SUCCESS, 0 },
+ };
+ 
+ static int got_exception;
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index ce064dbc6e0..cd4a2ab471c 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -2356,6 +2356,88 @@ static BOOL handle_syscall_trap( ucontext_t *sigcontext, siginfo_t *siginfo )
+ }
+ 
+ 
++/***********************************************************************
++ *           check_invalid_gsbase
++ *
++ * Check for fault caused by invalid %gs value (some copy protection schemes mess with it).
++ */
++static inline BOOL check_invalid_gsbase( ucontext_t *ucontext )
++{
++    unsigned int prefix_count = 0;
++    const BYTE *instr = (const BYTE *)RIP_sig( ucontext );
++    TEB *teb = NtCurrentTeb();
++    ULONG_PTR cur_gsbase = 0;
++
++    if (CS_sig(ucontext) != cs64_sel) return FALSE;
++
++#ifdef __linux__
++    if (user_shared_data->ProcessorFeatures[PF_RDWRFSGSBASE_AVAILABLE])
++        __asm__("rdgsbase %0" : "=r" (cur_gsbase));
++    else
++        arch_prctl( ARCH_GET_GS, &cur_gsbase );
++#elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
++    amd64_get_gsbase( &cur_gsbase );
++#elif defined(__NetBSD__)
++    sysarch( X86_64_GET_GSBASE, &cur_gsbase );
++#endif
++
++    if (cur_gsbase == (ULONG_PTR)teb) return FALSE;
++
++    for (;;)
++    {
++        switch (*instr)
++        {
++        /* instruction prefixes */
++        case 0x2e:  /* %cs: */
++        case 0x36:  /* %ss: */
++        case 0x3e:  /* %ds: */
++        case 0x26:  /* %es: */
++        case 0x40:  /* rex */
++        case 0x41:  /* rex */
++        case 0x42:  /* rex */
++        case 0x43:  /* rex */
++        case 0x44:  /* rex */
++        case 0x45:  /* rex */
++        case 0x46:  /* rex */
++        case 0x47:  /* rex */
++        case 0x48:  /* rex */
++        case 0x49:  /* rex */
++        case 0x4a:  /* rex */
++        case 0x4b:  /* rex */
++        case 0x4c:  /* rex */
++        case 0x4d:  /* rex */
++        case 0x4e:  /* rex */
++        case 0x4f:  /* rex */
++        case 0x64:  /* %fs: */
++        case 0x66:  /* opcode size */
++        case 0x67:  /* addr size */
++        case 0xf0:  /* lock */
++        case 0xf2:  /* repne */
++        case 0xf3:  /* repe */
++            if (++prefix_count >= 15) return FALSE;
++            instr++;
++            continue;
++        case 0x65:  /* %gs: */
++            break;
++        default:
++            return FALSE;
++        }
++        break;
++    }
++
++    TRACE( "gsbase %016lx teb %p at instr %p, fixing up\n", cur_gsbase, teb, instr );
++
++#ifdef __linux__
++    arch_prctl( ARCH_SET_GS, teb );
++#elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
++    amd64_set_gsbase( teb );
++#elif defined(__NetBSD__)
++    sysarch( X86_64_SET_GSBASE, &teb );
++#endif
++    return TRUE;
++}
++
++
+ /**********************************************************************
+  *		segv_handler
+  *
+@@ -2407,7 +2489,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+         rec.NumberParameters = 2;
+         rec.ExceptionInformation[0] = (ERROR_sig(ucontext) >> 1) & 0x09;
+         rec.ExceptionInformation[1] = (ULONG_PTR)siginfo->si_addr;
+-        if (!virtual_handle_fault( &rec, (void *)RSP_sig(ucontext) ))
++        if (!virtual_handle_fault( &rec, (void *)RSP_sig(ucontext) ) || check_invalid_gsbase( ucontext ))
+         {
+             leave_handler( ucontext );
+             return;
+-- 
+2.53.0
+

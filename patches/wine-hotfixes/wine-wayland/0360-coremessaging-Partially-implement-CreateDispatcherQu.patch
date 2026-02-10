@@ -1,0 +1,933 @@
+From 943548b3157882b27cd53a151a3ff543812214f4 Mon Sep 17 00:00:00 2001
+From: Mohamad Al-Jaf <mohamadaljaf@gmail.com>
+Date: Sun, 27 Apr 2025 22:39:13 -0400
+Subject: [PATCH 360/486] coremessaging: Partially implement
+ CreateDispatcherQueueController().
+
+Needed by Paint.NET installer.
+---
+ dlls/coremessaging/Makefile.in           |   2 +
+ dlls/coremessaging/async.c               | 655 +++++++++++++++++++++++
+ dlls/coremessaging/async_private.idl     |  46 ++
+ dlls/coremessaging/main.c                | 121 ++++-
+ dlls/coremessaging/private.h             |   6 +
+ dlls/coremessaging/tests/coremessaging.c |   5 +-
+ 6 files changed, 829 insertions(+), 6 deletions(-)
+ create mode 100644 dlls/coremessaging/async.c
+ create mode 100644 dlls/coremessaging/async_private.idl
+
+diff --git a/dlls/coremessaging/Makefile.in b/dlls/coremessaging/Makefile.in
+index 25de74385c5..4df45c482ef 100644
+--- a/dlls/coremessaging/Makefile.in
++++ b/dlls/coremessaging/Makefile.in
+@@ -3,5 +3,7 @@ IMPORTS   = combase
+ IMPORTLIB = coremessaging
+ 
+ SOURCES = \
++	async.c \
++	async_private.idl \
+ 	classes.idl \
+ 	main.c
+diff --git a/dlls/coremessaging/async.c b/dlls/coremessaging/async.c
+new file mode 100644
+index 00000000000..8f3869da5c7
+--- /dev/null
++++ b/dlls/coremessaging/async.c
+@@ -0,0 +1,655 @@
++/* WinRT IAsync* implementation
++ *
++ * Copyright 2022 Bernhard Kölbl for CodeWeavers
++ * Copyright 2022 Rémi Bernon for CodeWeavers
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#define WIDL_using_Wine_Internal
++#include "private.h"
++#include "initguid.h"
++#include "async_private.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(combase);
++
++#define Closed 4
++#define HANDLER_NOT_SET ((void *)~(ULONG_PTR)0)
++
++struct async_info
++{
++    IAsyncInfoImpl IAsyncInfoImpl_iface;
++    IAsyncInfo IAsyncInfo_iface;
++    IInspectable *IInspectable_outer;
++    LONG ref;
++
++    async_operation_callback callback;
++    TP_WORK *async_run_work;
++    IUnknown *invoker;
++    IUnknown *param;
++
++    CRITICAL_SECTION cs;
++    IAsyncOperationCompletedHandlerImpl *handler;
++    PROPVARIANT result;
++    AsyncStatus status;
++    HRESULT hr;
++};
++
++static inline struct async_info *impl_from_IAsyncInfoImpl( IAsyncInfoImpl *iface )
++{
++    return CONTAINING_RECORD( iface, struct async_info, IAsyncInfoImpl_iface );
++}
++
++static HRESULT WINAPI async_impl_QueryInterface( IAsyncInfoImpl *iface, REFIID iid, void **out )
++{
++    struct async_info *impl = impl_from_IAsyncInfoImpl( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IAsyncInfoImpl ))
++    {
++        IInspectable_AddRef( (*out = &impl->IAsyncInfoImpl_iface) );
++        return S_OK;
++    }
++
++    if (IsEqualGUID( iid, &IID_IAsyncInfo ))
++    {
++        IInspectable_AddRef( (*out = &impl->IAsyncInfo_iface) );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI async_impl_AddRef( IAsyncInfoImpl *iface )
++{
++    struct async_info *impl = impl_from_IAsyncInfoImpl( iface );
++    ULONG ref = InterlockedIncrement( &impl->ref );
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++    return ref;
++}
++
++static ULONG WINAPI async_impl_Release( IAsyncInfoImpl *iface )
++{
++    struct async_info *impl = impl_from_IAsyncInfoImpl( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++
++    if (!ref)
++    {
++        if (impl->handler && impl->handler != HANDLER_NOT_SET) IAsyncOperationCompletedHandlerImpl_Release( impl->handler );
++        IAsyncInfo_Close( &impl->IAsyncInfo_iface );
++        if (impl->param) IUnknown_Release( impl->param );
++        if (impl->invoker) IUnknown_Release( impl->invoker );
++        PropVariantClear( &impl->result );
++        impl->cs.DebugInfo->Spare[0] = 0;
++        DeleteCriticalSection( &impl->cs );
++        free( impl );
++    }
++
++    return ref;
++}
++
++static HRESULT WINAPI async_impl_put_Completed( IAsyncInfoImpl *iface, IAsyncOperationCompletedHandlerImpl *handler )
++{
++    struct async_info *impl = impl_from_IAsyncInfoImpl( iface );
++    HRESULT hr = S_OK;
++
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++
++    EnterCriticalSection( &impl->cs );
++    if (impl->status == Closed) hr = E_ILLEGAL_METHOD_CALL;
++    else if (impl->handler != HANDLER_NOT_SET) hr = E_ILLEGAL_DELEGATE_ASSIGNMENT;
++    else if ((impl->handler = handler))
++    {
++        IAsyncOperationCompletedHandlerImpl_AddRef( impl->handler );
++
++        if (impl->status > Started)
++        {
++            IInspectable *operation = impl->IInspectable_outer;
++            AsyncStatus status = impl->status;
++            impl->handler = NULL; /* Prevent concurrent invoke. */
++            LeaveCriticalSection( &impl->cs );
++
++            IAsyncOperationCompletedHandlerImpl_Invoke( handler, operation, status );
++            IAsyncOperationCompletedHandlerImpl_Release( handler );
++
++            return S_OK;
++        }
++    }
++    LeaveCriticalSection( &impl->cs );
++
++    return hr;
++}
++
++static HRESULT WINAPI async_impl_get_Completed( IAsyncInfoImpl *iface, IAsyncOperationCompletedHandlerImpl **handler )
++{
++    struct async_info *impl = impl_from_IAsyncInfoImpl( iface );
++    HRESULT hr = S_OK;
++
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++
++    EnterCriticalSection( &impl->cs );
++    if (impl->status == Closed) hr = E_ILLEGAL_METHOD_CALL;
++    if (impl->handler == NULL || impl->handler == HANDLER_NOT_SET) *handler = NULL;
++    else IAsyncOperationCompletedHandlerImpl_AddRef( (*handler = impl->handler) );
++    LeaveCriticalSection( &impl->cs );
++
++    return hr;
++}
++
++static HRESULT WINAPI async_impl_get_Result( IAsyncInfoImpl *iface, PROPVARIANT *result )
++{
++    struct async_info *impl = impl_from_IAsyncInfoImpl( iface );
++    HRESULT hr = E_ILLEGAL_METHOD_CALL;
++
++    TRACE( "iface %p, result %p.\n", iface, result );
++
++    EnterCriticalSection( &impl->cs );
++    if (impl->status == Completed || impl->status == Error)
++    {
++        PropVariantCopy( result, &impl->result );
++        hr = impl->hr;
++    }
++    LeaveCriticalSection( &impl->cs );
++
++    return hr;
++}
++
++static HRESULT WINAPI async_impl_Start( IAsyncInfoImpl *iface )
++{
++    struct async_info *impl = impl_from_IAsyncInfoImpl( iface );
++
++    TRACE( "iface %p.\n", iface );
++
++    /* keep the async alive in the callback */
++    IInspectable_AddRef( impl->IInspectable_outer );
++    SubmitThreadpoolWork( impl->async_run_work );
++
++    return S_OK;
++}
++
++static const struct IAsyncInfoImplVtbl async_impl_vtbl =
++{
++    /* IUnknown methods */
++    async_impl_QueryInterface,
++    async_impl_AddRef,
++    async_impl_Release,
++    /* IAsyncInfoImpl */
++    async_impl_put_Completed,
++    async_impl_get_Completed,
++    async_impl_get_Result,
++    async_impl_Start,
++};
++
++DEFINE_IINSPECTABLE_OUTER( async_info, IAsyncInfo, struct async_info, IInspectable_outer )
++
++static HRESULT WINAPI async_info_get_Id( IAsyncInfo *iface, UINT32 *id )
++{
++    struct async_info *impl = impl_from_IAsyncInfo( iface );
++    HRESULT hr = S_OK;
++
++    TRACE( "iface %p, id %p.\n", iface, id );
++
++    EnterCriticalSection( &impl->cs );
++    if (impl->status == Closed) hr = E_ILLEGAL_METHOD_CALL;
++    *id = 1;
++    LeaveCriticalSection( &impl->cs );
++
++    return hr;
++}
++
++static HRESULT WINAPI async_info_get_Status( IAsyncInfo *iface, AsyncStatus *status )
++{
++    struct async_info *impl = impl_from_IAsyncInfo( iface );
++    HRESULT hr = S_OK;
++
++    TRACE( "iface %p, status %p.\n", iface, status );
++
++    EnterCriticalSection( &impl->cs );
++    if (impl->status == Closed) hr = E_ILLEGAL_METHOD_CALL;
++    *status = impl->status;
++    LeaveCriticalSection( &impl->cs );
++
++    return hr;
++}
++
++static HRESULT WINAPI async_info_get_ErrorCode( IAsyncInfo *iface, HRESULT *error_code )
++{
++    struct async_info *impl = impl_from_IAsyncInfo( iface );
++    HRESULT hr = S_OK;
++
++    TRACE( "iface %p, error_code %p.\n", iface, error_code );
++
++    EnterCriticalSection( &impl->cs );
++    if (impl->status == Closed) *error_code = hr = E_ILLEGAL_METHOD_CALL;
++    else *error_code = impl->hr;
++    LeaveCriticalSection( &impl->cs );
++
++    return hr;
++}
++
++static HRESULT WINAPI async_info_Cancel( IAsyncInfo *iface )
++{
++    struct async_info *impl = impl_from_IAsyncInfo( iface );
++    HRESULT hr = S_OK;
++
++    TRACE( "iface %p.\n", iface );
++
++    EnterCriticalSection( &impl->cs );
++    if (impl->status == Closed) hr = E_ILLEGAL_METHOD_CALL;
++    else if (impl->status == Started) impl->status = Canceled;
++    LeaveCriticalSection( &impl->cs );
++
++    return hr;
++}
++
++static HRESULT WINAPI async_info_Close( IAsyncInfo *iface )
++{
++    struct async_info *impl = impl_from_IAsyncInfo( iface );
++    HRESULT hr = S_OK;
++
++    TRACE( "iface %p.\n", iface );
++
++    EnterCriticalSection( &impl->cs );
++    if (impl->status == Started)
++        hr = E_ILLEGAL_STATE_CHANGE;
++    else if (impl->status != Closed)
++    {
++        CloseThreadpoolWork( impl->async_run_work );
++        impl->async_run_work = NULL;
++        impl->status = Closed;
++    }
++    LeaveCriticalSection( &impl->cs );
++
++    return hr;
++}
++
++static const struct IAsyncInfoVtbl async_info_vtbl =
++{
++    /* IUnknown methods */
++    async_info_QueryInterface,
++    async_info_AddRef,
++    async_info_Release,
++    /* IInspectable methods */
++    async_info_GetIids,
++    async_info_GetRuntimeClassName,
++    async_info_GetTrustLevel,
++    /* IAsyncInfo */
++    async_info_get_Id,
++    async_info_get_Status,
++    async_info_get_ErrorCode,
++    async_info_Cancel,
++    async_info_Close,
++};
++
++static void CALLBACK async_info_callback( TP_CALLBACK_INSTANCE *instance, void *iface, TP_WORK *work )
++{
++    struct async_info *impl = impl_from_IAsyncInfoImpl( iface );
++    IInspectable *operation = impl->IInspectable_outer;
++    PROPVARIANT result = {0};
++    HRESULT hr;
++
++    hr = impl->callback( impl->invoker, impl->param, &result );
++
++    EnterCriticalSection( &impl->cs );
++    if (impl->status != Closed) impl->status = FAILED(hr) ? Error : Completed;
++    PropVariantCopy( &impl->result, &result );
++    impl->hr = hr;
++
++    if (impl->handler != NULL && impl->handler != HANDLER_NOT_SET)
++    {
++        IAsyncOperationCompletedHandlerImpl *handler = impl->handler;
++        AsyncStatus status = impl->status;
++        impl->handler = NULL; /* Prevent concurrent invoke. */
++        LeaveCriticalSection( &impl->cs );
++
++        IAsyncOperationCompletedHandlerImpl_Invoke( handler, operation, status );
++        IAsyncOperationCompletedHandlerImpl_Release( handler );
++    }
++    else LeaveCriticalSection( &impl->cs );
++
++    /* release refcount acquired in Start */
++    IInspectable_Release( operation );
++
++    PropVariantClear( &result );
++}
++
++static HRESULT async_info_create( IUnknown *invoker, IUnknown *param, async_operation_callback callback,
++                                  IInspectable *outer, IAsyncInfoImpl **out )
++{
++    struct async_info *impl;
++    HRESULT hr;
++
++    if (!(impl = calloc( 1, sizeof(struct async_info) ))) return E_OUTOFMEMORY;
++    impl->IAsyncInfoImpl_iface.lpVtbl = &async_impl_vtbl;
++    impl->IAsyncInfo_iface.lpVtbl = &async_info_vtbl;
++    impl->IInspectable_outer = outer;
++    impl->ref = 1;
++
++    impl->callback = callback;
++    impl->handler = HANDLER_NOT_SET;
++    impl->status = Started;
++    if (!(impl->async_run_work = CreateThreadpoolWork( async_info_callback, &impl->IAsyncInfoImpl_iface, NULL )))
++    {
++        hr = HRESULT_FROM_WIN32( GetLastError() );
++        free( impl );
++        return hr;
++    }
++
++    if ((impl->invoker = invoker)) IUnknown_AddRef( impl->invoker );
++    if ((impl->param = param)) IUnknown_AddRef( impl->param );
++
++    InitializeCriticalSectionEx( &impl->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO );
++    impl->cs.DebugInfo->Spare[0] = (DWORD_PTR)( __FILE__ ": async_info.cs" );
++
++    *out = &impl->IAsyncInfoImpl_iface;
++    return S_OK;
++}
++
++struct async_bool
++{
++    IAsyncOperation_boolean IAsyncOperation_boolean_iface;
++    IAsyncInfoImpl *IAsyncInfoImpl_inner;
++    LONG ref;
++};
++
++static inline struct async_bool *impl_from_IAsyncOperation_boolean( IAsyncOperation_boolean *iface )
++{
++    return CONTAINING_RECORD( iface, struct async_bool, IAsyncOperation_boolean_iface );
++}
++
++static HRESULT WINAPI async_bool_QueryInterface( IAsyncOperation_boolean *iface, REFIID iid, void **out )
++{
++    struct async_bool *impl = impl_from_IAsyncOperation_boolean( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IAsyncOperation_boolean ))
++    {
++        IInspectable_AddRef( (*out = &impl->IAsyncOperation_boolean_iface) );
++        return S_OK;
++    }
++
++    return IAsyncInfoImpl_QueryInterface( impl->IAsyncInfoImpl_inner, iid, out );
++}
++
++static ULONG WINAPI async_bool_AddRef( IAsyncOperation_boolean *iface )
++{
++    struct async_bool *impl = impl_from_IAsyncOperation_boolean( iface );
++    ULONG ref = InterlockedIncrement( &impl->ref );
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++    return ref;
++}
++
++static ULONG WINAPI async_bool_Release( IAsyncOperation_boolean *iface )
++{
++    struct async_bool *impl = impl_from_IAsyncOperation_boolean( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++
++    if (!ref)
++    {
++        /* guard against re-entry if inner releases an outer iface */
++        InterlockedIncrement( &impl->ref );
++        IAsyncInfoImpl_Release( impl->IAsyncInfoImpl_inner );
++        free( impl );
++    }
++
++    return ref;
++}
++
++static HRESULT WINAPI async_bool_GetIids( IAsyncOperation_boolean *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI async_bool_GetRuntimeClassName( IAsyncOperation_boolean *iface, HSTRING *class_name )
++{
++    return WindowsCreateString( L"Windows.Foundation.IAsyncOperation`1<Boolean>",
++                                ARRAY_SIZE(L"Windows.Foundation.IAsyncOperation`1<Boolean>"),
++                                class_name );
++}
++
++static HRESULT WINAPI async_bool_GetTrustLevel( IAsyncOperation_boolean *iface, TrustLevel *trust_level )
++{
++    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI async_bool_put_Completed( IAsyncOperation_boolean *iface, IAsyncOperationCompletedHandler_boolean *bool_handler )
++{
++    IAsyncOperationCompletedHandlerImpl *handler = (IAsyncOperationCompletedHandlerImpl *)bool_handler;
++    struct async_bool *impl = impl_from_IAsyncOperation_boolean( iface );
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    return IAsyncInfoImpl_put_Completed( impl->IAsyncInfoImpl_inner, handler );
++}
++
++static HRESULT WINAPI async_bool_get_Completed( IAsyncOperation_boolean *iface, IAsyncOperationCompletedHandler_boolean **bool_handler )
++{
++    IAsyncOperationCompletedHandlerImpl **handler = (IAsyncOperationCompletedHandlerImpl **)bool_handler;
++    struct async_bool *impl = impl_from_IAsyncOperation_boolean( iface );
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    return IAsyncInfoImpl_get_Completed( impl->IAsyncInfoImpl_inner, handler );
++}
++
++static HRESULT WINAPI async_bool_GetResults( IAsyncOperation_boolean *iface, BOOLEAN *results )
++{
++    struct async_bool *impl = impl_from_IAsyncOperation_boolean( iface );
++    PROPVARIANT result = {.vt = VT_BOOL};
++    HRESULT hr;
++
++    TRACE( "iface %p, results %p.\n", iface, results );
++
++    hr = IAsyncInfoImpl_get_Result( impl->IAsyncInfoImpl_inner, &result );
++
++    *results = result.boolVal;
++    PropVariantClear( &result );
++    return hr;
++}
++
++static const struct IAsyncOperation_booleanVtbl async_bool_vtbl =
++{
++    /* IUnknown methods */
++    async_bool_QueryInterface,
++    async_bool_AddRef,
++    async_bool_Release,
++    /* IInspectable methods */
++    async_bool_GetIids,
++    async_bool_GetRuntimeClassName,
++    async_bool_GetTrustLevel,
++    /* IAsyncOperation<boolean> */
++    async_bool_put_Completed,
++    async_bool_get_Completed,
++    async_bool_GetResults,
++};
++
++HRESULT async_operation_boolean_create( IUnknown *invoker, IUnknown *param, async_operation_callback callback,
++                                        IAsyncOperation_boolean **out )
++{
++    struct async_bool *impl;
++    HRESULT hr;
++
++    *out = NULL;
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IAsyncOperation_boolean_iface.lpVtbl = &async_bool_vtbl;
++    impl->ref = 1;
++
++    if (FAILED(hr = async_info_create( invoker, param, callback, (IInspectable *)&impl->IAsyncOperation_boolean_iface, &impl->IAsyncInfoImpl_inner )) ||
++        FAILED(hr = IAsyncInfoImpl_Start( impl->IAsyncInfoImpl_inner )))
++    {
++        if (impl->IAsyncInfoImpl_inner) IAsyncInfoImpl_Release( impl->IAsyncInfoImpl_inner );
++        free( impl );
++        return hr;
++    }
++
++    *out = &impl->IAsyncOperation_boolean_iface;
++    TRACE( "created IAsyncOperation_boolean %p\n", *out );
++    return S_OK;
++}
++
++struct async_action
++{
++    IAsyncAction IAsyncAction_iface;
++    IAsyncInfoImpl *IAsyncInfoImpl_inner;
++    LONG ref;
++};
++
++static inline struct async_action *impl_from_IAsyncAction( IAsyncAction *iface )
++{
++    return CONTAINING_RECORD( iface, struct async_action, IAsyncAction_iface );
++}
++
++static HRESULT WINAPI async_action_QueryInterface( IAsyncAction *iface, REFIID iid, void **out )
++{
++    struct async_action *impl = impl_from_IAsyncAction( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IAsyncAction ))
++    {
++        IInspectable_AddRef( (*out = &impl->IAsyncAction_iface) );
++        return S_OK;
++    }
++
++    return IAsyncInfoImpl_QueryInterface( impl->IAsyncInfoImpl_inner, iid, out );
++}
++
++static ULONG WINAPI async_action_AddRef( IAsyncAction *iface )
++{
++    struct async_action *impl = impl_from_IAsyncAction( iface );
++    ULONG ref = InterlockedIncrement( &impl->ref );
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++    return ref;
++}
++
++static ULONG WINAPI async_action_Release( IAsyncAction *iface )
++{
++    struct async_action *impl = impl_from_IAsyncAction( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++
++    if (!ref)
++    {
++        /* guard against re-entry if inner releases an outer iface */
++        InterlockedIncrement( &impl->ref );
++        IAsyncInfoImpl_Release( impl->IAsyncInfoImpl_inner );
++        free( impl );
++    }
++
++    return ref;
++}
++
++static HRESULT WINAPI async_action_GetIids( IAsyncAction *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI async_action_GetRuntimeClassName( IAsyncAction *iface, HSTRING *class_name )
++{
++    return WindowsCreateString( L"Windows.Foundation.IAsyncOperation`1<Boolean>",
++                                ARRAY_SIZE(L"Windows.Foundation.IAsyncOperation`1<Boolean>"),
++                                class_name );
++}
++
++static HRESULT WINAPI async_action_GetTrustLevel( IAsyncAction *iface, TrustLevel *trust_level )
++{
++    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI async_action_put_Completed( IAsyncAction *iface, IAsyncActionCompletedHandler *bool_handler )
++{
++    IAsyncOperationCompletedHandlerImpl *handler = (IAsyncOperationCompletedHandlerImpl *)bool_handler;
++    struct async_action *impl = impl_from_IAsyncAction( iface );
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    return IAsyncInfoImpl_put_Completed( impl->IAsyncInfoImpl_inner, handler );
++}
++
++static HRESULT WINAPI async_action_get_Completed( IAsyncAction *iface, IAsyncActionCompletedHandler **bool_handler )
++{
++    IAsyncOperationCompletedHandlerImpl **handler = (IAsyncOperationCompletedHandlerImpl **)bool_handler;
++    struct async_action *impl = impl_from_IAsyncAction( iface );
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    return IAsyncInfoImpl_get_Completed( impl->IAsyncInfoImpl_inner, handler );
++}
++
++static HRESULT WINAPI async_action_GetResults( IAsyncAction *iface )
++{
++    struct async_action *impl = impl_from_IAsyncAction( iface );
++    PROPVARIANT result;
++    HRESULT hr;
++
++    TRACE( "iface %p.\n", iface );
++
++    PropVariantInit( &result );
++    hr = IAsyncInfoImpl_get_Result( impl->IAsyncInfoImpl_inner, &result );
++    PropVariantClear( &result );
++    return hr;
++}
++
++static const struct IAsyncActionVtbl async_action_vtbl =
++{
++    /* IUnknown methods */
++    async_action_QueryInterface,
++    async_action_AddRef,
++    async_action_Release,
++    /* IInspectable methods */
++    async_action_GetIids,
++    async_action_GetRuntimeClassName,
++    async_action_GetTrustLevel,
++    /* IAsyncOperation<boolean> */
++    async_action_put_Completed,
++    async_action_get_Completed,
++    async_action_GetResults,
++};
++
++HRESULT async_action_create( IUnknown *invoker, async_operation_callback callback, IAsyncAction **out )
++{
++    struct async_action *impl;
++    HRESULT hr;
++
++    *out = NULL;
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IAsyncAction_iface.lpVtbl = &async_action_vtbl;
++    impl->ref = 1;
++
++    if (FAILED(hr = async_info_create( invoker, NULL, callback, (IInspectable *)&impl->IAsyncAction_iface, &impl->IAsyncInfoImpl_inner )) ||
++        FAILED(hr = IAsyncInfoImpl_Start( impl->IAsyncInfoImpl_inner )))
++    {
++        if (impl->IAsyncInfoImpl_inner) IAsyncInfoImpl_Release( impl->IAsyncInfoImpl_inner );
++        free( impl );
++        return hr;
++    }
++
++    *out = &impl->IAsyncAction_iface;
++    TRACE( "created IAsyncAction %p\n", *out );
++    return S_OK;
++}
+diff --git a/dlls/coremessaging/async_private.idl b/dlls/coremessaging/async_private.idl
+new file mode 100644
+index 00000000000..10741572601
+--- /dev/null
++++ b/dlls/coremessaging/async_private.idl
+@@ -0,0 +1,46 @@
++/*
++ * Copyright 2022 Rémi Bernon for CodeWeavers
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#pragma makedep header
++
++#ifdef __WIDL__
++#pragma winrt ns_prefix
++#endif
++
++import "propidl.idl";
++import "inspectable.idl";
++import "asyncinfo.idl";
++import "windowscontracts.idl";
++
++namespace Wine.Internal {
++    /* type-pruning version of AsyncOperationCompletedHandlerImpl<T> */
++    delegate HRESULT AsyncOperationCompletedHandlerImpl([in] IInspectable *async, [in] AsyncStatus status);
++
++    [
++        uuid(d81ab70d-82e0-481c-983d-401225d98a2c)
++    ]
++    interface IAsyncInfoImpl : IUnknown
++    {
++        [propput] HRESULT Completed([in] AsyncOperationCompletedHandlerImpl *handler);
++        [propget] HRESULT Completed([out, retval] AsyncOperationCompletedHandlerImpl **handler);
++        [propget] HRESULT Result([out, retval] PROPVARIANT *result);
++        HRESULT Start();
++    }
++
++    typedef HRESULT (*async_operation_callback)( IUnknown *invoker, IUnknown *param, PROPVARIANT *result );
++}
+diff --git a/dlls/coremessaging/main.c b/dlls/coremessaging/main.c
+index 5bb4a99ee57..0cb8380d373 100644
+--- a/dlls/coremessaging/main.c
++++ b/dlls/coremessaging/main.c
+@@ -116,6 +116,110 @@ static const struct IActivationFactoryVtbl factory_vtbl =
+     factory_ActivateInstance,
+ };
+ 
++struct dispatcher_queue_controller
++{
++    IDispatcherQueueController IDispatcherQueueController_iface;
++    LONG ref;
++};
++
++static inline struct dispatcher_queue_controller *impl_from_IDispatcherQueueController( IDispatcherQueueController *iface )
++{
++    return CONTAINING_RECORD( iface, struct dispatcher_queue_controller, IDispatcherQueueController_iface );
++}
++
++static HRESULT WINAPI dispatcher_queue_controller_QueryInterface( IDispatcherQueueController *iface, REFIID iid, void **out )
++{
++    struct dispatcher_queue_controller *impl = impl_from_IDispatcherQueueController( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IDispatcherQueueController ))
++    {
++        *out = &impl->IDispatcherQueueController_iface;
++        IInspectable_AddRef( *out );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI dispatcher_queue_controller_AddRef( IDispatcherQueueController *iface )
++{
++    struct dispatcher_queue_controller *impl = impl_from_IDispatcherQueueController( iface );
++    ULONG ref = InterlockedIncrement( &impl->ref );
++    TRACE( "iface %p increasing ref to %lu.\n", iface, ref );
++    return ref;
++}
++
++static ULONG WINAPI dispatcher_queue_controller_Release( IDispatcherQueueController *iface )
++{
++    struct dispatcher_queue_controller *impl = impl_from_IDispatcherQueueController( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++
++    TRACE( "iface %p decreasing ref to %lu.\n", iface, ref );
++
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI dispatcher_queue_controller_GetIids( IDispatcherQueueController *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI dispatcher_queue_controller_GetRuntimeClassName( IDispatcherQueueController *iface, HSTRING *class_name )
++{
++    FIXME( "iface %p, class_name %p stub!\n", iface, class_name );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI dispatcher_queue_controller_GetTrustLevel( IDispatcherQueueController *iface, TrustLevel *trust_level )
++{
++    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI dispatcher_queue_controller_get_DispatcherQueue( IDispatcherQueueController *iface, IDispatcherQueue **value )
++{
++    FIXME( "iface %p, value %p stub!\n", iface, value );
++    return E_NOTIMPL;
++}
++
++static HRESULT shutdown_queue_async( IUnknown *invoker, IUnknown *param, PROPVARIANT *result )
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI dispatcher_queue_controller_ShutdownQueueAsync( IDispatcherQueueController *iface, IAsyncAction **operation )
++{
++    FIXME( "iface %p, operation %p stub!\n", iface, operation );
++
++    if (!operation) return E_POINTER;
++    *operation = NULL;
++
++    return async_action_create( NULL, shutdown_queue_async, operation );
++}
++
++static const struct IDispatcherQueueControllerVtbl dispatcher_queue_controller_vtbl =
++{
++    dispatcher_queue_controller_QueryInterface,
++    dispatcher_queue_controller_AddRef,
++    dispatcher_queue_controller_Release,
++    /* IInspectable methods */
++    dispatcher_queue_controller_GetIids,
++    dispatcher_queue_controller_GetRuntimeClassName,
++    dispatcher_queue_controller_GetTrustLevel,
++    /* IDispatcherQueueController methods */
++    dispatcher_queue_controller_get_DispatcherQueue,
++    dispatcher_queue_controller_ShutdownQueueAsync,
++};
++
+ DEFINE_IINSPECTABLE( dispatcher_queue_controller_statics, IDispatcherQueueControllerStatics, struct dispatcher_queue_controller_statics, IActivationFactory_iface )
+ 
+ static HRESULT WINAPI dispatcher_queue_controller_statics_CreateOnDedicatedThread( IDispatcherQueueControllerStatics *iface, IDispatcherQueueController **result )
+@@ -163,7 +267,20 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+ 
+ HRESULT WINAPI CreateDispatcherQueueController( DispatcherQueueOptions options, PDISPATCHERQUEUECONTROLLER *queue_controller )
+ {
+-    FIXME( "options.dwSize = %lu, options.threadType = %d, options.apartmentType = %d, queue_controller %p stub!\n",
++    struct dispatcher_queue_controller *impl;
++
++    FIXME( "options.dwSize = %lu, options.threadType = %d, options.apartmentType = %d, queue_controller %p semi-stub!\n",
+             options.dwSize, options.threadType, options.apartmentType, queue_controller );
+-    return E_NOTIMPL;
++
++    if (!queue_controller) return E_POINTER;
++    if (options.dwSize != sizeof( DispatcherQueueOptions )) return E_INVALIDARG;
++    if (options.threadType != DQTYPE_THREAD_DEDICATED && options.threadType != DQTYPE_THREAD_CURRENT) return E_INVALIDARG;
++    if (!(impl = calloc( 1, sizeof( *impl ) ))) return E_OUTOFMEMORY;
++
++    impl->IDispatcherQueueController_iface.lpVtbl = &dispatcher_queue_controller_vtbl;
++    impl->ref = 1;
++
++    *queue_controller = &impl->IDispatcherQueueController_iface;
++    TRACE( "created IDispatcherQueueController %p.\n", *queue_controller );
++    return S_OK;
+ }
+diff --git a/dlls/coremessaging/private.h b/dlls/coremessaging/private.h
+index 09567dedc1c..bf1a2fca7a1 100644
+--- a/dlls/coremessaging/private.h
++++ b/dlls/coremessaging/private.h
+@@ -38,6 +38,10 @@
+ #define WIDL_using_Windows_System
+ #include "windows.system.h"
+ 
++#include "async_private.h"
++
++HRESULT async_action_create( IUnknown *invoker, async_operation_callback callback, IAsyncAction **out );
++
+ #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
+     static inline impl_type *impl_from( iface_type *iface )                                        \
+     {                                                                                              \
+@@ -75,5 +79,7 @@
+     }
+ #define DEFINE_IINSPECTABLE( pfx, iface_type, impl_type, base_iface )                              \
+     DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from_##iface_type, iface_type##_iface, &impl->base_iface )
++#define DEFINE_IINSPECTABLE_OUTER( pfx, iface_type, impl_type, outer_iface )                       \
++    DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from_##iface_type, iface_type##_iface, impl->outer_iface )
+ 
+ #endif
+diff --git a/dlls/coremessaging/tests/coremessaging.c b/dlls/coremessaging/tests/coremessaging.c
+index 18081062fdb..cabc3ccd809 100644
+--- a/dlls/coremessaging/tests/coremessaging.c
++++ b/dlls/coremessaging/tests/coremessaging.c
+@@ -263,9 +263,8 @@ static void check_create_dispatcher_queue_controller_( unsigned int line, DWORD
+     options.apartmentType = apartment_type;
+ 
+     hr = CreateDispatcherQueueController( options, &dispatcher_queue_controller );
+-    todo_wine
+     ok_(__FILE__, line)( hr == expected_hr, "got CreateDispatcherQueueController hr %#lx.\n", hr );
+-    if (FAILED(hr)) return;
++    if (hr == E_INVALIDARG) return;
+ 
+     hr = IDispatcherQueueController_get_DispatcherQueue( dispatcher_queue_controller, &dispatcher_queue );
+     todo_wine
+@@ -356,10 +355,8 @@ static void test_CreateDispatcherQueueController(void)
+     HRESULT hr;
+ 
+     hr = CreateDispatcherQueueController( options, NULL );
+-    todo_wine
+     ok( hr == E_POINTER || hr == 0x80000005 /* win10 22h2 */, "got hr %#lx.\n", hr );
+     hr = CreateDispatcherQueueController( options, &dispatcher_queue_controller );
+-    todo_wine
+     ok( hr == E_INVALIDARG, "got hr %#lx.\n", hr );
+     ok( dispatcher_queue_controller == (void *)0xdeadbeef, "got dispatcher_queue_controller %p.\n", dispatcher_queue_controller );
+ 
+-- 
+2.53.0
+

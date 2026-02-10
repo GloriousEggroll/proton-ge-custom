@@ -1,0 +1,98 @@
+From 7164c8f9b798bf2665b66cfb7f311ce068f675aa Mon Sep 17 00:00:00 2001
+From: Keno Fischer <keno@juliacomputing.com>
+Date: Wed, 15 Dec 2021 21:09:35 -0500
+Subject: [PATCH 334/486] ntdll: Make server requests robust to spurious short
+ writes.
+
+It is possible for the write/writev functions in send_request to
+return short writes, even in non-error conditions. There are
+several situations where this might happen. Examples are:
+ - SIGSTOP/SIGCONT (either explicitly or via ptrace attach)
+ - cgroup freezes and similar mechanisms
+ - system suspends
+ - External debuggers or profilers
+
+In general, Linux makes very few guarantees about syscall restarts.
+In some cases (in particular when no bytes have been transferred at all),
+the linux kernel will automatically restart the system call, but once any
+bytes have been transferred, the result will be a short write with
+no automatic restart.
+
+Signed-off-by: Keno Fischer <keno@juliacomputing.com>
+---
+ dlls/ntdll/unix/server.c | 42 +++++++++++++++++++++++++++++++++-------
+ 1 file changed, 35 insertions(+), 7 deletions(-)
+
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+index 71406976f4e..0d13d765a40 100644
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -186,18 +186,27 @@ static DECLSPEC_NORETURN void server_protocol_perror( const char *err )
+  */
+ static unsigned int send_request( const struct __server_request_info *req )
+ {
+-    unsigned int i;
+-    int ret;
++    int request_fd = ntdll_get_thread_data()->request_fd;
+ 
+     if (!req->u.req.request_header.request_size)
+     {
+-        if ((ret = write( ntdll_get_thread_data()->request_fd, &req->u.req,
+-                          sizeof(req->u.req) )) == sizeof(req->u.req)) return STATUS_SUCCESS;
++        data_size_t to_write = sizeof(req->u.req);
++        const char *write_ptr = (const char *)&req->u.req;
+ 
++        for (;;)
++        {
++            ssize_t ret = write( request_fd, write_ptr, to_write );
++            if (ret == to_write) return STATUS_SUCCESS;
++            if (ret < 0) break;
++            to_write -= ret;
++            write_ptr += ret;
++        }
+     }
+     else
+     {
++        data_size_t to_write = sizeof(req->u.req) + req->u.req.request_header.request_size;
+         struct iovec vec[__SERVER_MAX_DATA+1];
++        unsigned int i, j;
+ 
+         vec[0].iov_base = (void *)&req->u.req;
+         vec[0].iov_len = sizeof(req->u.req);
+@@ -206,11 +215,30 @@ static unsigned int send_request( const struct __server_request_info *req )
+             vec[i+1].iov_base = (void *)req->data[i].ptr;
+             vec[i+1].iov_len = req->data[i].size;
+         }
+-        if ((ret = writev( ntdll_get_thread_data()->request_fd, vec, i+1 )) ==
+-            req->u.req.request_header.request_size + sizeof(req->u.req)) return STATUS_SUCCESS;
++
++        for (;;)
++        {
++            ssize_t ret = writev( request_fd, vec, i + 1 );
++            if (ret == to_write) return STATUS_SUCCESS;
++            if (ret < 0) break;
++            to_write -= ret;
++            for (j = 0; j < i + 1; j++)
++            {
++                if (ret >= vec[j].iov_len)
++                {
++                    ret -= vec[j].iov_len;
++                    vec[j].iov_len = 0;
++                }
++                else
++                {
++                    vec[j].iov_base = (char *)vec[j].iov_base + ret;
++                    vec[j].iov_len -= ret;
++                    break;
++                }
++            }
++        }
+     }
+ 
+-    if (ret >= 0) server_protocol_error( "partial write %d\n", ret );
+     if (errno == EPIPE) abort_thread(0);
+     if (errno == EFAULT) return STATUS_ACCESS_VIOLATION;
+     server_protocol_perror( "write" );
+-- 
+2.53.0
+
