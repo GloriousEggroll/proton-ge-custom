@@ -197,14 +197,8 @@ apply_all_in_dir() {
     echo "WINE: -STAGING- user32-FlashWindowEx manually applied"
     apply_all_in_dir "../wine-staging/patches/user32-FlashWindowEx/"
 
-#    echo "WINE: -STAGING- winex11-Fixed-scancodes manually applied"
-#    apply_all_in_dir "../wine-staging/patches/winex11-Fixed-scancodes/"
-
     echo "WINE: -STAGING- winex11-Window_Style manually applied"
     apply_all_in_dir "../wine-staging/patches/winex11-Window_Style/"
-
-#    echo "WINE: -STAGING- winex11-ime-check-thread-data manually applied"
-#    apply_all_in_dir "../wine-staging/patches/winex11-ime-check-thread-data/"
 
     echo "WINE: -STAGING- winex11.drv-Query_server_position manually applied"
     apply_all_in_dir "../wine-staging/patches/winex11.drv-Query_server_position/"
@@ -244,6 +238,10 @@ apply_all_in_dir() {
     echo "WINE: -GAME FIXES- add le mans ultimate patches"
     apply_patch "../patches/game-patches/lemansultimate-gameinput.patch"
 
+    # https://github.com/ValveSoftware/Proton/issues/1528#issuecomment-3901142370
+    echo "WINE: -GAME FIXES- add Vermintide 2 fix"
+    apply_patch "../patches/game-patches/0001-HACK-Force-Vermintide-2-current-working-directory-to.patch"
+
 ### END GAME PATCH SECTION ###
 
 ### (2-5) WINE HOTFIX/BACKPORT SECTION ###
@@ -278,10 +276,8 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/0002-HACK-kernelbase-add-redirection-for-libxess_dx11.dll.patch"
 
     # https://github.com/GloriousEggroll/proton-ge-custom/issues/433
-    echo "WINE: -PENDING- add arknights endfield fixes"
-    apply_patch "../patches/wine-hotfixes/pending/0008-wintrust-Prevent-checking-if-winex11-winewayland-are.patch"
+    echo "WINE: -PENDING- add Duet Knight Abyss fixes"
     apply_patch "../patches/wine-hotfixes/pending/0009-HACK-kernel32-Spoof-GetProcAddress-of-KiUserApcDispa.patch"
-    apply_patch "../patches/wine-hotfixes/pending/0011-ntdll-Implement-NtDelayExecution-relative-wait-using.patch"
 
     # https://github.com/StephenCWills/wine/commits/akiba/
     # https://github.com/ValveSoftware/Proton/issues/651#issuecomment-3564552601
@@ -326,6 +322,10 @@ apply_all_in_dir() {
     # https://steamcommunity.com/app/2074920/discussions/0/604168604057160448/
     echo "WINE: --CUSTOM-- add WINE_HOSTBLOCK envvar to allow working around some problematic anticheats (notably eac)"
     apply_patch "../patches/proton/wine_host_block_envvar.patch"
+
+    # https://github.com/GloriousEggroll/proton-ge-custom/issues/433
+    echo "WINE: -PENDING- add Duet Knight Abyss fixes"
+    apply_patch "../patches/wine-hotfixes/pending/0009-HACK-kernel32-Spoof-GetProcAddress-of-KiUserApcDispa.patch"
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
