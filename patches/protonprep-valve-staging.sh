@@ -231,16 +231,14 @@ apply_all_in_dir() {
     echo "WINE: -GAME FIXES- add xinput support to Dragon Age Inquisition"
     apply_patch "../patches/game-patches/dai_xinput.patch"
 
-    echo "WINE: -GAME FIXES- add unsupported os popup fix for star citizen"
+    echo "WINE: -GAME FIXES- add fixes for star citizen"
     apply_patch "../patches/game-patches/silence-starcitizen-unsupported-os.patch"
+    apply_patch "../patches/game-patches/eac_60101_timeout.patch"
+
 
     # https://github.com/JacKeTUs/wine/commits/lmu-d2d1-tinkering
     echo "WINE: -GAME FIXES- add le mans ultimate patches"
     apply_patch "../patches/game-patches/lemansultimate-gameinput.patch"
-
-    # https://github.com/ValveSoftware/Proton/issues/1528#issuecomment-3901142370
-    echo "WINE: -GAME FIXES- add Vermintide 2 fix"
-    apply_patch "../patches/game-patches/0001-HACK-Force-Vermintide-2-current-working-directory-to.patch"
 
 ### END GAME PATCH SECTION ###
 
@@ -284,6 +282,13 @@ apply_all_in_dir() {
     echo "WINE: -PENDING- add akibas trip undead & undressed patches"
     apply_patch "../patches/wine-hotfixes/pending/akibastrip-video-voice.patch"
 
+    # Separate OpenXR steam reliance
+    # https://github.com/GloriousEggroll/proton-ge-custom/issues/214
+    echo "WINE: -PENDING- add OpenXR patches"
+    apply_patch "../patches/wine-hotfixes/pending/0001-wineopenxr_add.patch"
+    apply_patch "../patches/wine-hotfixes/pending/0002-wineopenxr_enable.patch"
+
+
 ### END WINE PENDING UPSTREAM SECTION ###
 
 
@@ -322,10 +327,6 @@ apply_all_in_dir() {
     # https://steamcommunity.com/app/2074920/discussions/0/604168604057160448/
     echo "WINE: --CUSTOM-- add WINE_HOSTBLOCK envvar to allow working around some problematic anticheats (notably eac)"
     apply_patch "../patches/proton/wine_host_block_envvar.patch"
-
-    # https://github.com/GloriousEggroll/proton-ge-custom/issues/433
-    echo "WINE: -PENDING- add Duet Knight Abyss fixes"
-    apply_patch "../patches/wine-hotfixes/pending/0009-HACK-kernel32-Spoof-GetProcAddress-of-KiUserApcDispa.patch"
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
