@@ -285,8 +285,7 @@ apply_all_in_dir() {
     # Separate OpenXR steam reliance
     # https://github.com/GloriousEggroll/proton-ge-custom/issues/214
     echo "WINE: -PENDING- add OpenXR patches"
-    apply_patch "../patches/wine-hotfixes/pending/0001-wineopenxr_add.patch"
-    apply_patch "../patches/wine-hotfixes/pending/0002-wineopenxr_enable.patch"
+    apply_patch "../patches/wine-hotfixes/pending/0001-integrate-wineopenxr-into-proton.patch"
 
 
 ### END WINE PENDING UPSTREAM SECTION ###
