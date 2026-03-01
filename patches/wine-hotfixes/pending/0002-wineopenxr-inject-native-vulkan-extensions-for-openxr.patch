@@ -1,0 +1,191 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 01 Mar 2026 00:00:00 +0000
+Subject: [PATCH] wineopenxr: inject native Vulkan extensions for OpenXR device
+ creation
+
+Fix BeamNG.drive (and other VR games) failing to initialize VR on Linux
+because the required native Vulkan device extensions (VK_KHR_external_memory_fd,
+VK_KHR_external_semaphore_fd) were not being injected into the Vulkan device
+creation call.
+
+In the KHR2 path (xrCreateVulkanDeviceKHR), ensure:
+1. The __WINE_OPENXR_VK_DEVICE_EXTENSIONS env var is populated by calling
+   wine_openxr_init_once() before device creation.
+2. VK_WINE_openxr_device_extensions is added to the device extension list
+   so winevulkan reads the env var and injects the native extensions.
+3. As a safety net, the vk_create_device_callback on the Unix side also
+   injects any missing required native extensions from the env var before
+   passing the device creation to the host OpenXR runtime.
+---
+ dlls/wineopenxr/openxr.c        | 68 ++++++++++++++++++++++++++++++---
+ dlls/wineopenxr/openxr_loader.c | 33 +++++++++++++++-
+ 2 files changed, 95 insertions(+), 6 deletions(-)
+
+diff --git a/dlls/wineopenxr/openxr.c b/dlls/wineopenxr/openxr.c
+index 1111111..2222222 100644
+--- a/dlls/wineopenxr/openxr.c
++++ b/dlls/wineopenxr/openxr.c
+@@ -3,6 +3,7 @@
+
+ #define _GNU_SOURCE
+ #include <dlfcn.h>
++#include <string.h>
+
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+@@ -234,6 +235,14 @@ static VkResult WINAPI vk_create_instance_callback(const VkInstanceCreateInfo *c
+   return ret;
+ }
+
++static BOOL has_vk_extension(const VkDeviceCreateInfo *info, const char *ext) {
++  uint32_t i;
++  for (i = 0; i < info->enabledExtensionCount; i++) {
++    if (!strcmp(info->ppEnabledExtensionNames[i], ext))
++      return TRUE;
++  }
++  return FALSE;
++}
++
+ static VkResult WINAPI vk_create_device_callback(VkPhysicalDevice phys_dev,
+                                                  const VkDeviceCreateInfo *create_info,
+                                                  const VkAllocationCallbacks *allocator,
+@@ -243,16 +252,65 @@ static VkResult WINAPI vk_create_device_callback(VkPhysicalDevice phys_dev,
+   /* Only Unix calls here, called from the Unix side. */
+   struct vk_create_callback_context *c = context;
+   XrVulkanDeviceCreateInfoKHR our_create_info;
++  VkDeviceCreateInfo modified_create_info;
++  const char **new_extensions = NULL;
++  char *ext_copy = NULL;
++  const char *openxr_ext_str;
+   VkResult ret;
+
+   our_create_info = *(const XrVulkanDeviceCreateInfoKHR *)c->create_info;
+   our_create_info.pfnGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)pfnGetInstanceProcAddr;
+   our_create_info.vulkanPhysicalDevice = phys_dev;
+-  our_create_info.vulkanCreateInfo = create_info;
+   our_create_info.vulkanAllocator = allocator;
++
++  /* Ensure required native OpenXR Vulkan device extensions are present.
++   * The env var contains the space-separated list of native extensions
++   * required by the OpenXR runtime (e.g. VK_KHR_external_memory_fd,
++   * VK_KHR_external_semaphore_fd). Inject any that are missing from
++   * the device creation extension list. */
++  modified_create_info = *create_info;
++  openxr_ext_str = getenv("__WINE_OPENXR_VK_DEVICE_EXTENSIONS");
++  if (openxr_ext_str && *openxr_ext_str) {
++    char *count_copy = strdup(openxr_ext_str);
++    if (count_copy) {
++      /* First pass: count how many extensions are missing */
++      uint32_t extra_count = 0;
++      char *saveptr = NULL;
++      char *token = strtok_r(count_copy, " ", &saveptr);
++      while (token) {
++        if (*token && !has_vk_extension(create_info, token))
++          extra_count++;
++        token = strtok_r(NULL, " ", &saveptr);
++      }
++      free(count_copy);
++
++      if (extra_count > 0) {
++        ext_copy = strdup(openxr_ext_str);
++        if (ext_copy) {
++          uint32_t new_count = create_info->enabledExtensionCount + extra_count;
++          new_extensions = malloc(new_count * sizeof(*new_extensions));
++          if (new_extensions) {
++            uint32_t idx = create_info->enabledExtensionCount;
++            memcpy(new_extensions, create_info->ppEnabledExtensionNames,
++                   create_info->enabledExtensionCount * sizeof(*new_extensions));
++
++            /* Second pass: add missing extensions (pointers into ext_copy) */
++            saveptr = NULL;
++            token = strtok_r(ext_copy, " ", &saveptr);
++            while (token) {
++              if (*token && !has_vk_extension(create_info, token)) {
++                TRACE("Injecting missing OpenXR native extension: %s\n", token);
++                new_extensions[idx++] = token;
++              }
++              token = strtok_r(NULL, " ", &saveptr);
++            }
++
++            modified_create_info.ppEnabledExtensionNames = new_extensions;
++            modified_create_info.enabledExtensionCount = new_count;
++          }
++        }
++      }
++    }
++  }
++
++  our_create_info.vulkanCreateInfo = &modified_create_info;
+   c->ret = g_xr_host_instance_dispatch_table.p_xrCreateVulkanDeviceKHR(
+       wine_instance_from_handle(c->wine_instance)->host_instance, &our_create_info, vk_device, &ret);
++
++  free(new_extensions);
++  free(ext_copy);
+   return ret;
+ }
+
+diff --git a/dlls/wineopenxr/openxr_loader.c b/dlls/wineopenxr/openxr_loader.c
+index 3333333..4444444 100644
+--- a/dlls/wineopenxr/openxr_loader.c
++++ b/dlls/wineopenxr/openxr_loader.c
+@@ -1691,6 +1691,8 @@ XrResult WINAPI xrCreateVulkanDeviceKHR(XrInstance instance,
+   struct vk_create_callback_context context;
+   VkCreateInfoWineDeviceCallback callback;
+   VkDeviceCreateInfo vulkan_create_info;
++  const char **new_extensions = NULL;
++  BOOL has_openxr_ext = FALSE;
++  uint32_t i;
+
+   TRACE("instance %p, createInfo %p, vulkanDevice %p, vulkanResult %p.\n", instance, createInfo, vulkanDevice,
+         vulkanResult);
+@@ -1699,12 +1701,33 @@ XrResult WINAPI xrCreateVulkanDeviceKHR(XrInstance instance,
+     WARN("Unexpected flags %#lx.\n", (long)createInfo->createFlags);
+   }
+
++  /* Ensure the OpenXR device extensions environment variable is set so that
++   * winevulkan can inject the native extensions required by the OpenXR runtime
++   * (e.g. VK_KHR_external_memory_fd, VK_KHR_external_semaphore_fd). */
++  wine_openxr_init_once();
++
+   context.wine_instance = instance;
+   context.create_info = (UINT64)createInfo;
+
+   vulkan_create_info = *createInfo->vulkanCreateInfo;
++
++  /* Check if VK_WINE_openxr_device_extensions is already in the extension list */
++  for (i = 0; i < vulkan_create_info.enabledExtensionCount; i++) {
++    if (!strcmp(vulkan_create_info.ppEnabledExtensionNames[i], WINE_VULKAN_DEVICE_EXTENSION_NAME)) {
++      has_openxr_ext = TRUE;
++      break;
++    }
++  }
++
++  /* If not present, add it so winevulkan injects the native OpenXR extensions */
++  if (!has_openxr_ext) {
++    TRACE("Injecting %s into device extension list.\n", WINE_VULKAN_DEVICE_EXTENSION_NAME);
++    new_extensions = malloc((vulkan_create_info.enabledExtensionCount + 1) * sizeof(*new_extensions));
++    if (new_extensions) {
++      memcpy(new_extensions, vulkan_create_info.ppEnabledExtensionNames,
++             vulkan_create_info.enabledExtensionCount * sizeof(*new_extensions));
++      new_extensions[vulkan_create_info.enabledExtensionCount] = WINE_VULKAN_DEVICE_EXTENSION_NAME;
++      vulkan_create_info.ppEnabledExtensionNames = new_extensions;
++      vulkan_create_info.enabledExtensionCount++;
++    }
++  }
++
+   callback.sType = VK_STRUCTURE_TYPE_CREATE_INFO_WINE_DEVICE_CALLBACK;
+   callback.native_create_callback = (UINT64)(ULONG_PTR)g_vk_create_device_callback;
+   callback.context = &context;
+@@ -1714,6 +1737,8 @@ XrResult WINAPI xrCreateVulkanDeviceKHR(XrInstance instance,
+   *vulkanResult =
+       vkCreateDevice(createInfo->vulkanPhysicalDevice, &vulkan_create_info, createInfo->vulkanAllocator, vulkanDevice);
+
++  free(new_extensions);
++
+   if (context.ret == XR_SUCCESS && *vulkanResult != VK_SUCCESS) {
+     WARN("winevulkan instance creation failed after native xrCreateVulkanInstanceKHR() success.\n");
+   }
+--
+2.43.0
+

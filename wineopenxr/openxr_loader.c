@@ -1789,6 +1789,9 @@ XrResult WINAPI xrCreateVulkanDeviceKHR(XrInstance instance,
   struct vk_create_callback_context context;
   VkCreateInfoWineDeviceCallback callback;
   VkDeviceCreateInfo vulkan_create_info;
+  const char **new_extensions = NULL;
+  BOOL has_openxr_ext = FALSE;
+  uint32_t i;
 
   TRACE("instance %p, createInfo %p, vulkanDevice %p, vulkanResult %p.\n", instance, createInfo, vulkanDevice,
         vulkanResult);
@@ -1797,10 +1800,37 @@ XrResult WINAPI xrCreateVulkanDeviceKHR(XrInstance instance,
     WARN("Unexpected flags %#lx.\n", (long)createInfo->createFlags);
   }
 
+  /* Ensure the OpenXR device extensions environment variable is set so that
+   * winevulkan can inject the native extensions required by the OpenXR runtime
+   * (e.g. VK_KHR_external_memory_fd, VK_KHR_external_semaphore_fd). */
+  wine_openxr_init_once();
+
   context.wine_instance = instance;
   context.create_info = (UINT64)createInfo;
 
   vulkan_create_info = *createInfo->vulkanCreateInfo;
+
+  /* Check if VK_WINE_openxr_device_extensions is already in the extension list */
+  for (i = 0; i < vulkan_create_info.enabledExtensionCount; i++) {
+    if (!strcmp(vulkan_create_info.ppEnabledExtensionNames[i], WINE_VULKAN_DEVICE_EXTENSION_NAME)) {
+      has_openxr_ext = TRUE;
+      break;
+    }
+  }
+
+  /* If not present, add it so winevulkan injects the native OpenXR extensions */
+  if (!has_openxr_ext) {
+    TRACE("Injecting %s into device extension list.\n", WINE_VULKAN_DEVICE_EXTENSION_NAME);
+    new_extensions = malloc((vulkan_create_info.enabledExtensionCount + 1) * sizeof(*new_extensions));
+    if (new_extensions) {
+      memcpy(new_extensions, vulkan_create_info.ppEnabledExtensionNames,
+             vulkan_create_info.enabledExtensionCount * sizeof(*new_extensions));
+      new_extensions[vulkan_create_info.enabledExtensionCount] = WINE_VULKAN_DEVICE_EXTENSION_NAME;
+      vulkan_create_info.ppEnabledExtensionNames = new_extensions;
+      vulkan_create_info.enabledExtensionCount++;
+    }
+  }
+
   callback.sType = VK_STRUCTURE_TYPE_CREATE_INFO_WINE_DEVICE_CALLBACK;
   callback.native_create_callback = g_vk_create_device_callback;
   callback.context = &context;
@@ -1809,6 +1839,8 @@ XrResult WINAPI xrCreateVulkanDeviceKHR(XrInstance instance,
 
   *vulkanResult =
       vkCreateDevice(createInfo->vulkanPhysicalDevice, &vulkan_create_info, createInfo->vulkanAllocator, vulkanDevice);
+
+  free(new_extensions);
 
   if (context.ret == XR_SUCCESS && *vulkanResult != VK_SUCCESS) {
     WARN("winevulkan instance creation failed after native xrCreateVulkanInstanceKHR() success.\n");

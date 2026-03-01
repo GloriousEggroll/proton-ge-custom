@@ -4,6 +4,7 @@
 
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <string.h>
 #include <time.h>
 
 #include "ntstatus.h"
@@ -326,6 +327,15 @@ static VkResult WINAPI vk_create_instance_callback(const VkInstanceCreateInfo *c
   return ret;
 }
 
+static BOOL has_vk_extension(const VkDeviceCreateInfo *info, const char *ext) {
+  uint32_t i;
+  for (i = 0; i < info->enabledExtensionCount; i++) {
+    if (!strcmp(info->ppEnabledExtensionNames[i], ext))
+      return TRUE;
+  }
+  return FALSE;
+}
+
 static VkResult WINAPI vk_create_device_callback(VkPhysicalDevice phys_dev,
                                                  const VkDeviceCreateInfo *create_info,
                                                  const VkAllocationCallbacks *allocator,
@@ -335,15 +345,73 @@ static VkResult WINAPI vk_create_device_callback(VkPhysicalDevice phys_dev,
   /* Only Unix calls here, called from the Unix side. */
   struct vk_create_callback_context *c = context;
   XrVulkanDeviceCreateInfoKHR our_create_info;
+  VkDeviceCreateInfo modified_create_info;
+  const char **new_extensions = NULL;
+  char *ext_copy = NULL;
+  const char *openxr_ext_str;
   VkResult ret;
 
   our_create_info = *(const XrVulkanDeviceCreateInfoKHR *)c->create_info;
   our_create_info.pfnGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)pfnGetInstanceProcAddr;
   our_create_info.vulkanPhysicalDevice = phys_dev;
-  our_create_info.vulkanCreateInfo = create_info;
   our_create_info.vulkanAllocator = allocator;
+
+  /* Ensure required native OpenXR Vulkan device extensions are present.
+   * The env var contains the space-separated list of native extensions
+   * required by the OpenXR runtime (e.g. VK_KHR_external_memory_fd,
+   * VK_KHR_external_semaphore_fd). Inject any that are missing from
+   * the device creation extension list. */
+  modified_create_info = *create_info;
+  openxr_ext_str = getenv("__WINE_OPENXR_VK_DEVICE_EXTENSIONS");
+  if (openxr_ext_str && *openxr_ext_str) {
+    char *count_copy = strdup(openxr_ext_str);
+    if (count_copy) {
+      /* First pass: count how many extensions are missing */
+      uint32_t extra_count = 0;
+      char *saveptr = NULL;
+      char *token = strtok_r(count_copy, " ", &saveptr);
+      while (token) {
+        if (*token && !has_vk_extension(create_info, token))
+          extra_count++;
+        token = strtok_r(NULL, " ", &saveptr);
+      }
+      free(count_copy);
+
+      if (extra_count > 0) {
+        ext_copy = strdup(openxr_ext_str);
+        if (ext_copy) {
+          uint32_t new_count = create_info->enabledExtensionCount + extra_count;
+          new_extensions = malloc(new_count * sizeof(*new_extensions));
+          if (new_extensions) {
+            uint32_t idx = create_info->enabledExtensionCount;
+            memcpy(new_extensions, create_info->ppEnabledExtensionNames,
+                   create_info->enabledExtensionCount * sizeof(*new_extensions));
+
+            /* Second pass: add missing extensions (pointers into ext_copy) */
+            saveptr = NULL;
+            token = strtok_r(ext_copy, " ", &saveptr);
+            while (token) {
+              if (*token && !has_vk_extension(create_info, token)) {
+                TRACE("Injecting missing OpenXR native extension: %s\n", token);
+                new_extensions[idx++] = token;
+              }
+              token = strtok_r(NULL, " ", &saveptr);
+            }
+
+            modified_create_info.ppEnabledExtensionNames = new_extensions;
+            modified_create_info.enabledExtensionCount = new_count;
+          }
+        }
+      }
+    }
+  }
+
+  our_create_info.vulkanCreateInfo = &modified_create_info;
   c->ret = g_xr_host_instance_dispatch_table.p_xrCreateVulkanDeviceKHR(
       wine_instance_from_handle(c->wine_instance)->host_instance, &our_create_info, vk_device, &ret);
+
+  free(new_extensions);
+  free(ext_copy);
   return ret;
 }
 

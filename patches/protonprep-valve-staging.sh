@@ -287,6 +287,11 @@ apply_all_in_dir() {
     echo "WINE: -PENDING- add OpenXR patches"
     apply_patch "../patches/wine-hotfixes/pending/0001-integrate-wineopenxr-into-proton.patch"
 
+    # Fix BeamNG VR: inject native Vulkan extensions (VK_KHR_external_memory_fd,
+    # VK_KHR_external_semaphore_fd) during OpenXR device creation
+    echo "WINE: -PENDING- fix OpenXR Vulkan extension injection for VR"
+    apply_patch "../patches/wine-hotfixes/pending/0002-wineopenxr-inject-native-vulkan-extensions-for-openxr.patch"
+
 
 ### END WINE PENDING UPSTREAM SECTION ###
 
