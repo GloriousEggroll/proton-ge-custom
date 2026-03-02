@@ -48,7 +48,6 @@
 	- [HansKristian/themaister (Hans-Kristian Arntzen)](#hanskristianthemaister-hans-kristian-arntzen)
 	- [flibitijibibo (Ethan Lee)](#flibitijibibo-ethan-lee)
 	- [simmons-public (Chris Simmons)](#simmons-public-chris-simmons)
-	- [Sporif (Amine Hassane)](#sporif-amine-hassane)
 	- [wine-staging maintainers](#wine-staging-maintainers)
 	- [Reporters](#reporters)
 	- [Patrons](#patrons)
@@ -421,12 +420,6 @@ Ethan is the creator of FAudio, and he also listened to my Warframe bug reports 
 - https://github.com/simons-public
 
 Chris is the creator of the original 'protonfixes' project. The portions of 'protonfixes' I've imported are what allow customizations to be made to prefixes for various Proton games. Without 'protonfixes' many games would still be broken and/or require manual prefix modification.
-
-### Sporif (Amine Hassane)
-
-- https://github.com/Sporif
-
-Amine is the current maintainer of dxvk-async. This is a feature that was originally removed from DXVK as it happened around the same time a few Overwatch bans happened. It was thought, but never confirmed whether or not this feature caused the bans, so the feature was removed as a safety precaution. It is still safe to use in many single player games, and games that do not have competitive anti-cheats. It has also been confirmed to work safely in Warframe and Path of Exile.
 
 ### wine-staging maintainers
 
