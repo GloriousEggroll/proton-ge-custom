@@ -28,6 +28,11 @@ static struct {
     {"XR_KHR_win32_convert_performance_counter_time", "XR_KHR_convert_timespec_time", TRUE, TRUE},
 };
 
+/* OpenXR loader functions loaded via dlopen to avoid link-time dependency on libopenxr_loader.so */
+static PFN_xrCreateInstance p_xrCreateInstance;
+static PFN_xrGetInstanceProcAddr p_xrGetInstanceProcAddr;
+static PFN_xrEnumerateInstanceExtensionProperties p_xrEnumerateInstanceExtensionProperties;
+
 static XrResult (*p_xrConvertTimespecTimeToTimeKHR)(XrInstance, const struct timespec *, XrTime *);
 static XrResult (*p_xrConvertTimeToTimespecTimeKHR)(XrInstance, XrTime, struct timespec *);
 
@@ -83,21 +88,21 @@ XrResult WINAPI wine_xrCreateInstance(const XrInstanceCreateInfo *createInfo, Xr
     TRACE("  -%s\n", createInfo->enabledExtensionNames[i]);
   }
 
-  res = xrCreateInstance(createInfo, instance);
+  res = p_xrCreateInstance(createInfo, instance);
   if (res != XR_SUCCESS) {
     WARN("xrCreateInstance failed: %d\n", res);
     goto cleanup;
   }
 
 #define USE_XR_FUNC(x) \
-  xrGetInstanceProcAddr(*instance, #x, (PFN_xrVoidFunction *)&g_xr_host_instance_dispatch_table.p_##x);
+  p_xrGetInstanceProcAddr(*instance, #x, (PFN_xrVoidFunction *)&g_xr_host_instance_dispatch_table.p_##x);
   ALL_XR_INSTANCE_FUNCS()
 #undef USE_XR_FUNC
 
   /* These will be NULL if XR_KHR_convert_timespec_time is not available. */
-  xrGetInstanceProcAddr(*instance, "xrConvertTimespecTimeToTimeKHR",
+  p_xrGetInstanceProcAddr(*instance, "xrConvertTimespecTimeToTimeKHR",
                         (PFN_xrVoidFunction *)&p_xrConvertTimespecTimeToTimeKHR);
-  xrGetInstanceProcAddr(*instance, "xrConvertTimeToTimespecTimeKHR",
+  p_xrGetInstanceProcAddr(*instance, "xrConvertTimeToTimespecTimeKHR",
                         (PFN_xrVoidFunction *)&p_xrConvertTimeToTimespecTimeKHR);
 
 cleanup:
@@ -157,7 +162,7 @@ XrResult WINAPI wine_xrEnumerateInstanceExtensionProperties(const char *layerNam
 
   TRACE("\n");
 
-  res = xrEnumerateInstanceExtensionProperties(layerName, propertyCapacityInput, propertyCountOutput, properties);
+  res = p_xrEnumerateInstanceExtensionProperties(layerName, propertyCapacityInput, propertyCountOutput, properties);
   if (res != XR_SUCCESS) {
     return res;
   }
@@ -421,6 +426,26 @@ NTSTATUS init_openxr(void *args) {
   unixlib_handle_t unix_funcs;
   Dl_info info;
   void *unix_handle;
+  void *xr_handle;
+
+  /* Load OpenXR loader at runtime to avoid link-time dependency */
+  xr_handle = dlopen("libopenxr_loader.so.1", RTLD_NOW);
+  if (!xr_handle)
+    xr_handle = dlopen("libopenxr_loader.so", RTLD_NOW);
+  if (!xr_handle) {
+    ERR("Failed to load OpenXR loader: %s\n", dlerror());
+    return STATUS_DLL_NOT_FOUND;
+  }
+
+  p_xrCreateInstance = (PFN_xrCreateInstance)dlsym(xr_handle, "xrCreateInstance");
+  p_xrGetInstanceProcAddr = (PFN_xrGetInstanceProcAddr)dlsym(xr_handle, "xrGetInstanceProcAddr");
+  p_xrEnumerateInstanceExtensionProperties = (PFN_xrEnumerateInstanceExtensionProperties)dlsym(xr_handle, "xrEnumerateInstanceExtensionProperties");
+
+  if (!p_xrCreateInstance || !p_xrGetInstanceProcAddr || !p_xrEnumerateInstanceExtensionProperties) {
+    ERR("Failed to load OpenXR functions from loader.\n");
+    dlclose(xr_handle);
+    return STATUS_ENTRYPOINT_NOT_FOUND;
+  }
 
   status = NtQueryVirtualMemory(GetCurrentProcess(), params->winevulkan,
                                 (MEMORY_INFORMATION_CLASS)1000 /*MemoryWineUnixFuncs*/, &unix_funcs, sizeof(unix_funcs),
@@ -564,6 +589,6 @@ NTSTATUS is_available_instance_function_openxr(void *args)
     }
   }
 
-  params->ret = xrGetInstanceProcAddr(wine_instance ? wine_instance->host_instance : XR_NULL_HANDLE, params->name, &fn);
+  params->ret = p_xrGetInstanceProcAddr(wine_instance ? wine_instance->host_instance : XR_NULL_HANDLE, params->name, &fn);
   return STATUS_SUCCESS;
 }
