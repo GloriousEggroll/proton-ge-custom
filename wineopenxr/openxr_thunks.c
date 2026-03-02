@@ -5470,5 +5470,3 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
 C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == unix_count);
 
 #endif /* _WIN64 */
-
-C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == unix_count);

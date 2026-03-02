@@ -564,6 +564,6 @@ NTSTATUS is_available_instance_function_openxr(void *args)
     }
   }
 
-  params->ret = xrGetInstanceProcAddr(wine_instance ? wine_instance->host_instance : NULL, params->name, &fn);
+  params->ret = xrGetInstanceProcAddr(wine_instance ? wine_instance->host_instance : XR_NULL_HANDLE, params->name, &fn);
   return STATUS_SUCCESS;
 }
