@@ -1919,35 +1919,155 @@ XrResult WINAPI xrNegotiateLoaderRuntimeInterface(const XrNegotiateLoaderInfo *i
   return XR_SUCCESS;
 }
 
+/* Build a translated extension string from native OpenXR device extensions.
+ * - Prepends VK_WINE_openxr_device_extensions (for winevulkan env var injection)
+ * - Translates VK_KHR_external_memory_fd -> VK_KHR_external_memory_win32
+ * - Translates VK_KHR_external_semaphore_fd -> VK_KHR_external_semaphore_win32
+ * - Keeps all other extensions as-is
+ * Returns a malloc'd string; caller must free. Size including NUL stored in *out_size. */
+static char *translate_openxr_device_extensions(const char *native_exts, uint32_t *out_size)
+{
+    size_t native_len = strlen(native_exts);
+    /* Max size: prefix + space + native + extra for fd->win32 growth + NUL */
+    size_t max_size = sizeof(WINE_VULKAN_DEVICE_EXTENSION_NAME) + 1 + native_len + 64;
+    char *result = malloc(max_size);
+    const char *p;
+    size_t pos;
+
+    if (!result) return NULL;
+
+    /* Start with VK_WINE_openxr_device_extensions */
+    memcpy(result, WINE_VULKAN_DEVICE_EXTENSION_NAME, sizeof(WINE_VULKAN_DEVICE_EXTENSION_NAME) - 1);
+    pos = sizeof(WINE_VULKAN_DEVICE_EXTENSION_NAME) - 1;
+
+    /* Parse each space-separated native extension and translate */
+    p = native_exts;
+    while (*p)
+    {
+        const char *token_start;
+        size_t token_len;
+
+        while (*p == ' ') p++;
+        if (!*p) break;
+
+        token_start = p;
+        while (*p && *p != ' ') p++;
+        token_len = p - token_start;
+
+        result[pos++] = ' ';
+
+        if (token_len == 25 && !strncmp(token_start, "VK_KHR_external_memory_fd", 25))
+        {
+            memcpy(result + pos, "VK_KHR_external_memory_win32", 28);
+            pos += 28;
+        }
+        else if (token_len == 28 && !strncmp(token_start, "VK_KHR_external_semaphore_fd", 28))
+        {
+            memcpy(result + pos, "VK_KHR_external_semaphore_win32", 31);
+            pos += 31;
+        }
+        else
+        {
+            memcpy(result + pos, token_start, token_len);
+            pos += token_len;
+        }
+    }
+
+    result[pos] = '\0';
+    *out_size = (uint32_t)(pos + 1);
+    return result;
+}
+
 XrResult WINAPI xrGetVulkanDeviceExtensionsKHR(XrInstance instance, XrSystemId systemId, uint32_t bufferCapacityInput, uint32_t *bufferCountOutput, char *buffer)
 {
     struct xrGetVulkanDeviceExtensionsKHR_params params;
+    char *native_buffer = NULL;
+    uint32_t native_size = 0;
+    char *translated;
+    uint32_t translated_size;
     NTSTATUS _status;
 
-    /* Even while returning fixed string still call the host function, that is a part of OpenXR over Vulkan
-     * expected initialization sequence. */
+    TRACE("instance %p, systemId 0x%s, bufferCapacityInput %u, bufferCountOutput %p, buffer %p.\n",
+          instance, wine_dbgstr_longlong(systemId), bufferCapacityInput, bufferCountOutput, buffer);
+
+    /* Always query the native OpenXR runtime for required Vulkan device extensions.
+     * This call is part of the OpenXR-over-Vulkan expected initialization sequence
+     * and has important side effects in the runtime. */
+
+    /* Step 1: Get native extension list size */
     params.instance = instance;
     params.systemId = systemId;
-    params.bufferCapacityInput = bufferCapacityInput;
-    params.bufferCountOutput = bufferCountOutput;
-    params.buffer = buffer;
+    params.bufferCapacityInput = 0;
+    params.bufferCountOutput = &native_size;
+    params.buffer = NULL;
     _status = UNIX_CALL(xrGetVulkanDeviceExtensionsKHR, &params);
-    assert(!_status && "xrGetVulkanDeviceExtensionsKHR");
-
-    if (params.result == XR_SUCCESS && bufferCapacityInput)
+    assert(!_status && "xrGetVulkanDeviceExtensionsKHR size query");
+    if (params.result != XR_SUCCESS)
     {
-        __wine_set_unix_env(WINE_VULKAN_DEVICE_VARIABLE, buffer);
-        strcpy(buffer, WINE_VULKAN_DEVICE_EXTENSION_NAME);
-        *bufferCountOutput = sizeof(WINE_VULKAN_DEVICE_EXTENSION_NAME);
-        TRACE("returning %s.\n", buffer);
-    }
-    else if ((params.result == XR_SUCCESS || params.result == XR_ERROR_SIZE_INSUFFICIENT)
-            && *bufferCountOutput < sizeof(WINE_VULKAN_DEVICE_EXTENSION_NAME))
-    {
-        *bufferCountOutput = sizeof(WINE_VULKAN_DEVICE_EXTENSION_NAME);
+        *bufferCountOutput = 0;
+        return params.result;
     }
 
-    return params.result;
+    /* Step 2: Get the actual native extension string */
+    native_buffer = malloc(native_size);
+    if (!native_buffer)
+    {
+        ERR("Failed to allocate %u bytes for native extensions.\n", native_size);
+        *bufferCountOutput = 0;
+        return XR_ERROR_RUNTIME_FAILURE;
+    }
+    params.bufferCapacityInput = native_size;
+    params.bufferCountOutput = &native_size;
+    params.buffer = native_buffer;
+    _status = UNIX_CALL(xrGetVulkanDeviceExtensionsKHR, &params);
+    assert(!_status && "xrGetVulkanDeviceExtensionsKHR data query");
+    if (params.result != XR_SUCCESS)
+    {
+        free(native_buffer);
+        *bufferCountOutput = 0;
+        return params.result;
+    }
+
+    TRACE("native extensions: %s\n", native_buffer);
+
+    /* Step 3: Set the env var with native extensions so winevulkan can inject
+     * them when VK_WINE_openxr_device_extensions is used during device creation. */
+    __wine_set_unix_env(WINE_VULKAN_DEVICE_VARIABLE, native_buffer);
+
+    /* Step 4: Build a translated extension string for the Windows game:
+     * - VK_WINE_openxr_device_extensions (catch-all for winevulkan injection)
+     * - All native extensions, with Linux fd-based extensions translated to
+     *   their Win32 equivalents so the game can enable them directly. */
+    translated = translate_openxr_device_extensions(native_buffer, &translated_size);
+    free(native_buffer);
+    if (!translated)
+    {
+        ERR("Failed to translate extensions.\n");
+        *bufferCountOutput = 0;
+        return XR_ERROR_RUNTIME_FAILURE;
+    }
+
+    TRACE("translated extensions (%u bytes): %s\n", translated_size, translated);
+
+    if (!bufferCapacityInput)
+    {
+        *bufferCountOutput = translated_size;
+        free(translated);
+        return XR_SUCCESS;
+    }
+
+    if (bufferCapacityInput < translated_size)
+    {
+        *bufferCountOutput = translated_size;
+        free(translated);
+        return XR_ERROR_SIZE_INSUFFICIENT;
+    }
+
+    memcpy(buffer, translated, translated_size);
+    *bufferCountOutput = translated_size;
+    free(translated);
+    TRACE("returning: %s\n", buffer);
+    return XR_SUCCESS;
 }
 
 
