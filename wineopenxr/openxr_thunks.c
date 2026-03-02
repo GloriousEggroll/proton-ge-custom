@@ -29,9 +29,8 @@
 
 #include "openxr_private.h"
 
-WINE_DEFAULT_DEBUG_CHANNEL(openxr);
-
 #ifdef _WIN64
+WINE_DEFAULT_DEBUG_CHANNEL(openxr);
 static inline void convert_XrInstanceCreateInfo_win64_to_host(struct conversion_context *ctx, const XrInstanceCreateInfo *in, XrInstanceCreateInfo *out)
 {
     const XrBaseInStructure *in_header;
