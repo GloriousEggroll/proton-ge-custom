@@ -214,7 +214,7 @@ XrResult WINAPI wine_xrGetVulkanGraphicsDeviceKHR(XrInstance instance,
                                                   VkInstance vkInstance,
                                                   VkPhysicalDevice *vkPhysicalDevice) {
   XrResult res;
-  TRACE("0x%s, 0x%s, %p, %p\n", wine_dbgstr_longlong(instance), wine_dbgstr_longlong(systemId), vkInstance, vkPhysicalDevice);
+  TRACE("%p, 0x%s, %p, %p\n", (void *)(uintptr_t)instance, wine_dbgstr_longlong(systemId), vkInstance, vkPhysicalDevice);
   res = g_xr_host_instance_dispatch_table.p_xrGetVulkanGraphicsDeviceKHR(
       wine_instance_from_handle(instance)->host_instance, systemId, get_native_VkInstance(vkInstance),
       vkPhysicalDevice);
@@ -228,7 +228,7 @@ XrResult WINAPI wine_xrGetVulkanGraphicsDevice2KHR(XrInstance instance,
   XrVulkanGraphicsDeviceGetInfoKHR our_getinfo;
   XrResult res;
 
-  TRACE("instance 0x%s, getInfo %p, vulkanPhysicalDevice %p.\n", wine_dbgstr_longlong(instance), getInfo, vulkanPhysicalDevice);
+  TRACE("instance %p, getInfo %p, vulkanPhysicalDevice %p.\n", (void *)(uintptr_t)instance, getInfo, vulkanPhysicalDevice);
 
   if (getInfo->next) {
     WARN("Unsupported chained structure %p.\n", getInfo->next);
@@ -255,7 +255,7 @@ XrResult WINAPI wine_xrGetVulkanInstanceExtensionsKHR(XrInstance instance,
   XrResult res;
   uint32_t lin_len;
 
-  TRACE("0x%s, 0x%s, %u, %p, %p\n", wine_dbgstr_longlong(instance), wine_dbgstr_longlong(systemId), bufferCapacityInput, bufferCountOutput,
+  TRACE("%p, 0x%s, %u, %p, %p\n", (void *)(uintptr_t)instance, wine_dbgstr_longlong(systemId), bufferCapacityInput, bufferCountOutput,
         buffer);
 
   /* Linux SteamVR does not return xlib_surface, but Windows SteamVR _does_
@@ -485,8 +485,8 @@ XrResult wine_xrConvertWin32PerformanceCounterToTimeKHR(XrInstance instance,
   LONGLONG monotonic_qpc;
   XrResult res;
 
-  TRACE("instance 0x%s, performanceCounter %p (%lld), time %p\n",
-        wine_dbgstr_longlong(instance), performanceCounter,
+  TRACE("instance %p, performanceCounter %p (%lld), time %p\n",
+        (void *)(uintptr_t)instance, performanceCounter,
         performanceCounter ? (long long)performanceCounter->QuadPart : 0, time);
 
   if (!performanceCounter || !time)
@@ -517,8 +517,8 @@ XrResult wine_xrConvertTimeToWin32PerformanceCounterKHR(XrInstance instance,
   LONGLONG monotonic_qpc;
   XrResult res;
 
-  TRACE("instance 0x%s, time %lld, performanceCounter %p\n",
-        wine_dbgstr_longlong(instance), (long long)time, performanceCounter);
+  TRACE("instance %p, time %lld, performanceCounter %p\n",
+        (void *)(uintptr_t)instance, (long long)time, performanceCounter);
 
   if (!performanceCounter)
     return XR_ERROR_VALIDATION_FAILURE;
