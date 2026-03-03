@@ -575,6 +575,8 @@ NTSTATUS is_available_instance_function_openxr(void *args)
     "xrGetD3D12GraphicsRequirementsKHR",
     "xrConvertTimeToWin32PerformanceCounterKHR",
     "xrConvertWin32PerformanceCounterToTimeKHR",
+    "xrGetVulkanDeviceExtensionsKHR",
+    "xrGetVulkanInstanceExtensionsKHR",
   };
   wine_XrInstance *wine_instance = wine_instance_from_handle(params->instance);
   PFN_xrVoidFunction fn;
