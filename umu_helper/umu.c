@@ -537,8 +537,6 @@ int main(int argc, char *argv[])
 
     if ((sgi = getenv("SteamGameId")))
     {
-        WCHAR path[MAX_PATH], *p;
-
         set_gamingrepair_succeeded(sgi);
 
         if (env_nonzero("PROTON_WAIT_ATTACH"))
