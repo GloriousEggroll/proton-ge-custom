@@ -1,0 +1,3389 @@
+From 2bd122347dbc985840be80cb8534a165b9dc8686 Mon Sep 17 00:00:00 2001
+From: Elizabeth Figura <zfigura@codeweavers.com>
+Date: Mon, 7 Jul 2025 21:44:10 -0400
+Subject: [PATCH 142/502] ntsync implementation
+
+---
+ dlls/ntdll/unix/esync.c        |   2 +-
+ dlls/ntdll/unix/file.c         |   2 +-
+ dlls/ntdll/unix/fsync.c        |   2 +-
+ dlls/ntdll/unix/process.c      |   2 +-
+ dlls/ntdll/unix/server.c       |  13 +-
+ dlls/ntdll/unix/sync.c         | 741 ++++++++++++++++++++++++++++++++-
+ dlls/ntdll/unix/thread.c       |   2 +-
+ dlls/ntdll/unix/unix_private.h |   6 +
+ dlls/ntdll/unix/virtual.c      |   1 +
+ include/wine/server_protocol.h |  62 ++-
+ server/change.c                |   2 +-
+ server/completion.c            |  27 +-
+ server/console.c               |  61 ++-
+ server/debugger.c              |  21 +-
+ server/device.c                |  31 +-
+ server/esync.c                 |   2 +-
+ server/event.c                 |  79 +++-
+ server/fd.c                    |  32 +-
+ server/file.h                  |   1 +
+ server/fsync.c                 |   2 +-
+ server/inproc_sync.c           | 145 +++++++
+ server/mailslot.c              |   6 +-
+ server/main.c                  |   5 +-
+ server/mutex.c                 | 115 +++--
+ server/named_pipe.c            |   8 +-
+ server/object.h                |   7 +
+ server/process.c               |  31 +-
+ server/process.h               |   1 +
+ server/protocol.def            |  23 +
+ server/queue.c                 |  86 +++-
+ server/request_handlers.h      |  19 +
+ server/request_trace.h         |  41 ++
+ server/semaphore.c             |  68 ++-
+ server/serial.c                |   2 +-
+ server/sock.c                  |   2 +-
+ server/thread.c                |  33 +-
+ server/thread.h                |   2 +
+ server/timer.c                 |  18 +-
+ 38 files changed, 1578 insertions(+), 125 deletions(-)
+
+diff --git a/dlls/ntdll/unix/esync.c b/dlls/ntdll/unix/esync.c
+index 3074f7c72ea..f9f65b28d3d 100644
+--- a/dlls/ntdll/unix/esync.c
++++ b/dlls/ntdll/unix/esync.c
+@@ -57,7 +57,7 @@ int do_esync(void)
+     static int do_esync_cached = -1;
+ 
+     if (do_esync_cached == -1)
+-        do_esync_cached = getenv("WINEESYNC") && atoi(getenv("WINEESYNC")) && !do_fsync();
++        do_esync_cached = getenv("WINEESYNC") && atoi(getenv("WINEESYNC")) && !do_fsync() && get_linux_sync_device() < 0;
+ 
+     return do_esync_cached;
+ #else
+diff --git a/dlls/ntdll/unix/file.c b/dlls/ntdll/unix/file.c
+index c6d5a3d0c47..d6ceeaf2863 100644
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -7417,7 +7417,7 @@ NTSTATUS WINAPI NtLockFile( HANDLE file, HANDLE event, PIO_APC_ROUTINE apc, void
+         }
+         if (handle)
+         {
+-            NtWaitForSingleObject( handle, FALSE, NULL );
++            wait_internal_server( handle, FALSE, NULL );
+             NtClose( handle );
+         }
+         else  /* Unix lock conflict, sleep a bit and retry */
+diff --git a/dlls/ntdll/unix/fsync.c b/dlls/ntdll/unix/fsync.c
+index a54fb0e4b7b..2f1cf481da1 100644
+--- a/dlls/ntdll/unix/fsync.c
++++ b/dlls/ntdll/unix/fsync.c
+@@ -171,7 +171,7 @@ int do_fsync(void)
+     if (do_fsync_cached == -1)
+     {
+         syscall( __NR_futex_waitv, NULL, 0, 0, NULL, 0 );
+-        do_fsync_cached = getenv("WINEFSYNC") && atoi(getenv("WINEFSYNC")) && errno != ENOSYS && errno != EPERM;
++        do_fsync_cached = getenv("WINEFSYNC") && atoi(getenv("WINEFSYNC")) && errno != ENOSYS && errno != EPERM && get_linux_sync_device() < 0;
+     }
+ 
+     return do_fsync_cached;
+diff --git a/dlls/ntdll/unix/process.c b/dlls/ntdll/unix/process.c
+index e33de3014ba..70c4bba027b 100644
+--- a/dlls/ntdll/unix/process.c
++++ b/dlls/ntdll/unix/process.c
+@@ -911,7 +911,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
+ 
+     /* wait for the new process info to be ready */
+ 
+-    NtWaitForSingleObject( process_info, FALSE, NULL );
++    wait_internal_server( process_info, FALSE, NULL );
+     SERVER_START_REQ( get_new_process_info )
+     {
+         req->info = wine_server_obj_handle( process_info );
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+index 92fdf68b000..71406976f4e 100644
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -800,7 +800,6 @@ unsigned int server_wait( const union select_op *select_op, data_size_t size, UI
+     return ret;
+ }
+ 
+-
+ /***********************************************************************
+  *              NtContinue  (NTDLL.@)
+  */
+@@ -877,7 +876,7 @@ unsigned int server_queue_process_apc( HANDLE process, const union apc_call *cal
+         }
+         else
+         {
+-            NtWaitForSingleObject( handle, FALSE, NULL );
++            wait_internal_server( handle, FALSE, NULL );
+ 
+             SERVER_START_REQ( get_apc_result )
+             {
+@@ -1813,12 +1812,17 @@ NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE
+         return result.dup_handle.status;
+     }
+ 
++    /* hold fd_cache_mutex to prevent the fd from being added again between the
++     * call to remove_fd_from_cache and close_handle */
+     server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
+ 
+     /* always remove the cached fd; if the server request fails we'll just
+      * retrieve it again */
+     if (options & DUPLICATE_CLOSE_SOURCE)
++    {
+         fd = remove_fd_from_cache( source );
++        close_inproc_sync_obj( source );
++    }
+ 
+     SERVER_START_REQ( dup_handle )
+     {
+@@ -1884,12 +1888,17 @@ NTSTATUS WINAPI NtClose( HANDLE handle )
+     if (HandleToLong( handle ) >= ~5 && HandleToLong( handle ) <= ~0)
+         return STATUS_SUCCESS;
+ 
++
++    /* hold fd_cache_mutex to prevent the fd from being added again between the
++     * call to remove_fd_from_cache and close_handle */
+     server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
+ 
+     /* always remove the cached fd; if the server request fails we'll just
+      * retrieve it again */
+     fd = remove_fd_from_cache( handle );
+ 
++    close_inproc_sync_obj( handle );
++
+     if (do_fsync())
+         fsync_close( handle );
+ 
+diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+index a791a054951..e877d2eae53 100644
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -30,9 +30,11 @@
+ #include <assert.h>
+ #include <errno.h>
+ #include <fcntl.h>
++#include <inttypes.h>
+ #include <limits.h>
+ #include <signal.h>
+ #include <sys/types.h>
++#include <sys/ioctl.h>
+ #include <sys/mman.h>
+ #ifdef HAVE_SYS_SYSCALL_H
+ #include <sys/syscall.h>
+@@ -48,6 +50,7 @@
+ #endif
+ #include <string.h>
+ #include <stdarg.h>
++#include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <time.h>
+@@ -307,7 +310,7 @@ static unsigned int validate_open_object_attributes( const OBJECT_ATTRIBUTES *at
+ 
+ #ifdef NTSYNC_IOC_EVENT_READ
+ 
+-static int get_linux_sync_device(void)
++int get_linux_sync_device(void)
+ {
+     static LONG device = -2;
+ 
+@@ -343,66 +346,776 @@ static int get_linux_sync_device(void)
+     return device;
+ }
+ 
++/* It's possible for synchronization primitives to remain alive even after being
++ * closed, because a thread is still waiting on them. It's rare in practice, and
++ * documented as being undefined behaviour by Microsoft, but it works, and some
++ * applications rely on it. This means we need to refcount handles, and defer
++ * deleting them on the server side until the refcount reaches zero. We do this
++ * by having each client process hold a handle to the in-process synchronization
++ * object, as well as a private refcount. When the client refcount reaches zero,
++ * it closes the handle; when all handles are closed, the server deletes the
++ * in-process synchronization object.
++ *
++ * We also need this for signal-and-wait. The signal and wait operations aren't
++ * atomic, but we can't perform the signal and then return STATUS_INVALID_HANDLE
++ * for the wait—we need to either do both operations or neither. That means we
++ * need to grab references to both objects, and prevent them from being
++ * destroyed before we're done with them.
++ *
++ * We want lookup of objects from the cache to be very fast; ideally, it should
++ * be lock-free. We achieve this by using atomic modifications to "refcount",
++ * and guaranteeing that all other fields are valid and correct *as long as*
++ * refcount is nonzero, and we store the entire structure in memory which will
++ * never be freed.
++ *
++ * This means that acquiring the object can't use a simple atomic increment; it
++ * has to use a compare-and-swap loop to ensure that it doesn't try to increment
++ * an object with a zero refcount. That's still leagues better than a real lock,
++ * though, and release can be a single atomic decrement.
++ *
++ * It also means that threads modifying the cache need to take a lock, to
++ * prevent other threads from writing to it concurrently.
++ *
++ * It's possible for an object currently in use (by a waiter) to be closed and
++ * the same handle immediately reallocated to a different object. This should be
++ * a very rare situation, and in that case we simply don't cache the handle.
++ */
++struct inproc_sync_cache_entry
++{
++    LONG refcount;
++    int fd;
++    unsigned int access;
++    unsigned short type; /* enum inproc_sync_type, stored as short to save space */
++    unsigned short closed;
++};
++
++
++static void release_inproc_sync_obj( struct inproc_sync_cache_entry *cache )
++{
++    /* save the fd now; as soon as the refcount hits 0 we cannot
++     * access the cache anymore */
++    int fd = cache->fd;
++    LONG refcount = InterlockedDecrement( &cache->refcount );
++
++    assert( refcount >= 0 );
++
++    if (!refcount)
++        close( fd );
++}
++
++#define INPROC_SYNC_CACHE_BLOCK_SIZE  (65536 / sizeof(struct inproc_sync_cache_entry))
++#define INPROC_SYNC_CACHE_ENTRIES     128
++
++static struct inproc_sync_cache_entry *inproc_sync_cache[INPROC_SYNC_CACHE_ENTRIES];
++static struct inproc_sync_cache_entry inproc_sync_cache_initial_block[INPROC_SYNC_CACHE_BLOCK_SIZE];
++
++static inline unsigned int inproc_sync_handle_to_index( HANDLE handle, unsigned int *entry )
++{
++    unsigned int idx = (wine_server_obj_handle(handle) >> 2) - 1;
++    *entry = idx / INPROC_SYNC_CACHE_BLOCK_SIZE;
++    return idx % INPROC_SYNC_CACHE_BLOCK_SIZE;
++}
++
++static struct inproc_sync_cache_entry *cache_inproc_sync_obj( HANDLE handle, obj_handle_t inproc_sync, int fd,
++                                                              enum inproc_sync_type type, unsigned int access )
++{
++    unsigned int entry, idx = inproc_sync_handle_to_index( handle, &entry );
++    struct inproc_sync_cache_entry *cache;
++    int refcount;
++
++    /* don't cache pseudo-handles; waiting on them is pointless anyway */
++    if ((ULONG)(ULONG_PTR)handle > 0xfffffffa)
++        return FALSE;
++
++    if (entry >= INPROC_SYNC_CACHE_ENTRIES)
++    {
++        FIXME( "too many allocated handles, not caching %p\n", handle );
++        return NULL;
++    }
++
++    if (!inproc_sync_cache[entry])  /* do we need to allocate a new block of entries? */
++    {
++        if (!entry) inproc_sync_cache[0] = inproc_sync_cache_initial_block;
++        else
++        {
++            static const size_t size = INPROC_SYNC_CACHE_BLOCK_SIZE * sizeof(struct inproc_sync_cache_entry);
++            void *ptr = anon_mmap_alloc( size, PROT_READ | PROT_WRITE );
++            if (ptr == MAP_FAILED) return NULL;
++            if (InterlockedCompareExchangePointer( (void **)&inproc_sync_cache[entry], ptr, NULL ))
++                munmap( ptr, size ); /* someone beat us to it */
++        }
++    }
++
++    cache = &inproc_sync_cache[entry][idx];
++
++    if (InterlockedCompareExchange( &cache->refcount, 0, 0 ))
++    {
++        /* The handle is currently being used for another object (i.e. it was
++         * closed and then reused, but some thread is waiting on the old handle
++         * or otherwise simultaneously using the old object). We can't cache
++         * this object until the old one is completely destroyed. */
++        return NULL;
++    }
++
++    cache->fd = fd;
++    cache->type = type;
++    cache->access = access;
++    cache->closed = FALSE;
++    /* Make sure we set the other members before the refcount; this store needs
++     * release semantics [paired with the load in get_cached_inproc_sync_obj()].
++     * Set the refcount to 2 (one for the handle, one for the caller). */
++    refcount = InterlockedExchange( &cache->refcount, 2 );
++    assert( !refcount );
++
++    return cache;
++}
++
++/* returns the previous value */
++static inline LONG interlocked_inc_if_nonzero( LONG *dest )
++{
++    LONG val, tmp;
++    for (val = *dest;; val = tmp)
++    {
++        if (!val || (tmp = InterlockedCompareExchange( dest, val + 1, val )) == val)
++            break;
++    }
++    return val;
++}
++
++static struct inproc_sync_cache_entry *get_cached_inproc_sync_obj( HANDLE handle )
++{
++    unsigned int entry, idx = inproc_sync_handle_to_index( handle, &entry );
++    struct inproc_sync_cache_entry *cache;
++
++    if (entry >= INPROC_SYNC_CACHE_ENTRIES || !inproc_sync_cache[entry])
++        return NULL;
++
++    cache = &inproc_sync_cache[entry][idx];
++
++    /* this load needs acquire semantics [paired with the store in
++     * cache_inproc_sync_obj()] */
++    if (!interlocked_inc_if_nonzero( &cache->refcount ))
++        return NULL;
++
++    if (cache->closed)
++    {
++        /* The object is still being used, but "handle" has been closed. The
++         * handle value might have been reused for another object in the
++         * meantime, in which case we have to report that valid object, so
++         * force the caller to check the server. */
++        release_inproc_sync_obj( cache );
++        return NULL;
++    }
++
++    return cache;
++}
++
++
++static BOOL inproc_sync_types_match( enum inproc_sync_type a, enum inproc_sync_type b )
++{
++    if (a == b) return TRUE;
++    if (a == INPROC_SYNC_AUTO_EVENT && b == INPROC_SYNC_MANUAL_EVENT) return TRUE;
++    if (b == INPROC_SYNC_AUTO_EVENT && a == INPROC_SYNC_MANUAL_EVENT) return TRUE;
++    return FALSE;
++}
++
++
++/* returns a pointer to a cache entry; if the object could not be cached,
++ * returns "stack_cache" instead, which should be allocated on stack */
++static NTSTATUS get_inproc_sync_obj( HANDLE handle, enum inproc_sync_type desired_type,
++                                     ACCESS_MASK desired_access,
++                                     struct inproc_sync_cache_entry *stack_cache,
++                                     struct inproc_sync_cache_entry **ret_cache )
++{
++    struct inproc_sync_cache_entry *cache;
++    obj_handle_t inproc_sync_handle;
++    enum inproc_sync_type type;
++    unsigned int access;
++    sigset_t sigset;
++    NTSTATUS ret;
++    int fd;
++
++    /* We don't need the device right now, but if we can't access it, that
++     * means ntsync isn't available. Fail fast in that case. */
++    if (get_linux_sync_device() < 0)
++        return STATUS_NOT_IMPLEMENTED;
++
++    /* try to find it in the cache already */
++    if ((cache = get_cached_inproc_sync_obj( handle )))
++    {
++        *ret_cache = cache;
++        return STATUS_SUCCESS;
++    }
++
++    /* We need to use fd_cache_mutex here to protect against races with
++     * other threads trying to receive fds for the fd cache,
++     * and we need to use an uninterrupted section to prevent reentrancy.
++     * We also need fd_cache_mutex to protect against the same race with
++     * NtClose, that is, to prevent the object from being cached again between
++     * close_inproc_sync_obj() and close_handle. */
++    server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
++
++    if ((cache = get_cached_inproc_sync_obj( handle )))
++    {
++        server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
++        *ret_cache = cache;
++        return STATUS_SUCCESS;
++    }
++
++    SERVER_START_REQ( get_linux_sync_obj )
++    {
++        req->handle = wine_server_obj_handle( handle );
++        if (!(ret = wine_server_call( req )))
++        {
++            obj_handle_t fd_handle;
++            fd = receive_fd( &fd_handle );
++            assert( wine_server_ptr_handle(fd_handle) == handle );
++            access = reply->access;
++            type = reply->type;
++        }
++    }
++    SERVER_END_REQ;
++
++    if (ret)
++    {
++        server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
++        return ret;
++    }
++
++    cache = cache_inproc_sync_obj( handle, inproc_sync_handle, fd, type, access );
++
++    server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
++
++    if (!cache)
++    {
++        cache = stack_cache;
++        cache->fd = fd;
++        cache->type = type;
++        cache->access = access;
++        cache->closed = FALSE;
++        cache->refcount = 1;
++    }
++
++    *ret_cache = cache;
++
++    if (desired_type && !inproc_sync_types_match( cache->type, desired_type ))
++    {
++        release_inproc_sync_obj( cache );
++        return STATUS_OBJECT_TYPE_MISMATCH;
++    }
++
++    if ((cache->access & desired_access) != desired_access)
++    {
++        release_inproc_sync_obj( cache );
++        return STATUS_ACCESS_DENIED;
++    }
++
++    return STATUS_SUCCESS;
++}
++
++
++static NTSTATUS linux_release_semaphore_obj( int obj, ULONG count, ULONG *prev_count )
++{
++    NTSTATUS ret;
++
++    ret = ioctl( obj, NTSYNC_IOC_SEM_RELEASE, &count );
++    if (ret < 0)
++    {
++        if (errno == EOVERFLOW)
++            return STATUS_SEMAPHORE_LIMIT_EXCEEDED;
++        else
++            return errno_to_status( errno );
++    }
++    if (prev_count) *prev_count = count;
++    return STATUS_SUCCESS;
++}
++
+ static NTSTATUS inproc_release_semaphore( HANDLE handle, ULONG count, ULONG *prev_count )
+ {
+-    return STATUS_NOT_IMPLEMENTED;
++    struct inproc_sync_cache_entry stack_cache, *cache;
++    NTSTATUS ret;
++
++    if ((ret = get_inproc_sync_obj( handle, INPROC_SYNC_SEMAPHORE,
++        SEMAPHORE_MODIFY_STATE, &stack_cache, &cache )))
++        return ret;
++
++    ret = linux_release_semaphore_obj( cache->fd, count, prev_count );
++
++    release_inproc_sync_obj( cache );
++    return ret;
++}
++
++static NTSTATUS linux_query_semaphore_obj( int obj, SEMAPHORE_BASIC_INFORMATION *info )
++{
++    struct ntsync_sem_args args = {0};
++    NTSTATUS ret;
++
++    ret = ioctl( obj, NTSYNC_IOC_SEM_READ, &args );
++    if (ret < 0)
++        return errno_to_status( errno );
++    info->CurrentCount = args.count;
++    info->MaximumCount = args.max;
++    return STATUS_SUCCESS;
+ }
+ 
+ static NTSTATUS inproc_query_semaphore( HANDLE handle, SEMAPHORE_BASIC_INFORMATION *info )
+ {
+-    return STATUS_NOT_IMPLEMENTED;
++    struct inproc_sync_cache_entry stack_cache, *cache;
++    NTSTATUS ret;
++
++    if ((ret = get_inproc_sync_obj( handle, INPROC_SYNC_SEMAPHORE,
++        SEMAPHORE_QUERY_STATE, &stack_cache, &cache )))
++        return ret;
++
++    ret = linux_query_semaphore_obj( cache->fd, info );
++
++    release_inproc_sync_obj( cache );
++    return ret;
++}
++
++static NTSTATUS linux_set_event_obj( int obj, LONG *prev_state )
++{
++    NTSTATUS ret;
++    __u32 prev;
++
++    ret = ioctl( obj, NTSYNC_IOC_EVENT_SET, &prev );
++    if (ret < 0)
++        return errno_to_status( errno );
++    if (prev_state) *prev_state = prev;
++    return STATUS_SUCCESS;
+ }
+ 
+ static NTSTATUS inproc_set_event( HANDLE handle, LONG *prev_state )
+ {
+-    return STATUS_NOT_IMPLEMENTED;
++    struct inproc_sync_cache_entry stack_cache, *cache;
++    NTSTATUS ret;
++
++    if ((ret = get_inproc_sync_obj( handle, INPROC_SYNC_AUTO_EVENT,
++        EVENT_MODIFY_STATE, &stack_cache, &cache )))
++        return ret;
++
++    ret = linux_set_event_obj( cache->fd, prev_state );
++
++    release_inproc_sync_obj( cache );
++    return ret;
++}
++
++static NTSTATUS linux_reset_event_obj( int obj, LONG *prev_state )
++{
++    NTSTATUS ret;
++    __u32 prev;
++
++    ret = ioctl( obj, NTSYNC_IOC_EVENT_RESET, &prev );
++    if (ret < 0)
++        return errno_to_status( errno );
++    if (prev_state) *prev_state = prev;
++    return STATUS_SUCCESS;
+ }
+ 
+ static NTSTATUS inproc_reset_event( HANDLE handle, LONG *prev_state )
+ {
+-    return STATUS_NOT_IMPLEMENTED;
++    struct inproc_sync_cache_entry stack_cache, *cache;
++    NTSTATUS ret;
++
++    if ((ret = get_inproc_sync_obj( handle, INPROC_SYNC_AUTO_EVENT,
++        EVENT_MODIFY_STATE, &stack_cache, &cache )))
++        return ret;
++
++    ret = linux_reset_event_obj( cache->fd, prev_state );
++
++    release_inproc_sync_obj( cache );
++    return ret;
++}
++
++static NTSTATUS linux_pulse_event_obj( int obj, LONG *prev_state )
++{
++    NTSTATUS ret;
++    __u32 prev;
++
++    ret = ioctl( obj, NTSYNC_IOC_EVENT_PULSE, &prev );
++    if (ret < 0)
++        return errno_to_status( errno );
++    if (prev_state) *prev_state = prev;
++    return STATUS_SUCCESS;
+ }
+ 
+ static NTSTATUS inproc_pulse_event( HANDLE handle, LONG *prev_state )
+ {
+-    return STATUS_NOT_IMPLEMENTED;
++    struct inproc_sync_cache_entry stack_cache, *cache;
++    NTSTATUS ret;
++
++    if ((ret = get_inproc_sync_obj( handle, INPROC_SYNC_AUTO_EVENT,
++        EVENT_MODIFY_STATE, &stack_cache, &cache )))
++        return ret;
++
++    ret = linux_pulse_event_obj( cache->fd, prev_state );
++
++    release_inproc_sync_obj( cache );
++    return ret;
++}
++
++static NTSTATUS linux_query_event_obj( int obj, enum inproc_sync_type type, EVENT_BASIC_INFORMATION *info )
++{
++    struct ntsync_event_args args = {0};
++    NTSTATUS ret;
++
++    ret = ioctl( obj, NTSYNC_IOC_EVENT_READ, &args );
++    if (ret < 0)
++        return errno_to_status( errno );
++    info->EventType = (type == INPROC_SYNC_AUTO_EVENT) ? SynchronizationEvent : NotificationEvent;
++    info->EventState = args.signaled;
++    return STATUS_SUCCESS;
+ }
+ 
+ static NTSTATUS inproc_query_event( HANDLE handle, EVENT_BASIC_INFORMATION *info )
+ {
+-    return STATUS_NOT_IMPLEMENTED;
++    struct inproc_sync_cache_entry stack_cache, *cache;
++    NTSTATUS ret;
++
++    if ((ret = get_inproc_sync_obj( handle, INPROC_SYNC_AUTO_EVENT,
++        EVENT_QUERY_STATE, &stack_cache, &cache )))
++        return ret;
++
++    ret = linux_query_event_obj( cache->fd, cache->type, info );
++
++    release_inproc_sync_obj( cache );
++    return ret;
++}
++
++static NTSTATUS linux_release_mutex_obj( int obj, LONG *prev_count )
++{
++    struct ntsync_mutex_args args = {0};
++    NTSTATUS ret;
++
++    args.owner = GetCurrentThreadId();
++    ret = ioctl( obj, NTSYNC_IOC_MUTEX_UNLOCK, &args );
++
++    if (ret < 0)
++    {
++        if (errno == EOVERFLOW)
++            return STATUS_MUTANT_LIMIT_EXCEEDED;
++        else if (errno == EPERM)
++            return STATUS_MUTANT_NOT_OWNED;
++        else
++            return errno_to_status( errno );
++    }
++    if (prev_count) *prev_count = 1 - args.count;
++    return STATUS_SUCCESS;
+ }
+ 
+ static NTSTATUS inproc_release_mutex( HANDLE handle, LONG *prev_count )
+ {
+-    return STATUS_NOT_IMPLEMENTED;
++    struct inproc_sync_cache_entry stack_cache, *cache;
++    NTSTATUS ret;
++
++    if ((ret = get_inproc_sync_obj( handle, INPROC_SYNC_MUTEX, 0, &stack_cache, &cache )))
++        return ret;
++
++    ret = linux_release_mutex_obj( cache->fd, prev_count );
++
++    release_inproc_sync_obj( cache );
++    return ret;
++}
++
++static NTSTATUS linux_query_mutex_obj( int obj, MUTANT_BASIC_INFORMATION *info )
++{
++    struct ntsync_mutex_args args = {0};
++    NTSTATUS ret;
++
++    ret = ioctl( obj, NTSYNC_IOC_MUTEX_READ, &args );
++
++    if (ret < 0)
++    {
++        if (errno == EOWNERDEAD)
++        {
++            info->AbandonedState = TRUE;
++            info->OwnedByCaller = FALSE;
++            info->CurrentCount = 1;
++            return STATUS_SUCCESS;
++        }
++        else
++            return errno_to_status( errno );
++    }
++    info->AbandonedState = FALSE;
++    info->OwnedByCaller = (args.owner == GetCurrentThreadId());
++    info->CurrentCount = 1 - args.count;
++    return STATUS_SUCCESS;
+ }
+ 
+ static NTSTATUS inproc_query_mutex( HANDLE handle, MUTANT_BASIC_INFORMATION *info )
+ {
+-    return STATUS_NOT_IMPLEMENTED;
++    struct inproc_sync_cache_entry stack_cache, *cache;
++    NTSTATUS ret;
++
++    if ((ret = get_inproc_sync_obj( handle, INPROC_SYNC_MUTEX, MUTANT_QUERY_STATE,
++        &stack_cache, &cache )))
++        return ret;
++
++    ret = linux_query_mutex_obj( cache->fd, info );
++
++    release_inproc_sync_obj( cache );
++    return ret;
++}
++
++static void select_queue(void)
++{
++    SERVER_START_REQ( select_inproc_queue )
++    {
++        wine_server_call( req );
++    }
++    SERVER_END_REQ;
++}
++
++static void unselect_queue( BOOL signaled )
++{
++    SERVER_START_REQ( unselect_inproc_queue )
++    {
++        req->signaled = signaled;
++        wine_server_call( req );
++    }
++    SERVER_END_REQ;
++}
++
++static int get_inproc_alert_obj(void)
++{
++    struct ntdll_thread_data *data = ntdll_get_thread_data();
++    struct inproc_sync_cache_entry stack_cache, *cache;
++    HANDLE alert_handle;
++    unsigned int ret;
++
++    if (data->linux_alert_obj == -1)
++    {
++        SERVER_START_REQ( get_inproc_alert_event )
++        {
++            if ((ret = wine_server_call( req )))
++                ERR( "failed to get inproc alert event, status %#x\n", ret );
++            alert_handle = wine_server_ptr_handle( reply->handle );
++        }
++        SERVER_END_REQ;
++
++        if ((ret = get_inproc_sync_obj( alert_handle, 0, SYNCHRONIZE, &stack_cache, &cache )))
++            ERR( "failed to get inproc alert obj, status %#x\n", ret );
++        data->linux_alert_obj = cache->fd;
++        /* Set the fd to -1 so release_inproc_sync_obj() won't close it.
++         * Manhandling the cache entry here is fine since we're the only thread
++         * that can access our own alert event. */
++        cache->fd = -1;
++        release_inproc_sync_obj( cache );
++        NtClose( alert_handle );
++    }
++
++    return data->linux_alert_obj;
++}
++
++static NTSTATUS linux_wait_objs( int device, const DWORD count, const int *objs,
++                                 BOOLEAN wait_any, BOOLEAN alertable, const LARGE_INTEGER *timeout )
++{
++    struct ntsync_wait_args args = {0};
++    unsigned long request;
++    struct timespec now;
++    int ret;
++
++    if (!timeout || timeout->QuadPart == TIMEOUT_INFINITE)
++    {
++        args.timeout = ~(__u64)0;
++    }
++    else if (timeout->QuadPart <= 0)
++    {
++        clock_gettime( CLOCK_MONOTONIC, &now );
++        args.timeout = (now.tv_sec * NSECPERSEC) + now.tv_nsec + (-timeout->QuadPart * 100);
++    }
++    else
++    {
++        args.timeout = (timeout->QuadPart * 100) - (SECS_1601_TO_1970 * NSECPERSEC);
++        args.flags |= NTSYNC_WAIT_REALTIME;
++    }
++
++    args.objs = (uintptr_t)objs;
++    args.count = count;
++    args.owner = GetCurrentThreadId();
++    args.index = ~0u;
++
++    if (alertable)
++        args.alert = get_inproc_alert_obj();
++
++    if (wait_any || count == 1)
++        request = NTSYNC_IOC_WAIT_ANY;
++    else
++        request = NTSYNC_IOC_WAIT_ALL;
++
++    do
++    {
++        ret = ioctl( device, request, &args );
++    } while (ret < 0 && errno == EINTR);
++
++    if (!ret)
++    {
++        if (args.index == count)
++        {
++            static const LARGE_INTEGER timeout;
++
++            ret = server_wait( NULL, 0, SELECT_INTERRUPTIBLE | SELECT_ALERTABLE, &timeout );
++            assert( ret == STATUS_USER_APC );
++            return ret;
++        }
++
++        return wait_any ? args.index : 0;
++    }
++    else if (errno == EOWNERDEAD)
++        return STATUS_ABANDONED + (wait_any ? args.index : 0);
++    else if (errno == ETIMEDOUT)
++        return STATUS_TIMEOUT;
++    else
++        return errno_to_status( errno );
+ }
+ 
++
+ static NTSTATUS inproc_wait( DWORD count, const HANDLE *handles, BOOLEAN wait_any,
+                              BOOLEAN alertable, const LARGE_INTEGER *timeout )
+ {
+-    int device;
++    struct inproc_sync_cache_entry stack_cache[64], *cache[64];
++    int device, objs[64];
++    HANDLE queue = NULL;
++    NTSTATUS ret;
++    DWORD i, j;
+ 
+     if ((device = get_linux_sync_device()) < 0)
+         return STATUS_NOT_IMPLEMENTED;
+ 
+-    return STATUS_NOT_IMPLEMENTED;
++
++    for (i = 0; i < count; ++i)
++    {
++        if ((ret = get_inproc_sync_obj( handles[i], 0, SYNCHRONIZE, &stack_cache[i], &cache[i] )))
++        {
++            for (j = 0; j < i; ++j)
++                release_inproc_sync_obj( cache[j] );
++            return ret;
++        }
++        if (cache[i]->type == INPROC_SYNC_QUEUE)
++            queue = handles[i];
++
++        objs[i] = cache[i]->fd;
++    }
++
++    /* It's common to wait on the message queue alone. Some applications wait
++     * on it in fast paths, with a zero timeout. Since we take two server calls
++     * instead of one when going through inproc_wait(), and since we only need
++     * to go through that path if we're waiting on other objects, just delegate
++     * to the server if we're only waiting on the message queue. */
++    if (count == 1 && queue)
++    {
++        release_inproc_sync_obj( cache[0] );
++        return wait_internal_server( handles[0], alertable, timeout );
++    }
++
++    if (queue) select_queue();
++
++    ret = linux_wait_objs( device, count, objs, wait_any, alertable, timeout );
++
++    if (queue) unselect_queue( handles[ret] == queue );
++
++    for (i = 0; i < count; ++i)
++        release_inproc_sync_obj( cache[i] );
++
++    return ret;
+ }
+ 
+ static NTSTATUS inproc_signal_and_wait( HANDLE signal, HANDLE wait,
+                                         BOOLEAN alertable, const LARGE_INTEGER *timeout )
+ {
++    struct inproc_sync_cache_entry signal_stack_cache, *signal_cache;
++    struct inproc_sync_cache_entry wait_stack_cache, *wait_cache;
++    HANDLE queue = NULL;
++    NTSTATUS ret;
+     int device;
+ 
+     if ((device = get_linux_sync_device()) < 0)
+         return STATUS_NOT_IMPLEMENTED;
+ 
+-    return STATUS_NOT_IMPLEMENTED;
++    if ((ret = get_inproc_sync_obj( signal, 0, 0, &signal_stack_cache, &signal_cache )))
++        return ret;
++
++    switch (signal_cache->type)
++    {
++        case INPROC_SYNC_SEMAPHORE:
++            if (!(signal_cache->access & SEMAPHORE_MODIFY_STATE))
++            {
++                release_inproc_sync_obj( signal_cache );
++                return STATUS_ACCESS_DENIED;
++            }
++            break;
++
++        case INPROC_SYNC_AUTO_EVENT:
++        case INPROC_SYNC_MANUAL_EVENT:
++            if (!(signal_cache->access & EVENT_MODIFY_STATE))
++            {
++                release_inproc_sync_obj( signal_cache );
++                return STATUS_ACCESS_DENIED;
++            }
++            break;
++
++        case INPROC_SYNC_MUTEX:
++            break;
++
++        default:
++            /* can't be signaled */
++            release_inproc_sync_obj( signal_cache );
++            return STATUS_OBJECT_TYPE_MISMATCH;
++    }
++
++    if ((ret = get_inproc_sync_obj( wait, 0, SYNCHRONIZE, &wait_stack_cache, &wait_cache )))
++    {
++        release_inproc_sync_obj( signal_cache );
++        return ret;
++    }
++
++    if (wait_cache->type == INPROC_SYNC_QUEUE)
++        queue = wait;
++
++    switch (signal_cache->type)
++    {
++        case INPROC_SYNC_SEMAPHORE:
++            ret = linux_release_semaphore_obj( signal_cache->fd, 1, NULL );
++            break;
++
++        case INPROC_SYNC_AUTO_EVENT:
++        case INPROC_SYNC_MANUAL_EVENT:
++            ret = linux_set_event_obj( signal_cache->fd, NULL );
++            break;
++
++        case INPROC_SYNC_MUTEX:
++            ret = linux_release_mutex_obj( signal_cache->fd, NULL );
++            break;
++
++        default:
++            assert( 0 );
++            break;
++    }
++
++    if (!ret)
++    {
++        if (queue) select_queue();
++        ret = linux_wait_objs( device, 1, &wait_cache->fd, TRUE, alertable, timeout );
++        if (queue) unselect_queue( !ret );
++    }
++
++    release_inproc_sync_obj( signal_cache );
++    release_inproc_sync_obj( wait_cache );
++    return ret;
++}
++
++/* caller must hold fd_cache_mutex */
++void close_inproc_sync_obj( HANDLE handle )
++{
++    struct inproc_sync_cache_entry *cache = get_cached_inproc_sync_obj( handle );
++
++    if (cache)
++    {
++        cache->closed = TRUE;
++        /* once for the reference we just grabbed, and once for the handle */
++        release_inproc_sync_obj( cache );
++        release_inproc_sync_obj( cache );
++    }
+ }
+ 
+ #else
+@@ -459,6 +1172,10 @@ static NTSTATUS inproc_signal_and_wait( HANDLE signal, HANDLE wait,
+     return STATUS_NOT_IMPLEMENTED;
+ }
+ 
++void close_inproc_sync_obj( HANDLE handle )
++{
++}
++
+ #endif
+ 
+ /******************************************************************************
+diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
+index d81cb409f79..e8dbb24bcb4 100644
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -1865,7 +1865,7 @@ NTSTATUS get_thread_context( HANDLE handle, void *context, BOOL *self, USHORT ma
+ 
+     if (ret == STATUS_PENDING)
+     {
+-        NtWaitForSingleObject( context_handle, FALSE, NULL );
++        wait_internal_server( context_handle, FALSE, NULL );
+ 
+         SERVER_START_REQ( get_thread_context )
+         {
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index ce041786ec0..d49cbd823fb 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -114,6 +114,7 @@ struct ntdll_thread_data
+     PRTL_THREAD_START_ROUTINE start;  /* thread entry point */
+     void              *param;         /* thread entry point parameter */
+     void              *jmp_buf;       /* setjmp buffer for exception handling */
++    int               linux_alert_obj;  /* fd for the linux in-process alert event */
+ };
+ 
+ C_ASSERT( sizeof(struct ntdll_thread_data) <= sizeof(((TEB *)0)->GdiTebBatch) );
+@@ -224,6 +225,8 @@ extern void start_server( BOOL debug );
+ 
+ extern pthread_mutex_t fd_cache_mutex;
+ 
++extern int get_linux_sync_device(void);
++
+ extern unsigned int server_call_unlocked( void *req_ptr );
+ extern void server_enter_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigset );
+ extern void server_leave_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigset );
+@@ -406,6 +409,8 @@ extern NTSTATUS wow64_wine_spawnvp( void *args );
+ 
+ extern void dbg_init(void);
+ 
++extern void close_inproc_sync_obj( HANDLE handle );
++
+ extern NTSTATUS call_user_apc_dispatcher( CONTEXT *context_ptr, ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3,
+                                           PNTAPCFUNC func, NTSTATUS status );
+ extern NTSTATUS call_user_exception_dispatcher( EXCEPTION_RECORD *rec, CONTEXT *context );
+@@ -416,6 +421,7 @@ extern void call_raise_user_exception_dispatcher(void);
+ extern const char * wine_debuginfostr_pc(void *pc);
+ 
+ #define TICKSPERSEC 10000000
++#define NSECPERSEC 1000000000
+ #define SECS_1601_TO_1970  ((369 * 365 + 89) * (ULONGLONG)86400)
+ 
+ static inline ULONGLONG ticks_from_time_t( time_t time )
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index 7378c967a5d..2eafc15bae7 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -4214,6 +4214,7 @@ static TEB *init_teb( void *ptr, BOOL is_wow )
+     thread_data->reply_fd   = -1;
+     thread_data->wait_fd[0] = -1;
+     thread_data->wait_fd[1] = -1;
++    thread_data->linux_alert_obj = -1;
+     list_add_head( &teb_list, &thread_data->entry );
+     return teb;
+ }
+diff --git a/include/wine/server_protocol.h b/include/wine/server_protocol.h
+index a33136a4bc0..2fe15d62803 100644
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -6167,6 +6167,54 @@ struct get_linux_sync_device_reply
+ };
+ 
+ 
++struct get_linux_sync_obj_request
++{
++    struct request_header __header;
++    obj_handle_t handle;
++};
++struct get_linux_sync_obj_reply
++{
++    struct reply_header __header;
++    int type;
++    unsigned int access;
++};
++
++
++struct select_inproc_queue_request
++{
++    struct request_header __header;
++    char __pad_12[4];
++};
++struct select_inproc_queue_reply
++{
++    struct reply_header __header;
++};
++
++
++struct unselect_inproc_queue_request
++{
++    struct request_header __header;
++    int          signaled;
++};
++struct unselect_inproc_queue_reply
++{
++    struct reply_header __header;
++};
++
++
++struct get_inproc_alert_event_request
++{
++    struct request_header __header;
++    char __pad_12[4];
++};
++struct get_inproc_alert_event_reply
++{
++    struct reply_header __header;
++    obj_handle_t handle;
++    char __pad_12[4];
++};
++
++
+ enum request
+ {
+     REQ_new_process,
+@@ -6476,6 +6524,10 @@ enum request
+     REQ_get_fsync_apc_idx,
+     REQ_fsync_free_shm_idx,
+     REQ_get_linux_sync_device,
++    REQ_get_linux_sync_obj,
++    REQ_select_inproc_queue,
++    REQ_unselect_inproc_queue,
++    REQ_get_inproc_alert_event,
+     REQ_NB_REQUESTS
+ };
+ 
+@@ -6790,6 +6842,10 @@ union generic_request
+     struct get_fsync_apc_idx_request get_fsync_apc_idx_request;
+     struct fsync_free_shm_idx_request fsync_free_shm_idx_request;
+     struct get_linux_sync_device_request get_linux_sync_device_request;
++    struct get_linux_sync_obj_request get_linux_sync_obj_request;
++    struct select_inproc_queue_request select_inproc_queue_request;
++    struct unselect_inproc_queue_request unselect_inproc_queue_request;
++    struct get_inproc_alert_event_request get_inproc_alert_event_request;
+ };
+ union generic_reply
+ {
+@@ -7102,8 +7158,12 @@ union generic_reply
+     struct get_fsync_apc_idx_reply get_fsync_apc_idx_reply;
+     struct fsync_free_shm_idx_reply fsync_free_shm_idx_reply;
+     struct get_linux_sync_device_reply get_linux_sync_device_reply;
++    struct get_linux_sync_obj_reply get_linux_sync_obj_reply;
++    struct select_inproc_queue_reply select_inproc_queue_reply;
++    struct unselect_inproc_queue_reply unselect_inproc_queue_reply;
++    struct get_inproc_alert_event_reply get_inproc_alert_event_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 858
++#define SERVER_PROTOCOL_VERSION 861
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+diff --git a/server/change.c b/server/change.c
+index f5129001836..5a9667eefcb 100644
+--- a/server/change.c
++++ b/server/change.c
+@@ -126,7 +126,7 @@ static const struct object_ops dir_ops =
+     NULL,                     /* unlink_name */
+     no_open_file,             /* open_file */
+     no_kernel_obj_list,       /* get_kernel_obj_list */
+-    no_get_inproc_sync,       /* get_inproc_sync */
++    default_fd_get_inproc_sync, /* get_inproc_sync */
+     dir_close_handle,         /* close_handle */
+     dir_destroy               /* destroy */
+ };
+diff --git a/server/completion.c b/server/completion.c
+index e2fd3b39924..7b12fc5ab04 100644
+--- a/server/completion.c
++++ b/server/completion.c
+@@ -25,6 +25,7 @@
+ 
+ #include <stdarg.h>
+ #include <stdio.h>
++#include <unistd.h>
+ 
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+@@ -79,8 +80,9 @@ struct completion
+     struct list    wait_queue;
+     unsigned int   depth;
+     int            closed;
+-    int                esync_fd;
+-    unsigned int       fsync_idx;
++    int            inproc_sync;
++    int            esync_fd;
++    unsigned int   fsync_idx;
+ };
+ 
+ static void completion_wait_dump( struct object*, int );
+@@ -170,6 +172,7 @@ static int completion_signaled( struct object *obj, struct wait_queue_entry *ent
+ static int completion_get_esync_fd( struct object *obj, enum esync_type *type );
+ static unsigned int completion_get_fsync_idx( struct object *obj, enum fsync_type *type );
+ static int completion_close_handle( struct object *obj, struct process *process, obj_handle_t handle );
++static int completion_get_inproc_sync( struct object *obj, enum inproc_sync_type *type );
+ static void completion_destroy( struct object * );
+ 
+ static const struct object_ops completion_ops =
+@@ -194,7 +197,7 @@ static const struct object_ops completion_ops =
+     default_unlink_name,       /* unlink_name */
+     no_open_file,              /* open_file */
+     no_kernel_obj_list,        /* get_kernel_obj_list */
+-    no_get_inproc_sync,        /* get_inproc_sync */
++    completion_get_inproc_sync,/* get_inproc_sync */
+     completion_close_handle,   /* close_handle */
+     completion_destroy         /* destroy */
+ };
+@@ -211,6 +214,7 @@ static void completion_destroy( struct object *obj)
+     {
+         free( tmp );
+     }
++    if (use_inproc_sync()) close( completion->inproc_sync );
+ }
+ 
+ static void completion_dump( struct object *obj, int verbose )
+@@ -265,6 +269,7 @@ static int completion_close_handle( struct object *obj, struct process *process,
+     }
+     completion->closed = 1;
+     wake_up( obj, 0 );
++    set_inproc_event( completion->inproc_sync );
+     return 1;
+ }
+ 
+@@ -298,6 +303,14 @@ static struct completion_wait *create_completion_wait( struct thread *thread )
+     return wait;
+ }
+ 
++static int completion_get_inproc_sync( struct object *obj, enum inproc_sync_type *type )
++{
++    struct completion *completion = (struct completion *)obj;
++
++    *type = INPROC_SYNC_MANUAL_SERVER;
++    return completion->inproc_sync;
++}
++
+ static struct completion *create_completion( struct object *root, const struct unicode_str *name,
+                                              unsigned int attr, unsigned int concurrent,
+                                              const struct security_descriptor *sd )
+@@ -312,6 +325,7 @@ static struct completion *create_completion( struct object *root, const struct u
+             list_init( &completion->wait_queue );
+             completion->depth = 0;
+             completion->closed = 0;
++            completion->inproc_sync = create_inproc_event( TRUE, FALSE );
+         }
+     }
+     if (do_esync()) completion->esync_fd = esync_create_fd( 0, 0 );
+@@ -346,7 +360,11 @@ void add_completion( struct completion *completion, apc_param_t ckey, apc_param_
+         wake_up( &wait->obj, 1 );
+         if (list_empty( &completion->queue )) return;
+     }
+-    if (!list_empty( &completion->queue )) wake_up( &completion->obj, 0 );
++    if (!list_empty( &completion->queue ))
++    {
++        wake_up( &completion->obj, 0 );
++        set_inproc_event( completion->inproc_sync );
++    }
+ }
+ 
+ /* create a completion */
+@@ -449,6 +467,7 @@ DECL_HANDLER(remove_completion)
+         reply->wait_handle = 0;
+         if (list_empty( &completion->queue ))
+         {
++            reset_inproc_event( completion->inproc_sync );
+             if (do_esync()) esync_clear( completion->esync_fd );
+             if (do_fsync()) fsync_clear( &completion->obj );
+         }
+diff --git a/server/console.c b/server/console.c
+index 530ee31581f..de5bc946e9b 100644
+--- a/server/console.c
++++ b/server/console.c
+@@ -56,6 +56,7 @@ struct console
+ {
+     struct object                obj;           /* object header */
+     int                          signaled;      /* is console signaled */
++    int                          inproc_sync;   /* in-process synchronization object */
+     struct thread               *renderer;      /* console renderer thread */
+     struct screen_buffer        *active;        /* active screen buffer */
+     struct console_server       *server;        /* console server object */
+@@ -73,6 +74,7 @@ static struct object *console_lookup_name( struct object *obj, struct unicode_st
+                                            unsigned int attr, struct object *root );
+ static struct object *console_open_file( struct object *obj, unsigned int access,
+                                          unsigned int sharing, unsigned int options );
++static int console_get_inproc_sync( struct object *obj, enum inproc_sync_type *type );
+ static int console_add_queue( struct object *obj, struct wait_queue_entry *entry );
+ 
+ static const struct object_ops console_ops =
+@@ -97,7 +99,7 @@ static const struct object_ops console_ops =
+     NULL,                             /* unlink_name */
+     console_open_file,                /* open_file */
+     no_kernel_obj_list,               /* get_kernel_obj_list */
+-    no_get_inproc_sync,               /* get_inproc_sync */
++    console_get_inproc_sync,          /* get_inproc_sync */
+     no_close_handle,                  /* close_handle */
+     console_destroy                   /* destroy */
+ };
+@@ -144,6 +146,7 @@ struct console_server
+     unsigned int          once_input : 1; /* flag if input thread has already been requested */
+     int                   term_fd;     /* UNIX terminal fd */
+     struct termios        termios;     /* original termios */
++    int                   inproc_sync; /* in-process synchronization object */
+     int                   esync_fd;
+     unsigned int          fsync_idx;
+ };
+@@ -158,6 +161,7 @@ static struct object *console_server_lookup_name( struct object *obj, struct uni
+                                                 unsigned int attr, struct object *root );
+ static struct object *console_server_open_file( struct object *obj, unsigned int access,
+                                                 unsigned int sharing, unsigned int options );
++static int console_server_get_inproc_sync( struct object *obj, enum inproc_sync_type *type );
+ 
+ static const struct object_ops console_server_ops =
+ {
+@@ -181,7 +185,7 @@ static const struct object_ops console_server_ops =
+     NULL,                             /* unlink_name */
+     console_server_open_file,         /* open_file */
+     no_kernel_obj_list,               /* get_kernel_obj_list */
+-    no_get_inproc_sync,               /* get_inproc_sync */
++    console_server_get_inproc_sync,   /* get_inproc_sync */
+     no_close_handle,                  /* close_handle */
+     console_server_destroy            /* destroy */
+ };
+@@ -562,6 +566,7 @@ static struct object *create_console(void)
+ 
+     console->renderer      = NULL;
+     console->signaled      = 0;
++    console->inproc_sync   = create_inproc_event( TRUE, console->signaled );
+     console->active        = NULL;
+     console->server        = NULL;
+     console->fd            = NULL;
+@@ -605,6 +610,7 @@ static int queue_host_ioctl( struct console_server *server, unsigned int code, u
+     }
+     list_add_tail( &server->queue, &ioctl->entry );
+     wake_up( &server->obj, 0 );
++    set_inproc_event( server->inproc_sync );
+     if (async) set_error( STATUS_PENDING );
+     return 1;
+ }
+@@ -641,6 +647,7 @@ static void disconnect_console_server( struct console_server *server )
+         server->console->server = NULL;
+         server->console = NULL;
+         wake_up( &server->obj, 0 );
++        set_inproc_event( server->inproc_sync );
+     }
+ }
+ 
+@@ -795,6 +802,7 @@ static void console_destroy( struct object *obj )
+     free_async_queue( &console->read_q );
+     if (console->fd)
+         release_object( console->fd );
++    if (use_inproc_sync()) close( console->inproc_sync );
+ }
+ 
+ static struct object *create_console_connection( struct console *console )
+@@ -820,6 +828,22 @@ static struct object *create_console_connection( struct console *console )
+     return &connection->obj;
+ }
+ 
++static int console_get_inproc_sync( struct object *obj, enum inproc_sync_type *type )
++{
++    struct console *console = (struct console *)obj;
++
++    /* cf. console_add_queue() */
++    if (console->server && !console->server->once_input)
++    {
++        console->server->once_input = 1;
++        if (console->server->term_fd == -1)
++            queue_host_ioctl( console->server, IOCTL_CONDRV_PEEK, 0, NULL, NULL );
++    }
++
++    *type = INPROC_SYNC_MANUAL_SERVER;
++    return console->inproc_sync;
++}
++
+ static struct object *console_lookup_name( struct object *obj, struct unicode_str *name,
+                                            unsigned int attr, struct object *root )
+ {
+@@ -909,6 +933,7 @@ static void console_server_destroy( struct object *obj )
+     assert( obj->ops == &console_server_ops );
+     disconnect_console_server( server );
+     if (server->fd) release_object( server->fd );
++    if (use_inproc_sync()) close( server->inproc_sync );
+     if (do_esync()) close( server->esync_fd );
+     if (server->fsync_idx) fsync_free_shm_idx( server->fsync_idx );
+ }
+@@ -985,6 +1010,14 @@ static struct object *console_server_open_file( struct object *obj, unsigned int
+     return grab_object( obj );
+ }
+ 
++static int console_server_get_inproc_sync( struct object *obj, enum inproc_sync_type *type )
++{
++    struct console_server *server = (struct console_server*)obj;
++
++    *type = INPROC_SYNC_MANUAL_SERVER;
++    return server->inproc_sync;
++}
++
+ static struct object *create_console_server( void )
+ {
+     struct console_server *server;
+@@ -994,6 +1027,7 @@ static struct object *create_console_server( void )
+     server->busy       = 0;
+     server->once_input = 0;
+     server->term_fd    = -1;
++    server->inproc_sync = create_inproc_event( TRUE, TRUE );
+     list_init( &server->queue );
+     list_init( &server->read_queue );
+     server->fd = alloc_pseudo_fd( &console_server_fd_ops, &server->obj, FILE_SYNCHRONOUS_IO_NONALERT );
+@@ -1598,11 +1632,27 @@ DECL_HANDLER(get_next_console_request)
+ 
+     if (!server->console->renderer) server->console->renderer = current;
+ 
+-    if (!req->signal) server->console->signaled = 0;
++    if (!req->signal)
++    {
++        server->console->signaled = 0;
++        reset_inproc_event( server->console->inproc_sync );
++    }
+     else if (!server->console->signaled)
+     {
+         server->console->signaled = 1;
+         wake_up( &server->console->obj, 0 );
++        set_inproc_event( server->console->inproc_sync );
++        /* FIXME: backport other console changes from upstream */
++        /*
++         *          LIST_FOR_EACH_ENTRY( screen_buffer, &server->console->screen_buffers, struct screen_buffer, entry )
++         +        {                                                                                     *
++         wake_up( &screen_buffer->obj, 0 );
++         +            set_inproc_event( screen_buffer->inproc_sync );
++         +        }
++         LIST_FOR_EACH_ENTRY( input, &server->console->inputs, struct console_input, entry )
++         wake_up( &input->obj, 0 );
++         LIST_FOR_EACH_ENTRY( output, &server->console->outputs, struct console_output, entry )
++         */
+     }
+ 
+     if (req->read)
+@@ -1630,6 +1680,9 @@ DECL_HANDLER(get_next_console_request)
+             esync_clear( server->esync_fd );
+     }
+ 
++    if (list_empty( &server->queue ))
++        reset_inproc_event( server->inproc_sync );
++
+     if (ioctl)
+     {
+         struct async *async = ioctl->async;
+@@ -1717,6 +1770,8 @@ DECL_HANDLER(get_next_console_request)
+         fsync_clear( &server->obj );
+     if (do_esync() && list_empty( &server->queue ))
+         esync_clear( server->esync_fd );
++    if (list_empty( &server->queue ))
++        reset_inproc_event( server->inproc_sync );
+ 
+     release_object( server );
+ }
+diff --git a/server/debugger.c b/server/debugger.c
+index 249c530e9b1..21783fcc2b0 100644
+--- a/server/debugger.c
++++ b/server/debugger.c
+@@ -25,6 +25,7 @@
+ #include <string.h>
+ #include <stdarg.h>
+ #include <stdio.h>
++#include <unistd.h>
+ 
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+@@ -71,6 +72,7 @@ struct debug_obj
+     struct object        obj;         /* object header */
+     struct list          event_queue; /* pending events queue */
+     unsigned int         flags;       /* debug flags */
++    int                  inproc_sync; /* in-process synchronization object */
+ };
+ 
+ 
+@@ -107,6 +109,7 @@ static const struct object_ops debug_event_ops =
+ 
+ static void debug_obj_dump( struct object *obj, int verbose );
+ static int debug_obj_signaled( struct object *obj, struct wait_queue_entry *entry );
++static int debug_obj_get_inproc_sync( struct object *obj, enum inproc_sync_type *type );
+ static void debug_obj_destroy( struct object *obj );
+ 
+ static const struct object_ops debug_obj_ops =
+@@ -131,7 +134,7 @@ static const struct object_ops debug_obj_ops =
+     default_unlink_name,           /* unlink_name */
+     no_open_file,                  /* open_file */
+     no_kernel_obj_list,            /* get_kernel_obj_list */
+-    no_get_inproc_sync,            /* get_inproc_sync */
++    debug_obj_get_inproc_sync,     /* get_inproc_sync */
+     no_close_handle,               /* close_handle */
+     debug_obj_destroy              /* destroy */
+ };
+@@ -259,6 +262,7 @@ static void link_event( struct debug_obj *debug_obj, struct debug_event *event )
+         /* grab reference since debugger could be killed while trying to wake up */
+         grab_object( debug_obj );
+         wake_up( &debug_obj->obj, 0 );
++        set_inproc_event( debug_obj->inproc_sync );
+         release_object( debug_obj );
+     }
+ }
+@@ -271,6 +275,7 @@ static void resume_event( struct debug_obj *debug_obj, struct debug_event *event
+     {
+         grab_object( debug_obj );
+         wake_up( &debug_obj->obj, 0 );
++        set_inproc_event( debug_obj->inproc_sync );
+         release_object( debug_obj );
+     }
+ }
+@@ -336,6 +341,14 @@ static int debug_obj_signaled( struct object *obj, struct wait_queue_entry *entr
+     return find_event_to_send( debug_obj ) != NULL;
+ }
+ 
++static int debug_obj_get_inproc_sync( struct object *obj, enum inproc_sync_type *type )
++{
++    struct debug_obj *debug_obj = (struct debug_obj *)obj;
++
++    *type = INPROC_SYNC_MANUAL_SERVER;
++    return debug_obj->inproc_sync;
++}
++
+ static void debug_obj_destroy( struct object *obj )
+ {
+     struct list *ptr;
+@@ -348,6 +361,8 @@ static void debug_obj_destroy( struct object *obj )
+     /* free all pending events */
+     while ((ptr = list_head( &debug_obj->event_queue )))
+         unlink_event( debug_obj, LIST_ENTRY( ptr, struct debug_event, entry ));
++
++    if (use_inproc_sync()) close( debug_obj->inproc_sync );
+ }
+ 
+ struct debug_obj *get_debug_obj( struct process *process, obj_handle_t handle, unsigned int access )
+@@ -367,6 +382,7 @@ static struct debug_obj *create_debug_obj( struct object *root, const struct uni
+         {
+             debug_obj->flags = flags;
+             list_init( &debug_obj->event_queue );
++            debug_obj->inproc_sync = create_inproc_event( TRUE, FALSE );
+         }
+     }
+     return debug_obj;
+@@ -575,6 +591,9 @@ DECL_HANDLER(wait_debug_event)
+         reply->tid = get_thread_id( event->sender );
+         alloc_event_handles( event, current->process );
+         set_reply_data( &event->data, min( get_reply_max_size(), sizeof(event->data) ));
++
++        if (!find_event_to_send( debug_obj ))
++            reset_inproc_event( debug_obj->inproc_sync );
+     }
+     else
+     {
+diff --git a/server/device.c b/server/device.c
+index b310e76428b..d8f00369c41 100644
+--- a/server/device.c
++++ b/server/device.c
+@@ -25,6 +25,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <stdarg.h>
++#include <unistd.h>
+ 
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+@@ -97,6 +98,7 @@ struct device_manager
+     struct list            requests;       /* list of pending irps across all devices */
+     struct irp_call       *current_call;   /* call currently executed on client side */
+     struct wine_rb_tree    kernel_objects; /* map of objects that have client side pointer associated */
++    int                    inproc_sync;   /* in-process synchronization object */
+     int                    esync_fd;       /* esync file descriptor */
+     unsigned int           fsync_idx;
+ };
+@@ -105,6 +107,7 @@ static void device_manager_dump( struct object *obj, int verbose );
+ static int device_manager_signaled( struct object *obj, struct wait_queue_entry *entry );
+ static int device_manager_get_esync_fd( struct object *obj, enum esync_type *type );
+ static unsigned int device_manager_get_fsync_idx( struct object *obj, enum fsync_type *type );
++static int device_manager_get_inproc_sync( struct object *obj, enum inproc_sync_type *type );
+ static void device_manager_destroy( struct object *obj );
+ 
+ static const struct object_ops device_manager_ops =
+@@ -129,7 +132,7 @@ static const struct object_ops device_manager_ops =
+     NULL,                             /* unlink_name */
+     no_open_file,                     /* open_file */
+     no_kernel_obj_list,               /* get_kernel_obj_list */
+-    no_get_inproc_sync,               /* get_inproc_sync */
++    device_manager_get_inproc_sync,   /* get_inproc_sync */
+     no_close_handle,                  /* close_handle */
+     device_manager_destroy            /* destroy */
+ };
+@@ -244,7 +247,7 @@ static const struct object_ops device_file_ops =
+     NULL,                             /* unlink_name */
+     no_open_file,                     /* open_file */
+     device_file_get_kernel_obj_list,  /* get_kernel_obj_list */
+-    no_get_inproc_sync,               /* get_inproc_sync */
++    default_fd_get_inproc_sync,       /* get_inproc_sync */
+     device_file_close_handle,         /* close_handle */
+     device_file_destroy               /* destroy */
+ };
+@@ -436,7 +439,12 @@ static void add_irp_to_queue( struct device_manager *manager, struct irp_call *i
+     irp->thread = thread ? (struct thread *)grab_object( thread ) : NULL;
+     if (irp->file) list_add_tail( &irp->file->requests, &irp->dev_entry );
+     list_add_tail( &manager->requests, &irp->mgr_entry );
+-    if (list_head( &manager->requests ) == &irp->mgr_entry) wake_up( &manager->obj, 0 );  /* first one */
++    if (list_head( &manager->requests ) == &irp->mgr_entry)
++    {
++        /* first one */
++        wake_up( &manager->obj, 0 );
++        set_inproc_event( manager->inproc_sync );
++    }
+ }
+ 
+ static struct object *device_open_file( struct object *obj, unsigned int access,
+@@ -782,6 +790,9 @@ static void delete_file( struct device_file *file )
+         set_irp_result( irp, STATUS_FILE_DELETED, NULL, 0, 0 );
+     }
+ 
++    if (list_empty( &file->device->manager->requests ))
++        reset_inproc_event( file->device->manager->inproc_sync );
++
+     release_object( file );
+ }
+ 
+@@ -827,6 +838,14 @@ static unsigned int device_manager_get_fsync_idx( struct object *obj, enum fsync
+     return manager->fsync_idx;
+ }
+ 
++static int device_manager_get_inproc_sync( struct object *obj, enum inproc_sync_type *type )
++{
++    struct device_manager *manager = (struct device_manager *)obj;
++
++    *type = INPROC_SYNC_MANUAL_SERVER;
++    return manager->inproc_sync;
++}
++
+ static void device_manager_destroy( struct object *obj )
+ {
+     struct device_manager *manager = (struct device_manager *)obj;
+@@ -862,6 +881,7 @@ static void device_manager_destroy( struct object *obj )
+         release_object( irp );
+     }
+ 
++    if (use_inproc_sync()) close( manager->inproc_sync );
+     if (do_esync())
+         close( manager->esync_fd );
+     if (manager->fsync_idx) fsync_free_shm_idx( manager->fsync_idx );
+@@ -874,6 +894,7 @@ static struct device_manager *create_device_manager(void)
+     if ((manager = alloc_object( &device_manager_ops )))
+     {
+         manager->current_call = NULL;
++        manager->inproc_sync = create_inproc_event( TRUE, FALSE );
+         list_init( &manager->devices );
+         list_init( &manager->requests );
+         wine_rb_init( &manager->kernel_objects, compare_kernel_object );
+@@ -1070,6 +1091,10 @@ DECL_HANDLER(get_next_device_request)
+                 }
+                 list_remove( &irp->mgr_entry );
+                 list_init( &irp->mgr_entry );
++
++                if (list_empty( &manager->requests ))
++                    reset_inproc_event( manager->inproc_sync );
++
+                 /* we already own the object if it's only on manager queue */
+                 if (irp->file) grab_object( irp );
+                 manager->current_call = irp;
+diff --git a/server/esync.c b/server/esync.c
+index 24f3d41ad77..f2734652738 100644
+--- a/server/esync.c
++++ b/server/esync.c
+@@ -51,7 +51,7 @@ int do_esync(void)
+     static int do_esync_cached = -1;
+ 
+     if (do_esync_cached == -1)
+-        do_esync_cached = getenv("WINEESYNC") && atoi(getenv("WINEESYNC")) && !do_fsync();
++        do_esync_cached = getenv("WINEESYNC") && atoi(getenv("WINEESYNC")) && !do_fsync() && !use_inproc_sync();
+ 
+     return do_esync_cached;
+ #else
+diff --git a/server/event.c b/server/event.c
+index e6c86472c71..930d7f8ab58 100644
+--- a/server/event.c
++++ b/server/event.c
+@@ -25,6 +25,7 @@
+ #include <stdlib.h>
+ #include <stdarg.h>
+ #include <sys/types.h>
++#include <unistd.h>
+ 
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+@@ -57,7 +58,11 @@ struct event
+     struct object  obj;             /* object header */
+     struct list    kernel_object;   /* list of kernel object pointers */
+     int            manual_reset;    /* is it a manual reset event? */
+-    int            signaled;        /* event has been signaled */
++    union
++    {
++        int        signaled;        /* event has been signaled */
++        int        inproc_sync;
++    } u;
+     int            esync_fd;        /* esync file descriptor */
+     unsigned int   fsync_idx;
+ };
+@@ -69,6 +74,7 @@ static int event_get_esync_fd( struct object *obj, enum esync_type *type );
+ static unsigned int event_get_fsync_idx( struct object *obj, enum fsync_type *type );
+ static int event_signal( struct object *obj, unsigned int access);
+ static struct list *event_get_kernel_obj_list( struct object *obj );
++static int event_get_inproc_sync( struct object *obj, enum inproc_sync_type *type);
+ static void event_destroy( struct object *obj );
+ 
+ static const struct object_ops event_ops =
+@@ -93,7 +99,7 @@ static const struct object_ops event_ops =
+     default_unlink_name,       /* unlink_name */
+     no_open_file,              /* open_file */
+     event_get_kernel_obj_list, /* get_kernel_obj_list */
+-    no_get_inproc_sync,        /* get_inproc_sync */
++    event_get_inproc_sync,     /* get_inproc_sync */
+     no_close_handle,           /* close_handle */
+     event_destroy              /* destroy */
+ };
+@@ -116,10 +122,13 @@ struct type_descr keyed_event_type =
+ struct keyed_event
+ {
+     struct object  obj;             /* object header */
++    int            inproc_sync;     /* in-process synchronization object */
+ };
+ 
+ static void keyed_event_dump( struct object *obj, int verbose );
+ static int keyed_event_signaled( struct object *obj, struct wait_queue_entry *entry );
++static int keyed_event_get_inproc_sync( struct object *obj, enum inproc_sync_type *type );
++static void keyed_event_destroy( struct object *obj );
+ 
+ static const struct object_ops keyed_event_ops =
+ {
+@@ -143,9 +152,9 @@ static const struct object_ops keyed_event_ops =
+     default_unlink_name,         /* unlink_name */
+     no_open_file,                /* open_file */
+     no_kernel_obj_list,          /* get_kernel_obj_list */
+-    no_get_inproc_sync,          /* get_inproc_sync */
++    keyed_event_get_inproc_sync, /* get_inproc_sync */
+     no_close_handle,             /* close_handle */
+-    no_destroy                   /* destroy */
++    keyed_event_destroy          /* destroy */
+ };
+ 
+ 
+@@ -162,9 +171,13 @@ struct event *create_event( struct object *root, const struct unicode_str *name,
+             /* initialize it if it didn't already exist */
+             list_init( &event->kernel_object );
+             event->manual_reset = manual_reset;
+-            event->signaled     = initial_state;
+             event->fsync_idx = 0;
+ 
++            if (use_inproc_sync())
++                event->u.inproc_sync = create_inproc_event( event->manual_reset, initial_state );
++            else
++                event->u.signaled = initial_state;
++
+             if (do_fsync())
+                 event->fsync_idx = fsync_alloc_shm( initial_state, 0 );
+ 
+@@ -190,10 +203,10 @@ struct event *get_event_obj( struct process *process, obj_handle_t handle, unsig
+ 
+ static void pulse_event( struct event *event )
+ {
+-    event->signaled = 1;
++    event->u.signaled = 1;
+     /* wake up all waiters if manual reset, a single one otherwise */
+     wake_up( &event->obj, !event->manual_reset );
+-    event->signaled = 0;
++    event->u.signaled = 0;
+ 
+     if (do_fsync())
+         fsync_clear( &event->obj );
+@@ -201,6 +214,12 @@ static void pulse_event( struct event *event )
+ 
+ void set_event( struct event *event )
+ {
++    if (use_inproc_sync())
++    {
++        set_inproc_event( event->u.inproc_sync );
++        return;
++    }
++
+     if (do_fsync() && event->obj.ops == &fsync_ops)
+     {
+         fsync_set_event( (struct fsync *)event );
+@@ -213,13 +232,19 @@ void set_event( struct event *event )
+         return;
+     }
+ 
+-    event->signaled = 1;
++    event->u.signaled = 1;
+     /* wake up all waiters if manual reset, a single one otherwise */
+     wake_up( &event->obj, !event->manual_reset );
+ }
+ 
+ void reset_event( struct event *event )
+ {
++    if (use_inproc_sync())
++    {
++        reset_inproc_event( event->u.inproc_sync );
++        return;
++    }
++
+     if (do_fsync() && event->obj.ops == &fsync_ops)
+     {
+         fsync_reset_event( (struct fsync *)event );
+@@ -231,7 +256,7 @@ void reset_event( struct event *event )
+         esync_reset_event( (struct esync *)event );
+         return;
+     }
+-    event->signaled = 0;
++    event->u.signaled = 0;
+ 
+     if (do_fsync())
+         fsync_clear( &event->obj );
+@@ -245,14 +270,14 @@ static void event_dump( struct object *obj, int verbose )
+     struct event *event = (struct event *)obj;
+     assert( obj->ops == &event_ops );
+     fprintf( stderr, "Event manual=%d signaled=%d\n",
+-             event->manual_reset, event->signaled );
++             event->manual_reset, event->u.signaled );
+ }
+ 
+ static int event_signaled( struct object *obj, struct wait_queue_entry *entry )
+ {
+     struct event *event = (struct event *)obj;
+     assert( obj->ops == &event_ops );
+-    return event->signaled;
++    return event->u.signaled;
+ }
+ 
+ static int event_get_esync_fd( struct object *obj, enum esync_type *type )
+@@ -274,7 +299,7 @@ static void event_satisfied( struct object *obj, struct wait_queue_entry *entry
+     struct event *event = (struct event *)obj;
+     assert( obj->ops == &event_ops );
+     /* Reset if it's an auto-reset event */
+-    if (!event->manual_reset) event->signaled = 0;
++    if (!event->manual_reset) event->u.signaled = 0;
+ }
+ 
+ static int event_signal( struct object *obj, unsigned int access )
+@@ -297,10 +322,20 @@ static struct list *event_get_kernel_obj_list( struct object *obj )
+     return &event->kernel_object;
+ }
+ 
++static int event_get_inproc_sync( struct object *obj, enum inproc_sync_type *type)
++{
++    struct event *event = (struct event *)obj;
++
++    *type = event->manual_reset ? INPROC_SYNC_MANUAL_EVENT : INPROC_SYNC_AUTO_EVENT;
++
++    return event->u.inproc_sync;
++}
++
+ static void event_destroy( struct object *obj )
+ {
+     struct event *event = (struct event *)obj;
+ 
++    if (use_inproc_sync()) close( event->u.inproc_sync );
+     if (do_esync())
+         close( event->esync_fd );
+     if (event->fsync_idx) fsync_free_shm_idx( event->fsync_idx );
+@@ -316,6 +351,7 @@ struct keyed_event *create_keyed_event( struct object *root, const struct unicod
+         if (get_error() != STATUS_OBJECT_NAME_EXISTS)
+         {
+             /* initialize it if it didn't already exist */
++            event->inproc_sync = create_inproc_event( TRUE, TRUE );
+         }
+     }
+     return event;
+@@ -359,6 +395,21 @@ static int keyed_event_signaled( struct object *obj, struct wait_queue_entry *en
+     return 0;
+ }
+ 
++static int keyed_event_get_inproc_sync( struct object *obj, enum inproc_sync_type *type )
++{
++    struct keyed_event *event = (struct keyed_event *)obj;
++
++    *type = INPROC_SYNC_MANUAL_SERVER;
++    return event->inproc_sync;
++}
++
++static void keyed_event_destroy( struct object *obj )
++{
++    struct keyed_event *event = (struct keyed_event *)obj;
++
++    if (use_inproc_sync()) close( event->inproc_sync );
++}
++
+ /* create an event */
+ DECL_HANDLER(create_event)
+ {
+@@ -399,7 +450,7 @@ DECL_HANDLER(event_op)
+     struct event *event;
+ 
+     if (!(event = get_event_obj( current->process, req->handle, EVENT_MODIFY_STATE ))) return;
+-    reply->state = event->signaled;
++    reply->state = event->u.signaled;
+     switch(req->op)
+     {
+     case PULSE_EVENT:
+@@ -426,7 +477,7 @@ DECL_HANDLER(query_event)
+     if (!(event = get_event_obj( current->process, req->handle, EVENT_QUERY_STATE ))) return;
+ 
+     reply->manual_reset = event->manual_reset;
+-    reply->state = event->signaled;
++    reply->state = event->u.signaled;
+ 
+     release_object( event );
+ }
+diff --git a/server/fd.c b/server/fd.c
+index 31f9165efc2..02e8ac03bc9 100644
+--- a/server/fd.c
++++ b/server/fd.c
+@@ -166,6 +166,7 @@ struct fd
+     unsigned int         comp_flags;  /* completion flags */
+     int                  esync_fd;    /* esync file descriptor */
+     unsigned int         fsync_idx;   /* fsync shm index */
++    int                  inproc_sync; /* in-process synchronization object */
+ };
+ 
+ static void fd_dump( struct object *obj, int verbose );
+@@ -1603,6 +1604,7 @@ static void fd_destroy( struct object *obj )
+         free( fd->unix_name );
+     }
+ 
++    if (use_inproc_sync()) close( fd->inproc_sync );
+     if (do_esync())
+         close( fd->esync_fd );
+     if (fd->fsync_idx) fsync_free_shm_idx( fd->fsync_idx );
+@@ -1726,6 +1728,7 @@ static struct fd *alloc_fd_object(void)
+     fd->comp_flags = 0;
+     fd->esync_fd   = -1;
+     fd->fsync_idx  = 0;
++    fd->inproc_sync = create_inproc_event( TRUE, fd->signaled );
+     init_async_queue( &fd->read_q );
+     init_async_queue( &fd->write_q );
+     init_async_queue( &fd->wait_q );
+@@ -1775,6 +1778,7 @@ struct fd *alloc_pseudo_fd( const struct fd_ops *fd_user_ops, struct object *use
+     fd->no_fd_status = STATUS_BAD_DEVICE_TYPE;
+     fd->esync_fd   = -1;
+     fd->fsync_idx  = 0;
++    fd->inproc_sync = create_inproc_event( TRUE, fd->inproc_sync );
+     init_async_queue( &fd->read_q );
+     init_async_queue( &fd->write_q );
+     init_async_queue( &fd->wait_q );
+@@ -2230,13 +2234,18 @@ void set_fd_signaled( struct fd *fd, int signaled )
+ {
+     if (fd->comp_flags & FILE_SKIP_SET_EVENT_ON_HANDLE) return;
+     fd->signaled = signaled;
+-    if (signaled) wake_up( fd->user, 0 );
+-
+-    if (do_fsync() && !signaled)
+-        fsync_clear( fd->user );
++    if (signaled)
++    {
++        wake_up( fd->user, 0 );
++        set_inproc_event( fd->inproc_sync );
++    }
++    else
++    {
++        reset_inproc_event( fd->inproc_sync );
+ 
+-    if (do_esync() && !signaled)
+-        esync_clear( fd->esync_fd );
++        if (do_fsync()) fsync_clear( fd->user );
++        if (do_esync()) esync_clear( fd->esync_fd );
++    }
+ }
+ 
+ /* check if events are pending and if yes return which one(s) */
+@@ -2253,6 +2262,17 @@ int check_fd_events( struct fd *fd, int events )
+     return pfd.revents;
+ }
+ 
++int default_fd_get_inproc_sync( struct object *obj, enum inproc_sync_type *type )
++{
++    struct fd *fd = get_obj_fd( obj );
++    int ret;
++
++    *type = INPROC_SYNC_MANUAL_SERVER;
++    ret = fd->inproc_sync;
++    release_object( fd );
++    return ret;
++}
++
+ /* default signaled() routine for objects that poll() on an fd */
+ int default_fd_signaled( struct object *obj, struct wait_queue_entry *entry )
+ {
+diff --git a/server/file.h b/server/file.h
+index e7c5a32bbb5..cd61e56f1fc 100644
+--- a/server/file.h
++++ b/server/file.h
+@@ -113,6 +113,7 @@ extern void get_nt_name( struct fd *fd, struct unicode_str *name );
+ extern int default_fd_signaled( struct object *obj, struct wait_queue_entry *entry );
+ extern int default_fd_get_esync_fd( struct object *obj, enum esync_type *type );
+ extern unsigned int default_fd_get_fsync_idx( struct object *obj, enum fsync_type *type );
++extern int default_fd_get_inproc_sync( struct object *obj, enum inproc_sync_type *type );
+ extern int default_fd_get_poll_events( struct fd *fd );
+ extern void default_poll_event( struct fd *fd, int event );
+ extern void fd_cancel_async( struct fd *fd, struct async *async );
+diff --git a/server/fsync.c b/server/fsync.c
+index 20049d85aed..d35bd4341e8 100644
+--- a/server/fsync.c
++++ b/server/fsync.c
+@@ -59,7 +59,7 @@ int do_fsync(void)
+     if (do_fsync_cached == -1)
+     {
+         syscall( __NR_futex_waitv, 0, 0, 0, 0, 0);
+-        do_fsync_cached = getenv("WINEFSYNC") && atoi(getenv("WINEFSYNC")) && errno != ENOSYS && errno != EPERM;
++        do_fsync_cached = getenv("WINEFSYNC") && atoi(getenv("WINEFSYNC")) && errno != ENOSYS && errno != EPERM && !use_inproc_sync();
+     }
+ 
+     return do_fsync_cached;
+diff --git a/server/inproc_sync.c b/server/inproc_sync.c
+index e6fb2dfd2d4..1e696d9ecbb 100644
+--- a/server/inproc_sync.c
++++ b/server/inproc_sync.c
+@@ -44,16 +44,134 @@
+ #include <sys/stat.h>
+ #include <unistd.h>
+ 
++static int get_enabled(void)
++{
++    static int enabled = -1;
++
++    if (enabled == -1)
++    {
++        const char *env = getenv("WINENTSYNC");
++        enabled = (env && !strcmp(env, "1"));
++    }
++
++    return enabled;
++}
++
+ static int get_linux_device(void)
+ {
+     static int fd = -2;
+ 
++    if (!get_enabled())
++        return -2;
++
+     if (fd == -2)
+         fd = open( "/dev/ntsync", O_CLOEXEC | O_RDONLY );
+ 
+     return fd;
+ }
+ 
++int use_inproc_sync(void)
++{
++    return get_linux_device() >= 0;
++}
++
++int create_inproc_event( int manual_reset, int signaled )
++{
++    struct ntsync_event_args args;
++    int device;
++
++    if ((device = get_linux_device()) < 0) return -1;
++
++    args.signaled = signaled;
++    args.manual = manual_reset;
++    return ioctl( device, NTSYNC_IOC_CREATE_EVENT, &args );
++}
++
++int create_inproc_semaphore( unsigned int count, unsigned int max )
++{
++    struct ntsync_sem_args args;
++    int device;
++
++    if ((device = get_linux_device()) < 0) return -1;
++
++    args.count = count;
++    args.max = max;
++    return ioctl( device, NTSYNC_IOC_CREATE_SEM, &args );
++}
++
++int create_inproc_mutex( thread_id_t owner, unsigned int count )
++{
++    struct ntsync_mutex_args args;
++    int device;
++
++    if ((device = get_linux_device()) < 0) return -1;
++
++    args.owner = owner;
++    args.count = count;
++    return ioctl( device, NTSYNC_IOC_CREATE_MUTEX, &args );
++}
++
++void set_inproc_event( int event )
++{
++    __u32 count;
++
++    if (!use_inproc_sync()) return;
++
++    if (debug_level) fprintf( stderr, "set_inproc_event %d\n", event );
++
++    ioctl( event, NTSYNC_IOC_EVENT_SET, &count );
++}
++
++void reset_inproc_event( int event )
++{
++    __u32 count;
++
++    if (!use_inproc_sync()) return;
++
++    if (debug_level) fprintf( stderr, "reset_inproc_event %d\n", event );
++
++    ioctl( event, NTSYNC_IOC_EVENT_RESET, &count);
++}
++
++void abandon_inproc_mutex( thread_id_t tid, int mutex )
++{
++    ioctl( mutex, NTSYNC_IOC_MUTEX_KILL, &tid );
++}
++
++#else
++
++int use_inproc_sync(void)
++{
++    return 0;
++}
++
++int create_inproc_event( int manual_reset, int signaled )
++{
++    return -1;
++}
++
++int create_inproc_semaphore( unsigned int count, unsigned int max )
++{
++    return -1;
++}
++
++int create_inproc_mutex( thread_id_t owner, unsigned int count )
++{
++    return -1;
++}
++
++void set_inproc_event( int event )
++{
++}
++
++void reset_inproc_event( int event )
++{
++}
++
++void abandon_inproc_mutex( thread_id_t tid, int mutex )
++{
++}
++
+ #endif
+ 
+ 
+@@ -70,3 +188,30 @@ DECL_HANDLER(get_linux_sync_device)
+     set_error( STATUS_NOT_IMPLEMENTED );
+     #endif
+ }
++
++DECL_HANDLER(get_linux_sync_obj)
++{
++#ifdef NTSYNC_IOC_EVENT_READ
++    struct object *obj;
++    int fd;
++
++    if ((obj = get_handle_obj( current->process, req->handle, 0, NULL )))
++    {
++        enum inproc_sync_type type;
++
++        if ((fd = obj->ops->get_inproc_sync( obj, &type )) >= 0)
++        {
++            reply->type = type;
++            reply->access = get_handle_access( current->process, req->handle );
++            send_client_fd( current->process, fd, req->handle );
++        }
++        else
++            set_error( STATUS_NOT_IMPLEMENTED );
++
++        release_object( obj );
++    }
++
++#else
++    set_error( STATUS_NOT_IMPLEMENTED );
++#endif
++}
+diff --git a/server/mailslot.c b/server/mailslot.c
+index f89778b924e..fef0ce25b4c 100644
+--- a/server/mailslot.c
++++ b/server/mailslot.c
+@@ -95,7 +95,7 @@ static const struct object_ops mailslot_ops =
+     default_unlink_name,       /* unlink_name */
+     mailslot_open_file,        /* open_file */
+     no_kernel_obj_list,        /* get_kernel_obj_list */
+-    no_get_inproc_sync,        /* get_inproc_sync */
++    default_fd_get_inproc_sync,/* get_inproc_sync */
+     no_close_handle,           /* close_handle */
+     mailslot_destroy           /* destroy */
+ };
+@@ -159,7 +159,7 @@ static const struct object_ops mail_writer_ops =
+     NULL,                       /* unlink_name */
+     no_open_file,               /* open_file */
+     no_kernel_obj_list,         /* get_kernel_obj_list */
+-    no_get_inproc_sync,         /* get_inproc_sync */
++    default_fd_get_inproc_sync, /* get_inproc_sync */
+     no_close_handle,            /* close_handle */
+     mail_writer_destroy         /* destroy */
+ };
+@@ -260,7 +260,7 @@ static const struct object_ops mailslot_device_file_ops =
+     NULL,                                   /* unlink_name */
+     no_open_file,                           /* open_file */
+     no_kernel_obj_list,                     /* get_kernel_obj_list */
+-    no_get_inproc_sync,                     /* get_inproc_sync */
++    default_fd_get_inproc_sync,             /* get_inproc_sync */
+     no_close_handle,                        /* close_handle */
+     mailslot_device_file_destroy            /* destroy */
+ };
+diff --git a/server/main.c b/server/main.c
+index d0a0a4879b5..7d45a09e9cc 100644
+--- a/server/main.c
++++ b/server/main.c
+@@ -232,13 +232,16 @@ int main( int argc, char *argv[] )
+     sock_init();
+     open_master_socket();
+ 
++    if (use_inproc_sync())
++        fprintf( stderr, "wineserver: using ntsync synchronization.\n" );
++
+     if (do_fsync())
+         fsync_init();
+ 
+     if (do_esync())
+         esync_init();
+ 
+-    if (!do_fsync() && !do_esync())
++    if (!do_fsync() && !do_esync() && !use_inproc_sync())
+         fprintf( stderr, "wineserver: using server-side synchronization.\n" );
+ 
+     if (debug_level) fprintf( stderr, "wineserver: starting (pid=%ld)\n", (long) getpid() );
+diff --git a/server/mutex.c b/server/mutex.c
+index 58ac83bd3f7..6a16f703170 100644
+--- a/server/mutex.c
++++ b/server/mutex.c
+@@ -25,6 +25,7 @@
+ #include <stdlib.h>
+ #include <stdarg.h>
+ #include <sys/types.h>
++#include <unistd.h>
+ 
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+@@ -38,6 +39,8 @@
+ 
+ static const WCHAR mutex_name[] = {'M','u','t','a','n','t'};
+ 
++static struct list inproc_mutexes = LIST_INIT(inproc_mutexes);
++
+ struct type_descr mutex_type =
+ {
+     { mutex_name, sizeof(mutex_name) },   /* name */
+@@ -53,10 +56,21 @@ struct type_descr mutex_type =
+ struct mutex
+ {
+     struct object  obj;             /* object header */
+-    struct thread *owner;           /* mutex owner */
+-    unsigned int   count;           /* recursion count */
+-    int            abandoned;       /* has it been abandoned? */
+-    struct list    entry;           /* entry in owner thread mutex list */
++    union
++    {
++        struct
++        {
++            struct thread *owner;           /* mutex owner */
++            unsigned int   count;           /* recursion count */
++            int            abandoned;       /* has it been abandoned? */
++            struct list    entry;           /* entry in owner thread mutex list */
++        } server;
++        struct
++        {
++            int inproc_sync;
++            struct list entry;
++        } inproc;
++    } u;
+ };
+ 
+ static void mutex_dump( struct object *obj, int verbose );
+@@ -64,6 +78,7 @@ static int mutex_signaled( struct object *obj, struct wait_queue_entry *entry );
+ static void mutex_satisfied( struct object *obj, struct wait_queue_entry *entry );
+ static void mutex_destroy( struct object *obj );
+ static int mutex_signal( struct object *obj, unsigned int access );
++static int mutex_get_inproc_sync( struct object *obj, enum inproc_sync_type *type );
+ 
+ static const struct object_ops mutex_ops =
+ {
+@@ -87,7 +102,7 @@ static const struct object_ops mutex_ops =
+     default_unlink_name,       /* unlink_name */
+     no_open_file,              /* open_file */
+     no_kernel_obj_list,        /* get_kernel_obj_list */
+-    no_get_inproc_sync,        /* get_inproc_sync */
++    mutex_get_inproc_sync,     /* get_inproc_sync */
+     no_close_handle,           /* close_handle */
+     mutex_destroy              /* destroy */
+ };
+@@ -96,23 +111,23 @@ static const struct object_ops mutex_ops =
+ /* grab a mutex for a given thread */
+ static void do_grab( struct mutex *mutex, struct thread *thread )
+ {
+-    assert( !mutex->count || (mutex->owner == thread) );
++    assert( !mutex->u.server.count || (mutex->u.server.owner == thread) );
+ 
+-    if (!mutex->count++)  /* FIXME: avoid wrap-around */
++    if (!mutex->u.server.count++)  /* FIXME: avoid wrap-around */
+     {
+-        assert( !mutex->owner );
+-        mutex->owner = thread;
+-        list_add_head( &thread->mutex_list, &mutex->entry );
++        assert( !mutex->u.server.owner );
++        mutex->u.server.owner = thread;
++        list_add_head( &thread->mutex_list, &mutex->u.server.entry );
+     }
+ }
+ 
+ /* release a mutex once the recursion count is 0 */
+ static void do_release( struct mutex *mutex )
+ {
+-    assert( !mutex->count );
++    assert( !mutex->u.server.count );
+     /* remove the mutex from the thread list of owned mutexes */
+-    list_remove( &mutex->entry );
+-    mutex->owner = NULL;
++    list_remove( &mutex->u.server.entry );
++    mutex->u.server.owner = NULL;
+     wake_up( &mutex->obj, 0 );
+ }
+ 
+@@ -126,10 +141,18 @@ static struct mutex *create_mutex( struct object *root, const struct unicode_str
+         if (get_error() != STATUS_OBJECT_NAME_EXISTS)
+         {
+             /* initialize it if it didn't already exist */
+-            mutex->count = 0;
+-            mutex->owner = NULL;
+-            mutex->abandoned = 0;
+-            if (owned) do_grab( mutex, current );
++            if (use_inproc_sync())
++            {
++                mutex->u.inproc.inproc_sync = create_inproc_mutex( owned ? current->id : 0, !!owned );
++                list_add_tail( &inproc_mutexes, &mutex->u.inproc.entry );
++            }
++            else
++            {
++                mutex->u.server.count = 0;
++                mutex->u.server.owner = NULL;
++                mutex->u.server.abandoned = 0;
++                if (owned) do_grab( mutex, current );
++            }
+         }
+     }
+     return mutex;
+@@ -137,30 +160,34 @@ static struct mutex *create_mutex( struct object *root, const struct unicode_str
+ 
+ void abandon_mutexes( struct thread *thread )
+ {
++    struct mutex *mutex;
+     struct list *ptr;
+ 
+     while ((ptr = list_head( &thread->mutex_list )) != NULL)
+     {
+-        struct mutex *mutex = LIST_ENTRY( ptr, struct mutex, entry );
+-        assert( mutex->owner == thread );
+-        mutex->count = 0;
+-        mutex->abandoned = 1;
++        struct mutex *mutex = LIST_ENTRY( ptr, struct mutex, u.server.entry );
++        assert( mutex->u.server.owner == thread );
++        mutex->u.server.count = 0;
++        mutex->u.server.abandoned = 1;
+         do_release( mutex );
+     }
++
++    LIST_FOR_EACH_ENTRY(mutex, &inproc_mutexes, struct mutex, u.inproc.entry)
++        abandon_inproc_mutex( thread->id, mutex->u.inproc.inproc_sync );
+ }
+ 
+ static void mutex_dump( struct object *obj, int verbose )
+ {
+     struct mutex *mutex = (struct mutex *)obj;
+     assert( obj->ops == &mutex_ops );
+-    fprintf( stderr, "Mutex count=%u owner=%p\n", mutex->count, mutex->owner );
++    fprintf( stderr, "Mutex count=%u owner=%p\n", mutex->u.server.count, mutex->u.server.owner );
+ }
+ 
+ static int mutex_signaled( struct object *obj, struct wait_queue_entry *entry )
+ {
+     struct mutex *mutex = (struct mutex *)obj;
+     assert( obj->ops == &mutex_ops );
+-    return (!mutex->count || (mutex->owner == get_wait_queue_thread( entry )));
++    return (!mutex->u.server.count || (mutex->u.server.owner == get_wait_queue_thread( entry )));
+ }
+ 
+ static void mutex_satisfied( struct object *obj, struct wait_queue_entry *entry )
+@@ -169,8 +196,8 @@ static void mutex_satisfied( struct object *obj, struct wait_queue_entry *entry
+     assert( obj->ops == &mutex_ops );
+ 
+     do_grab( mutex, get_wait_queue_thread( entry ));
+-    if (mutex->abandoned) make_wait_abandoned( entry );
+-    mutex->abandoned = 0;
++    if (mutex->u.server.abandoned) make_wait_abandoned( entry );
++    mutex->u.server.abandoned = 0;
+ }
+ 
+ static int mutex_signal( struct object *obj, unsigned int access )
+@@ -183,23 +210,39 @@ static int mutex_signal( struct object *obj, unsigned int access )
+         set_error( STATUS_ACCESS_DENIED );
+         return 0;
+     }
+-    if (!mutex->count || (mutex->owner != current))
++    if (!mutex->u.server.count || (mutex->u.server.owner != current))
+     {
+         set_error( STATUS_MUTANT_NOT_OWNED );
+         return 0;
+     }
+-    if (!--mutex->count) do_release( mutex );
++    if (!--mutex->u.server.count) do_release( mutex );
+     return 1;
+ }
+ 
++static int mutex_get_inproc_sync( struct object *obj, enum inproc_sync_type *type )
++{
++    struct mutex *mutex = (struct mutex *)obj;
++
++    *type = INPROC_SYNC_MUTEX;
++    return mutex->u.inproc.inproc_sync;
++}
++
+ static void mutex_destroy( struct object *obj )
+ {
+     struct mutex *mutex = (struct mutex *)obj;
+     assert( obj->ops == &mutex_ops );
+ 
+-    if (!mutex->count) return;
+-    mutex->count = 0;
+-    do_release( mutex );
++    if (use_inproc_sync())
++    {
++        close( mutex->u.inproc.inproc_sync );
++        list_remove( &mutex->u.inproc.entry );
++    }
++    else
++    {
++        if (!mutex->u.server.count) return;
++        mutex->u.server.count = 0;
++        do_release( mutex );
++    }
+ }
+ 
+ /* create a mutex */
+@@ -243,11 +286,11 @@ DECL_HANDLER(release_mutex)
+     if ((mutex = (struct mutex *)get_handle_obj( current->process, req->handle,
+                                                  0, &mutex_ops )))
+     {
+-        if (!mutex->count || (mutex->owner != current)) set_error( STATUS_MUTANT_NOT_OWNED );
++        if (!mutex->u.server.count || (mutex->u.server.owner != current)) set_error( STATUS_MUTANT_NOT_OWNED );
+         else
+         {
+-            reply->prev_count = mutex->count;
+-            if (!--mutex->count) do_release( mutex );
++            reply->prev_count = mutex->u.server.count;
++            if (!--mutex->u.server.count) do_release( mutex );
+         }
+         release_object( mutex );
+     }
+@@ -261,9 +304,9 @@ DECL_HANDLER(query_mutex)
+     if ((mutex = (struct mutex *)get_handle_obj( current->process, req->handle,
+                                                  MUTANT_QUERY_STATE, &mutex_ops )))
+     {
+-        reply->count = mutex->count;
+-        reply->owned = (mutex->owner == current);
+-        reply->abandoned = mutex->abandoned;
++        reply->count = mutex->u.server.count;
++        reply->owned = (mutex->u.server.owner == current);
++        reply->abandoned = mutex->u.server.abandoned;
+ 
+         release_object( mutex );
+     }
+diff --git a/server/named_pipe.c b/server/named_pipe.c
+index ad0c9f549a6..fbcd75321bc 100644
+--- a/server/named_pipe.c
++++ b/server/named_pipe.c
+@@ -187,7 +187,7 @@ static const struct object_ops pipe_server_ops =
+     NULL,                         /* unlink_name */
+     pipe_server_open_file,        /* open_file */
+     no_kernel_obj_list,           /* get_kernel_obj_list */
+-    no_get_inproc_sync,           /* get_inproc_sync */
++    default_fd_get_inproc_sync,   /* get_inproc_sync */
+     async_close_obj_handle,       /* close_handle */
+     pipe_server_destroy           /* destroy */
+ };
+@@ -234,7 +234,7 @@ static const struct object_ops pipe_client_ops =
+     NULL,                         /* unlink_name */
+     no_open_file,                 /* open_file */
+     no_kernel_obj_list,           /* get_kernel_obj_list */
+-    no_get_inproc_sync,           /* get_inproc_sync */
++    default_fd_get_inproc_sync,   /* get_inproc_sync */
+     async_close_obj_handle,       /* close_handle */
+     pipe_end_destroy              /* destroy */
+ };
+@@ -318,7 +318,7 @@ static const struct object_ops named_pipe_device_file_ops =
+     NULL,                                    /* unlink_name */
+     no_open_file,                            /* open_file */
+     no_kernel_obj_list,                      /* get_kernel_obj_list */
+-    no_get_inproc_sync,                      /* get_inproc_sync */
++    default_fd_get_inproc_sync,              /* get_inproc_sync */
+     no_close_handle,                         /* close_handle */
+     named_pipe_device_file_destroy           /* destroy */
+ };
+@@ -372,7 +372,7 @@ static const struct object_ops named_pipe_dir_ops =
+     NULL,                                    /* unlink_name */
+     named_pipe_dir_open_file,                /* open_file */
+     no_kernel_obj_list,                      /* get_kernel_obj_list */
+-    no_get_inproc_sync,                      /* get_inproc_sync */
++    default_fd_get_inproc_sync,              /* get_inproc_sync */
+     named_pipe_dir_close_handle,             /* close_handle */
+     named_pipe_dir_destroy                   /* destroy */
+ };
+diff --git a/server/object.h b/server/object.h
+index e212ec75a0d..c860ec1d1e0 100644
+--- a/server/object.h
++++ b/server/object.h
+@@ -240,7 +240,14 @@ extern void abandon_mutexes( struct thread *thread );
+ 
+ /* in-process synchronization functions */
+ 
++extern int use_inproc_sync(void);
++extern int create_inproc_event( int manual_reset, int signaled );
++extern int create_inproc_semaphore( unsigned int count, unsigned int max );
++extern int create_inproc_mutex( thread_id_t owner, unsigned int count );
+ extern int no_get_inproc_sync( struct object *obj, enum inproc_sync_type *type );
++extern void set_inproc_event( int event );
++extern void reset_inproc_event( int event );
++extern void abandon_inproc_mutex( thread_id_t tid, int mutex );
+ 
+ /* serial functions */
+ 
+diff --git a/server/process.c b/server/process.c
+index 8faf3ae754d..ae987a6cfd5 100644
+--- a/server/process.c
++++ b/server/process.c
+@@ -96,6 +96,7 @@ static unsigned int process_map_access( struct object *obj, unsigned int access
+ static struct security_descriptor *process_get_sd( struct object *obj );
+ static void process_poll_event( struct fd *fd, int event );
+ static struct list *process_get_kernel_obj_list( struct object *obj );
++static int process_get_inproc_sync( struct object *obj, enum inproc_sync_type *type );
+ static void process_destroy( struct object *obj );
+ static int process_get_esync_fd( struct object *obj, enum esync_type *type );
+ static unsigned int process_get_fsync_idx( struct object *obj, enum fsync_type *type );
+@@ -124,7 +125,7 @@ static const struct object_ops process_ops =
+     NULL,                        /* unlink_name */
+     no_open_file,                /* open_file */
+     process_get_kernel_obj_list, /* get_kernel_obj_list */
+-    no_get_inproc_sync,          /* get_inproc_sync */
++    process_get_inproc_sync,     /* get_inproc_sync */
+     no_close_handle,             /* close_handle */
+     process_destroy              /* destroy */
+ };
+@@ -202,6 +203,7 @@ struct type_descr job_type =
+ static void job_dump( struct object *obj, int verbose );
+ static int job_signaled( struct object *obj, struct wait_queue_entry *entry );
+ static int job_close_handle( struct object *obj, struct process *process, obj_handle_t handle );
++static int job_get_inproc_sync( struct object *obj, enum inproc_sync_type *type );
+ static void job_destroy( struct object *obj );
+ 
+ struct job
+@@ -218,6 +220,7 @@ struct job
+     struct job *parent;
+     struct list parent_job_entry;  /* list entry for parent job */
+     struct list child_job_list;    /* list of child jobs */
++    int         inproc_sync;       /* in-process synchronization object */
+ };
+ 
+ static const struct object_ops job_ops =
+@@ -242,7 +245,7 @@ static const struct object_ops job_ops =
+     default_unlink_name,           /* unlink_name */
+     no_open_file,                  /* open_file */
+     no_kernel_obj_list,            /* get_kernel_obj_list */
+-    no_get_inproc_sync,            /* get_inproc_sync */
++    job_get_inproc_sync,           /* get_inproc_sync */
+     job_close_handle,              /* close_handle */
+     job_destroy                    /* destroy */
+ };
+@@ -267,6 +270,7 @@ static struct job *create_job_object( struct object *root, const struct unicode_
+             job->completion_port = NULL;
+             job->completion_key = 0;
+             job->parent = NULL;
++            job->inproc_sync = create_inproc_event( TRUE, FALSE );
+         }
+     }
+     return job;
+@@ -423,6 +427,15 @@ static void terminate_job( struct job *job, int exit_code )
+     job->terminating = 0;
+     job->signaled = 1;
+     wake_up( &job->obj, 0 );
++    set_inproc_event( job->inproc_sync );
++}
++
++static int job_get_inproc_sync( struct object *obj, enum inproc_sync_type *type )
++{
++    struct job *job = (struct job *)obj;
++
++    *type = INPROC_SYNC_MANUAL_SERVER;
++    return job->inproc_sync;
+ }
+ 
+ static int job_close_handle( struct object *obj, struct process *process, obj_handle_t handle )
+@@ -453,6 +466,8 @@ static void job_destroy( struct object *obj )
+         list_remove( &job->parent_job_entry );
+         release_object( job->parent );
+     }
++
++    if (use_inproc_sync()) close( job->inproc_sync );
+ }
+ 
+ static void job_dump( struct object *obj, int verbose )
+@@ -699,6 +714,7 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
+     process->rawinput_device_count = 0;
+     process->rawinput_mouse  = NULL;
+     process->rawinput_kbd    = NULL;
++    process->inproc_sync     = create_inproc_event( TRUE, FALSE );
+     memset( &process->image_info, 0, sizeof(process->image_info) );
+     process->esync_fd        = -1;
+     process->fsync_idx       = 0;
+@@ -827,6 +843,8 @@ static void process_destroy( struct object *obj )
+     free( process->rawinput_devices );
+     free( process->dir_cache );
+     free( process->image );
++
++    if (use_inproc_sync()) close( process->inproc_sync );
+     if (do_esync()) close( process->esync_fd );
+     if (process->fsync_idx)
+     {
+@@ -880,6 +898,14 @@ static struct list *process_get_kernel_obj_list( struct object *obj )
+     return &process->kernel_object;
+ }
+ 
++static int process_get_inproc_sync( struct object *obj, enum inproc_sync_type *type )
++{
++    struct process *process = (struct process *)obj;
++
++    *type = INPROC_SYNC_MANUAL_SERVER;
++    return process->inproc_sync;
++}
++
+ static struct security_descriptor *process_get_sd( struct object *obj )
+ {
+     static struct security_descriptor *process_default_sd;
+@@ -1044,6 +1070,7 @@ static void process_killed( struct process *process )
+     release_job_process( process );
+     start_sigkill_timer( process );
+     wake_up( &process->obj, 0 );
++    set_inproc_event( process->inproc_sync );
+ }
+ 
+ /* add a thread to a process running threads list */
+diff --git a/server/process.h b/server/process.h
+index e332069c56f..8cf5c2fba1f 100644
+--- a/server/process.h
++++ b/server/process.h
+@@ -86,6 +86,7 @@ struct process
+     struct list          rawinput_entry;  /* entry in the rawinput process list */
+     struct list          kernel_object;   /* list of kernel object pointers */
+     struct pe_image_info image_info;      /* main exe image info */
++    int                  inproc_sync;     /* in-process synchronization object */
+     int                  esync_fd;        /* esync file descriptor (signaled on exit) */
+     unsigned int         fsync_idx;
+     struct cpu_topology_override cpu_override; /* Overridden CPUs to host CPUs mapping. */
+diff --git a/server/protocol.def b/server/protocol.def
+index 2a90837992e..23453fbaba5 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -4271,3 +4271,26 @@ enum inproc_sync_type
+ /* Obtain a fd for the ntsync device */
+ @REQ(get_linux_sync_device)
+ @END
++
++/* Get the in-process synchronization fd associated with the waitable handle */
++@REQ(get_linux_sync_obj)
++    obj_handle_t handle;        /* handle to the object */
++@REPLY
++    int type;                   /* object type */
++    unsigned int access;        /* handle access rights */
++@END
++
++/* Begin a client-side wait on a message queue */
++@REQ(select_inproc_queue)
++@END
++
++/* End a client-side wait on a message queue */
++@REQ(unselect_inproc_queue)
++    int          signaled;        /* was the queue signaled? */
++@END
++
++/* Get an event handle to be used for thread alerts with in-process synchronization */
++@REQ(get_inproc_alert_event)
++@REPLY
++    obj_handle_t handle;          /* handle to the event */
++@END
+diff --git a/server/queue.c b/server/queue.c
+index 20d8c2d959c..ad6547a2bce 100644
+--- a/server/queue.c
++++ b/server/queue.c
+@@ -146,6 +146,8 @@ struct msg_queue
+     timeout_t              last_get_msg;    /* time of last get message call */
+     int                    keystate_lock;   /* owns an input keystate lock */
+     const queue_shm_t     *shared;          /* queue in session shared memory */
++    int                    inproc_sync;     /* in-process synchronization object */
++    int                    in_inproc_wait;      /* are we in a client-side wait? */
+     int                    esync_fd;        /* esync file descriptor (signalled on message) */
+     int                    esync_in_msgwait; /* our thread is currently waiting on us */
+     unsigned int           fsync_idx;
+@@ -169,6 +171,7 @@ static int msg_queue_signaled( struct object *obj, struct wait_queue_entry *entr
+ static int msg_queue_get_esync_fd( struct object *obj, enum esync_type *type );
+ static unsigned int msg_queue_get_fsync_idx( struct object *obj, enum fsync_type *type );
+ static void msg_queue_satisfied( struct object *obj, struct wait_queue_entry *entry );
++static int msg_queue_get_inproc_sync( struct object *obj, enum inproc_sync_type *type );
+ static void msg_queue_destroy( struct object *obj );
+ static void msg_queue_poll_event( struct fd *fd, int event );
+ static void thread_input_dump( struct object *obj, int verbose );
+@@ -197,7 +200,7 @@ static const struct object_ops msg_queue_ops =
+     NULL,                      /* unlink_name */
+     no_open_file,              /* open_file */
+     no_kernel_obj_list,        /* get_kernel_obj_list */
+-    no_get_inproc_sync,        /* get_inproc_sync */
++    msg_queue_get_inproc_sync, /* get_inproc_sync */
+     no_close_handle,           /* close_handle */
+     msg_queue_destroy          /* destroy */
+ };
+@@ -339,6 +342,8 @@ static struct msg_queue *create_msg_queue( struct thread *thread, struct thread_
+         queue->hooks           = NULL;
+         queue->last_get_msg    = current_time;
+         queue->keystate_lock   = 0;
++        queue->inproc_sync     = create_inproc_event( TRUE, FALSE );
++        queue->in_inproc_wait  = 0;
+         queue->esync_fd        = -1;
+         queue->esync_in_msgwait = 0;
+         queue->fsync_idx       = 0;
+@@ -766,7 +771,11 @@ static inline void set_queue_bits( struct msg_queue *queue, unsigned int bits )
+     }
+     SHARED_WRITE_END;
+ 
+-    if (is_signaled( queue )) wake_up( &queue->obj, 0 );
++    if (is_signaled( queue ))
++    {
++        wake_up( &queue->obj, 0 );
++        set_inproc_event( queue->inproc_sync );
++    }
+ }
+ 
+ /* clear some queue bits */
+@@ -792,6 +801,9 @@ static inline void clear_queue_bits( struct msg_queue *queue, unsigned int bits
+         if (queue->keystate_lock) unlock_input_keystate( queue->input );
+         queue->keystate_lock = 0;
+     }
++
++    if (!is_signaled( queue ))
++        reset_inproc_event( queue->inproc_sync );
+ }
+ 
+ /* check if message is matched by the filter */
+@@ -1303,6 +1315,9 @@ static int is_queue_hung( struct msg_queue *queue )
+             return 0;  /* thread is waiting on queue -> not hung */
+     }
+ 
++    if (queue->in_inproc_wait)
++        return 0;
++
+     if (do_fsync() && queue->fsync_in_msgwait)
+         return 0;   /* thread is waiting on queue in absentia -> not hung */
+ 
+@@ -1388,6 +1403,15 @@ static void msg_queue_satisfied( struct object *obj, struct wait_queue_entry *en
+         shared->changed_mask = 0;
+     }
+     SHARED_WRITE_END;
++    reset_inproc_event( queue->inproc_sync );
++}
++
++static int msg_queue_get_inproc_sync( struct object *obj, enum inproc_sync_type *type )
++{
++    struct msg_queue *queue = (struct msg_queue *)obj;
++
++    *type = INPROC_SYNC_QUEUE;
++    return queue->inproc_sync;
+ }
+ 
+ static void msg_queue_destroy( struct object *obj )
+@@ -1433,6 +1457,7 @@ static void msg_queue_destroy( struct object *obj )
+     if (queue->hooks) release_object( queue->hooks );
+     if (queue->fd) release_object( queue->fd );
+     if (queue->shared) free_shared_object( queue->shared );
++    if (use_inproc_sync()) close( queue->inproc_sync );
+     if (do_esync()) close( queue->esync_fd );
+     if (queue->fsync_idx) fsync_free_shm_idx( queue->fsync_idx );
+ }
+@@ -1445,6 +1470,7 @@ static void msg_queue_poll_event( struct fd *fd, int event )
+     if (event & (POLLERR | POLLHUP)) set_fd_events( fd, -1 );
+     else set_fd_events( queue->fd, 0 );
+     wake_up( &queue->obj, 0 );
++    set_inproc_event( queue->inproc_sync );
+ }
+ 
+ static void thread_input_dump( struct object *obj, int verbose )
+@@ -3318,7 +3344,15 @@ DECL_HANDLER(set_queue_mask)
+                 }
+                 SHARED_WRITE_END;
+             }
+-            else wake_up( &queue->obj, 0 );
++            else
++            {
++                wake_up( &queue->obj, 0 );
++                set_inproc_event( queue->inproc_sync );
++            }
++        }
++        else
++        {
++            reset_inproc_event( queue->inproc_sync );
+         }
+ 
+         if (do_fsync() && !is_signaled( queue ))
+@@ -3352,6 +3386,9 @@ DECL_HANDLER(get_queue_status)
+             shared->changed_bits &= ~req->clear_bits;
+         }
+         SHARED_WRITE_END;
++
++        if (!is_signaled( queue ))
++            reset_inproc_event( queue->inproc_sync );
+     }
+     else reply->wake_bits = reply->changed_bits = 0;
+ }
+@@ -3549,6 +3586,9 @@ DECL_HANDLER(get_message)
+     }
+     SHARED_WRITE_END;
+ 
++    if (!is_signaled( queue ))
++        reset_inproc_event( queue->inproc_sync );
++
+     /* then check for posted messages */
+     if ((filter & QS_POSTMESSAGE) &&
+         get_posted_message( queue, get_win, req->get_first, req->get_last, req->flags, reply ))
+@@ -3608,6 +3648,7 @@ DECL_HANDLER(get_message)
+     }
+     SHARED_WRITE_END;
+ 
++    reset_inproc_event( queue->inproc_sync );
+     set_error( STATUS_PENDING );  /* FIXME */
+ 
+     if (do_fsync() && !is_signaled( queue ))
+@@ -4436,6 +4477,45 @@ DECL_HANDLER(track_mouse_from_pointer)
+     }
+ }
+ 
++DECL_HANDLER(select_inproc_queue)
++{
++    struct msg_queue *queue = current->queue;
++
++    if (queue->in_inproc_wait)
++    {
++        set_error( STATUS_ACCESS_DENIED );
++    }
++    else
++    {
++        check_thread_queue_idle( current );
++
++        if (queue->fd)
++            set_fd_events( queue->fd, POLLIN );
++
++        queue->in_inproc_wait = 1;
++    }
++}
++
++DECL_HANDLER(unselect_inproc_queue)
++{
++    struct msg_queue *queue = current->queue;
++
++    if (!queue->in_inproc_wait)
++    {
++        set_error( STATUS_ACCESS_DENIED );
++    }
++    else
++    {
++        if (queue->fd)
++            set_fd_events( queue->fd, 0 );
++
++        if (req->signaled)
++            msg_queue_satisfied( &queue->obj, NULL );
++
++        queue->in_inproc_wait = 0;
++    }
++}
++
+ DECL_HANDLER(esync_msgwait)
+ {
+     struct msg_queue *queue = get_current_queue();
+diff --git a/server/request_handlers.h b/server/request_handlers.h
+index 30e6ee25bc9..28fb4b2df34 100644
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -314,6 +314,10 @@ DECL_HANDLER(fsync_msgwait);
+ DECL_HANDLER(get_fsync_apc_idx);
+ DECL_HANDLER(fsync_free_shm_idx);
+ DECL_HANDLER(get_linux_sync_device);
++DECL_HANDLER(get_linux_sync_obj);
++DECL_HANDLER(select_inproc_queue);
++DECL_HANDLER(unselect_inproc_queue);
++DECL_HANDLER(get_inproc_alert_event);
+ 
+ typedef void (*req_handler)( const void *req, void *reply );
+ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+@@ -625,6 +629,10 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+     (req_handler)req_get_fsync_apc_idx,
+     (req_handler)req_fsync_free_shm_idx,
+     (req_handler)req_get_linux_sync_device,
++    (req_handler)req_get_linux_sync_obj,
++    (req_handler)req_select_inproc_queue,
++    (req_handler)req_unselect_inproc_queue,
++    (req_handler)req_get_inproc_alert_event,
+ };
+ 
+ C_ASSERT( sizeof(abstime_t) == 8 );
+@@ -2383,3 +2391,14 @@ C_ASSERT( offsetof(struct fsync_free_shm_idx_request, shm_idx) == 12 );
+ C_ASSERT( sizeof(struct fsync_free_shm_idx_request) == 16 );
+ C_ASSERT( sizeof(struct fsync_free_shm_idx_reply) == 8 );
+ C_ASSERT( sizeof(struct get_linux_sync_device_request) == 16 );
++C_ASSERT( offsetof(struct get_linux_sync_obj_request, handle) == 12 );
++C_ASSERT( sizeof(struct get_linux_sync_obj_request) == 16 );
++C_ASSERT( offsetof(struct get_linux_sync_obj_reply, type) == 8 );
++C_ASSERT( offsetof(struct get_linux_sync_obj_reply, access) == 12 );
++C_ASSERT( sizeof(struct get_linux_sync_obj_reply) == 16 );
++C_ASSERT( sizeof(struct select_inproc_queue_request) == 16 );
++C_ASSERT( offsetof(struct unselect_inproc_queue_request, signaled) == 12 );
++C_ASSERT( sizeof(struct unselect_inproc_queue_request) == 16 );
++C_ASSERT( sizeof(struct get_inproc_alert_event_request) == 16 );
++C_ASSERT( offsetof(struct get_inproc_alert_event_reply, handle) == 8 );
++C_ASSERT( sizeof(struct get_inproc_alert_event_reply) == 16 );
+diff --git a/server/request_trace.h b/server/request_trace.h
+index 8de40b18686..b70342f9581 100644
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -3514,6 +3514,35 @@ static void dump_get_linux_sync_device_request( const struct get_linux_sync_devi
+ {
+ }
+ 
++static void dump_get_linux_sync_obj_request( const struct get_linux_sync_obj_request *req )
++{
++    fprintf( stderr, " handle=%04x", req->handle );
++}
++
++static void dump_get_linux_sync_obj_reply( const struct get_linux_sync_obj_reply *req )
++{
++    fprintf( stderr, " type=%d", req->type );
++    fprintf( stderr, ", access=%08x", req->access );
++}
++
++static void dump_select_inproc_queue_request( const struct select_inproc_queue_request *req )
++{
++}
++
++static void dump_unselect_inproc_queue_request( const struct unselect_inproc_queue_request *req )
++{
++    fprintf( stderr, " signaled=%d", req->signaled );
++}
++
++static void dump_get_inproc_alert_event_request( const struct get_inproc_alert_event_request *req )
++{
++}
++
++static void dump_get_inproc_alert_event_reply( const struct get_inproc_alert_event_reply *req )
++{
++    fprintf( stderr, " handle=%04x", req->handle );
++}
++
+ typedef void (*dump_func)( const void *req );
+ 
+ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
+@@ -3825,6 +3854,10 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_get_fsync_apc_idx_request,
+     (dump_func)dump_fsync_free_shm_idx_request,
+     (dump_func)dump_get_linux_sync_device_request,
++    (dump_func)dump_get_linux_sync_obj_request,
++    (dump_func)dump_select_inproc_queue_request,
++    (dump_func)dump_unselect_inproc_queue_request,
++    (dump_func)dump_get_inproc_alert_event_request,
+ };
+ 
+ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+@@ -4136,6 +4169,10 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_get_fsync_apc_idx_reply,
+     NULL,
+     NULL,
++    (dump_func)dump_get_linux_sync_obj_reply,
++    NULL,
++    NULL,
++    (dump_func)dump_get_inproc_alert_event_reply,
+ };
+ 
+ static const char * const req_names[REQ_NB_REQUESTS] =
+@@ -4447,6 +4484,10 @@ static const char * const req_names[REQ_NB_REQUESTS] =
+     "get_fsync_apc_idx",
+     "fsync_free_shm_idx",
+     "get_linux_sync_device",
++    "get_linux_sync_obj",
++    "select_inproc_queue",
++    "unselect_inproc_queue",
++    "get_inproc_alert_event",
+ };
+ 
+ static const struct
+diff --git a/server/semaphore.c b/server/semaphore.c
+index 567a922c0ac..ecd6c8b7c82 100644
+--- a/server/semaphore.c
++++ b/server/semaphore.c
+@@ -25,6 +25,7 @@
+ #include <stdlib.h>
+ #include <stdarg.h>
+ #include <sys/types.h>
++#include <unistd.h>
+ 
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+@@ -52,15 +53,24 @@ struct type_descr semaphore_type =
+ 
+ struct semaphore
+ {
+-    struct object  obj;    /* object header */
+-    unsigned int   count;  /* current count */
+-    unsigned int   max;    /* maximum possible count */
++    struct object  obj;            /* object header */
++    union
++    {
++        struct
++        {
++            unsigned int   count;  /* current count */
++            unsigned int   max;    /* maximum possible count */
++        } s;
++        int inproc_sync;           /* in-process synchronization object */
++    } u;
+ };
+ 
+ static void semaphore_dump( struct object *obj, int verbose );
+ static int semaphore_signaled( struct object *obj, struct wait_queue_entry *entry );
+ static void semaphore_satisfied( struct object *obj, struct wait_queue_entry *entry );
+ static int semaphore_signal( struct object *obj, unsigned int access );
++static int semaphore_get_inproc_sync( struct object *obj, enum inproc_sync_type *type );
++static void semaphore_destroy( struct object *obj );
+ 
+ static const struct object_ops semaphore_ops =
+ {
+@@ -84,9 +94,9 @@ static const struct object_ops semaphore_ops =
+     default_unlink_name,           /* unlink_name */
+     no_open_file,                  /* open_file */
+     no_kernel_obj_list,            /* get_kernel_obj_list */
+-    no_get_inproc_sync,            /* get_inproc_sync */
++    semaphore_get_inproc_sync,     /* get_inproc_sync */
+     no_close_handle,               /* close_handle */
+-    no_destroy                     /* destroy */
++    semaphore_destroy              /* destroy */
+ };
+ 
+ 
+@@ -106,8 +116,15 @@ static struct semaphore *create_semaphore( struct object *root, const struct uni
+         if (get_error() != STATUS_OBJECT_NAME_EXISTS)
+         {
+             /* initialize it if it didn't already exist */
+-            sem->count = initial;
+-            sem->max   = max;
++            if (use_inproc_sync())
++            {
++                sem->u.inproc_sync = create_inproc_semaphore( initial, max );
++            }
++            else
++            {
++                sem->u.s.count = initial;
++                sem->u.s.max   = max;
++            }
+         }
+     }
+     return sem;
+@@ -116,20 +133,20 @@ static struct semaphore *create_semaphore( struct object *root, const struct uni
+ static int release_semaphore( struct semaphore *sem, unsigned int count,
+                               unsigned int *prev )
+ {
+-    if (prev) *prev = sem->count;
+-    if (sem->count + count < sem->count || sem->count + count > sem->max)
++    if (prev) *prev = sem->u.s.count;
++    if (sem->u.s.count + count < sem->u.s.count || sem->u.s.count + count > sem->u.s.max)
+     {
+         set_error( STATUS_SEMAPHORE_LIMIT_EXCEEDED );
+         return 0;
+     }
+-    else if (sem->count)
++    else if (sem->u.s.count)
+     {
+         /* there cannot be any thread to wake up if the count is != 0 */
+-        sem->count += count;
++        sem->u.s.count += count;
+     }
+     else
+     {
+-        sem->count = count;
++        sem->u.s.count = count;
+         wake_up( &sem->obj, count );
+     }
+     return 1;
+@@ -139,22 +156,22 @@ static void semaphore_dump( struct object *obj, int verbose )
+ {
+     struct semaphore *sem = (struct semaphore *)obj;
+     assert( obj->ops == &semaphore_ops );
+-    fprintf( stderr, "Semaphore count=%d max=%d\n", sem->count, sem->max );
++    fprintf( stderr, "Semaphore count=%d max=%d\n", sem->u.s.count, sem->u.s.max );
+ }
+ 
+ static int semaphore_signaled( struct object *obj, struct wait_queue_entry *entry )
+ {
+     struct semaphore *sem = (struct semaphore *)obj;
+     assert( obj->ops == &semaphore_ops );
+-    return (sem->count > 0);
++    return (sem->u.s.count > 0);
+ }
+ 
+ static void semaphore_satisfied( struct object *obj, struct wait_queue_entry *entry )
+ {
+     struct semaphore *sem = (struct semaphore *)obj;
+     assert( obj->ops == &semaphore_ops );
+-    assert( sem->count );
+-    sem->count--;
++    assert( sem->u.s.count );
++    sem->u.s.count--;
+ }
+ 
+ static int semaphore_signal( struct object *obj, unsigned int access )
+@@ -170,6 +187,21 @@ static int semaphore_signal( struct object *obj, unsigned int access )
+     return release_semaphore( sem, 1, NULL );
+ }
+ 
++static int semaphore_get_inproc_sync( struct object *obj, enum inproc_sync_type *type )
++{
++    struct semaphore *semaphore = (struct semaphore *)obj;
++
++    *type = INPROC_SYNC_SEMAPHORE;
++    return semaphore->u.inproc_sync;
++}
++
++static void semaphore_destroy( struct object *obj )
++{
++    struct semaphore *semaphore = (struct semaphore *)obj;
++
++    if (use_inproc_sync()) close( semaphore->u.inproc_sync );
++}
++
+ /* create a semaphore */
+ DECL_HANDLER(create_semaphore)
+ {
+@@ -224,8 +256,8 @@ DECL_HANDLER(query_semaphore)
+     if ((sem = (struct semaphore *)get_handle_obj( current->process, req->handle,
+                                                    SEMAPHORE_QUERY_STATE, &semaphore_ops )))
+     {
+-        reply->current = sem->count;
+-        reply->max = sem->max;
++        reply->current = sem->u.s.count;
++        reply->max = sem->u.s.max;
+         release_object( sem );
+     }
+ }
+diff --git a/server/serial.c b/server/serial.c
+index 93619ebccde..c1bdfbbe2b5 100644
+--- a/server/serial.c
++++ b/server/serial.c
+@@ -105,7 +105,7 @@ static const struct object_ops serial_ops =
+     NULL,                         /* unlink_name */
+     no_open_file,                 /* open_file */
+     no_kernel_obj_list,           /* get_kernel_obj_list */
+-    no_get_inproc_sync,           /* get_inproc_sync */
++    default_fd_get_inproc_sync,   /* get_inproc_sync */
+     no_close_handle,              /* close_handle */
+     serial_destroy                /* destroy */
+ };
+diff --git a/server/sock.c b/server/sock.c
+index 977286615dc..af2f778108c 100644
+--- a/server/sock.c
++++ b/server/sock.c
+@@ -485,7 +485,7 @@ static const struct object_ops sock_ops =
+     NULL,                         /* unlink_name */
+     no_open_file,                 /* open_file */
+     no_kernel_obj_list,           /* get_kernel_obj_list */
+-    no_get_inproc_sync,           /* get_inproc_sync */
++    default_fd_get_inproc_sync,   /* get_inproc_sync */
+     sock_close_handle,            /* close_handle */
+     sock_destroy                  /* destroy */
+ };
+diff --git a/server/thread.c b/server/thread.c
+index 4dce10259b4..28e49a09bed 100644
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -190,6 +190,7 @@ static unsigned int thread_get_fsync_idx( struct object *obj, enum fsync_type *t
+ static unsigned int thread_map_access( struct object *obj, unsigned int access );
+ static void thread_poll_event( struct fd *fd, int event );
+ static struct list *thread_get_kernel_obj_list( struct object *obj );
++static int thread_get_inproc_sync( struct object *obj, enum inproc_sync_type *type );
+ static void destroy_thread( struct object *obj );
+ 
+ static const struct object_ops thread_ops =
+@@ -214,7 +215,7 @@ static const struct object_ops thread_ops =
+     NULL,                       /* unlink_name */
+     no_open_file,               /* open_file */
+     thread_get_kernel_obj_list, /* get_kernel_obj_list */
+-    no_get_inproc_sync,         /* get_inproc_sync */
++    thread_get_inproc_sync,     /* get_inproc_sync */
+     no_close_handle,            /* close_handle */
+     destroy_thread              /* destroy */
+ };
+@@ -313,6 +314,8 @@ static inline void init_thread_structure( struct thread *thread )
+     thread->token           = NULL;
+     thread->desc            = NULL;
+     thread->desc_len        = 0;
++    thread->inproc_sync     = create_inproc_event( TRUE, FALSE );
++    thread->inproc_alert_event = NULL;
+ 
+     thread->creation_time = current_time;
+     thread->exit_time     = 0;
+@@ -483,6 +486,14 @@ static struct list *thread_get_kernel_obj_list( struct object *obj )
+     return &thread->kernel_object;
+ }
+ 
++static int thread_get_inproc_sync( struct object *obj, enum inproc_sync_type *type )
++{
++    struct thread *thread = (struct thread *)obj;
++
++    *type = INPROC_SYNC_MANUAL_SERVER;
++    return thread->inproc_sync;
++}
++
+ /* cleanup everything that is no longer needed by a dead thread */
+ /* used by destroy_thread and kill_thread */
+ static void cleanup_thread( struct thread *thread )
+@@ -539,6 +550,8 @@ static void destroy_thread( struct object *obj )
+     if (thread->id) free_ptid( thread->id );
+     if (thread->token) release_object( thread->token );
+ 
++    if (use_inproc_sync()) close( thread->inproc_sync );
++    if (thread->inproc_alert_event) release_object( thread->inproc_alert_event );
+     if (do_esync())
+         close( thread->esync_fd );
+     if (thread->fsync_idx)
+@@ -1322,6 +1335,9 @@ static int queue_apc( struct process *process, struct thread *thread, struct thr
+     {
+         wake_thread( thread );
+ 
++        if (apc->call.type == APC_USER && thread->inproc_alert_event)
++            set_event( thread->inproc_alert_event );
++
+         if (do_fsync() && queue == &thread->user_apc)
+             fsync_wake_futex( thread->fsync_apc_idx );
+ 
+@@ -1359,6 +1375,8 @@ void thread_cancel_apc( struct thread *thread, struct object *owner, enum apc_ty
+         apc->executed = 1;
+         wake_up( &apc->obj, 0 );
+         release_object( apc );
++        if (list_empty( &thread->user_apc ) && thread->inproc_alert_event)
++            reset_event( thread->inproc_alert_event );
+         return;
+     }
+ }
+@@ -1373,6 +1391,9 @@ static struct thread_apc *thread_dequeue_apc( struct thread *thread, int system
+     {
+         apc = LIST_ENTRY( ptr, struct thread_apc, entry );
+         list_remove( ptr );
++
++        if (list_empty( &thread->user_apc ) && thread->inproc_alert_event)
++            reset_event( thread->inproc_alert_event );
+     }
+ 
+     if (do_fsync() && list_empty( &thread->system_apc ) && list_empty( &thread->user_apc ))
+@@ -1481,6 +1502,7 @@ void kill_thread( struct thread *thread, int violent_death )
+     if (do_esync())
+         esync_abandon_mutexes( thread );
+     wake_up( &thread->obj, 0 );
++    set_inproc_event( thread->inproc_sync );
+     if (violent_death) send_thread_signal( thread, SIGQUIT );
+     cleanup_thread( thread );
+     remove_process_thread( thread->process, thread );
+@@ -2279,3 +2301,12 @@ DECL_HANDLER(get_next_thread)
+     set_error( STATUS_NO_MORE_ENTRIES );
+     release_object( process );
+ }
++
++DECL_HANDLER(get_inproc_alert_event)
++{
++    if (!current->inproc_alert_event)
++        current->inproc_alert_event = create_event( NULL, NULL, 0, 1, !list_empty( &current->user_apc ), NULL );
++
++    if (current->inproc_alert_event)
++        reply->handle = alloc_handle( current->process, current->inproc_alert_event, SYNCHRONIZE, 0 );
++}
+diff --git a/server/thread.h b/server/thread.h
+index d9b057311a7..4b21eea2238 100644
+--- a/server/thread.h
++++ b/server/thread.h
+@@ -98,6 +98,8 @@ struct thread
+     data_size_t            desc_len;      /* thread description length in bytes */
+     WCHAR                 *desc;          /* thread description string */
+     struct completion_wait *completion_wait; /* completion port wait object the thread is associated with */
++    int                    inproc_sync;    /* in-process synchronization object */
++    struct event          *inproc_alert_event; /* in-process synchronization alert event */
+ };
+ 
+ extern struct thread *current;
+diff --git a/server/timer.c b/server/timer.c
+index ca367a6fb7d..e3058f48bd8 100644
+--- a/server/timer.c
++++ b/server/timer.c
+@@ -26,6 +26,7 @@
+ #include <sys/time.h>
+ #include <sys/types.h>
+ #include <stdarg.h>
++#include <unistd.h>
+ 
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+@@ -65,6 +66,7 @@ struct timer
+     client_ptr_t         arg;       /* callback argument */
+     int                  esync_fd;  /* esync file descriptor */
+     unsigned int         fsync_idx; /* fsync shm index */
++    int                  inproc_sync; /* in-process synchronization object */
+ };
+ 
+ static void timer_dump( struct object *obj, int verbose );
+@@ -72,6 +74,7 @@ static int timer_signaled( struct object *obj, struct wait_queue_entry *entry );
+ static int timer_get_esync_fd( struct object *obj, enum esync_type *type );
+ static unsigned int timer_get_fsync_idx( struct object *obj, enum fsync_type *type );
+ static void timer_satisfied( struct object *obj, struct wait_queue_entry *entry );
++static int timer_get_inproc_sync( struct object *obj, enum inproc_sync_type *type );
+ static void timer_destroy( struct object *obj );
+ 
+ static const struct object_ops timer_ops =
+@@ -96,7 +99,7 @@ static const struct object_ops timer_ops =
+     default_unlink_name,       /* unlink_name */
+     no_open_file,              /* open_file */
+     no_kernel_obj_list,        /* get_kernel_obj_list */
+-    no_get_inproc_sync,        /* get_inproc_sync */
++    timer_get_inproc_sync,     /* get_inproc_sync */
+     no_close_handle,           /* close_handle */
+     timer_destroy              /* destroy */
+ };
+@@ -121,6 +124,7 @@ static struct timer *create_timer( struct object *root, const struct unicode_str
+             timer->thread   = NULL;
+             timer->esync_fd = -1;
+             timer->fsync_idx = 0;
++            timer->inproc_sync = create_inproc_event( manual, FALSE );
+ 
+             if (do_fsync())
+                 timer->fsync_idx = fsync_alloc_shm( 0, 0 );
+@@ -168,6 +172,7 @@ static void timer_callback( void *private )
+     /* wake up waiters */
+     timer->signaled = 1;
+     wake_up( &timer->obj, 0 );
++    set_inproc_event( timer->inproc_sync );
+ }
+ 
+ /* cancel a running timer */
+@@ -199,6 +204,8 @@ static int set_timer( struct timer *timer, timeout_t expire, unsigned int period
+         period = 0;  /* period doesn't make any sense for a manual timer */
+         timer->signaled = 0;
+ 
++        reset_inproc_event( timer->inproc_sync );
++
+         if (do_fsync())
+             fsync_clear( &timer->obj );
+ 
+@@ -252,6 +259,14 @@ static void timer_satisfied( struct object *obj, struct wait_queue_entry *entry
+     if (!timer->manual) timer->signaled = 0;
+ }
+ 
++static int timer_get_inproc_sync( struct object *obj, enum inproc_sync_type *type )
++{
++    struct timer *timer = (struct timer *)obj;
++
++    *type = timer->manual ? INPROC_SYNC_MANUAL_SERVER : INPROC_SYNC_AUTO_SERVER;
++    return timer->inproc_sync;
++}
++
+ static void timer_destroy( struct object *obj )
+ {
+     struct timer *timer = (struct timer *)obj;
+@@ -259,6 +274,7 @@ static void timer_destroy( struct object *obj )
+ 
+     if (timer->timeout) remove_timeout_user( timer->timeout );
+     if (timer->thread) release_object( timer->thread );
++    if (use_inproc_sync()) close( timer->inproc_sync );
+     if (do_esync()) close( timer->esync_fd );
+     if (timer->fsync_idx) fsync_free_shm_idx( timer->fsync_idx );
+ }
+-- 
+2.53.0
+

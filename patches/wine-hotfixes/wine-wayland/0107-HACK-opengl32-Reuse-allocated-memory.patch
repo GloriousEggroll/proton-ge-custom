@@ -1,0 +1,95 @@
+From abf31671858a3b1fc38b0cb7f92255e42a5b1357 Mon Sep 17 00:00:00 2001
+From: Etaash Mathamsetty
+ <45927311+Etaash-mathamsetty@users.noreply.github.com>
+Date: Fri, 20 Jun 2025 16:18:18 -0400
+Subject: [PATCH 107/502] HACK: opengl32: Reuse allocated memory
+
+around 1.5x to 2x faster on top of the 20x speed up
+---
+ dlls/opengl32/wgl.c | 51 +++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 49 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/opengl32/wgl.c b/dlls/opengl32/wgl.c
+index f80ab921d64..238f70cdb61 100644
+--- a/dlls/opengl32/wgl.c
++++ b/dlls/opengl32/wgl.c
+@@ -1675,6 +1675,16 @@ static void *get_named_buffer_pointer( GLint buffer )
+     return ptr;
+ }
+ 
++/* FIXME: these should be one per GL context */
++struct mem_desc {
++    void *addr;
++    SIZE_T size;
++    BOOL active;
++};
++#define NUM_MAPPINGS 512
++static struct mem_desc mappings[NUM_MAPPINGS];
++static LONG count;
++
+ /* if this code gets called we are in wow64 mode */
+ static void *allocate_mapping( SIZE_T length )
+ {
+@@ -1682,6 +1692,34 @@ static void *allocate_mapping( SIZE_T length )
+     MEM_EXTENDED_PARAMETER param;
+     void *ret = NULL;
+     MEM_ADDRESS_REQUIREMENTS req = {0};
++    struct mem_desc *slot = NULL;
++
++    /* an array is easy to implement but may not be the best option */
++    for (LONG i = 0; i < count; i++)
++    {
++        if (!mappings[i].active && mappings[i].size >= length)
++        {
++            return mappings[i].addr;
++        }
++    }
++
++    /* too many mappings are present!
++     * time to clear some out
++     * FIXME: This is not optimal, need to find a way to reduce the count as well when this happens
++     */
++    if (count >= NUM_MAPPINGS)
++    {
++        for (LONG i = 0; i < count; i++)
++        {
++            if (!mappings[i].active)
++            {
++                mappings[i].size = 0;
++                NtFreeVirtualMemory(NtCurrentProcess(), &mappings[i].addr, &mappings[i].size, MEM_RELEASE);
++                mappings[i].addr = NULL;
++                slot = &mappings[i];
++            }
++        }
++    }
+ 
+     req.Alignment = 0x10000;
+     param.Type = MemExtendedParameterAddressRequirements;
+@@ -1691,13 +1729,22 @@ static void *allocate_mapping( SIZE_T length )
+                                        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE, &param, 1);
+     if (status) ret = NULL;
+ 
++    if (!slot) slot = &mappings[count++];
++
++    slot->addr = ret;
++    slot->size = length;
++    slot->active = TRUE;
++
+     return ret;
+ }
+ 
+ static void free_mapping( void *ptr )
+ {
+-    SIZE_T size = 0;
+-    NtFreeVirtualMemory(NtCurrentProcess(), &ptr, &size, MEM_RELEASE);
++    for (LONG i = 0; i < count; i++)
++    {
++        if (ptr == mappings[i].addr)
++            mappings[i].active = FALSE;
++    }
+ }
+ #endif
+ 
+-- 
+2.53.0
+

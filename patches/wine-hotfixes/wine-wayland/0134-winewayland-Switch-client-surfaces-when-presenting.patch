@@ -1,0 +1,143 @@
+From 2c75d5f27798164d1f99df37b7eb4c0603c5a32b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?R=C3=A9mi=20Bernon?= <rbernon@codeweavers.com>
+Date: Fri, 30 May 2025 10:24:20 +0200
+Subject: [PATCH 134/502] winewayland: Switch client surfaces when presenting.
+
+---
+ dlls/winewayland.drv/opengl.c     |  5 +++-
+ dlls/winewayland.drv/vulkan.c     |  5 +++-
+ dlls/winewayland.drv/waylanddrv.h |  1 +
+ dlls/winewayland.drv/window.c     | 41 +++++++++++--------------------
+ 4 files changed, 23 insertions(+), 29 deletions(-)
+
+diff --git a/dlls/winewayland.drv/opengl.c b/dlls/winewayland.drv/opengl.c
+index c6a84a4f1bd..cd5c20fa3fe 100644
+--- a/dlls/winewayland.drv/opengl.c
++++ b/dlls/winewayland.drv/opengl.c
+@@ -220,7 +220,8 @@ static struct wayland_gl_drawable *wayland_gl_drawable_create(HWND hwnd, int for
+     /* Get the client surface for the HWND. If don't have a wayland surface
+      * (e.g., HWND_MESSAGE windows) just create a dummy surface to act as the
+      * target render surface. */
+-    if (!(gl->client = get_client_surface(hwnd))) goto err;
++    if (!(gl->client = wayland_client_surface_create(hwnd))) goto err;
++    set_client_surface(hwnd, gl->client);
+ 
+     tid = NtUserGetWindowThread(hwnd, &pid);
+     if (tid && pid != GetCurrentProcessId())
+@@ -729,6 +730,8 @@ static BOOL wayland_wglSwapBuffers(HDC hdc)
+ 
+     if (ctx) wgl_context_refresh(ctx);
+     ensure_window_surface_contents(toplevel);
++    set_client_surface(hwnd, gl->client);
++
+     /* Although all the EGL surfaces we create are double-buffered, we want to
+      * use some as single-buffered, so avoid swapping those. */
+     if (gl->double_buffered) p_eglSwapBuffers(egl_display, gl->surface);
+diff --git a/dlls/winewayland.drv/vulkan.c b/dlls/winewayland.drv/vulkan.c
+index 97b611dc980..ade62d0df22 100644
+--- a/dlls/winewayland.drv/vulkan.c
++++ b/dlls/winewayland.drv/vulkan.c
+@@ -75,7 +75,7 @@ static VkResult wayland_vulkan_surface_create(HWND hwnd, const struct vulkan_ins
+ 
+     TRACE("%p %p %p %p\n", hwnd, instance, surface, private);
+ 
+-    if (!(client = get_client_surface(hwnd)))
++    if (!(client = wayland_client_surface_create(hwnd)))
+     {
+         ERR("Failed to create client surface for hwnd=%p\n", hwnd);
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+@@ -103,6 +103,7 @@ static VkResult wayland_vulkan_surface_create(HWND hwnd, const struct vulkan_ins
+         return res;
+     }
+ 
++    set_client_surface(hwnd, client);
+     *private = client;
+ 
+     TRACE("Created surface=0x%s, private=%p\n", wine_dbgstr_longlong(*surface), *private);
+@@ -128,8 +129,10 @@ static void wayland_vulkan_surface_update(HWND hwnd, void *private)
+ 
+ static void wayland_vulkan_surface_presented(HWND hwnd, void *private, VkResult result)
+ {
++    struct wayland_client_surface *client = private;
+     HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
+     ensure_window_surface_contents(toplevel);
++    set_client_surface(hwnd, client);
+ }
+ 
+ static BOOL wayland_vulkan_surface_enable_fshack(HWND hwnd, void *private)
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index 7f7e8b5e7b4..c8a7dbe63d6 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -435,6 +435,7 @@ struct wayland_win_data *wayland_win_data_get_nolock(HWND hwnd);
+ void wayland_win_data_release(struct wayland_win_data *data);
+ 
+ struct wayland_client_surface *get_client_surface(HWND hwnd);
++void set_client_surface(HWND hwnd, struct wayland_client_surface *client);
+ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region);
+ struct wayland_shm_buffer *get_window_surface_contents(HWND hwnd);
+ void ensure_window_surface_contents(HWND hwnd);
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index 32b1a00f6cd..26735e3fb51 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -810,42 +810,29 @@ void WAYLAND_FlashWindowEx(FLASHWINFO *info)
+     }
+ }
+ 
+-/**********************************************************************
+- *          get_client_surface
+- */
+-struct wayland_client_surface *get_client_surface(HWND hwnd)
++void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
+ {
+-    struct wayland_client_surface *client;
++    struct wayland_client_surface *old_client;
+     struct wayland_win_data *data;
+     HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
+ 
+-    if ((data = wayland_win_data_get(hwnd)))
+-    {
+-        /* ownership is shared with one of the callers, the last caller to release
+-         * its reference will also destroy it and clear our pointer. */
+-        if ((client = data->client_surface)) InterlockedIncrement(&client->ref);
+-    }
+-    else
+-    {
+-        client = NULL;
+-    }
++    /* ownership is shared with the callers, the last caller to release
++     * its reference will also destroy it and clear our pointer. */
+ 
+-    if (!client && !(client = wayland_client_surface_create(hwnd)))
+-    {
+-        if (data) wayland_win_data_release(data);
+-        return NULL;
+-    }
+-    if (!data) return client;
++    if (!(data = wayland_win_data_get(hwnd))) return;
+ 
+-    if (toplevel && NtUserIsWindowVisible(hwnd))
+-        wayland_client_surface_attach(client, toplevel);
+-    else
+-        wayland_client_surface_detach(client);
++    if ((old_client = data->client_surface))
++        wayland_client_surface_detach(old_client);
+ 
+-    if (!data->client_surface) data->client_surface = client;
++    if ((data->client_surface = new_client))
++    {
++        if (toplevel && NtUserIsWindowVisible(hwnd))
++            wayland_client_surface_attach(new_client, toplevel);
++        else
++            wayland_client_surface_detach(new_client);
++    }
+ 
+     wayland_win_data_release(data);
+-    return client;
+ }
+ 
+ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region)
+-- 
+2.53.0
+

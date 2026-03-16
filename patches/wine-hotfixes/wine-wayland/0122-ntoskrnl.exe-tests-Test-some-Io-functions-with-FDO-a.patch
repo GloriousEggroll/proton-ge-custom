@@ -1,0 +1,145 @@
+From 24812458252cbcd175eed55d934da4584b9d4733 Mon Sep 17 00:00:00 2001
+From: Alexander Morozov <amorozov@etersoft.ru>
+Date: Thu, 24 Apr 2025 02:48:07 +0300
+Subject: [PATCH 122/502] ntoskrnl.exe/tests: Test some Io functions with FDO
+ and PDO.
+
+---
+ dlls/ntoskrnl.exe/tests/driver_pnp.c | 61 ++++++++++++++++++++++++++++
+ dlls/ntoskrnl.exe/tests/ntoskrnl.c   | 11 +++++
+ include/ddk/wdm.h                    |  4 ++
+ 3 files changed, 76 insertions(+)
+
+diff --git a/dlls/ntoskrnl.exe/tests/driver_pnp.c b/dlls/ntoskrnl.exe/tests/driver_pnp.c
+index 4d55bb02a95..076bd774b2b 100644
+--- a/dlls/ntoskrnl.exe/tests/driver_pnp.c
++++ b/dlls/ntoskrnl.exe/tests/driver_pnp.c
+@@ -727,6 +727,65 @@ static void test_device_properties( DEVICE_OBJECT *device )
+     }
+ }
+ 
++static void test_enumerator_name(void)
++{
++    static const WCHAR root[] = L"ROOT";
++    WCHAR buffer[10];
++    ULONG req_size;
++    NTSTATUS status;
++
++    status = IoGetDeviceProperty(bus_fdo, DevicePropertyEnumeratorName, sizeof(buffer), buffer, &req_size);
++    todo_wine ok(status == STATUS_INVALID_DEVICE_REQUEST, "got unexpected status %#lx\n", status);
++
++    req_size = 0;
++    memset(buffer, 0, sizeof(buffer));
++    status = IoGetDeviceProperty(bus_pdo, DevicePropertyEnumeratorName, sizeof(buffer), buffer, &req_size);
++    ok(status == STATUS_SUCCESS, "IoGetDeviceProperty failed: %#lx\n", status);
++    todo_wine ok(req_size == sizeof(root), "unexpected size %lu\n", req_size);
++    if (status == STATUS_SUCCESS)
++        todo_wine ok(!wcscmp(root, buffer), "unexpected property value '%ls'\n", buffer);
++}
++
++static void test_device_registry_key(void)
++{
++    static const WCHAR foobar[] = L"foobar";
++    static const WCHAR foo[] = L"foo";
++
++    KEY_VALUE_PARTIAL_INFORMATION *info;
++    UNICODE_STRING name_str;
++    NTSTATUS status;
++    HANDLE hkey;
++    DWORD size;
++
++    status = IoOpenDeviceRegistryKey(bus_fdo, PLUGPLAY_REGKEY_DEVICE, KEY_ALL_ACCESS, &hkey);
++    todo_wine ok(status == STATUS_INVALID_PARAMETER, "got unexpected status %#lx\n", status);
++
++    status = IoOpenDeviceRegistryKey(bus_pdo, PLUGPLAY_REGKEY_DEVICE, KEY_ALL_ACCESS, &hkey);
++    ok(status == STATUS_SUCCESS, "IoOpenDeviceRegistryKey failed: %#lx\n", status);
++    if (status == STATUS_SUCCESS)
++    {
++        RtlInitUnicodeString(&name_str, foobar);
++        status = ZwQueryValueKey(hkey, &name_str, KeyValuePartialInformation, NULL, 0, &size);
++        ok(status == STATUS_BUFFER_TOO_SMALL, "got unexpected status %#lx\n", status);
++
++        info = ExAllocatePool(PagedPool, size);
++        ok(!!info, "failed to allocate memory\n");
++        if (info)
++        {
++            memset(info, 0, size);
++            status = ZwQueryValueKey(hkey, &name_str, KeyValuePartialInformation, info, size, &size);
++            ok(status == STATUS_SUCCESS, "ZwQueryValueKey failed: %#lx\n", status);
++            ok(info->Type == REG_SZ, "expected type REG_SZ, got %lu\n", info->Type);
++            ok(info->DataLength == sizeof(foo), "unexpected DataLength %lu\n", info->DataLength);
++            ok(!wcscmp((WCHAR *)info->Data, foo), "got unexpected key value\n");
++            ExFreePool(info);
++        }
++
++        status = ZwClose(hkey);
++        ok(status == STATUS_SUCCESS, "ZwClose failed: %#lx\n", status);
++    }
++}
++
+ static NTSTATUS fdo_ioctl(IRP *irp, IO_STACK_LOCATION *stack, ULONG code)
+ {
+     switch (code)
+@@ -734,6 +793,8 @@ static NTSTATUS fdo_ioctl(IRP *irp, IO_STACK_LOCATION *stack, ULONG code)
+         case IOCTL_WINETEST_BUS_MAIN:
+             test_bus_query();
+             test_device_properties( bus_pdo );
++            test_enumerator_name();
++            test_device_registry_key();
+             return STATUS_SUCCESS;
+ 
+         case IOCTL_WINETEST_BUS_REGISTER_IFACE:
+diff --git a/dlls/ntoskrnl.exe/tests/ntoskrnl.c b/dlls/ntoskrnl.exe/tests/ntoskrnl.c
+index e9a0cb61c8a..98bd3795e98 100644
+--- a/dlls/ntoskrnl.exe/tests/ntoskrnl.c
++++ b/dlls/ntoskrnl.exe/tests/ntoskrnl.c
+@@ -1456,6 +1456,8 @@ static void test_pnp_devices(void)
+     static const WCHAR expect_device_bus_desc_w[] = L"WineTestDevice";
+     static const WCHAR expect_compat_id_w[] = L"winetest_compat\0winetest_compat_1\0";
+     static const WCHAR expect_container_id_w[] = L"{12345678-1234-1234-1234-123456789123}";
++    static const char foobar[] = "foobar";
++    static const char foo[] = "foo";
+ 
+     char buffer[200];
+     WCHAR buffer_w[200];
+@@ -1482,6 +1484,8 @@ static void test_pnp_devices(void)
+     IO_STATUS_BLOCK io;
+     HDEVINFO set;
+     HWND window;
++    LSTATUS status;
++    HKEY key;
+     BOOL ret;
+     int id;
+ 
+@@ -1515,6 +1519,13 @@ static void test_pnp_devices(void)
+     ok(!strcmp(iface_detail->DevicePath, "\\\\?\\root#winetest#0#{deadbeef-29ef-4538-a5fd-b69573a362c0}"),
+             "wrong path %s\n", debugstr_a(iface_detail->DevicePath));
+ 
++    /* Create a device parameter for testing IoOpenDeviceRegistryKey */
++    key = SetupDiCreateDevRegKeyA(set, &device, DICS_FLAG_GLOBAL, 0, DIREG_DEV, NULL, NULL);
++    ok(key != INVALID_HANDLE_VALUE, "failed to create a hardware parameters key, got error %#lx\n", GetLastError());
++    status = RegSetValueExA(key, foobar, 0, REG_SZ, (const BYTE *)foo, sizeof(foo));
++    ok(status == ERROR_SUCCESS, "failed to save a device parameter, got error %lu\n", status);
++    RegCloseKey(key);
++
+     SetupDiDestroyDeviceInfoList(set);
+ 
+     bus = CreateFileA(iface_detail->DevicePath, 0, 0, NULL, OPEN_EXISTING, 0, NULL);
+diff --git a/include/ddk/wdm.h b/include/ddk/wdm.h
+index 787fe5853c5..fbc1b07f77b 100644
+--- a/include/ddk/wdm.h
++++ b/include/ddk/wdm.h
+@@ -1744,6 +1744,10 @@ void      WINAPI ExReleaseResourceForThreadLite(ERESOURCE*,ERESOURCE_THREAD);
+ ULONG     WINAPI ExSetTimerResolution(ULONG,BOOLEAN);
+ void      WINAPI ExUnregisterCallback(void*);
+ 
++#define PLUGPLAY_REGKEY_DEVICE            1
++#define PLUGPLAY_REGKEY_DRIVER            2
++#define PLUGPLAY_REGKEY_CURRENT_HWPROFILE 4
++
+ #define PLUGPLAY_PROPERTY_PERSISTENT 0x0001
+ 
+ void      WINAPI IoFreeErrorLogEntry(void*);
+-- 
+2.53.0
+
