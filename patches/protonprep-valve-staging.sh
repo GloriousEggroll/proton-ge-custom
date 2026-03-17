@@ -285,7 +285,7 @@ apply_all_in_dir() {
     # Separate OpenXR steam reliance
     # https://github.com/GloriousEggroll/proton-ge-custom/issues/214
     echo "WINE: -PENDING- add OpenXR patches"
-    apply_patch "../patches/wine-hotfixes/pending/0001-integrate-wineopenxr-into-proton.patch"
+    apply_patch "../patches/wine-hotfixes/pending/0001-decouple-wineopenxr-from-steamvr-and-integrate-it-in.patch"
 
 
 ### END WINE PENDING UPSTREAM SECTION ###

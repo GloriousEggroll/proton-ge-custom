@@ -1,10 +1,11 @@
-From 5823691fd04ca36c6d838c331c155bf6614bafa2 Mon Sep 17 00:00:00 2001
-From: Glorious <gloriouseggroll@gmail.com>
-Date: Mon, 23 Feb 2026 16:10:14 -0700
-Subject: [PATCH] integrate wineopenxr into proton
+From 7dab274a8deb93f84e436b2f6ba561f83615dc79 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Mon, 16 Mar 2026 22:09:03 -0600
+Subject: [PATCH] decouple wineopenxr from steamvr and integrate it into wine
+ directly
 
 ---
- configure.ac                           |    5 +
+ configure.ac                           |    7 +
  dlls/ntdll/unix/env.c                  |    1 +
  dlls/wineopenxr/Makefile.in            |   12 +
  dlls/wineopenxr/dxvk-interop.h         |  366 +
@@ -12,7 +13,7 @@ Subject: [PATCH] integrate wineopenxr into proton
  dlls/wineopenxr/loader_thunks.c        | 4947 +++++++++++++
  dlls/wineopenxr/loader_thunks.h        | 3517 +++++++++
  dlls/wineopenxr/make_openxr            | 3584 +++++++++
- dlls/wineopenxr/openxr.c               |  411 ++
+ dlls/wineopenxr/openxr.c               |  464 ++
  dlls/wineopenxr/openxr_loader.c        | 2238 ++++++
  dlls/wineopenxr/openxr_loader.h        |  127 +
  dlls/wineopenxr/openxr_private.h       |   60 +
@@ -24,7 +25,7 @@ Subject: [PATCH] integrate wineopenxr into proton
  dlls/wineopenxr/wineopenxr.spec        |    7 +
  dlls/wineopenxr/wineopenxr64.json      |    6 +
  loader/wine.inf.in                     |    1 +
- 20 files changed, 31180 insertions(+)
+ 20 files changed, 31235 insertions(+)
  create mode 100644 dlls/wineopenxr/Makefile.in
  create mode 100644 dlls/wineopenxr/dxvk-interop.h
  create mode 100644 dlls/wineopenxr/loader_structs.h
@@ -44,10 +45,10 @@ Subject: [PATCH] integrate wineopenxr into proton
  create mode 100644 dlls/wineopenxr/wineopenxr64.json
 
 diff --git a/configure.ac b/configure.ac
-index 5fbc2890d73..95257aa206a 100644
+index 40078cf2a5b..ecfdb315d38 100644
 --- a/configure.ac
 +++ b/configure.ac
-@@ -2401,6 +2396,7 @@ dnl *** Check for modules to disable by default
+@@ -2398,6 +2398,7 @@ dnl *** Check for modules to disable by default
  
  enable_win16=${enable_win16:-i386}
  enable_vcruntime140_1=${enable_vcruntime140_1:-x86_64,arm64ec,aarch64}
@@ -55,11 +56,16 @@ index 5fbc2890d73..95257aa206a 100644
  
  if test -n "$PE_ARCHS"
  then
-@@ -3341,6 +3345,7 @@ WINE_CONFIG_MAKEFILE(dlls/winegstreamer)
+@@ -3342,6 +3343,12 @@ WINE_CONFIG_MAKEFILE(dlls/winegstreamer)
  WINE_CONFIG_MAKEFILE(dlls/winehid.sys)
  WINE_CONFIG_MAKEFILE(dlls/winemac.drv)
  WINE_CONFIG_MAKEFILE(dlls/winemapi)
 +WINE_CONFIG_MAKEFILE(dlls/wineopenxr)
++if test "$HOST_ARCH" = "i386"
++then
++    DISABLED_SUBDIRS="$DISABLED_SUBDIRS dlls/wineopenxr"
++fi
++
  WINE_CONFIG_MAKEFILE(dlls/wineoss.drv)
  WINE_CONFIG_MAKEFILE(dlls/wineps.drv)
  WINE_CONFIG_MAKEFILE(dlls/wineps16.drv16,enable_win16)
@@ -8979,7 +8985,7 @@ index 00000000000..52aec91c897
 +#endif /* __WINE_OPENXR_LOADER_THUNKS_H */
 diff --git a/dlls/wineopenxr/make_openxr b/dlls/wineopenxr/make_openxr
 new file mode 100755
-index 00000000000..ff0d387dbb1
+index 00000000000..d463acd6a3c
 --- /dev/null
 +++ b/dlls/wineopenxr/make_openxr
 @@ -0,0 +1,3584 @@
@@ -12569,16 +12575,18 @@ index 00000000000..ff0d387dbb1
 +    main()
 diff --git a/dlls/wineopenxr/openxr.c b/dlls/wineopenxr/openxr.c
 new file mode 100644
-index 00000000000..a37eceb0516
+index 00000000000..958bddbcec4
 --- /dev/null
 +++ b/dlls/wineopenxr/openxr.c
-@@ -0,0 +1,411 @@
+@@ -0,0 +1,464 @@
 +#if 0
 +#pragma makedep unix
 +#endif
 +
 +#define _GNU_SOURCE
 +#include <dlfcn.h>
++#include <fcntl.h>
++#include <unistd.h>
 +
 +#include "ntstatus.h"
 +#define WIN32_NO_STATUS
@@ -12588,9 +12596,51 @@ index 00000000000..a37eceb0516
 +
 +#include "openxr_private.h"
 +
-+#ifdef _WIN64
 +WINE_DEFAULT_DEBUG_CHANNEL(openxr);
-+#endif /* _WIN64 */
++#define wine_dbgstr_xrhandle(h) wine_dbgstr_longlong((ULONGLONG)(h))
++
++static BOOL should_silence_openxr_loader_errors(void)
++{
++  const char *value = getenv("PRESSURE_VESSEL_IMPORT_OPENXR_1_RUNTIMES");
++
++  return !value || !value[0] || !strcmp(value, "0");
++}
++
++static int silence_openxr_loader_errors_begin(void)
++{
++  int saved_stderr, devnull;
++
++  if (!should_silence_openxr_loader_errors())
++    return -1;
++
++  if ((saved_stderr = dup(STDERR_FILENO)) == -1)
++    return -1;
++
++  if ((devnull = open("/dev/null", O_WRONLY)) == -1)
++  {
++    close(saved_stderr);
++    return -1;
++  }
++
++  if (dup2(devnull, STDERR_FILENO) == -1)
++  {
++    close(devnull);
++    close(saved_stderr);
++    return -1;
++  }
++
++  close(devnull);
++  return saved_stderr;
++}
++
++static void silence_openxr_loader_errors_end(int saved_stderr)
++{
++  if (saved_stderr == -1)
++    return;
++
++  dup2(saved_stderr, STDERR_FILENO);
++  close(saved_stderr);
++}
 +
 +static struct {
 +  const char *win32_ext, *linux_ext;
@@ -12616,6 +12666,7 @@ index 00000000000..a37eceb0516
 +  XrInstanceCreateInfo our_createInfo;
 +  const char *ext_name;
 +  const char **new_list;
++  int saved_stderr;
 +
 +  TRACE("%p, %p\n", createInfo, instance);
 +
@@ -12654,7 +12705,9 @@ index 00000000000..a37eceb0516
 +    TRACE("  -%s\n", createInfo->enabledExtensionNames[i]);
 +  }
 +
++  saved_stderr = silence_openxr_loader_errors_begin();
 +  res = xrCreateInstance(createInfo, instance);
++  silence_openxr_loader_errors_end(saved_stderr);
 +  if (res != XR_SUCCESS) {
 +    WARN("xrCreateInstance failed: %d\n", res);
 +    goto cleanup;
@@ -12719,10 +12772,13 @@ index 00000000000..a37eceb0516
 +                                                            XrExtensionProperties *properties) {
 +  uint32_t i, j, dst, count, extra_extensions_count;
 +  XrResult res;
++  int saved_stderr;
 +
 +  TRACE("\n");
 +
++  saved_stderr = silence_openxr_loader_errors_begin();
 +  res = xrEnumerateInstanceExtensionProperties(layerName, propertyCapacityInput, propertyCountOutput, properties);
++  silence_openxr_loader_errors_end(saved_stderr);
 +  if (res != XR_SUCCESS) {
 +    return res;
 +  }
@@ -12779,7 +12835,7 @@ index 00000000000..a37eceb0516
 +                                                  VkInstance vkInstance,
 +                                                  VkPhysicalDevice *vkPhysicalDevice) {
 +  XrResult res;
-+  TRACE("%p, 0x%s, %p, %p\n", instance, wine_dbgstr_longlong(systemId), vkInstance, vkPhysicalDevice);
++  TRACE("0x%s, 0x%s, %p, %p\n", wine_dbgstr_xrhandle(instance), wine_dbgstr_longlong(systemId), vkInstance, vkPhysicalDevice);
 +  res = g_xr_host_instance_dispatch_table.p_xrGetVulkanGraphicsDeviceKHR(
 +      wine_instance_from_handle(instance)->host_instance, systemId, get_native_VkInstance(vkInstance),
 +      vkPhysicalDevice);
@@ -12793,7 +12849,7 @@ index 00000000000..a37eceb0516
 +  XrVulkanGraphicsDeviceGetInfoKHR our_getinfo;
 +  XrResult res;
 +
-+  TRACE("instance %p, getInfo %p, vulkanPhysicalDevice %p.\n", instance, getInfo, vulkanPhysicalDevice);
++  TRACE("instance 0x%s, getInfo %p, vulkanPhysicalDevice %p.\n", wine_dbgstr_xrhandle(instance), getInfo, vulkanPhysicalDevice);
 +
 +  if (getInfo->next) {
 +    WARN("Unsupported chained structure %p.\n", getInfo->next);
@@ -12820,7 +12876,7 @@ index 00000000000..a37eceb0516
 +  XrResult res;
 +  uint32_t lin_len;
 +
-+  TRACE("%p, 0x%s, %u, %p, %p\n", instance, wine_dbgstr_longlong(systemId), bufferCapacityInput, bufferCountOutput,
++  TRACE("0x%s, 0x%s, %u, %p, %p\n", wine_dbgstr_xrhandle(instance), wine_dbgstr_longlong(systemId), bufferCapacityInput, bufferCountOutput,
 +        buffer);
 +
 +  /* Linux SteamVR does not return xlib_surface, but Windows SteamVR _does_
@@ -12863,7 +12919,7 @@ index 00000000000..a37eceb0516
 +  unsigned int i;
 +  VkResult ret;
 +
-+  our_create_info = *(const XrVulkanInstanceCreateInfoKHR *)c->create_info;
++  our_create_info = *(const XrVulkanInstanceCreateInfoKHR *)(ULONG_PTR)c->create_info;
 +  our_create_info.pfnGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)pfnGetInstanceProcAddr;
 +  our_create_info.vulkanCreateInfo = create_info;
 +  our_create_info.vulkanAllocator = allocator;
@@ -12903,7 +12959,7 @@ index 00000000000..a37eceb0516
 +  XrVulkanDeviceCreateInfoKHR our_create_info;
 +  VkResult ret;
 +
-+  our_create_info = *(const XrVulkanDeviceCreateInfoKHR *)c->create_info;
++  our_create_info = *(const XrVulkanDeviceCreateInfoKHR *)(ULONG_PTR)c->create_info;
 +  our_create_info.pfnGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)pfnGetInstanceProcAddr;
 +  our_create_info.vulkanPhysicalDevice = phys_dev;
 +  our_create_info.vulkanCreateInfo = create_info;
@@ -12952,8 +13008,8 @@ index 00000000000..a37eceb0516
 +
 +  dlclose(unix_handle);
 +
-+  params->create_instance_callback = (UINT64)&vk_create_instance_callback;
-+  params->create_device_callback = (UINT64)&vk_create_device_callback;
++  params->create_instance_callback = (UINT64)(ULONG_PTR)&vk_create_instance_callback;
++  params->create_device_callback = (UINT64)(ULONG_PTR)&vk_create_device_callback;
 +
 +  return STATUS_SUCCESS;
 +}
@@ -12971,6 +13027,7 @@ index 00000000000..a37eceb0516
 +  wine_XrInstance *wine_instance = wine_instance_from_handle(params->instance);
 +  PFN_xrVoidFunction fn;
 +  unsigned int i;
++  int saved_stderr = -1;
 +
 +  for (i = 0; i < ARRAY_SIZE(always_supported); ++i)
 +  {
@@ -12981,7 +13038,9 @@ index 00000000000..a37eceb0516
 +    }
 +  }
 +
-+  params->ret = xrGetInstanceProcAddr(wine_instance ? wine_instance->host_instance : NULL, params->name, &fn);
++  saved_stderr = silence_openxr_loader_errors_begin();
++  params->ret = xrGetInstanceProcAddr(wine_instance ? wine_instance->host_instance : (XrInstance)0, params->name, &fn);
++  silence_openxr_loader_errors_end(saved_stderr);
 +  return STATUS_SUCCESS;
 +}
 diff --git a/dlls/wineopenxr/openxr_loader.c b/dlls/wineopenxr/openxr_loader.c
@@ -15429,7 +15488,7 @@ index 00000000000..18e064a77a1
 +#endif /* __WINE_OPENXR_PRIVATE_H */
 diff --git a/dlls/wineopenxr/openxr_thunks.c b/dlls/wineopenxr/openxr_thunks.c
 new file mode 100644
-index 00000000000..4773fbb692c
+index 00000000000..2572cd9edff
 --- /dev/null
 +++ b/dlls/wineopenxr/openxr_thunks.c
 @@ -0,0 +1,5448 @@
@@ -31365,258 +31424,3 @@ index 1b822ad1eab..9fe8a5f5656 100644
 -- 
 2.53.0
 
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: OpenAI <assistant@example.com>
-Date: Sun, 15 Mar 2026 22:30:00 +0000
-Subject: [PATCH] wineopenxr: fix debug channel declaration for current tree
-
-The uploaded tree already contains the openxr_thunks.c fixes:
-- WINE_DEFAULT_DEBUG_CHANNEL(openxr) is guarded by _WIN64
-- the stray trailing C_ASSERT() is gone
-
-But openxr.c still guards WINE_DEFAULT_DEBUG_CHANNEL(openxr) with _WIN64
-while the file uses TRACE/WARN/ERR unconditionally. That leaves
-__wine_dbch___default undefined in non-_WIN64 builds.
-
-Also add a local helper for formatting opaque OpenXR handle values via
-wine_dbgstr_longlong().
----
- dlls/wineopenxr/openxr.c | 5 ++---
- 1 file changed, 2 insertions(+), 3 deletions(-)
-
-diff --git a/dlls/wineopenxr/openxr.c b/dlls/wineopenxr/openxr.c
-index 1111111..2222222 100644
---- a/dlls/wineopenxr/openxr.c
-+++ b/dlls/wineopenxr/openxr.c
-@@ -11,10 +11,9 @@
- 
- #include "openxr_private.h"
- 
--#ifdef _WIN64
- WINE_DEFAULT_DEBUG_CHANNEL(openxr);
--#endif /* _WIN64 */
-+#define wine_dbgstr_xrhandle(h) wine_dbgstr_longlong((ULONGLONG)(h))
- 
- static struct {
-   const char *win32_ext, *linux_ext;
-   BOOL remove_original;
--- 
-2.43.0
-
---- a/dlls/wineopenxr/openxr.c	2026-03-16 04:32:01.926310572 +0000
-+++ b/dlls/wineopenxr/openxr.c	2026-03-16 04:32:44.245958096 +0000
-@@ -203,7 +203,7 @@
-                                                   VkInstance vkInstance,
-                                                   VkPhysicalDevice *vkPhysicalDevice) {
-   XrResult res;
--  TRACE("%p, 0x%s, %p, %p\n", instance, wine_dbgstr_longlong(systemId), vkInstance, vkPhysicalDevice);
-+  TRACE("0x%s, 0x%s, %p, %p\n", wine_dbgstr_xrhandle(instance), wine_dbgstr_longlong(systemId), vkInstance, vkPhysicalDevice);
-   res = g_xr_host_instance_dispatch_table.p_xrGetVulkanGraphicsDeviceKHR(
-       wine_instance_from_handle(instance)->host_instance, systemId, get_native_VkInstance(vkInstance),
-       vkPhysicalDevice);
-@@ -217,7 +217,7 @@
-   XrVulkanGraphicsDeviceGetInfoKHR our_getinfo;
-   XrResult res;
- 
--  TRACE("instance %p, getInfo %p, vulkanPhysicalDevice %p.\n", instance, getInfo, vulkanPhysicalDevice);
-+  TRACE("instance 0x%s, getInfo %p, vulkanPhysicalDevice %p.\n", wine_dbgstr_xrhandle(instance), getInfo, vulkanPhysicalDevice);
- 
-   if (getInfo->next) {
-     WARN("Unsupported chained structure %p.\n", getInfo->next);
-@@ -244,7 +244,7 @@
-   XrResult res;
-   uint32_t lin_len;
- 
--  TRACE("%p, 0x%s, %u, %p, %p\n", instance, wine_dbgstr_longlong(systemId), bufferCapacityInput, bufferCountOutput,
-+  TRACE("0x%s, 0x%s, %u, %p, %p\n", wine_dbgstr_xrhandle(instance), wine_dbgstr_longlong(systemId), bufferCapacityInput, bufferCountOutput,
-         buffer);
- 
-   /* Linux SteamVR does not return xlib_surface, but Windows SteamVR _does_
-@@ -287,7 +287,7 @@
-   unsigned int i;
-   VkResult ret;
- 
--  our_create_info = *(const XrVulkanInstanceCreateInfoKHR *)c->create_info;
-+  our_create_info = *(const XrVulkanInstanceCreateInfoKHR *)(ULONG_PTR)c->create_info;
-   our_create_info.pfnGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)pfnGetInstanceProcAddr;
-   our_create_info.vulkanCreateInfo = create_info;
-   our_create_info.vulkanAllocator = allocator;
-@@ -327,7 +327,7 @@
-   XrVulkanDeviceCreateInfoKHR our_create_info;
-   VkResult ret;
- 
--  our_create_info = *(const XrVulkanDeviceCreateInfoKHR *)c->create_info;
-+  our_create_info = *(const XrVulkanDeviceCreateInfoKHR *)(ULONG_PTR)c->create_info;
-   our_create_info.pfnGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)pfnGetInstanceProcAddr;
-   our_create_info.vulkanPhysicalDevice = phys_dev;
-   our_create_info.vulkanCreateInfo = create_info;
-@@ -376,8 +376,8 @@
- 
-   dlclose(unix_handle);
- 
--  params->create_instance_callback = (UINT64)&vk_create_instance_callback;
--  params->create_device_callback = (UINT64)&vk_create_device_callback;
-+  params->create_instance_callback = (UINT64)(ULONG_PTR)&vk_create_instance_callback;
-+  params->create_device_callback = (UINT64)(ULONG_PTR)&vk_create_device_callback;
- 
-   return STATUS_SUCCESS;
- }
-@@ -405,6 +405,6 @@
-     }
-   }
- 
--  params->ret = xrGetInstanceProcAddr(wine_instance ? wine_instance->host_instance : NULL, params->name, &fn);
-+  params->ret = xrGetInstanceProcAddr(wine_instance ? wine_instance->host_instance : (XrInstance)0, params->name, &fn);
-   return STATUS_SUCCESS;
- }
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: OpenAI <chatgpt@openai.com>
-Date: Sun, 15 Mar 2026 23:59:00 -0600
-Subject: [PATCH] configure: disable wineopenxr on i386 after makefile setup
-
-The wineopenxr integration already sets:
-
-    enable_wineopenxr=${enable_wineopenxr:-x86_64,arm64ec,aarch64}
-
-In a WoW64/PE_ARCHS build that only disables PE subdirs; it does not stop the
-host i386 Unix build from emitting dlls/wineopenxr/wineopenxr.so.
-
-The earlier attempt to append to DISABLED_SUBDIRS near HOST_ARCH detection ran
-before WINE_CONFIG_HELPERS initialized DISABLED_SUBDIRS, so it got overwritten
-and had no effect.
-
-Append dlls/wineopenxr to DISABLED_SUBDIRS immediately after its
-WINE_CONFIG_MAKEFILE() call, when the helper state is already live.
----
- configure.ac | 5 +++++
- 1 file changed, 5 insertions(+)
-
-diff --git a/configure.ac b/configure.ac
-index 95257aa206a..a6ae1564b5d 100644
---- a/configure.ac
-+++ b/configure.ac
-@@ -3343,6 +3347,11 @@ WINE_CONFIG_MAKEFILE(dlls/winegstreamer)
- WINE_CONFIG_MAKEFILE(dlls/winehid.sys)
- WINE_CONFIG_MAKEFILE(dlls/winemac.drv)
- WINE_CONFIG_MAKEFILE(dlls/winemapi)
- WINE_CONFIG_MAKEFILE(dlls/wineopenxr)
-+if test "$HOST_ARCH" = "i386"
-+then
-+    DISABLED_SUBDIRS="$DISABLED_SUBDIRS dlls/wineopenxr"
-+fi
-+
- WINE_CONFIG_MAKEFILE(dlls/wineoss.drv)
- WINE_CONFIG_MAKEFILE(dlls/wineps.drv)
- WINE_CONFIG_MAKEFILE(dlls/wineps16.drv16,enable_win16)
--- 
-2.49.0
---- a/dlls/wineopenxr/openxr.c
-+++ b/dlls/wineopenxr/openxr.c
-@@ -4,6 +4,8 @@
- 
- #define _GNU_SOURCE
- #include <dlfcn.h>
-+#include <fcntl.h>
-+#include <unistd.h>
- 
- #include "ntstatus.h"
- #define WIN32_NO_STATUS
-@@ -17,6 +19,49 @@
- WINE_DEFAULT_DEBUG_CHANNEL(openxr);
- #endif /* _WIN64 */
- 
-+static BOOL should_silence_openxr_loader_errors(void)
-+{
-+  const char *value = getenv("PRESSURE_VESSEL_IMPORT_OPENXR_1_RUNTIMES");
-+
-+  return !value || !value[0] || !strcmp(value, "0");
-+}
-+
-+static int silence_openxr_loader_errors_begin(void)
-+{
-+  int saved_stderr, devnull;
-+
-+  if (!should_silence_openxr_loader_errors())
-+    return -1;
-+
-+  if ((saved_stderr = dup(STDERR_FILENO)) == -1)
-+    return -1;
-+
-+  if ((devnull = open("/dev/null", O_WRONLY)) == -1)
-+  {
-+    close(saved_stderr);
-+    return -1;
-+  }
-+
-+  if (dup2(devnull, STDERR_FILENO) == -1)
-+  {
-+    close(devnull);
-+    close(saved_stderr);
-+    return -1;
-+  }
-+
-+  close(devnull);
-+  return saved_stderr;
-+}
-+
-+static void silence_openxr_loader_errors_end(int saved_stderr)
-+{
-+  if (saved_stderr == -1)
-+    return;
-+
-+  dup2(saved_stderr, STDERR_FILENO);
-+  close(saved_stderr);
-+}
-+
- static struct {
-   const char *win32_ext, *linux_ext;
-   BOOL remove_original;
-@@ -41,6 +86,7 @@
-   XrInstanceCreateInfo our_createInfo;
-   const char *ext_name;
-   const char **new_list;
-+  int saved_stderr;
- 
-   TRACE("%p, %p\n", createInfo, instance);
- 
-@@ -79,7 +125,9 @@
-     TRACE("  -%s\n", createInfo->enabledExtensionNames[i]);
-   }
- 
-+  saved_stderr = silence_openxr_loader_errors_begin();
-   res = xrCreateInstance(createInfo, instance);
-+  silence_openxr_loader_errors_end(saved_stderr);
-   if (res != XR_SUCCESS) {
-     WARN("xrCreateInstance failed: %d\n", res);
-     goto cleanup;
-@@ -144,10 +192,13 @@
-                                                             XrExtensionProperties *properties) {
-   uint32_t i, j, dst, count, extra_extensions_count;
-   XrResult res;
-+  int saved_stderr;
- 
-   TRACE("\n");
- 
-+  saved_stderr = silence_openxr_loader_errors_begin();
-   res = xrEnumerateInstanceExtensionProperties(layerName, propertyCapacityInput, propertyCountOutput, properties);
-+  silence_openxr_loader_errors_end(saved_stderr);
-   if (res != XR_SUCCESS) {
-     return res;
-   }
-@@ -394,6 +394,7 @@ NTSTATUS is_available_instance_function_openxr(void *args)
-   wine_XrInstance *wine_instance = wine_instance_from_handle(params->instance);
-   PFN_xrVoidFunction fn;
-   unsigned int i;
-+  int saved_stderr = -1;
- 
-   for (i = 0; i < ARRAY_SIZE(always_supported); ++i)
-   {
-@@ -406,6 +457,8 @@
-     }
-   }
- 
-+  saved_stderr = silence_openxr_loader_errors_begin();
-   params->ret = xrGetInstanceProcAddr(wine_instance ? wine_instance->host_instance : (XrInstance)0, params->name, &fn);
-+  silence_openxr_loader_errors_end(saved_stderr);
-   return STATUS_SUCCESS;
- }
