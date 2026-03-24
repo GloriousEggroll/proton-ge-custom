@@ -329,6 +329,9 @@ apply_all_in_dir() {
     echo "WINE: --CUSTOM-- add WINE_HOSTBLOCK envvar to allow working around some problematic anticheats (notably eac)"
     apply_patch "../patches/proton/wine_host_block_envvar.patch"
 
+    echo "WINE: -CUSTOM- Dynamically relocate .exes, improving compatibility with modding / hooking tools"
+    apply_patch "../patches/proton/0001-server-Dynamically-relocate-.exes-by-default-too.patch"
+
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
     ./tools/make_requests
