@@ -1,0 +1,111 @@
+From 1080c214fd08b8c1f279fe9ddbdafea4abff78d3 Mon Sep 17 00:00:00 2001
+From: Cwooper <cwooperm@gmail.com>
+Date: Fri, 27 Mar 2026 02:42:17 -0700
+Subject: [PATCH 508/508] winewayland: Handle WS_MINIMIZE and restore for
+ fake-minimize games.
+
+CryEngine games "fake minimize" during startup by setting WS_MINIMIZE
+and moving the window to (-32000,-32000). The Wayland driver did not
+handle this, causing it to send xdg_toplevel_unset_fullscreen which
+triggers a 0x0 configure from the compositor and freezes Vulkan present.
+
+- Detect WS_MINIMIZE and set conf->minimized so the driver calls
+  xdg_toplevel_set_minimized instead of unsetting fullscreen/maximized
+- When the compositor sends a configure while the window is at the
+  offscreen sentinel position, ack the configure and send SC_RESTORE
+  to let Win32 handle the full restore sequence
+- Save data->rects into locals before releasing the win data mutex,
+  fixing an existing use-after-release bug
+
+Fixes: GloriousEggroll/proton-ge-custom#484
+---
+ dlls/winewayland.drv/window.c | 39 ++++++++++++++++++++++++++++++++---
+ 1 file changed, 36 insertions(+), 3 deletions(-)
+
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index 4decc0f..edf4f59 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -169,6 +169,10 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
+     {
+         conf->minimized = TRUE;
+     }
++    else if (style & WS_MINIMIZE)
++    {
++        conf->minimized = TRUE;
++    }
+     /* The fullscreen state is implied by the window position and style. */
+     else if (data->is_fullscreen)
+     {
+@@ -311,12 +315,14 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
+          /* First do all state unsettings, before setting new state. Some
+           * Wayland compositors misbehave if the order is reversed. */
+         if (!(surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
+-            (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED))
++            (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
++            !surface->window.minimized)
+         {
+             xdg_toplevel_unset_maximized(surface->xdg_toplevel);
+         }
+         if (!(surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
+-            (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
++            (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
++            !surface->window.minimized)
+         {
+             xdg_toplevel_unset_fullscreen(surface->xdg_toplevel);
+             surface->requested_output = NULL;
+@@ -598,8 +604,10 @@ static void wayland_configure_window(HWND hwnd)
+     DWORD style;
+     BOOL needs_enter_size_move = FALSE;
+     BOOL needs_exit_size_move = FALSE;
++    BOOL restoring_from_minimize = FALSE;
+     struct wayland_win_data *data;
+     RECT rect;
++    LONG saved_window_left, saved_window_top;
+ 
+     if (!(data = wayland_win_data_get(hwnd))) return;
+     if (!(surface = data->wayland_surface))
+@@ -689,6 +697,31 @@ static void wayland_configure_window(HWND hwnd)
+     offset_y = ((surface->window.rect.top - surface->window.window_rect.top) +
+                 (surface->window.window_rect.bottom - surface->window.rect.bottom));
+ 
++    /* Save window position before releasing data, since data->rects may be
++     * modified by another thread after release. */
++    saved_window_left = data->rects.window.left;
++    saved_window_top = data->rects.window.top;
++
++    /* Detect restore from minimize: the window is at the offscreen sentinel
++     * position (-32000,-32000) and the compositor is sending a configure.
++     * Send SC_RESTORE to let Win32 handle the full restore sequence (clearing
++     * WS_MINIMIZE, restoring position/size, sending WM_SIZE, etc.).
++     * We must ack the configure before returning to avoid a protocol
++     * violation, then let SC_RESTORE trigger a new configure cycle. */
++    restoring_from_minimize = saved_window_left <= -30000 &&
++                              saved_window_top <= -30000;
++    if (restoring_from_minimize)
++    {
++        TRACE("hwnd=%p restoring from minimize\n", hwnd);
++        surface->current = surface->processing;
++        memset(&surface->processing, 0, sizeof(surface->processing));
++        xdg_surface_ack_configure(surface->xdg_surface,
++                                  surface->current.serial);
++        wayland_win_data_release(data);
++        send_message(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0);
++        return;
++    }
++
+     wayland_win_data_release(data);
+ 
+     TRACE("processing=%dx%d,%#x\n", width, height, state);
+@@ -721,7 +754,7 @@ static void wayland_configure_window(HWND hwnd)
+     }
+ 
+     SetRect(&rect, 0, 0, window_width, window_height);
+-    OffsetRect(&rect, data->rects.window.left, data->rects.window.top);
++    OffsetRect(&rect, saved_window_left, saved_window_top);
+     NtUserSetRawWindowPos(hwnd, rect, flags, FALSE);
+ }
+ 
+-- 
+2.53.0
+
