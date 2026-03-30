@@ -102,6 +102,13 @@ asdf install protonge latest
 
 It's also possible to use the asdf plugin in Flatpak installations, by customizing the target `compatibilitytools.d` path. For more settings check the [plugin's official documentation](https://github.com/augustobmoura/asdf-protonge).
 
+#### Via [`ProtonPlus`, a proton version manager](https://protonplus.vysp3r.com/)
+
+ProtonPlus is a GUI Frontend for managing proton versions, including GE-Proton. 
+It is a great tool for those who want a more user-friendly way to manage their proton versions.
+
+To install Proton-GE, Select the `Proton-GE` dropdown, and select the version you want to install, or `Proton-GE Latest` to install the latest version and automatically update it when new versions are released.
+
 After every install you need to restart Steam, and [enable proton-ge-custom](#enabling).
 
 #### Native
