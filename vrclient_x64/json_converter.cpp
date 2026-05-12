@@ -27,32 +27,6 @@ WINE_DEFAULT_DEBUG_CHANNEL(vrclient);
 
 #define IS_ABSOLUTE( x ) (*x == '/' || *x == '\\' || (*x && *(x + 1) == ':'))
 
-static char *get_unix_file_name( const WCHAR *path )
-{
-    UNICODE_STRING nt_name;
-    OBJECT_ATTRIBUTES attr;
-    UINT status;
-    ULONG size = 256;
-    char *buffer;
-
-    nt_name.Buffer = (WCHAR *)path;
-    nt_name.MaximumLength = nt_name.Length = lstrlenW( path ) * sizeof(WCHAR);
-    InitializeObjectAttributes( &attr, &nt_name, 0, 0, NULL );
-    for (;;)
-    {
-        if (!(buffer = (char *)malloc( size ))) return NULL;
-        status = wine_nt_to_unix_file_name( &attr, buffer, &size, FILE_OPEN_IF );
-        if (status != STATUS_BUFFER_TOO_SMALL) break;
-        free( buffer );
-    }
-    if (status && status != STATUS_NO_SUCH_FILE)
-    {
-        free( buffer );
-        return NULL;
-    }
-    return buffer;
-}
-
 char *vrclient_dos_to_unix_path( const char *src )
 {
     WCHAR srcW[PATH_MAX] = {'\\', '?', '?', '\\', 0}, *tmp;
@@ -83,7 +57,7 @@ char *vrclient_dos_to_unix_path( const char *src )
     else
     {
         for (tmp = srcW; *tmp; ++tmp) if (*tmp == '/') *tmp = '\\';
-        unix_path = get_unix_file_name( srcW );
+        if (ntdll_get_unix_file_name( srcW, &unix_path, FILE_OPEN_IF )) unix_path = NULL;
     }
 
     if (!unix_path)
@@ -130,17 +104,8 @@ unsigned int vrclient_unix_path_to_dos_path( bool api_result, const char *src, c
         return 0;
     }
 
-    status = wine_unix_to_nt_file_name( src, NULL, &size );
-    if (status != STATUS_BUFFER_TOO_SMALL)
-    {
-        WARN( "Unable to convert unix filename to DOS: %s, status %#x.\n", debugstr_a(src), status );
-        *dst = 0;
-        return 0;
-    }
-
-    dosW = (WCHAR *)malloc( size * sizeof(WCHAR) );
-    status = wine_unix_to_nt_file_name( src, dosW, &size );
-    if (!status) r = ntdll_wcstoumbs( dosW, size, dst, dst_bytes, FALSE );
+    status = ntdll_get_dos_file_name( src, &dosW, FILE_OPEN_IF );
+    if (!status) r = ntdll_wcstoumbs( dosW, -1, dst, dst_bytes, FALSE );
     else *dst = 0;
     free( dosW );
 
@@ -177,7 +142,7 @@ static bool convert_path_to_win(std::string &s)
     if (!sz) return false;
 
     for (tmp = srcW; *tmp; ++tmp) if (*tmp == '/') *tmp = '\\';
-    if (!(unix_path = get_unix_file_name( srcW ))) return false;
+    if (ntdll_get_unix_file_name( srcW, &unix_path, FILE_OPEN_IF )) return false;
 
     /* XXX assuming the system encoding is UTF-8 */
     s = unix_path;

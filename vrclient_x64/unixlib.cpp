@@ -8,9 +8,6 @@
 #include <pthread.h>
 #include <stdlib.h>
 
-#define WINE_VK_HOST
-#include <vulkan/vulkan.h>
-
 #if 0
 #pragma makedep unix
 #endif
@@ -20,72 +17,11 @@ WINE_DEFAULT_DEBUG_CHANNEL(vrclient);
 static void *(*p_HmdSystemFactory)( const char *name, int *return_code );
 static void *(*p_VRClientCoreFactory)( const char *name, int *return_code );
 
-VkDevice_T *(*p_get_native_VkDevice)( VkDevice_T * );
-VkInstance_T *(*p_get_native_VkInstance)( VkInstance_T * );
-VkPhysicalDevice_T *(*p_get_native_VkPhysicalDevice)( VkPhysicalDevice_T * );
-VkPhysicalDevice_T *(*p_get_wrapped_VkPhysicalDevice)( VkInstance_T *, VkPhysicalDevice_T * );
-VkQueue_T *(*p_get_native_VkQueue)( VkQueue_T * );
-
 static PFN_vkCreateInstance p_vkCreateInstance;
 static PFN_vkDestroyInstance p_vkDestroyInstance;
 static PFN_vkEnumeratePhysicalDevices p_vkEnumeratePhysicalDevices;
 PFN_vkGetPhysicalDeviceProperties p_vkGetPhysicalDeviceProperties;
-
-static void *get_winevulkan_unixlib( HMODULE winevulkan )
-{
-    UINT64 unix_funcs;
-    NTSTATUS status;
-    Dl_info info;
-
-    status = NtQueryVirtualMemory( GetCurrentProcess(), winevulkan, (MEMORY_INFORMATION_CLASS)1000 /*MemoryWineUnixFuncs*/,
-                                   &unix_funcs, sizeof(unix_funcs), NULL );
-    if (status)
-    {
-        WINE_ERR("NtQueryVirtualMemory status %#x.\n", (int)status);
-        return NULL;
-    }
-
-    if (!dladdr( (void *)(ULONG_PTR)unix_funcs, &info ))
-    {
-        WINE_ERR("dladdr failed.\n");
-        return NULL;
-    }
-
-    WINE_TRACE( "path %s.\n", info.dli_fname );
-    return dlopen( info.dli_fname, RTLD_NOW );
-}
-
 static void *vulkan;
-
-static BOOL load_vk_unwrappers( HMODULE winevulkan )
-{
-    void *unix_handle;
-
-    if (!(unix_handle = get_winevulkan_unixlib( winevulkan )))
-    {
-        ERR("Unable to open winevulkan.so.\n");
-        return FALSE;
-    }
-
-#define LOAD_FUNC( name )                                                        \
-    if (!(p_##name = (decltype(p_##name))dlsym( unix_handle, "__wine_" #name ))) \
-    {                                                                            \
-        ERR( "%s not found.\n", #name );                                         \
-        dlclose( unix_handle );                                                  \
-        return FALSE;                                                            \
-    }
-
-    LOAD_FUNC( get_native_VkDevice )
-    LOAD_FUNC( get_native_VkInstance )
-    LOAD_FUNC( get_native_VkPhysicalDevice )
-    LOAD_FUNC( get_wrapped_VkPhysicalDevice )
-    LOAD_FUNC( get_native_VkQueue )
-
-#undef LOAD_FUNC
-
-    dlclose( unix_handle );
-    return TRUE;
-}
 
 BOOL load_vulkan(void)
 {
@@ -168,6 +104,39 @@ static int parse_extensions( const char *extensions, char ***list )
     return count;
 }
 
+static void map_device_extensions( char **exts )
+{
+    static struct
+    {
+        const char *unix_ext;
+        const char *win32_ext;
+    }
+    map_extensions[] =
+    {
+        { "VK_KHR_external_memory_fd", "VK_KHR_external_memory_win32" },
+        { "VK_KHR_external_semaphore_fd", "VK_KHR_external_semaphore_win32" },
+        { "VK_KHR_external_fence_fd", "VK_KHR_external_fence_win32" },
+    };
+    int i, j, count;
+    char **list, *p;
+
+    count = parse_extensions( *exts, &list );
+    p = *exts = (char *)calloc( 1, strlen( *exts ) + 1 + ARRAY_SIZE(map_extensions) * 10 );
+    for (i = 0; i < count; ++i)
+    {
+        TRACE("%s\n", list[i]);
+        for (j = 0; j < ARRAY_SIZE(map_extensions); ++j)
+        {
+            if (!strcmp( list[i], map_extensions[j].unix_ext )) break;
+        }
+        if (i) *p++ = ' ';
+        strcpy( p, j == ARRAY_SIZE(map_extensions) ? list[i] : map_extensions[j].win32_ext );
+        p += strlen( p );
+    }
+    if (list) free( list[0] );
+    free( list );
+}
+
 template< typename Params >
 static NTSTATUS vrclient_init_registry( Params *params, bool wow64 )
 {
@@ -191,7 +160,7 @@ static NTSTATUS vrclient_init_registry( Params *params, bool wow64 )
     u_IVRCompositor_IVRCompositor_028 *compositor;
     VkPhysicalDevice *phys_devices = NULL;
     VkPhysicalDeviceProperties prop = {};
-    char *buffer = NULL, *new_buffer;
+    char *buffer = NULL, *new_buffer, *p;
     char *xr_inst_ext, *xr_dev_ext;
     VkInstance vk_instance = NULL;
     BOOL vr_initialized = FALSE;
@@ -283,8 +252,9 @@ static NTSTATUS vrclient_init_registry( Params *params, bool wow64 )
         if (!(buffer = (char *)malloc( length ))) goto failed;
         *buffer = 0;
         compositor->GetVulkanDeviceExtensionsRequired( phys_devices[i], buffer, length );
+        map_device_extensions( &buffer );
 
-        sprintf( name, "PCIID:%04x:%04x", prop.vendorID, prop.deviceID );
+        sprintf( name, "PCIID:%04x:%04x", prop.vendorID, (uint16_t)prop.deviceID );
         TRACE( "%s: %s.\n", name, buffer );
         set_reg_ascii_str( params->vr_key, name, buffer );
 
@@ -347,8 +317,6 @@ static NTSTATUS vrclient_init( Params *params, bool wow64 )
     LOAD_FUNC( VRClientCoreFactory );
 
 #undef LOAD_FUNC
-
-    if (!load_vk_unwrappers( params->winevulkan )) return 0;
 
     params->_ret = true;
     return 0;
@@ -440,3 +408,185 @@ VRCLIENT_UNIX_FUNC( vrclient_VRClientCoreFactory );
 VRCLIENT_UNIX_FUNC( vrclient_get_unix_buffer );
 
 VRCLIENT_UNIX_IMPL( IVRTrackedCamera, 001, GetVideoStreamFrame );
+
+/* manual conversion functions */
+static void *alloc_low_mem( ULONG_PTR size )
+{
+    SYSTEM_BASIC_INFORMATION info;
+    ULONG_PTR zero_bits;
+    void *ret = NULL;
+
+    NtQuerySystemInformation(SystemEmulationBasicInformation, &info, sizeof(info), NULL);
+    zero_bits = (ULONG_PTR)info.HighestUserAddress | 0x7fffffff;
+    NtAllocateVirtualMemory( GetCurrentProcess(), &ret, zero_bits, &size, MEM_COMMIT, PAGE_READWRITE );
+    return ret;
+}
+
+#if defined(__x86_64__) || defined(__aarch64__)
+w32_HiddenAreaMesh_t::operator u64_HiddenAreaMesh_t() const
+{
+    u64_HiddenAreaMesh_t ret;
+    ret.pVertexData = this->pVertexData;
+    ret.unTriangleCount = this->unTriangleCount;
+    return ret;
+}
+
+u64_HiddenAreaMesh_t::operator w32_HiddenAreaMesh_t() const
+{
+    w32_HiddenAreaMesh_t ret;
+    HmdVector2_t *ret_ptr;
+    unsigned int size;
+
+    size = this->unTriangleCount * 3 * sizeof(*this->pVertexData);
+    ret_ptr = (HmdVector2_t *)alloc_low_mem( size );
+    memcpy( ret_ptr, this->pVertexData, size );
+    ret.pVertexData = ret_ptr;
+    ret.unTriangleCount = this->unTriangleCount;
+    return ret;
+}
+
+static uint8_t *copy_texture_map_data( const uint8_t *src, unsigned int width, unsigned int height, unsigned int mips,
+                                       int format )
+{
+    unsigned int size = 0, i;
+    uint8_t *ret;
+
+    if (format) FIXME( "Unhandled format %d.\n", format );
+
+    for (i = 0; i < mips; ++i)
+    {
+        size += width * height;
+        if (width > 1) width >>= 1;
+        if (height > 1) height >>= 1;
+    }
+    size *= 4;
+    ret = (uint8_t *)alloc_low_mem( size );
+    memcpy( ret, src, size );
+    return ret;
+}
+
+w32_RenderModel_TextureMap_t_1237::operator u64_RenderModel_TextureMap_t_1237() const
+{
+    u64_RenderModel_TextureMap_t_1237 ret;
+    ret.unWidth = this->unWidth;
+    ret.unHeight = this->unHeight;
+    ret.rubTextureMapData = this->rubTextureMapData;
+    ret.format = this->format;
+    ret.unMipLevels = this->unMipLevels;
+    return ret;
+}
+
+u64_RenderModel_TextureMap_t_1237::operator w32_RenderModel_TextureMap_t_1237() const
+{
+    w32_RenderModel_TextureMap_t_1237 ret;
+    ret.unWidth = this->unWidth;
+    ret.unHeight = this->unHeight;
+    ret.rubTextureMapData = copy_texture_map_data( this->rubTextureMapData, unWidth, unHeight, unMipLevels, format );
+    ret.format = this->format;
+    ret.unMipLevels = this->unMipLevels;
+    return ret;
+}
+
+w32_RenderModel_TextureMap_t_11111::operator u64_RenderModel_TextureMap_t_11111() const
+{
+    u64_RenderModel_TextureMap_t_11111 ret;
+    ret.unWidth = this->unWidth;
+    ret.unHeight = this->unHeight;
+    ret.rubTextureMapData = this->rubTextureMapData;
+    ret.format = this->format;
+    return ret;
+}
+
+u64_RenderModel_TextureMap_t_11111::operator w32_RenderModel_TextureMap_t_11111() const
+{
+    w32_RenderModel_TextureMap_t_11111 ret;
+    ret.unWidth = this->unWidth;
+    ret.unHeight = this->unHeight;
+    ret.rubTextureMapData = copy_texture_map_data( this->rubTextureMapData, unWidth, unHeight, 1, format );
+    ret.format = this->format;
+    return ret;
+}
+
+w32_RenderModel_TextureMap_t_090::operator u64_RenderModel_TextureMap_t_090() const
+{
+    u64_RenderModel_TextureMap_t_090 ret;
+    ret.unWidth = this->unWidth;
+    ret.unHeight = this->unHeight;
+    ret.rubTextureMapData = this->rubTextureMapData;
+    return ret;
+}
+
+u64_RenderModel_TextureMap_t_090::operator w32_RenderModel_TextureMap_t_090() const
+{
+    w32_RenderModel_TextureMap_t_090 ret;
+    ret.unWidth = this->unWidth;
+    ret.unHeight = this->unHeight;
+    ret.rubTextureMapData = copy_texture_map_data( this->rubTextureMapData, unWidth, unHeight, 1, 0 );
+    return ret;
+}
+
+w32_RenderModel_t_0912::operator u64_RenderModel_t_0912() const
+{
+    u64_RenderModel_t_0912 ret;
+    ret.rVertexData = this->rVertexData;
+    ret.unVertexCount = this->unVertexCount;
+    ret.rIndexData = this->rIndexData;
+    ret.unTriangleCount = this->unTriangleCount;
+    ret.diffuseTextureId = this->diffuseTextureId;
+    return ret;
+}
+
+u64_RenderModel_t_0912::operator w32_RenderModel_t_0912() const
+{
+    w32_RenderModel_t_0912 ret;
+    unsigned int size;
+    BYTE *data;
+
+    size = unVertexCount * sizeof(*rVertexData) + unTriangleCount * 3 * sizeof(*rIndexData);
+    data = (BYTE *)alloc_low_mem( size );
+    ret.rVertexData = (RenderModel_Vertex_t *)data;
+    memcpy( data, this->rVertexData, unVertexCount * sizeof(*rVertexData) );
+    data += unVertexCount * sizeof(*rVertexData);
+    ret.unVertexCount = this->unVertexCount;
+    ret.rIndexData = (uint16_t *)data;
+    memcpy( data, this->rIndexData, unTriangleCount * 3 * sizeof(*rIndexData) );
+    ret.unTriangleCount = this->unTriangleCount;
+
+    ret.diffuseTextureId = this->diffuseTextureId;
+    return ret;
+}
+
+w32_RenderModel_t_090::operator u64_RenderModel_t_090() const
+{
+    u64_RenderModel_t_090 ret;
+    ret.ulInternalHandle = this->ulInternalHandle;
+    ret.rVertexData = this->rVertexData;
+    ret.unVertexCount = this->unVertexCount;
+    ret.rIndexData = this->rIndexData;
+    ret.unTriangleCount = this->unTriangleCount;
+    ret.diffuseTexture = this->diffuseTexture;
+    return ret;
+}
+
+u64_RenderModel_t_090::operator w32_RenderModel_t_090() const
+{
+    w32_RenderModel_t_090 ret;
+    unsigned int size;
+    BYTE *data;
+
+    ret.ulInternalHandle = this->ulInternalHandle;
+
+    size = unVertexCount * sizeof(*rVertexData) + unTriangleCount * 3 * sizeof(*rIndexData);
+    data = (BYTE *)alloc_low_mem( size );
+    ret.rVertexData = (RenderModel_Vertex_t *)data;
+    memcpy( data, this->rVertexData, unVertexCount * sizeof(*rVertexData) );
+    data += unVertexCount * sizeof(*rVertexData);
+    ret.unVertexCount = this->unVertexCount;
+    ret.rIndexData = (uint16_t *)data;
+    memcpy( data, this->rIndexData, unTriangleCount * 3 * sizeof(*rIndexData) );
+    ret.unTriangleCount = this->unTriangleCount;
+
+    ret.diffuseTexture = this->diffuseTexture;
+    return ret;
+}
+#endif
