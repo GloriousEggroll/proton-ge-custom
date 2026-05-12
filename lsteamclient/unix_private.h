@@ -13,6 +13,7 @@
 #include <stdlib.h>
 
 #include "wine/debug.h"
+#include "wine/unixlib.h"
 #include "wine/list.h"
 
 #ifdef __cplusplus
