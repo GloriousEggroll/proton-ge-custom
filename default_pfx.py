@@ -51,7 +51,7 @@ def make_relative_symlink(target, linkname):
     os.symlink(rel, linkname)
 
 def setup_dll_symlinks(default_pfx_dir, dist_dir, arm64):
-    skip_dlls = [ 'amd_ags_x64.dll' ]
+    skip_dlls = [ 'amd_ags_x64.dll', 'comctl32.dll', 'comctl32_v6.dll' ]
     for walk_dir, dirs, files in os.walk(default_pfx_dir):
         for file_ in files:
             filename = os.path.join(walk_dir, file_)
