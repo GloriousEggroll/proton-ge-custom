@@ -185,9 +185,6 @@ function configure() {
       echo "CONTAINER_MOUNT_OPTS := $CONTAINER_MOUNT_OPTS"
     fi
     echo "ENABLE_CCACHE := 1"
-    if [[ -n "$arg_enable_bear" ]]; then
-      echo "ENABLE_BEAR := 1"
-    fi
 
     # Include base
     echo ""
@@ -208,7 +205,6 @@ arg_target_arch=""
 arg_container_engine=""
 arg_docker_opts=""
 arg_relabel_volumes=""
-arg_enable_bear=""
 arg_help=""
 invalid_args=""
 function parse_args() {
@@ -256,8 +252,6 @@ function parse_args() {
       val_used=1
     elif [[ $arg = --relabel-volumes ]]; then
       arg_relabel_volumes="1"
-    elif [[ $arg = --enable-bear ]]; then
-      arg_enable_bear="1"
     elif [[ $arg = --proton-sdk-image ]]; then
       val_used=1
       arg_protonsdk_image="$val"
@@ -313,7 +307,6 @@ usage() {
   "$1" ""
   "$1" "    --relabel-volumes Bind-mounted volumes will be relabeled. Use with caution."
   "$1" ""
-  "$1" "    --enable-bear Invokes make via bear creating compile_commands.json."
   "$1" ""
   "$1" "  Steam Runtime"
   "$1" "    Proton builds that are to be installed & run under the steam client must be built with"
