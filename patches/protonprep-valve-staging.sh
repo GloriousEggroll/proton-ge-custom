@@ -330,6 +330,9 @@ apply_all_in_dir() {
     echo "WINE: -CUSTOM- Dynamically relocate .exes, improving compatibility with modding / hooking tools"
     apply_patch "../patches/proton/0001-server-Dynamically-relocate-.exes-by-default-too.patch"
 
+    echo "WINE: -CUSTOM- Nukitashi 2 video playback fix -- claude"
+    apply_patch "../patches/wine-hotfixes/ge_video_fixes/nukitashi2-video-fix.patch"
+
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
     ./tools/make_requests
