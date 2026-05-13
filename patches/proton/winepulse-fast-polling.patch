@@ -1,39 +1,34 @@
 diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
-index 85062ead684..08117c4c2b0 100644
+index a626f348ee5..62e4e5d29c2 100644
 --- a/dlls/winepulse.drv/pulse.c
 +++ b/dlls/winepulse.drv/pulse.c
-@@ -59,6 +59,21 @@ DEFINE_GUID(GUID_NULL,0,0,0,0,0,0,0,0,0,0,0);
+@@ -59,6 +59,16 @@ DEFINE_GUID(GUID_NULL,0,0,0,0,0,0,0,0,0,0,0);
  
  WINE_DEFAULT_DEBUG_CHANNEL(pulse);
  
-+static BOOL get_fast_polling_override(void)
++static int get_fast_polling_override(void)
 +{
-+    static int val = -1;
-+    if (val == -1) {
-+        const char *env = getenv("WINEPULSE_FAST_POLLING");
-+        if (env && atoi(env) != 0) {
-+            val = 1;
-+            TRACE("Fast polling enabled via env var\n");
-+        } else {
-+            val = 0;
-+        }
-+    }
-+    return val == 1;
++    char *e = getenv("PULSE_AUDIO_FAST_POLLING");
++
++    if (!e)
++        return 0;
++
++    return atoi(e);
 +}
 +
  enum phys_device_bus_type {
      phys_device_bus_invalid = -1,
      phys_device_bus_pci,
-@@ -109,6 +124,8 @@ struct pulse_stream
-     struct list packet_filled_head;
-     struct list period_entry;
-     struct pulse_period *period;
+@@ -107,6 +117,8 @@ struct pulse_stream
+     pa_usec_t stream_time, last_time;
+ 
+     INT64 clock_lastpos, clock_written;
 +    SIZE_T rem_samples;
 +    INT event_count;
- };
  
- typedef struct _ACPacket
-@@ -1279,7 +1296,7 @@ static NTSTATUS pulse_create_stream(void *args)
+     struct list packet_free_head;
+     struct list packet_filled_head;
+@@ -1285,7 +1297,7 @@ static NTSTATUS pulse_create_stream(void *args)
  
      stream->bufsize_frames = ceil((params->duration / 10000000.) * params->fmt->nSamplesPerSec);
      bufsize_bytes = stream->bufsize_frames * pa_frame_size(&stream->ss);
@@ -42,122 +37,111 @@ index 85062ead684..08117c4c2b0 100644
  
      stream->share = params->share;
      stream->flags = params->flags;
-@@ -1492,6 +1509,7 @@ static void pulse_write(struct pulse_stream *stream)
+@@ -1500,6 +1512,8 @@ static void pulse_write(struct pulse_stream *stream)
  
      if (stream->just_underran)
      {
 +        stream->rem_samples = 0;
++
          /* prebuffer with silence if needed */
          if(stream->pa_held_bytes < bytes){
              to_write = bytes - stream->pa_held_bytes;
-@@ -1640,7 +1658,7 @@ static void pa_streams_timer_cb(pa_mainloop_api *api, pa_time_event *e, const st
-     struct pulse_period *period = userdata;
+@@ -1650,6 +1664,7 @@ static void pa_streams_timer_cb(pa_mainloop_api *api, pa_time_event *e, const st
      struct pulse_stream *stream;
+     int64_t adjust = 0;
      UINT32 adv_bytes;
--
 +    SIZE_T safe_bytes;
-     period->timer_last_time += period->period;
+     int err;
  
-     TRACE("period %p, now %llu, timer_last_time %llu.\n", period, (long long)pa_rtclock_now(), (long long)period->timer_last_time);
-@@ -1652,20 +1670,87 @@ static void pa_streams_timer_cb(pa_mainloop_api *api, pa_time_event *e, const st
-             if (stream->dataflow == eRender)
+     if (period->timer_stream && !period->timer_stream->started)
+@@ -1704,8 +1719,45 @@ static void pa_streams_timer_cb(pa_mainloop_api *api, pa_time_event *e, const st
              {
                  pulse_write(stream);
+ 
+-                /* regardless of what PA does, advance one per`iod */
+-                adv_bytes = min(stream->period_bytes, stream->held_bytes);
 +                if (get_fast_polling_override())
 +                {
-+                     /* --- FAST POLLING LOGIC --- */
 +                    SIZE_T frame_size = pa_frame_size(&stream->ss);
-+                    UINT64 total_samples;
++                    UINT64 total_samples = stream->mmdev_period_usec * stream->ss.rate + stream->rem_samples;
 +
-+                    total_samples = stream->mmdev_period_usec * stream->ss.rate + stream->rem_samples;
 +                    adv_bytes = (total_samples / 1000000) * frame_size;
 +                    stream->rem_samples = total_samples % 1000000;
 +
 +                    safe_bytes = adv_bytes;
-+
-+                    if ((stream->held_bytes > stream->pa_held_bytes))
++                    if (stream->held_bytes > stream->pa_held_bytes)
 +                    {
 +                        SIZE_T limit = stream->held_bytes - stream->pa_held_bytes;
 +                        if (safe_bytes > limit)
 +                            safe_bytes = limit;
 +                    }
-+                    else {
++                    else
++                    {
 +                        safe_bytes = 0;
 +                    }
 +
-+                    adv_bytes=min(adv_bytes, safe_bytes);
-+                    stream->lcl_offs_bytes += adv_bytes;
-+                    stream->lcl_offs_bytes %= stream->real_bufsize_bytes;
-+                    stream->held_bytes -= adv_bytes;
++                    adv_bytes = min(adv_bytes, safe_bytes);
 +                }
 +                else
 +                {
-+                    /* --- ORIGINAL LOGIC --- */
 +                    safe_bytes = stream->period_bytes;
-+
-+                    if ((stream->held_bytes > stream->pa_held_bytes))
++                    if (stream->held_bytes > stream->pa_held_bytes)
 +                    {
 +                        SIZE_T limit = stream->held_bytes - stream->pa_held_bytes;
 +                        if (safe_bytes > limit)
 +                            safe_bytes = limit;
 +                    }
-+                    else {
++                    else
++                    {
 +                        safe_bytes = 0;
 +                    }
- 
--                /* regardless of what PA does, advance one period */
--                adv_bytes = min(stream->period_bytes, stream->held_bytes);
--                stream->lcl_offs_bytes += adv_bytes;
--                stream->lcl_offs_bytes %= stream->real_bufsize_bytes;
--                stream->held_bytes -= adv_bytes;
++
 +                    adv_bytes = safe_bytes;
-+                    stream->lcl_offs_bytes += adv_bytes;
-+                    stream->lcl_offs_bytes %= stream->real_bufsize_bytes;
-+                    stream->held_bytes -= adv_bytes;
 +                }
-             }
-             else if(stream->dataflow == eCapture)
-             {
++
+                 stream->lcl_offs_bytes += adv_bytes;
+                 stream->lcl_offs_bytes %= stream->real_bufsize_bytes;
+                 stream->held_bytes -= adv_bytes;
+@@ -1715,8 +1767,34 @@ static void pa_streams_timer_cb(pa_mainloop_api *api, pa_time_event *e, const st
                  pulse_read(stream);
              }
          }
 -        if (stream->event)
--            NtSetEvent(stream->event, NULL);
-+         if (get_fast_polling_override())
++        if (get_fast_polling_override())
 +        {
 +            if (stream->event)
 +            {
-+            BOOL should_signal = FALSE;
++                BOOL should_signal = FALSE;
 +
-+            if (stream->dataflow == eRender)
-+            {
++                if (stream->dataflow == eRender)
++                {
 +                    stream->event_count++;
 +                    if (stream->event_count >= 5)
 +                    {
 +                        should_signal = TRUE;
 +                        stream->event_count = 0;
 +                    }
-+            }
-+            else /* eCapture: Signal every single tick */
-+            {
-+                should_signal = TRUE;
-+            }
-+            if (should_signal)
-+                NtSetEvent(stream->event, NULL);
++                }
++                else
++                {
++                    should_signal = TRUE;
++                }
++
++                if (should_signal)
++                    NtSetEvent(stream->event, NULL);
 +            }
 +        }
-+        else
++        else if (stream->event)
 +        {
-+             if (stream->event)
-+                 NtSetEvent(stream->event, NULL);
+             NtSetEvent(stream->event, NULL);
 +        }
      }
-     pa_context_rttime_restart(pulse_ctx, e, period->timer_last_time + period->period);
- }
-@@ -1816,6 +1901,7 @@ static NTSTATUS pulse_start(void *args)
+ 
+     TRACE("period %p, now %llu, next_timer %llu.\n", period, (long long)now, (long long)next_timer);
+@@ -1877,6 +1955,7 @@ static NTSTATUS pulse_start(void *args)
+     if (SUCCEEDED(params->result))
      {
          stream->started = TRUE;
-         stream->just_started = TRUE;
 +        stream->event_count = 0;
          pulse_add_stream_to_period(stream);
      }

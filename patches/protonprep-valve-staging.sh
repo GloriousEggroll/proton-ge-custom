@@ -197,9 +197,6 @@ apply_all_in_dir() {
     apply_patch "../patches/game-patches/silence-starcitizen-unsupported-os.patch"
     apply_patch "../patches/game-patches/eac_60101_timeout.patch"
 
-    # https://github.com/JacKeTUs/wine/commits/lmu-d2d1-tinkering
-    echo "WINE: -GAME FIXES- add le mans ultimate patches"
-    apply_patch "../patches/game-patches/lemansultimate-gameinput.patch"
 
 ### END GAME PATCH SECTION ###
 
@@ -219,15 +216,11 @@ apply_all_in_dir() {
 
     # https://github.com/ValveSoftware/wine/pull/205
     # https://github.com/ValveSoftware/Proton/issues/4625
-#    echo "WINE: -PENDING- Add WINE_DISABLE_SFN option. (Yakuza 5 cutscenes fix)"
-#    apply_patch "../patches/wine-hotfixes/pending/ntdll_add_wine_disable_sfn.patch"
+    echo "WINE: -PENDING- Add WINE_DISABLE_SFN option. (Yakuza 5 cutscenes fix)"
+    apply_patch "../patches/wine-hotfixes/pending/ntdll_add_wine_disable_sfn.patch"
 
     echo "WINE: -PENDING- ncrypt: NCryptDecrypt implementation (PSN Login for Ghost of Tsushima)"
     apply_patch "../patches/wine-hotfixes/pending/NCryptDecrypt_implementation.patch"
-
-    #https://github.com/GloriousEggroll/proton-ge-custom/issues/283
-    echo "WINE: -PENDING- quartz: backport to allow clannad videos to work"
-    apply_patch "../patches/wine-hotfixes/pending/8848.patch"
 
     #https://github.com/Open-Wine-Components/umu-protonfixes/pull/370#issuecomment-3368898328
     echo "WINE: -PENDING- add nvidia DLSS upgrade patch"
@@ -254,17 +247,17 @@ apply_all_in_dir() {
 
 ### (2-7) PROTON-GE ADDITIONAL CUSTOM PATCHES ###
 
-#    echo "WINE: Add winepulse fast polling env variable"
-#    apply_patch "../patches/proton/winepulse-fast-polling.patch"
+    echo "WINE: Add winepulse fast polling env variable"
+    apply_patch "../patches/proton/winepulse-fast-polling.patch"
 
-#    echo "WINE: Add an env variable to override channel count in winealsa"
-#    apply_patch "../patches/proton/winealsa-override-channel-count.patch"
+    echo "WINE: Add an env variable to override channel count in winealsa"
+    apply_patch "../patches/proton/winealsa-override-channel-count.patch"
 
-#    echo "WINE: -FSR- fullscreen hack fsr patch"
-#    apply_patch "../patches/proton/0001-fshack-Implement-AMD-FSR-upscaler-for-fullscreen-hac.patch"
+    echo "WINE: -FSR- fullscreen hack fsr patch"
+    apply_patch "../patches/proton/0001-fshack-Implement-AMD-FSR-upscaler-for-fullscreen-hac.patch"
 
-#    echo "WINE: -Nvidia Reflex- Support VK_NV_low_latency2"
-#    apply_patch "../patches/proton/83-nv_low_latency_wine.patch"
+    echo "WINE: -Nvidia Reflex- Support VK_NV_low_latency2"
+    apply_patch "../patches/proton/83-nv_low_latency_wine.patch"
 
     echo "WINE: -CUSTOM- Add nls to tools"
     apply_patch "../patches/proton/build_failure_prevention-add-nls.patch"
@@ -272,14 +265,8 @@ apply_all_in_dir() {
     echo "WINE: -CUSTOM Add options to disable proton media converter."
     apply_patch "../patches/proton/add-envvar-to-gate-media-converter.patch"
 
-#    echo "WINE: -CUSTOM- Downgrade MESSAGE to TRACE to remove write_watches spam"
-#    apply_patch "../patches/proton/0001-ntdll-Downgrade-using-kernel-write-watches-from-MESS.patch"
-
     echo "WINE: -CUSTOM- Add WINE_NO_WM_DECORATION option to disable window decorations so that borders behave properly"
     apply_patch "../patches/proton/0001-win32u-add-env-switch-to-disable-wm-decorations.patch"
-
-    echo "WINE: -CUSTOM- Fix a crash in ID2D1DeviceContext if no target is set"
-    apply_patch "../patches/proton/fix-a-crash-in-ID2D1DeviceContext-if-no-target-is-set.patch"
 
     echo "WINE: -CUSTOM- Add envvar to allow method=automatic to be set for video orientation in gstreamer"
     apply_patch "../patches/proton/proton-use_winegstreamer_and_set_orientation-PROTON_MEDIA_USE_GST-PROTON_GST_VIDEO_ORIENTATION.patch"
@@ -291,8 +278,11 @@ apply_all_in_dir() {
     echo "WINE: -CUSTOM- Dynamically relocate .exes, improving compatibility with modding / hooking tools"
     apply_patch "../patches/proton/0001-server-Dynamically-relocate-.exes-by-default-too.patch"
 
-    echo "WINE: -CUSTOM- Nukitashi 2 video playback fix -- claude"
+    echo "WINE: -CUSTOM- Nukitashi 2 video playback fix"
     apply_patch "../patches/wine-hotfixes/ge_video_fixes/nukitashi2-video-fix.patch"
+
+    echo "WINE: mutter -> cinnamon detection patch for winex11"
+    apply_patch "../patches/proton/winex11-mutter-cinnamon.patch"
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
