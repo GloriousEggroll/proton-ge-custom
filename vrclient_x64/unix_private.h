@@ -11,16 +11,12 @@
 
 #include "wine/debug.h"
 #include "wine/list.h"
+#include "wine/vulkan.h"
+#include "wine/vulkan_driver.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif /* __cplusplus */
-
-extern VkDevice_T *(*p_get_native_VkDevice)( VkDevice_T * );
-extern VkInstance_T *(*p_get_native_VkInstance)( VkInstance_T * );
-extern VkPhysicalDevice_T *(*p_get_native_VkPhysicalDevice)( VkPhysicalDevice_T * );
-extern VkPhysicalDevice_T *(*p_get_wrapped_VkPhysicalDevice)( VkInstance_T *, VkPhysicalDevice_T * );
-extern VkQueue_T *(*p_get_native_VkQueue)( VkQueue_T * );
 
 extern char *json_convert_startup_info(const char *startup_info);
 extern char *json_convert_paths(const char *input);

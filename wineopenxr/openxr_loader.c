@@ -878,6 +878,15 @@ int64_t map_format_vulkan_to_dxgi(int64_t format) {
     case VK_FORMAT_R16G16B16A16_SFLOAT:
       return DXGI_FORMAT_R16G16B16A16_FLOAT;
 
+    case VK_FORMAT_R16G16B16A16_UNORM:
+      return DXGI_FORMAT_R16G16B16A16_UNORM;
+
+    case VK_FORMAT_R5G6B5_UNORM_PACK16:
+      return DXGI_FORMAT_B5G6R5_UNORM;
+
+    case VK_FORMAT_R32_SFLOAT:
+      return DXGI_FORMAT_R32_FLOAT;
+
     case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
       return DXGI_FORMAT_R10G10B10A2_UNORM;
 
@@ -1768,7 +1777,7 @@ XrResult WINAPI xrCreateVulkanInstanceKHR(XrInstance instance,
   vulkan_create_info = *createInfo->vulkanCreateInfo;
   callback.sType = VK_STRUCTURE_TYPE_CREATE_INFO_WINE_INSTANCE_CALLBACK;
   callback.native_create_callback = g_vk_create_instance_callback;
-  callback.context = &context;
+  callback.context = (UINT64)&context;
   callback.pNext = vulkan_create_info.pNext;
   vulkan_create_info.pNext = &callback;
 
@@ -1803,7 +1812,7 @@ XrResult WINAPI xrCreateVulkanDeviceKHR(XrInstance instance,
   vulkan_create_info = *createInfo->vulkanCreateInfo;
   callback.sType = VK_STRUCTURE_TYPE_CREATE_INFO_WINE_DEVICE_CALLBACK;
   callback.native_create_callback = g_vk_create_device_callback;
-  callback.context = &context;
+  callback.context = (UINT64)&context;
   callback.pNext = vulkan_create_info.pNext;
   vulkan_create_info.pNext = &callback;
 

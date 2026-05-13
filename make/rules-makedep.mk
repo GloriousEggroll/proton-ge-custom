@@ -22,6 +22,7 @@ $(2)_arm64ec-windows_LIBFLAGS = $$(foreach d,$$($(2)_arm64ec_DEPS),-L$$($$(d)_ar
 
 $$(OBJ)/.$(1)-$(3)-configure: $$(OBJ)/.wine-$$(HOST_ARCH)-tools
 	@echo ":: configuring $(1)-$(3)..." >&2
+	touch $$($(2)_$(3)_OBJ)/config.status
 
 	sed -e '1 i\UNIX_LIBS = $$(WINE_$(3)_LIBDIR)/wine/$(3)-unix/ntdll.so\n' \
 	    -e '/^all:$$$$/,$$$$c all:' \
@@ -65,6 +66,10 @@ $$(OBJ)/.$(1)-$(3)-configure: $$(OBJ)/.wine-$$(HOST_ARCH)-tools
 	    -e '/^PE_ARCHS/s/aarch64//' \
 	    $$(WINE_$(3)_OBJ)/Makefile > $$($(2)_$(3)_OBJ)/Makefile
 
+	if [ -n "$$($(2)_$(3)_PE_ARCHS)" ]; then \
+		sed -i -e '/^PE_ARCHS/c PE_ARCHS =  $$($(2)_$(3)_PE_ARCHS)' $$($(2)_$(3)_OBJ)/Makefile; \
+	fi
+
 	cd "$$($(2)_$(3)_OBJ)" && env $$($(2)_$(3)_ENV) \
 	$$(WINE_$$(HOST_ARCH)_OBJ)/tools/makedep
 
@@ -73,9 +78,13 @@ $$(OBJ)/.$(1)-$(3)-configure: $$(OBJ)/.wine-$$(HOST_ARCH)-tools
 $$(OBJ)/.$(1)-$(3)-build:
 	@echo ":: building $(1)-$(3)..." >&2
 	+cd "$$($(2)_$(3)_OBJ)" && env $$($(2)_$(3)_ENV) \
-	$$(BEAR) $$(MAKE)
+	$$(MAKE)
 	cd "$$($(2)_$(3)_OBJ)" && env $$($(2)_$(3)_ENV) \
 	$$(MAKE) install
+	if [ "$(3)" == "aarch64" ]; then \
+		mkdir -p $$($(2)_$(3)_DST)/lib/wine/aarch64-windows/ && \
+		mv $$($(2)_$(3)_DST)/lib/wine/arm64ec-windows/* $$($(2)_$(3)_DST)/lib/wine/aarch64-windows/; \
+	fi
 	touch $$@
 endif
 endef

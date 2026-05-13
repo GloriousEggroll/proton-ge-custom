@@ -1,0 +1,140 @@
+From 3d60c7c3edce19371e14d00fceddbaaf46dab74b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?R=C3=A9mi=20Bernon?= <rbernon@codeweavers.com>
+Date: Fri, 6 Jan 2023 08:09:11 +0100
+Subject: [PATCH 5/9] winex11: Use the user configured keyboard layout if any.
+
+Wine-Bug: https://bugs.winehq.org/show_bug.cgi?id=30984
+Wine-Bug: https://bugs.winehq.org/show_bug.cgi?id=45605
+---
+ dlls/winex11.drv/keyboard.c    | 33 +++++++++++++++++++++++++++------
+ dlls/winex11.drv/x11drv.h      |  2 ++
+ dlls/winex11.drv/x11drv_main.c |  4 ++++
+ 3 files changed, 33 insertions(+), 6 deletions(-)
+
+diff --git a/dlls/winex11.drv/keyboard.c b/dlls/winex11.drv/keyboard.c
+index 8dad121d637..414bc191437 100644
+--- a/dlls/winex11.drv/keyboard.c
++++ b/dlls/winex11.drv/keyboard.c
+@@ -938,7 +938,6 @@ static const struct {
+ 
+  {0, NULL, NULL, NULL, NULL} /* sentinel */
+ };
+-static unsigned kbd_layout=0; /* index into above table of layouts */
+ 
+ /* maybe more of these scancodes should be extended? */
+                 /* extended must be set for ALT_R, CTRL_R,
+@@ -1114,6 +1113,26 @@ WCHAR *x11drv_get_keyboard_layout_list( DWORD *length )
+     return layouts;
+ }
+ 
++int x11drv_find_keyboard_layout( const WCHAR *layout )
++{
++    int i, len;
++    char *tmp;
++
++    len = lstrlenW( layout );
++    if (!(tmp = malloc( len * 3 + 1 ))) return -1;
++    ntdll_wcstoumbs( layout, len + 1, tmp, len * 3 + 1, FALSE );
++
++    for (i = 0; main_key_tab[i].comment; i++)
++    {
++        const char *name = main_key_tab[i].comment;
++        if (!strcmp( name, tmp )) break;
++    }
++    free( tmp );
++
++    if (!main_key_tab[i].comment) return -1;
++    return i;
++}
++
+ /* Returns the Windows virtual key code associated with the X event <e> */
+ /* kbd_section must be held */
+ static WORD EVENT_event_to_vkey( XIC xic, XKeyEvent *e)
+@@ -1493,11 +1512,11 @@ static char keysym_to_char( KeySym keysym )
+  *  whichever matches most closely.
+  * kbd_section must be held.
+  */
+-static void
++static int
+ X11DRV_KEYBOARD_DetectLayout( Display *display )
+ {
+   unsigned current, match, mismatch, seq, i, syms;
+-  int score, keyc, key, pkey, ok;
++  int score, keyc, key, pkey, ok, kbd_layout = 0;
+   KeySym keysym = 0;
+   const char (*lkey)[MAIN_LEN][4];
+   unsigned max_seq = 0;
+@@ -1592,6 +1611,7 @@ X11DRV_KEYBOARD_DetectLayout( Display *display )
+         main_key_tab[kbd_layout].comment);
+ 
+   TRACE("detected layout is \"%s\"\n", main_key_tab[kbd_layout].comment);
++  return kbd_layout;
+ }
+ 
+ 
+@@ -1627,7 +1647,7 @@ void X11DRV_InitKeyboard( Display *display )
+         { 0x41, 0x5a }, /* VK_A - VK_Z */
+         { 0, 0 }
+     };
+-    int vkey_range;
++    int vkey_range, kbd_layout;
+ 
+     pthread_mutex_lock( &kbd_mutex );
+     XDisplayKeycodes(display, &min_keycode, &max_keycode);
+@@ -1659,8 +1679,9 @@ void X11DRV_InitKeyboard( Display *display )
+     }
+     XFreeModifiermap(mmp);
+ 
+-    /* Detect the keyboard layout */
+-    X11DRV_KEYBOARD_DetectLayout( display );
++    /* use the configured layout from registry or auto detect it */
++    kbd_layout = keyboard_layout;
++    if (kbd_layout == -1) kbd_layout = X11DRV_KEYBOARD_DetectLayout( display );
+     lkey = main_key_tab[kbd_layout].key;
+     syms = (keysyms_per_keycode > 4) ? 4 : keysyms_per_keycode;
+ 
+diff --git a/dlls/winex11.drv/x11drv.h b/dlls/winex11.drv/x11drv.h
+index 4efb27c8742..cbfe5c35921 100644
+--- a/dlls/winex11.drv/x11drv.h
++++ b/dlls/winex11.drv/x11drv.h
+@@ -474,6 +474,7 @@ extern BOOL use_take_focus;
+ extern BOOL use_primary_selection;
+ extern BOOL use_system_cursors;
+ extern BOOL grab_fullscreen;
++extern int keyboard_layout;
+ extern BOOL usexcomposite;
+ extern BOOL use_xfixes;
+ extern BOOL managed_mode;
+@@ -798,6 +799,7 @@ extern void init_icm_profile(void);
+ 
+ /* keyboard.c */
+ 
++extern int x11drv_find_keyboard_layout( const WCHAR *layout );
+ extern WCHAR *x11drv_get_keyboard_layout_list( DWORD *size );
+ 
+ #define DEPTH_COUNT 3
+diff --git a/dlls/winex11.drv/x11drv_main.c b/dlls/winex11.drv/x11drv_main.c
+index 6d31cf89d06..7b75f6cb920 100644
+--- a/dlls/winex11.drv/x11drv_main.c
++++ b/dlls/winex11.drv/x11drv_main.c
+@@ -75,6 +75,7 @@ BOOL use_take_focus = TRUE;
+ BOOL use_primary_selection = FALSE;
+ BOOL use_system_cursors = TRUE;
+ BOOL grab_fullscreen = FALSE;
++int keyboard_layout = -1;
+ BOOL managed_mode = TRUE;
+ BOOL private_color_map = FALSE;
+ int primary_monitor = 0;
+@@ -562,6 +563,9 @@ static void setup_options(void)
+     if (!get_config_key( hkey, appkey, "GrabFullscreen", buffer, sizeof(buffer) ))
+         grab_fullscreen = IS_OPTION_TRUE( buffer[0] );
+ 
++    if (!get_config_key( hkey, appkey, "KeyboardLayout", buffer, sizeof(buffer) ))
++        keyboard_layout = x11drv_find_keyboard_layout( buffer );
++
+     p = x11drv_get_keyboard_layout_list( &len );
+     if (p) set_reg_string_value( hkey, "KeyboardLayoutList", p, len * sizeof(WCHAR) );
+     free( p );
+-- 
+2.54.0
+

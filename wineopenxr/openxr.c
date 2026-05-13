@@ -12,6 +12,7 @@
 #include "winnt.h"
 #include "winternl.h"
 #include "wine/server_protocol.h"
+#include "wine/vulkan_driver.h"
 
 #include "openxr_private.h"
 
@@ -31,12 +32,6 @@ static XrResult (*p_xrConvertTimespecTimeToTimeKHR)(XrInstance, const struct tim
 static XrResult (*p_xrConvertTimeToTimespecTimeKHR)(XrInstance, XrTime, struct timespec *);
 
 struct openxr_instance_funcs g_xr_host_instance_dispatch_table;
-
-VkDevice (*get_native_VkDevice)(VkDevice);
-VkInstance (*get_native_VkInstance)(VkInstance);
-VkPhysicalDevice (*get_native_VkPhysicalDevice)(VkPhysicalDevice);
-VkPhysicalDevice (*get_wrapped_VkPhysicalDevice)(VkInstance, VkPhysicalDevice);
-VkQueue (*get_native_VkQueue)(VkQueue);
 
 XrResult WINAPI wine_xrCreateInstance(const XrInstanceCreateInfo *createInfo, XrInstance *instance) {
   XrResult res;
@@ -116,9 +111,9 @@ XrResult WINAPI wine_xrCreateSession(XrInstance instance, const XrSessionCreateI
         const XrGraphicsBindingVulkanKHR *their_vk_binding = (const XrGraphicsBindingVulkanKHR *)createInfo->next;
 
         our_vk_binding = *their_vk_binding;
-        our_vk_binding.instance = get_native_VkInstance(their_vk_binding->instance);
-        our_vk_binding.physicalDevice = get_native_VkPhysicalDevice(their_vk_binding->physicalDevice);
-        our_vk_binding.device = get_native_VkDevice(their_vk_binding->device);
+        our_vk_binding.instance = vulkan_instance_from_handle(their_vk_binding->instance)->host.instance;
+        our_vk_binding.physicalDevice = vulkan_physical_device_from_handle(their_vk_binding->physicalDevice)->host.physical_device;
+        our_vk_binding.device = vulkan_device_from_handle(their_vk_binding->device)->host.device;
 
         our_create_info = *createInfo;
         our_create_info.next = &our_vk_binding;
@@ -208,6 +203,21 @@ XrResult WINAPI wine_xrEnumerateInstanceExtensionProperties(const char *layerNam
   return XR_SUCCESS;
 }
 
+static VkPhysicalDevice get_client_physical_device( VkInstance handle, VkPhysicalDevice host_physical_device )
+{
+    struct vulkan_instance *instance = vulkan_instance_from_handle( handle );
+    unsigned int i;
+
+    for (i = 0; i < instance->physical_device_count; ++i)
+    {
+        if (instance->physical_devices[i].host.physical_device == host_physical_device)
+            return instance->physical_devices[i].client.physical_device;
+    }
+
+    ERR( "Unknown native physical device: %p, instance %p, handle %p\n", host_physical_device, instance, handle );
+    return NULL;
+}
+
 XrResult WINAPI wine_xrGetVulkanGraphicsDeviceKHR(XrInstance instance,
                                                   XrSystemId systemId,
                                                   VkInstance vkInstance,
@@ -215,9 +225,9 @@ XrResult WINAPI wine_xrGetVulkanGraphicsDeviceKHR(XrInstance instance,
   XrResult res;
   TRACE("%p, 0x%s, %p, %p\n", instance, wine_dbgstr_longlong(systemId), vkInstance, vkPhysicalDevice);
   res = g_xr_host_instance_dispatch_table.p_xrGetVulkanGraphicsDeviceKHR(
-      wine_instance_from_handle(instance)->host_instance, systemId, get_native_VkInstance(vkInstance),
+      wine_instance_from_handle(instance)->host_instance, systemId, vulkan_instance_from_handle(vkInstance)->host.instance,
       vkPhysicalDevice);
-  *vkPhysicalDevice = get_wrapped_VkPhysicalDevice(vkInstance, *vkPhysicalDevice);
+  *vkPhysicalDevice = get_client_physical_device(vkInstance, *vkPhysicalDevice);
   return res;
 }
 
@@ -234,12 +244,12 @@ XrResult WINAPI wine_xrGetVulkanGraphicsDevice2KHR(XrInstance instance,
   }
 
   our_getinfo = *getInfo;
-  our_getinfo.vulkanInstance = get_native_VkInstance(our_getinfo.vulkanInstance);
+  our_getinfo.vulkanInstance = vulkan_instance_from_handle(our_getinfo.vulkanInstance)->host.instance;
 
   res = g_xr_host_instance_dispatch_table.p_xrGetVulkanGraphicsDevice2KHR(
       wine_instance_from_handle(instance)->host_instance, &our_getinfo, vulkanPhysicalDevice);
   if (res == XR_SUCCESS) {
-    *vulkanPhysicalDevice = get_wrapped_VkPhysicalDevice(getInfo->vulkanInstance, *vulkanPhysicalDevice);
+    *vulkanPhysicalDevice = get_client_physical_device(getInfo->vulkanInstance, *vulkanPhysicalDevice);
   }
   return res;
 }
@@ -349,42 +359,6 @@ static VkResult WINAPI vk_create_device_callback(VkPhysicalDevice phys_dev,
 
 NTSTATUS init_openxr(void *args) {
   struct init_openxr_params *params = args;
-  NTSTATUS status;
-  unixlib_handle_t unix_funcs;
-  Dl_info info;
-  void *unix_handle;
-
-  status = NtQueryVirtualMemory(GetCurrentProcess(), params->winevulkan,
-                                (MEMORY_INFORMATION_CLASS)1000 /*MemoryWineUnixFuncs*/, &unix_funcs, sizeof(unix_funcs),
-                                NULL);
-  if (status) {
-    ERR("NtQueryVirtualMemory status %#x.\n", (int)status);
-    return status;
-  }
-
-  if (!dladdr((void *)(ULONG_PTR)unix_funcs, &info)) {
-    ERR("dladdr failed.\n");
-    return STATUS_INVALID_PARAMETER;
-  }
-
-  TRACE("path %s.\n", info.dli_fname);
-  if (!(unix_handle = dlopen(info.dli_fname, RTLD_NOW))) {
-    ERR("dlopen failed.\n");
-    return STATUS_INVALID_PARAMETER;
-  }
-
-#define L(name)                                      \
-  if (!(name = dlsym(unix_handle, "__wine_" #name))) \
-    ERR("%s not found.\n", #name);
-
-  L(get_native_VkDevice);
-  L(get_native_VkInstance);
-  L(get_native_VkPhysicalDevice);
-  L(get_wrapped_VkPhysicalDevice);
-  L(get_native_VkQueue);
-#undef L
-
-  dlclose(unix_handle);
 
   params->create_instance_callback = (UINT64)&vk_create_instance_callback;
   params->create_device_callback = (UINT64)&vk_create_device_callback;

@@ -21,7 +21,7 @@ $$(OBJ)/.$(1)-$(3)-tools:
 ifeq ($(3),$$(HOST_ARCH))
 	@echo ":: building $(1)-$(3)-tools..." >&2
 	+cd "$$($(2)_$(3)_OBJ)" && env $$($(2)_$(3)_ENV) \
-	$$(BEAR) $$(MAKE) __tooldeps__
+	$$(MAKE) __tooldeps__
 endif
 	touch $$@
 

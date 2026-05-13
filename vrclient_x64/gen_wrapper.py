@@ -11,6 +11,7 @@ import os
 import re
 
 SDK_VERSIONS = [
+    "v2.15.6",
     "v2.12.14",
     "v2.7.1",
     "v2.5.1",
@@ -147,6 +148,7 @@ SIZED_STRUCTS = {
     "VRBoneTransform_t",
     "VRControllerState001_t",
     "VREvent_t",
+    "VREyeTrackingData_t",
     "VROverlayIntersectionMaskPrimitive_t",
     "VROverlayView_t",
 }
@@ -228,6 +230,9 @@ MANUAL_STRUCTS = [
     "COpenVRContext", # not actually used
 ]
 MANUAL_WOW64_STRUCTS = [
+    "HiddenAreaMesh_t",
+    "RenderModel_t",
+    "RenderModel_TextureMap_t",
 ]
 
 UNIX_FUNCS = [
@@ -240,6 +245,8 @@ UNIX_FUNCS = [
 ]
 
 MANUAL_METHODS = {
+    "IVRApplications_LaunchInternalProcess": True,
+    "IVRApplications_RegisterSubprocess": lambda ver, abi: abi == 'u',
     "IVRClientCore_BIsHmdPresent": lambda ver, abi: abi == 'w',
     "IVRClientCore_Init": lambda ver, abi: True,
     "IVRClientCore_GetGenericInterface": lambda ver, abi: abi == 'w',
