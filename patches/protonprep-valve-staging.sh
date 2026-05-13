@@ -87,8 +87,6 @@ apply_all_in_dir() {
     -W server-File_Permissions \
     -W kernel32-CopyFileEx \
     -W dbghelp-Debug_Symbols \
-    -W mmsystem.dll16-MIDIHDR_Refcount \
-    -W vcomp_for_dynamic_init_i8 \
     -W version-VerQueryValue \
     -W mf_http_support \
     -W server-PeekMessage \
@@ -108,9 +106,9 @@ apply_all_in_dir() {
     -W kernel32-Debugger \
     -W ntdll-ext4-case-folder \
     -W winex11-Window_Style \
+    -W wininet-Cleanup \
     -W winex11-ime-check-thread-data \
     -W winex11-Fixed-scancodes \
-    -W wininet-Cleanup \
     -W Staging
 
     # NOTE: Some patches are applied manually because they -do- apply, just not cleanly, ie with patch fuzz.
@@ -121,8 +119,6 @@ apply_all_in_dir() {
     # server-File_Permissions - requires ntdll-Junction_Pointsv
     # kernel32-CopyFileEx - breaks various installers
     # dbghelp-Debug_Symbols - Ubisoft Connect games (3/3 I had installed and could test) will crash inside pe_load_debug_info function with this enabled
-    # mmsystem.dll16-MIDIHDR_Refcount - triggers Werror
-    # vcomp_for_dynamic_init_i8 - triggers Werror
     # version-VerQueryValue - just a test and doesn't apply cleanly. not relevant for gaming
     # mf_http_support - disabled in favor of custom ffmpeg backend video playback solution
 
@@ -144,10 +140,10 @@ apply_all_in_dir() {
     # kernel32-Debugger - applied manually
     # ntdll-ext4-case-folder - applied manually
     # winex11-Window_Style - applied manually
-    # winex11-ime-check-thread-data - applied manually - triggers Werror, rebase
-    # winex11-Fixed-scancodes - applied manually  - needs winex11-ime-check-thread-data
     # wininet-Cleanup - applied manually
     # Staging - applied manually
+    # winex11-ime-check-thread-data - applied manually, needed rebase
+    # winex11-Fixed-scancodes - applied manually, needed rebase
 
     # winex11-WM_WINDOWPOSCHANGING - Causes origin to freeze -- currently also disabled in upstream staging
     # ntdll-Junction_Points - breaks CEG drm -- currently also disabled in upstream staging
@@ -175,6 +171,24 @@ apply_all_in_dir() {
 
     echo "WINE: -STAGING- Staging manually applied"
     apply_all_in_dir "../wine-staging/patches/Staging/"
+
+    echo "WINE: -STAGING- winex11-ime-check-thread-data manually applied"
+    apply_all_in_dir "../patches/wine-hotfixes/wine-staging/winex11-ime-check-thread-data/"
+
+    echo "WINE: -STAGING- winex11-Fixed-scancodes manually applied"
+    apply_all_in_dir "../patches/wine-hotfixes/wine-staging/winex11-Fixed-scancodes/"
+
+    echo "WINE: -STAGING- comctl32_animate_avi cleanup -Werror"
+    apply_all_in_dir "../patches/wine-hotfixes/wine-staging/comctl32_animate_avi/"
+
+    echo "WINE: -STAGING- d3drm-starwars cleanup -Werror"
+    apply_all_in_dir "../patches/wine-hotfixes/wine-staging/d3drm-starwars/"
+
+    echo "WINE: -STAGING- windowscodecs-TIFF_Support cleanup -Werror"
+    apply_all_in_dir "../patches/wine-hotfixes/wine-staging/windowscodecs-TIFF_Support/"
+
+    echo "WINE: -STAGING- mmsystem.dll16-MIDIHDR_Refcount cleanup -Werror"
+    apply_all_in_dir "../patches/wine-hotfixes/wine-staging/mmsystem.dll16-MIDIHDR_Refcount/"
 
 
 ### END WINE STAGING APPLY SECTION ###
