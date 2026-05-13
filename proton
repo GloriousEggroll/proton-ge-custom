@@ -45,7 +45,7 @@ import protonfixes
 #To enable debug logging, copy "user_settings.sample.py" to "user_settings.py"
 #and edit it if needed.
 
-CURRENT_PREFIX_VERSION="GE-Proton10-34"
+CURRENT_PREFIX_VERSION="GE-Proton11-1"
 
 PFX="Proton: "
 ld_path_var = "LD_LIBRARY_PATH"
@@ -639,7 +639,6 @@ class Proton:
         self.default_pfx_dir = self.path("files/share/default_pfx/")
         self.user_settings_file = self.path("user_settings.py")
         self.wine_bin = self.bin_dir + "wine"
-        self.wine64_bin = self.bin_dir + "wine64"
         self.wineserver_bin = self.bin_dir + "wineserver"
         self.dist_lock = FileLock(self.path("dist.lock"), timeout=-1)
         self.host_pe_arch = "x86_64-windows"
@@ -652,12 +651,6 @@ class Proton:
             self.default_pfx_dir = self.path("files/share/default_pfx_arm64/")
             self.bin_dir = self.path("files/bin-arm64/")
             self.wine_bin = self.bin_dir + "wine"
-            self.wine64_bin = self.bin_dir + "wine"
-            self.wineserver_bin = self.bin_dir + "wineserver"
-        elif os.environ.get("PROTON_USE_WOW64", None) == "1" or "wow64" in proton_config or not file_exists(self.wine_bin, follow_symlinks=True):
-            self.bin_dir = self.path("files/bin-wow64/")
-            self.wine_bin = self.bin_dir + "wine"
-            self.wine64_bin = self.bin_dir + "wine"
             self.wineserver_bin = self.bin_dir + "wineserver"
 
     def path(self, d):
@@ -828,11 +821,12 @@ class CompatData:
                     log("Unable to write new registry file to " + self.prefix_dir + "system.reg")
                     pass
 
+            delete_dde_keys = {}
             # Prior to prefix version 6.3-3, ShellExecute* APIs used DDE.
             # Wipe out old registry entries.
             if int(old_proton_maj) < 6 or (int(old_proton_maj) == 6 and int(old_proton_min) < 3) or \
                     (int(old_proton_maj) == 6 and int(old_proton_min) == 3 and int(old_prefix_ver) < 3):
-                delete_keys = {
+                delete_dde_keys = {
                     "[Software\\\\Classes\\\\htmlfile\\\\shell\\\\open\\\\ddeexec",
                     "[Software\\\\Classes\\\\pdffile\\\\shell\\\\open\\\\ddeexec",
                     "[Software\\\\Classes\\\\xmlfile\\\\shell\\\\open\\\\ddeexec",
@@ -841,16 +835,37 @@ class CompatData:
                     "[Software\\\\Classes\\\\https\\\\shell\\\\open\\\\ddeexec",
                 }
                 dde_wb = '@="\\"C:\\\\windows\\\\system32\\\\winebrowser.exe\\" -nohome"'
+                log("Removing ShellExecute DDE registry entries.")
 
+            delete_keys = {}
+            # Remove shadergpures.sys service which was set up in prefix versions before 11
+            if int(old_proton_maj) < 11:
+                delete_keys = {
+                    "[System\\\\ControlSet001\\\\Services\\\\SharedGpuResources]",
+                    "[System\\\\CurrentControlSet\\\\Services\\\\SharedGpuResources]",
+                }
+                log("Removing sharedgpures.sys service.")
+
+            if delete_dde_keys or delete_keys:
                 sysreg_fp = self.prefix_dir + "system.reg"
                 new_sysreg_fp = self.prefix_dir + "system.reg.new"
 
-                log("Removing ShellExecute DDE registry entries.")
 
                 with open(sysreg_fp, "r") as reg_in:
                     with open(new_sysreg_fp, "w") as reg_out:
+                        deleting_key = False
                         for line in reg_in:
-                            if line[:line.find("ddeexec")+len("ddeexec")] in delete_keys:
+                            if deleting_key:
+                                if line[0] != '[':
+                                    continue
+                                deleting_key = False
+                            if line.split(' ')[0] in delete_keys:
+                                deleting_key = True
+                                continue
+                            if not delete_dde_keys:
+                                reg_out.write(line)
+                                continue
+                            if line[:line.find("ddeexec")+len("ddeexec")] in delete_dde_keys:
                                 reg_out.write(line.replace("ddeexec", "ddeexec_old", 1))
                             elif line.rstrip() == dde_wb:
                                 reg_out.write(line.replace("-nohome", "%1"))
@@ -1118,6 +1133,10 @@ class CompatData:
                     "vcruntime1*.dll," +
                     "ucrtbase.dll," +
 
+                    #there are different instances (comctl32.dll in system32 and a copy of comctl32_v6.dll
+                    #in winsxs, handle that by leaving a copy)
+                    "comctl32.dll," +
+
                     #some games balk at ntdll symlink(?)
                     "ntdll.dll," +
 
@@ -1250,7 +1269,6 @@ class CompatData:
                             prefix=self.prefix_dir, track_file=tracked_files, link_debug=True)
                     try_copy(g_proton.arch_pe_dir("wine/dxvk", True) + f + ".dll", "drive_c/windows/syswow64",
                             prefix=self.prefix_dir, track_file=tracked_files, link_debug=True)
-
                     g_session.dlloverrides[f] = "n"
 
                 for f in vkd3d_protonfiles:
@@ -1261,7 +1279,6 @@ class CompatData:
                             prefix=self.prefix_dir, track_file=tracked_files, link_debug=True, optional=optional)
                     try_copy(g_proton.arch_pe_dir("wine/vkd3d-proton", True) + f + ".dll", "drive_c/windows/syswow64",
                             prefix=self.prefix_dir, track_file=tracked_files, link_debug=True, optional=optional)
-
                     g_session.dlloverrides[f] = "n"
 
                 for f in icufiles:
@@ -1315,6 +1332,9 @@ class CompatData:
             setup_steam_dir_drive()
             setup_openvr_paths()
 
+	    # valve ffmpeg configuration below is disabled for proton-ge, we ship our own ffmpeg build.
+            # add Steam ffmpeg libraries to path
+            #prepend_to_env_str(g_session.env, ld_path_var, steamdir + "/ubuntu12_64/video/:" + steamdir + "/ubuntu12_32/video/:" + steamdir + "/steamrtarm64/video/", ":")
 
 def comma_escaped(s):
     escaped = False
@@ -1330,9 +1350,6 @@ def default_compat_config():
     if "SteamAppId" in os.environ:
         appid = os.environ["SteamAppId"]
         if appid in [
-                #affected by CW bug 22265
-                "692890", #Roboquest
-
                 #affected by CW bug 19741
                 "1017900", #Age of Empires: Definitive Edition
 
@@ -1401,57 +1418,6 @@ def default_compat_config():
             ret.add("hideintelgpu")
 
         if appid in [
-                "1341820", #As Dusk falls
-                "280790", #Creativerse
-                "306130", #The Elder Scrolls Online
-                "24010", #Train Simulator
-                "374320", #DARK SOULS III
-                "65500", #Aura: Fate of the Ages
-                "4000", #Garry's Mod
-                "383120", #Empyrion - Galactic Survival
-                "2371630", #Sword Art Online: Integral Factor
-                "460790", #Bayonetta
-                "273590", #Descent 3
-                "834530", #Yakuza Kiwami
-                "2526380", #Sword of Convallaria
-                "1088710", #Yakuza 3 Remastered
-                "1105500", #Yakuza 4 Remastered
-                "714010", #Aimlabs
-                "2249070", #Strip Fighter ZERO
-                "1845910", #Dragon Age: The Veilguard
-                "6030", #Star Wars - Jedi Knight II: Jedi Outcast
-                "2842040", #Star Wars Outlaws
-                "245300", #Disney Epic Mickey 2: The Power of Two
-                "2594920", #Atelier Resleriana: Forgotten Alchemy and the Polar Night Liberator
-                "2586520", #Atelier Resleriana [JP]
-                "3209830", #Stronghold Crusader: Definitive Edition Demo
-                "3024040", #Stronghold Crusader: Definitive Edition
-                "2433890", #Stronghold: Definitive Edition Demo
-                "2140020", #Stronghold: Definitive Edition
-                "3314070", #The Sims 2 Legacy Collection
-                "2709570", #Supermarket Together
-                "2623190", #The Elder Scrolls IV: Oblivion Remastered
-                "2139460", #Once Human
-                "632360", #Risk of Rain 2
-                "2531310", #The Last of Us Part II Remastered
-                "2564460", #Banter
-                "2680010", #The First Berserker: Khazan
-                "3438330", #Firefly Village Demo
-                "3393740", #Firefly Village
-                "2840770", #Avatar: Frontiers of Pandora
-                "429660", #Tales of Berseria
-                "1286220", #Sea Power
-                "2827230", #Wild Assault
-                "3159330", #Assassin's Creed Shadows
-                "367500", #Dragon's Dogma: Dark Arisen
-                "1890220", #Figmin XR
-                "2058180", #Judgment
-                "3950020", #Duet Night Abyss
-                "2507950", #Delta Force
-                ]:
-            ret.add("gamedrive")
-
-        if appid in [
                 "202990", #Call of Duty: Black Ops II - Multiplayer
                 "212910", #Call of Duty: Black Ops II - Zombies
                 "499100", #Dark Parables: The Exiled Prince Collector's Edition (499100)
@@ -1502,6 +1468,7 @@ def default_compat_config():
                 "435150", #Divinity: Original Sin 2 - Definitive Edition
                 "2176900", #Fablecraft
                 "2853730", #Skull and Bones
+                "1761380", #Otherworld Legends (just to disable nvcuda.dll)
                 ]:
             ret.add("disablenvapi")
 
@@ -1554,22 +1521,19 @@ def default_compat_config():
             ret.add("fnad3d11")
 
     #options to also be enabled for prerequisite setup steps
+    ret.add("gamedrive")
+
     if "STEAM_COMPAT_APP_ID" in os.environ:
         appid = os.environ["STEAM_COMPAT_APP_ID"]
 
         if appid in [
+                "247660", #Deadly Premonition: The Director's Cut
                 "1026680", #FINAL FANTASY VIII - REMASTERED
-                "3280350", #DEATH STRANDING 2: ON THE BEACH
                 "3513350", #Wuthering Waves
                 "3837340", #FINAL FANTASY VII
+                "337000", #Deus Ex: Mankind Divided
                 ]:
             ret.add("noxalia")
-
-        if appid in [
-                "255960", #Bad Mojo Redux
-                "2471120", #Rocket Jockey
-                ]:
-            ret.add("gamedrive")
 
         if appid in [
                 "275850", #No Man's Sky
@@ -1611,6 +1575,7 @@ default_cpu_limit = {
     "286810"    :  30,  # Hard Truck Apocalypse: Rise of Clans / Ex Machina: Meridian 113
     "70000"     :  28,  # Dino D-Day
     "115320"    :  8,   # Prototype 2
+    "65540"     :  16,  # Gothic 1 Classic
 }
 
 class Session:
@@ -1684,6 +1649,8 @@ class Session:
             self.env["SteamVirtualGamepadInfo"] = self.env["SteamVirtualGamepadInfo_Proton"]
 
         self.env.pop("WINEARCH", "")
+        if os.environ.get("PROTON_USE_WOW64", None) == "1" and platform.machine() == "x86_64":
+            self.env["WINEARCH"] = "wow64"
 
         if 'ORIG_'+ld_path_var not in os.environ:
             # Allow wine to restore this when calling an external app.
@@ -2005,7 +1972,13 @@ class Session:
                 ]:
             self.env["OPENSSL_ia32cap"] = "~0x20000000"
 
-        if os.environ.get("SteamGameId", 0) == "500810":
+        if os.environ.get("SteamGameId", 0) in [
+                "500810", #Arcanum
+                "4249100", #Resident Evil (1996)
+                "4249110", #Resident Evil 2 (1998)
+                "4249130", #Dino Crisis
+                "4249150", #Breath of Fire IV
+                ]:
             self.dlloverrides["ddraw"] = "n,b"
 
         # CW Bug 26050
@@ -2132,6 +2105,11 @@ class Session:
             # Disable hidraw for Sony DualShock and DualSense controllers.
             self.env["PROTON_DISABLE_HIDRAW"] = "0x054C/0x05C4,0x054C/0x09CC,0x054C/0x0BA0,0x054C/0x0CE6,0x054C/0x0DF2"
 
+
+        if "__GLVND_DISALLOW_PATCHING" not in self.env:
+            self.env["__GLVND_DISALLOW_PATCHING"] = "1"
+
+        self.env.setdefault("WINE_MONO_HIDETYPES", "0")
 
         # NVIDIA software may check for the "DriverStore" by querying the
         # NGXCore\NGXPath registry key via `D3DDDI_QUERYREGISTRY_SERVICEKEY` for
@@ -2338,18 +2316,27 @@ class Session:
         # Either launch the game from Steam, or put the file steam_appid.txt containing the correct appID in your game folder.
         # Also don't use steam api for US (3347400) versions of Girls Frontline: Exilium 2
         elif "UMU_ID" in os.environ or os.environ.get("SteamGameId", 0) in ["3347400"]:
-            log(sys.argv[2])
             if os.environ.get("UMU_USE_STEAM", "0") == "1":
                 append_to_env_str(self.env, "WINEDLLOVERRIDES", "lsteamclient=d", ";")
-                argv = [g_proton.wine64_bin, "c:\\windows\\system32\\steam.exe"]
+                if g_proton.host_pe_arch == "x86_64-windows":
+                    #run with winepreloader directly to avoid restart through start.exe
+                    self.env["WINELOADERNOEXEC"] = "1"
+                    argv = [g_proton.lib_dir + "/wine/x86_64-unix/wine-preloader", g_proton.lib_dir + "/wine/x86_64-unix/wine", "c:\\windows\\system32\\steam.exe"]
+                else:
+                    argv = [g_proton.wine_bin, "c:\\windows\\system32\\steam.exe"]
             elif len(sys.argv) >= 3 and sys.argv[2].startswith('/'):
                 log("Executable a unix path, launching with /unix option.")
-                argv = [g_proton.wine64_bin, "c:\\windows\\system32\\umu.exe"]
+                if g_proton.host_pe_arch == "x86_64-windows":
+                    #run with winepreloader directly to avoid restart through start.exe
+                    self.env["WINELOADERNOEXEC"] = "1"
+                    argv = [g_proton.lib_dir + "/wine/x86_64-unix/wine-preloader", g_proton.lib_dir + "/wine/x86_64-unix/wine", "c:\\windows\\system32\\umu.exe"]
+                else:
+                    argv = [g_proton.wine_bin, "c:\\windows\\system32\\umu.exe"]
             else:
                 log("Executable is inside wine prefix, launching normally.")
-                argv = [g_proton.wine64_bin]
+                argv = [g_proton.wine_bin]
         else:
-            argv = [g_proton.wine64_bin, "c:\\windows\\system32\\steam.exe"]
+            argv = [g_proton.wine_bin, "c:\\windows\\system32\\steam.exe"]
 
         rc = self.run_proc(adverb + argv + sys.argv[2:] + self.cmdlineappend)
 
