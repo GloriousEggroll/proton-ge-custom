@@ -18,6 +18,7 @@ apply_all_in_dir() {
     pushd dxvk
     git reset --hard HEAD
     git clean -xdf
+    patch -Np1 < ../patches/game-patches/layered-overlay-dxvk.patch
     popd
 
     pushd vkd3d-proton
@@ -210,6 +211,7 @@ apply_all_in_dir() {
     echo "WINE: -GAME FIXES- add fixes for star citizen"
     apply_patch "../patches/game-patches/silence-starcitizen-unsupported-os.patch"
     apply_patch "../patches/game-patches/eac_60101_timeout.patch"
+    apply_patch "../patches/game-patches/layered-overlay-wine.patch"
 
 
 ### END GAME PATCH SECTION ###
