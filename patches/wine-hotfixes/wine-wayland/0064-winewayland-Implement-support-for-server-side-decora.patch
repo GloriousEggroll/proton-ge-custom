@@ -1,19 +1,19 @@
-From cc1e0753b3dba19bd577b099ecc59e17d03649ab Mon Sep 17 00:00:00 2001
+From 9048379f3d46a9ee00847cdaf4157cb1c065fb97 Mon Sep 17 00:00:00 2001
 From: Etaash Mathamsetty
  <45927311+Etaash-mathamsetty@users.noreply.github.com>
 Date: Tue, 10 Feb 2026 23:30:27 -0600
-Subject: [PATCH 064/119] winewayland: Implement support for server-side
+Subject: [PATCH 064/153] winewayland: Implement support for server-side
  decorations.
 
 ---
  dlls/winewayland.drv/Makefile.in              |   1 +
  dlls/winewayland.drv/wayland.c                |  28 +++
- dlls/winewayland.drv/wayland_surface.c        |  86 ++++++++-
+ dlls/winewayland.drv/wayland_surface.c        | 100 +++++++++-
  dlls/winewayland.drv/waylanddrv.h             |  19 +-
  dlls/winewayland.drv/waylanddrv_main.c        |   1 +
- dlls/winewayland.drv/window.c                 |  70 ++++++-
+ dlls/winewayland.drv/window.c                 |  88 ++++++++-
  .../xdg-decoration-unstable-v1.xml            | 176 ++++++++++++++++++
- 7 files changed, 373 insertions(+), 8 deletions(-)
+ 7 files changed, 400 insertions(+), 13 deletions(-)
  create mode 100644 dlls/winewayland.drv/xdg-decoration-unstable-v1.xml
 
 diff --git a/dlls/winewayland.drv/Makefile.in b/dlls/winewayland.drv/Makefile.in
@@ -82,24 +82,27 @@ index 1129f63fb4b..99d59fc1360 100644
  
      return TRUE;
 diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
-index 32fc643288b..e7a8433dd34 100644
+index a4900a02fbe..a7a725c169f 100644
 --- a/dlls/winewayland.drv/wayland_surface.c
 +++ b/dlls/winewayland.drv/wayland_surface.c
-@@ -57,6 +57,13 @@ static void xdg_surface_handle_configure(void *private, struct xdg_surface *xdg_
+@@ -57,6 +57,16 @@ static void xdg_surface_handle_configure(void *private, struct xdg_surface *xdg_
          should_post = surface->requested.serial == 0;
          initial_configure = surface->current.serial == 0;
          surface->pending.serial = serial;
 +        if (!surface->pending.decor && surface->current.decor)
 +            surface->pending.decor = surface->current.decor;
-+        else if (surface->pending.decor)
++        else if (!surface->pending.decor && surface->requested.decor)
++            surface->pending.decor = surface->requested.decor;
++        if (surface->pending.decor &&
++            surface->pending.decor != surface->current.decor)
 +        {
-+            should_post |= (surface->pending.decor != surface->current.decor);
-+            initial_configure |= (surface->pending.decor != surface->current.decor);
++            should_post = TRUE;
++            initial_configure = TRUE;
 +        }
          surface->requested = surface->pending;
          memset(&surface->pending, 0, sizeof(surface->pending));
      }
-@@ -171,6 +178,30 @@ static const struct wp_fractional_scale_v1_listener wp_fractional_scale_listener
+@@ -185,6 +195,30 @@ static const struct wp_fractional_scale_v1_listener wp_fractional_scale_listener
      wp_fractional_scale_handle_scale
  };
  
@@ -130,8 +133,8 @@ index 32fc643288b..e7a8433dd34 100644
  /**********************************************************************
   *          wayland_surface_create
   *
-@@ -274,19 +305,62 @@ void wayland_surface_destroy(struct wayland_surface *surface)
-     free(surface);
+@@ -311,19 +345,62 @@ static void wayland_surface_init_fractional_scale(struct wayland_surface *surfac
+     }
  }
  
 +static void wayland_surface_init_decoration(struct wayland_surface *surface)
@@ -195,17 +198,17 @@ index 32fc643288b..e7a8433dd34 100644
  
      wayland_surface_clear_role(surface);
      surface->role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
-@@ -339,6 +413,8 @@ void wayland_surface_make_toplevel(struct wayland_surface *surface)
-             surface->hwnd);
-     }
+@@ -360,6 +437,8 @@ void wayland_surface_make_toplevel(struct wayland_surface *surface)
+ 
+     wayland_surface_init_fractional_scale(surface, 1.0);
  
 +    if (server_decor) wayland_surface_init_decoration(surface);
 +
      wl_surface_commit(surface->wl_surface);
      wl_display_flush(process_wayland.wl_display);
  
-@@ -442,6 +518,12 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
-             surface->wp_fractional_scale_v1 = NULL;
+@@ -447,6 +526,12 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
+             surface->xdg_toplevel_icon = NULL;
          }
  
 +        if (surface->zxdg_toplevel_decoration_v1)
@@ -217,6 +220,35 @@ index 32fc643288b..e7a8433dd34 100644
          if (surface->xdg_toplevel)
          {
              xdg_toplevel_destroy(surface->xdg_toplevel);
+@@ -741,9 +826,12 @@ static BOOL wayland_surface_reconfigure_xdg(struct wayland_surface *surface,
+                                              width, height,
+                                              window->state))
+     {
++        /* if a decoration change occured during the initial configure, avoid
++         * a double ack as that would cause a protocol error */
++        if (surface->processing.serial != surface->current.serial)
++            xdg_surface_ack_configure(surface->xdg_surface, surface->processing.serial);
+         surface->current = surface->processing;
+         memset(&surface->processing, 0, sizeof(surface->processing));
+-        xdg_surface_ack_configure(surface->xdg_surface, surface->current.serial);
+     }
+     /* If this is the initial configure, and we have a compatible requested
+      * config, use that, in order to draw windows that don't go through the
+@@ -753,9 +841,13 @@ static BOOL wayland_surface_reconfigure_xdg(struct wayland_surface *surface,
+                                                   width, height,
+                                                   window->state))
+     {
++        if (surface->requested.serial != surface->current.serial)
++            xdg_surface_ack_configure(surface->xdg_surface, surface->requested.serial);
+         surface->current = surface->requested;
+         memset(&surface->requested, 0, sizeof(surface->requested));
+-        xdg_surface_ack_configure(surface->xdg_surface, surface->current.serial);
++        /* decoration changes must go through the message loop */
++        surface->requested.decor = surface->current.decor;
++        surface->current.decor = 0;
+     }
+     else if (!surface->current.serial ||
+              !wayland_surface_config_is_compatible(&surface->current,
 diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
 index 5e1919bb44c..4eb2be4d845 100644
 --- a/dlls/winewayland.drv/waylanddrv.h
@@ -309,7 +341,7 @@ index 4952b51a9ba..81c70f506d7 100644
      .pVulkanInit = WAYLAND_VulkanInit,
      .pOpenGLInit = WAYLAND_OpenGLInit,
 diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
-index 2aee891e833..1eca53cbc92 100644
+index 2aee891e833..24a20ccd3a9 100644
 --- a/dlls/winewayland.drv/window.c
 +++ b/dlls/winewayland.drv/window.c
 @@ -156,7 +156,8 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
@@ -370,7 +402,32 @@ index 2aee891e833..1eca53cbc92 100644
      UINT flags = 0;
      uint32_t state;
      DWORD style;
-@@ -588,6 +596,11 @@ static void wayland_configure_window(HWND hwnd)
+@@ -542,9 +550,21 @@ static void wayland_configure_window(HWND hwnd)
+ 
+     if (!surface->requested.serial)
+     {
+-        TRACE("requested configure event already handled, returning\n");
+-        wayland_win_data_release(data);
+-        return;
++        /* leftover decor from an initial configure */
++        if (surface->requested.decor && surface->current.serial &&
++            surface->requested.decor != surface->current.decor)
++        {
++            int decor = surface->requested.decor;
++            surface->requested = surface->current;
++            surface->requested.decor = decor;
++            surface->requested.processed = FALSE;
++        }
++        else
++        {
++            TRACE("hwnd=%p requested configure event already handled, returning\n", hwnd);
++            wayland_win_data_release(data);
++            return;
++        }
+     }
+ 
+     surface->processing = surface->requested;
+@@ -588,6 +608,11 @@ static void wayland_configure_window(HWND hwnd)
      {
          flags |= SWP_FRAMECHANGED;
      }
@@ -382,7 +439,7 @@ index 2aee891e833..1eca53cbc92 100644
  
      wayland_surface_coords_from_window(surface,
                                         surface->window.rect.right -
-@@ -610,6 +623,10 @@ static void wayland_configure_window(HWND hwnd)
+@@ -610,6 +635,10 @@ static void wayland_configure_window(HWND hwnd)
  
      wayland_surface_coords_to_window(surface, width, height,
                                       &window_width, &window_height);
@@ -393,7 +450,7 @@ index 2aee891e833..1eca53cbc92 100644
  
      wayland_win_data_release(data);
  
-@@ -620,6 +637,12 @@ static void wayland_configure_window(HWND hwnd)
+@@ -620,6 +649,12 @@ static void wayland_configure_window(HWND hwnd)
  
      flags |= SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOMOVE;
      if (window_width == 0 || window_height == 0) flags |= SWP_NOSIZE;
@@ -406,7 +463,7 @@ index 2aee891e833..1eca53cbc92 100644
  
      style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
      if (!(state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) != !(style & WS_MAXIMIZE))
-@@ -828,6 +851,43 @@ BOOL WAYLAND_HasWindowManager(const char *name)
+@@ -828,6 +863,43 @@ BOOL WAYLAND_HasWindowManager(const char *name)
      return FALSE;
  }
  
