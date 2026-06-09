@@ -1,4 +1,4 @@
-From aca88994c28754e2ed1a4c6cd498bb6c1821f696 Mon Sep 17 00:00:00 2001
+From 39a5b83fd1a19a86cb50af4cfabd0a85920c1b86 Mon Sep 17 00:00:00 2001
 From: GloriousEggroll <gloriouseggroll@gmail.com>
 Date: Tue, 9 Jun 2026 15:59:48 -0600
 Subject: [PATCH 3/6] mf: stabilize media session and media engine playback
@@ -12,7 +12,7 @@ This removes several SteamGameId-style assumptions by making the generic path ha
 
 - I Can't Win Against Those Pretty Girls [我打不过漂亮的她们] can recover from tiny seeks and repeated pause/play through generic MediaEngine seek coalescing instead of a hard-coded skip path.
 
-- RE7 and Metal Gear Solid V keep the intended low-copy buffer behavior through general 2D/linear buffer handling instead of game checks.
+- RE7 and Metal Gear Solid V now rely on Valve's upstream 2D-buffer write support instead of carrying the old low-copy SteamGameId hack.
 
 - Oddworld: Abe's Oddysee no longer needs winetricks overrides for its video path; the video that previously hung now advances through the generic MediaEngine and presentation-clock path.
 
@@ -35,14 +35,14 @@ The EVR changes also keep presenter state, sample release, and frame scheduling 
  dlls/mf/clock.c                       |  87 ++++++--
  dlls/mf/evr.c                         | 125 ++++++++---
  dlls/mf/session.c                     | 288 +++++++++++++++-----------
- dlls/mf/topology_loader.c             |  68 +++++-
+ dlls/mf/topology_loader.c             |  69 +++++-
  dlls/mfmediaengine/main.c             | 174 +++++++++++-----
  dlls/mfmediaengine/video_frame_sink.c |   9 +-
- dlls/mfplat/buffer.c                  | 129 ++++++++++--
+ dlls/mfplat/buffer.c                  | 109 +++++++++-
  dlls/mfplat/main.c                    | 144 ++++++++++++-
  dlls/mfplat/tests/mfplat.c            |   2 +-
  dlls/rtworkq/queue.c                  |   3 +-
- 14 files changed, 1011 insertions(+), 283 deletions(-)
+ 14 files changed, 1003 insertions(+), 272 deletions(-)
 
 diff --git a/dlls/evr/evr.c b/dlls/evr/evr.c
 index 108f13cdc89..d698cef10a0 100644
@@ -1800,11 +1800,11 @@ index fb8a29a640c..12a4fadd0ef 100644
          IMFMediaEvent_Release(event);
  
 diff --git a/dlls/mf/topology_loader.c b/dlls/mf/topology_loader.c
-index e5ca6c5cd1f..e6b7fbc2b3e 100644
+index 5a1a9c4a755..bed12bbc673 100644
 --- a/dlls/mf/topology_loader.c
 +++ b/dlls/mf/topology_loader.c
-@@ -821,13 +821,31 @@ static HRESULT topology_branch_connect_optional_chain(IMFTopology *topology, str
-             break;
+@@ -828,13 +828,32 @@ static HRESULT topology_branch_connect_optional_chain(IMFTopology *topology, str
+ 
          if (SUCCEEDED(hr = topology_branch_create_optional(topology, current, node, stream, &up_branch, &down_branch)))
          {
 +            IMFMediaType *previous_up_type = NULL;
@@ -1814,7 +1814,7 @@ index e5ca6c5cd1f..e6b7fbc2b3e 100644
              if (FAILED(hr = topology_branch_connect(topology, CONNECT_DIRECT, up_branch, NULL, !!method))
                      || FAILED(hr = topology_branch_connect(topology, CONNECT_DIRECT, down_branch, NULL, FALSE)))
              {
--                if (FAILED(hr = topology_branch_connect(topology, CONNECT_DIRECT, current, NULL, FALSE)))
+-                if (FAILED(hr = topology_branch_connect_with_type(topology, current, orig)))
 +                IMFMediaTypeHandler *handler;
 +
 +                if (previous_up_type && SUCCEEDED(topology_node_get_type_handler(current->up.node,
@@ -1827,7 +1827,8 @@ index e5ca6c5cd1f..e6b7fbc2b3e 100644
 +
 +                IMFTopologyNode_DisconnectOutput(down_branch->up.node, down_branch->up.stream);
 +                if (FAILED(hr = IMFTopologyNode_ConnectOutput(current->up.node, current->up.stream,
-+                        current->down.node, current->down.stream)))
++                        current->down.node, current->down.stream))
++                        && FAILED(hr = topology_branch_connect_with_type(topology, current, orig)))
                      WARN("Failed to restore previous branch %s\n", debugstr_topology_branch(current));
                  IMFTopology_RemoveNode(topology, down_branch->up.node);
              }
@@ -1836,7 +1837,7 @@ index e5ca6c5cd1f..e6b7fbc2b3e 100644
              topology_branch_destroy(down_branch);
              topology_branch_destroy(up_branch);
          }
-@@ -978,6 +996,29 @@ static HRESULT topology_loader_connect_copier(IMFTopology *topology, IMFTopology
+@@ -986,6 +1005,29 @@ static HRESULT topology_loader_connect_copier(IMFTopology *topology, IMFTopology
      return S_OK;
  }
  
@@ -1866,7 +1867,7 @@ index e5ca6c5cd1f..e6b7fbc2b3e 100644
  HRESULT topology_node_set_device_manager(IMFTopologyNode *node, IUnknown *device_manager)
  {
      IMFTransform *transform;
-@@ -1030,16 +1071,36 @@ static HRESULT topology_loader_connect_d3d_aware_sink(IMFTopology *topology,
+@@ -1038,16 +1080,36 @@ static HRESULT topology_loader_connect_d3d_aware_sink(IMFTopology *topology,
          IMFTopologyNode *node, MFTOPOLOGY_DXVA_MODE dxva_mode)
  {
      IMFTopologyNode *upstream_node;
@@ -1904,7 +1905,7 @@ index e5ca6c5cd1f..e6b7fbc2b3e 100644
      {
          if (SUCCEEDED(IMFTopologyNode_GetInput(node, 0, &upstream_node, &upstream_output)))
          {
-@@ -1054,6 +1115,9 @@ static HRESULT topology_loader_connect_d3d_aware_sink(IMFTopology *topology,
+@@ -1062,6 +1124,9 @@ static HRESULT topology_loader_connect_d3d_aware_sink(IMFTopology *topology,
                          || !(info.dwFlags & (MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES | MFT_OUTPUT_STREAM_PROVIDES_SAMPLES)))
                      needs_copier = FALSE;
  
@@ -1915,7 +1916,7 @@ index e5ca6c5cd1f..e6b7fbc2b3e 100644
              }
  
 diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
-index a7be9d90db9..09842b8a312 100644
+index 02359ff4dc8..63241f1ad02 100644
 --- a/dlls/mfmediaengine/main.c
 +++ b/dlls/mfmediaengine/main.c
 @@ -100,6 +100,7 @@ enum media_engine_flags
@@ -2087,8 +2088,8 @@ index a7be9d90db9..09842b8a312 100644
 +    start_playback = (engine->flags & FLAGS_ENGINE_PLAY_PENDING) || !(engine->flags & FLAGS_ENGINE_PAUSED);
      media_engine_set_flag(engine, FLAGS_ENGINE_SOURCE_PENDING | FLAGS_ENGINE_PLAY_PENDING, FALSE);
  
-     if (SUCCEEDED(IMFAsyncResult_GetState(result, &state)))
-@@ -1800,10 +1871,17 @@ static HRESULT WINAPI media_engine_GetCurrentSource(IMFMediaEngineEx *iface, BST
+     if (engine->extension)
+@@ -1808,10 +1879,17 @@ static HRESULT WINAPI media_engine_GetCurrentSource(IMFMediaEngineEx *iface, BST
  static USHORT WINAPI media_engine_GetNetworkState(IMFMediaEngineEx *iface)
  {
      struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
@@ -2108,7 +2109,7 @@ index a7be9d90db9..09842b8a312 100644
  }
  
  static MF_MEDIA_ENGINE_PRELOAD WINAPI media_engine_GetPreload(IMFMediaEngineEx *iface)
-@@ -1902,10 +1980,9 @@ static USHORT WINAPI media_engine_GetReadyState(IMFMediaEngineEx *iface)
+@@ -1910,10 +1988,9 @@ static USHORT WINAPI media_engine_GetReadyState(IMFMediaEngineEx *iface)
      struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
      unsigned short state;
  
@@ -2120,7 +2121,7 @@ index a7be9d90db9..09842b8a312 100644
      LeaveCriticalSection(&engine->cs);
  
      return state;
-@@ -1924,8 +2001,6 @@ static double WINAPI media_engine_GetCurrentTime(IMFMediaEngineEx *iface)
+@@ -1932,8 +2009,6 @@ static double WINAPI media_engine_GetCurrentTime(IMFMediaEngineEx *iface)
      double ret = 0.0;
      MFTIME clocktime;
  
@@ -2129,7 +2130,7 @@ index a7be9d90db9..09842b8a312 100644
      EnterCriticalSection(&engine->cs);
      if (engine->flags & FLAGS_ENGINE_IS_ENDED)
      {
-@@ -1939,6 +2014,10 @@ static double WINAPI media_engine_GetCurrentTime(IMFMediaEngineEx *iface)
+@@ -1947,6 +2022,10 @@ static double WINAPI media_engine_GetCurrentTime(IMFMediaEngineEx *iface)
      {
          ret = mftime_to_seconds(clocktime);
      }
@@ -2140,7 +2141,7 @@ index a7be9d90db9..09842b8a312 100644
      LeaveCriticalSection(&engine->cs);
  
      return ret;
-@@ -1960,23 +2039,6 @@ static HRESULT media_engine_set_current_time(struct media_engine *engine, double
+@@ -1968,23 +2047,6 @@ static HRESULT media_engine_set_current_time(struct media_engine *engine, double
          return S_OK;
      }
  
@@ -2164,7 +2165,7 @@ index a7be9d90db9..09842b8a312 100644
      engine->next_seek = NAN;
  
      position.vt = VT_I8;
-@@ -2045,10 +2107,9 @@ static BOOL WINAPI media_engine_IsPaused(IMFMediaEngineEx *iface)
+@@ -2053,10 +2115,9 @@ static BOOL WINAPI media_engine_IsPaused(IMFMediaEngineEx *iface)
      struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
      BOOL value;
  
@@ -2176,7 +2177,7 @@ index a7be9d90db9..09842b8a312 100644
      LeaveCriticalSection(&engine->cs);
  
      return value;
-@@ -2247,9 +2308,9 @@ static HRESULT WINAPI media_engine_Play(IMFMediaEngineEx *iface)
+@@ -2255,9 +2316,9 @@ static HRESULT WINAPI media_engine_Play(IMFMediaEngineEx *iface)
      struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
      HRESULT hr = S_OK;
  
@@ -2188,7 +2189,7 @@ index a7be9d90db9..09842b8a312 100644
  
      if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
          hr = MF_E_SHUTDOWN;
-@@ -2262,17 +2323,23 @@ static HRESULT WINAPI media_engine_Play(IMFMediaEngineEx *iface)
+@@ -2270,17 +2331,23 @@ static HRESULT WINAPI media_engine_Play(IMFMediaEngineEx *iface)
              media_engine_set_flag(engine, FLAGS_ENGINE_PAUSED | FLAGS_ENGINE_IS_ENDED, FALSE);
              IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_PLAY, 0, 0);
  
@@ -2213,7 +2214,7 @@ index a7be9d90db9..09842b8a312 100644
      LeaveCriticalSection(&engine->cs);
  
      return hr;
-@@ -2283,20 +2350,25 @@ static HRESULT WINAPI media_engine_Pause(IMFMediaEngineEx *iface)
+@@ -2291,20 +2358,25 @@ static HRESULT WINAPI media_engine_Pause(IMFMediaEngineEx *iface)
      struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
      HRESULT hr = S_OK;
  
@@ -2243,7 +2244,7 @@ index a7be9d90db9..09842b8a312 100644
  
                  IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_TIMEUPDATE, 0, 0);
                  IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_PAUSE, 0, 0);
-@@ -2306,6 +2378,8 @@ static HRESULT WINAPI media_engine_Pause(IMFMediaEngineEx *iface)
+@@ -2314,6 +2386,8 @@ static HRESULT WINAPI media_engine_Pause(IMFMediaEngineEx *iface)
          IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_PURGEQUEUEDEVENTS, 0, 0);
      }
  
@@ -2300,7 +2301,7 @@ index 5f2dcbb8c95..11e3a0a1511 100644
  
      LeaveCriticalSection(&sink->cs);
 diff --git a/dlls/mfplat/buffer.c b/dlls/mfplat/buffer.c
-index 535448679e2..87992240c33 100644
+index d94e63e2244..633b64ea0f9 100644
 --- a/dlls/mfplat/buffer.c
 +++ b/dlls/mfplat/buffer.c
 @@ -24,6 +24,7 @@
@@ -2345,61 +2346,7 @@ index 535448679e2..87992240c33 100644
  static void copy_image_imc1(BYTE *dest, LONG dest_stride, const BYTE *src, LONG src_stride, DWORD width, DWORD lines)
  {
      MFCopyImage(dest, dest_stride, src, src_stride, width / 2, lines);
-@@ -293,11 +321,17 @@ static HRESULT WINAPI memory_1d_2d_buffer_QueryInterface(IMFMediaBuffer *iface,
- static HRESULT memory_2d_buffer_lock(struct buffer *buffer, BYTE **scanline0, LONG *pitch,
-         BYTE **buffer_start, DWORD *buffer_length);
- 
-+static BOOL memory_2d_buffer_is_contiguous(const struct buffer *buffer)
-+{
-+    return buffer->_2d.scanline0 == buffer->data && buffer->_2d.pitch > 0
-+            && buffer->_2d.width == buffer->_2d.pitch && !buffer->_2d.copy_image
-+            && buffer->_2d.plane_size <= buffer->max_length;
-+}
-+
- static HRESULT WINAPI memory_1d_2d_buffer_Lock(IMFMediaBuffer *iface, BYTE **data, DWORD *max_length, DWORD *current_length)
- {
-     struct buffer *buffer = impl_from_IMFMediaBuffer(iface);
-     HRESULT hr = S_OK;
--    const char *sgi;
- 
-     TRACE("%p, %p, %p, %p.\n", iface, data, max_length, current_length);
- 
-@@ -309,17 +343,11 @@ static HRESULT WINAPI memory_1d_2d_buffer_Lock(IMFMediaBuffer *iface, BYTE **dat
- 
-     EnterCriticalSection(&buffer->cs);
- 
--    if (!buffer->_2d.linear_buffer && buffer->_2d.width == buffer->_2d.pitch
--            && (sgi = getenv("SteamGameId")) && (!strcmp(sgi, "418370") || !strcmp(sgi, "287700")))
-+    if (!buffer->_2d.linear_buffer && memory_2d_buffer_is_contiguous(buffer))
-     {
-         BYTE *scanline;
-         LONG pitch;
- 
--        /* width and pitch are the same, so this avoids a potentially expensive copy
--         * this is a HACK as it does not match Windows behaviour (Windows will copy the buffer)
--         * this fixes performance regressions for Resident Evil 7 Biohazard (418370) and
--         * Metal Gear Solid V (287700).
--         */
-         hr = memory_2d_buffer_lock(buffer, &scanline, &pitch, data, NULL);
-     }
-     else if (!buffer->_2d.linear_buffer && buffer->_2d.locks)
-@@ -365,14 +393,12 @@ static HRESULT WINAPI memory_1d_2d_buffer_Unlock(IMFMediaBuffer *iface)
- {
-     struct buffer *buffer = impl_from_IMFMediaBuffer(iface);
-     HRESULT hr = S_OK;
--    const char *sgi;
- 
-     TRACE("%p.\n", iface);
- 
-     EnterCriticalSection(&buffer->cs);
- 
--    if (!buffer->_2d.linear_buffer && buffer->_2d.width == buffer->_2d.pitch
--            && (sgi = getenv("SteamGameId")) && (!strcmp(sgi, "418370") || !strcmp(sgi, "287700")))
-+    if (!buffer->_2d.linear_buffer && memory_2d_buffer_is_contiguous(buffer))
-     {
-         if (buffer->_2d.locks)
-             --buffer->_2d.locks;
-@@ -722,9 +748,62 @@ static HRESULT WINAPI memory_2d_buffer_Lock2DSize(IMF2DBuffer2 *iface, MF2DBuffe
+@@ -689,9 +717,62 @@ static HRESULT WINAPI memory_2d_buffer_Lock2DSize(IMF2DBuffer2 *iface, MF2DBuffe
  
  static HRESULT WINAPI memory_2d_buffer_Copy2DTo(IMF2DBuffer2 *iface, IMF2DBuffer2 *dest_buffer)
  {
@@ -2464,7 +2411,7 @@ index 535448679e2..87992240c33 100644
  }
  
  static const IMF2DBuffer2Vtbl memory_2d_buffer_vtbl =
-@@ -967,6 +1046,19 @@ static HRESULT WINAPI dxgi_1d_2d_buffer_QueryInterface(IMFMediaBuffer *iface, RE
+@@ -934,6 +1015,19 @@ static HRESULT WINAPI dxgi_1d_2d_buffer_QueryInterface(IMFMediaBuffer *iface, RE
      return S_OK;
  }
  
@@ -2484,7 +2431,7 @@ index 535448679e2..87992240c33 100644
  static HRESULT dxgi_surface_buffer_create_readback_texture(struct buffer *buffer)
  {
      D3D11_TEXTURE2D_DESC texture_desc;
-@@ -1003,6 +1095,7 @@ static HRESULT dxgi_surface_buffer_map(struct buffer *buffer, MF2DBuffer_LockFla
+@@ -970,6 +1064,7 @@ static HRESULT dxgi_surface_buffer_map(struct buffer *buffer, MF2DBuffer_LockFla
  
      ID3D11Texture2D_GetDevice(buffer->dxgi_surface.texture, &device);
      ID3D11Device_GetImmediateContext(device, &immediate_context);
@@ -2492,7 +2439,7 @@ index 535448679e2..87992240c33 100644
  
      if (flags == MF2DBuffer_LockFlags_Read || flags == MF2DBuffer_LockFlags_ReadWrite)
      {
-@@ -1030,6 +1123,7 @@ static void dxgi_surface_buffer_unmap(struct buffer *buffer, MF2DBuffer_LockFlag
+@@ -997,6 +1092,7 @@ static void dxgi_surface_buffer_unmap(struct buffer *buffer, MF2DBuffer_LockFlag
  
      ID3D11Texture2D_GetDevice(buffer->dxgi_surface.texture, &device);
      ID3D11Device_GetImmediateContext(device, &immediate_context);
@@ -2500,7 +2447,7 @@ index 535448679e2..87992240c33 100644
      ID3D11DeviceContext_Unmap(immediate_context, (ID3D11Resource *)buffer->dxgi_surface.rb_texture, 0);
      memset(&buffer->dxgi_surface.map_desc, 0, sizeof(buffer->dxgi_surface.map_desc));
  
-@@ -1037,7 +1131,6 @@ static void dxgi_surface_buffer_unmap(struct buffer *buffer, MF2DBuffer_LockFlag
+@@ -1004,7 +1100,6 @@ static void dxgi_surface_buffer_unmap(struct buffer *buffer, MF2DBuffer_LockFlag
      {
          ID3D11DeviceContext_CopySubresourceRegion(immediate_context, (ID3D11Resource *)buffer->dxgi_surface.texture,
                  buffer->dxgi_surface.sub_resource_idx, 0, 0, 0, (ID3D11Resource *)buffer->dxgi_surface.rb_texture, 0, NULL);
@@ -2508,7 +2455,7 @@ index 535448679e2..87992240c33 100644
      }
  
      ID3D11DeviceContext_Release(immediate_context);
-@@ -1151,7 +1244,7 @@ static HRESULT dxgi_surface_buffer_lock(struct buffer *buffer, MF2DBuffer_LockFl
+@@ -1118,7 +1213,7 @@ static HRESULT dxgi_surface_buffer_lock(struct buffer *buffer, MF2DBuffer_LockFl
          if (buffer_start)
              *buffer_start = *scanline0;
          if (buffer_length)
@@ -2517,7 +2464,7 @@ index 535448679e2..87992240c33 100644
      }
  
      return hr;
-@@ -1432,10 +1525,14 @@ static p_copy_image_func get_2d_buffer_copy_func(DWORD fourcc)
+@@ -1399,10 +1494,14 @@ static p_copy_image_func get_2d_buffer_copy_func(DWORD fourcc)
          case MAKEFOURCC('I','M','C','2'):
          case MAKEFOURCC('I','M','C','4'):
          case MAKEFOURCC('N','V','1','1'):
@@ -2534,7 +2481,7 @@ index 535448679e2..87992240c33 100644
          case MAKEFOURCC('N','V','1','2'):
          case MAKEFOURCC('P','0','1','0'):
 diff --git a/dlls/mfplat/main.c b/dlls/mfplat/main.c
-index 0a7c294294e..3723e1a929c 100644
+index 5384506e0b7..0c6ac57dfc1 100644
 --- a/dlls/mfplat/main.c
 +++ b/dlls/mfplat/main.c
 @@ -56,6 +56,107 @@
@@ -2710,7 +2657,7 @@ index 0a7c294294e..3723e1a929c 100644
  
      CoTaskMemFree(mimeW);
      CoTaskMemFree(urlW);
-@@ -7420,11 +7552,19 @@ static HRESULT WINAPI eventqueue_GetEvent(IMFMediaEventQueue *iface, DWORD flags
+@@ -7483,11 +7615,19 @@ static HRESULT WINAPI eventqueue_GetEvent(IMFMediaEventQueue *iface, DWORD flags
  
  static void queue_notify_subscriber(struct event_queue *queue)
  {
@@ -2732,10 +2679,10 @@ index 0a7c294294e..3723e1a929c 100644
  
  static HRESULT WINAPI eventqueue_BeginGetEvent(IMFMediaEventQueue *iface, IMFAsyncCallback *callback, IUnknown *state)
 diff --git a/dlls/mfplat/tests/mfplat.c b/dlls/mfplat/tests/mfplat.c
-index c9514293c49..218ff98cb09 100644
+index 8754118fde7..867821d651f 100644
 --- a/dlls/mfplat/tests/mfplat.c
 +++ b/dlls/mfplat/tests/mfplat.c
-@@ -1356,7 +1356,7 @@ static void test_source_resolver(void)
+@@ -1398,7 +1398,7 @@ static void test_source_resolver(void)
      ok(hr == S_OK, "Failed to set string value, hr %#lx.\n", hr);
      IMFAttributes_Release(attributes);
  
