@@ -1,101 +1,83 @@
-From bd2166c4193ae01a6c09a74f39f709ac63b70d9a Mon Sep 17 00:00:00 2001
+From 4c4fe6710ab69dcf650151507114902888166341 Mon Sep 17 00:00:00 2001
 From: Etaash Mathamsetty
  <45927311+Etaash-mathamsetty@users.noreply.github.com>
 Date: Sat, 18 Apr 2026 19:05:16 -0500
-Subject: [PATCH 066/119] winewayland: Implement client surface caching.
+Subject: [PATCH 066/153] winewayland: Implement client surface caching.
 
 Requires: https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/34918
 ---
- dlls/winewayland.drv/opengl.c          |  2 +-
- dlls/winewayland.drv/vulkan.c          | 30 ++++++++++++++++++++++++--
- dlls/winewayland.drv/wayland_surface.c |  2 +-
- dlls/winewayland.drv/waylanddrv.h      |  4 +++-
- dlls/winewayland.drv/window.c          | 11 +++++++++-
- 5 files changed, 43 insertions(+), 6 deletions(-)
+ dlls/winewayland.drv/vulkan.c     | 40 ++++++++++++++++++++++++++++++-
+ dlls/winewayland.drv/waylanddrv.h |  2 ++
+ dlls/winewayland.drv/window.c     |  1 +
+ 3 files changed, 42 insertions(+), 1 deletion(-)
 
-diff --git a/dlls/winewayland.drv/opengl.c b/dlls/winewayland.drv/opengl.c
-index 8a47f3d3e4b..beeae7c1329 100644
---- a/dlls/winewayland.drv/opengl.c
-+++ b/dlls/winewayland.drv/opengl.c
-@@ -118,7 +118,7 @@ static BOOL wayland_opengl_surface_create(HWND hwnd, BOOL raw, int format, struc
- 
-     if (!(gl->wl_egl_window = wl_egl_window_create(client->wl_surface, rect.right, rect.bottom))) goto err;
-     if (!(gl->base.surface = funcs->p_eglCreateWindowSurface(egl->display, config, gl->wl_egl_window, attribs))) goto err;
--    set_client_surface(hwnd, client);
-+    set_client_surface(hwnd, client, FALSE);
- 
-     TRACE("Created drawable %s with egl_surface %p\n", debugstr_opengl_drawable(&gl->base), gl->base.surface);
- 
 diff --git a/dlls/winewayland.drv/vulkan.c b/dlls/winewayland.drv/vulkan.c
-index 14d9a1871cc..d74e3193c74 100644
+index 14d9a1871cc..cdc6ddf1440 100644
 --- a/dlls/winewayland.drv/vulkan.c
 +++ b/dlls/winewayland.drv/vulkan.c
-@@ -39,6 +39,31 @@ WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
+@@ -39,6 +39,42 @@ WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
  
  static const struct vulkan_driver_funcs wayland_vulkan_driver_funcs;
  
-+static struct wayland_client_surface *find_stashed_surface(HWND hwnd)
++static struct wayland_client_surface *stash_client_surface(HWND hwnd,
++                                                           struct wayland_client_surface *surface)
 +{
 +    struct wayland_client_surface *ret = NULL;
 +    struct wayland_win_data *data;
 +
 +    if (!(data = wayland_win_data_get(hwnd))) return NULL;
 +
-+    if (data->stashed_client &&
-+        !data->stashed_client->client.busy_ref)
++    if (surface)
 +    {
-+        ret = data->stashed_client;
++        if ((ret = data->stashed_client) == surface)
++        {
++            wayland_win_data_release(data);
++            return ret;
++        }
++        client_surface_add_ref(&surface->client);
++        data->stashed_client = surface;
++    }
++    else if ((ret = data->stashed_client) && !ReadAcquire(&ret->client.busy_ref))
++    {
 +        /* cannot decrease the ref count here as there is a
 +         * new VkSurface referencing this client surface */
 +        data->stashed_client = NULL;
-+        if (data->client_surface == ret)
-+        {
-+            wayland_client_surface_attach(ret, NULL);
-+            data->client_surface = NULL;
-+        }
++        /* detach the client surface to ensure it is reparented */
++        wayland_client_surface_attach(ret, NULL);
++        if (data->client_surface == ret) data->client_surface = NULL;
 +    }
++    else ret = NULL;
 +
 +    wayland_win_data_release(data);
++
++    if (ret && surface) client_surface_release(&ret->client);
++
 +    return ret;
 +}
 +
  static VkResult wayland_vulkan_surface_create(HWND hwnd, BOOL raw, const struct vulkan_instance *instance,
                                                VkSurfaceKHR *handle, struct client_surface **client)
  {
-@@ -48,7 +73,8 @@ static VkResult wayland_vulkan_surface_create(HWND hwnd, BOOL raw, const struct
+@@ -48,7 +84,8 @@ static VkResult wayland_vulkan_surface_create(HWND hwnd, BOOL raw, const struct
  
      TRACE("%p %p %p %p\n", hwnd, instance, handle, client);
  
 -    if (!(surface = wayland_client_surface_create(hwnd)))
-+    if (!(surface = find_stashed_surface(hwnd)) &&
++    if (!(surface = stash_client_surface(hwnd, NULL)) &&
 +        !(surface = wayland_client_surface_create(hwnd)))
      {
          ERR("Failed to create vulkan client surface\n");
          return VK_ERROR_OUT_OF_HOST_MEMORY;
-@@ -68,7 +94,7 @@ static VkResult wayland_vulkan_surface_create(HWND hwnd, BOOL raw, const struct
-         return res;
+@@ -69,6 +106,7 @@ static VkResult wayland_vulkan_surface_create(HWND hwnd, BOOL raw, const struct
      }
  
--    set_client_surface(hwnd, surface);
-+    set_client_surface(hwnd, surface, TRUE);
+     set_client_surface(hwnd, surface);
++    stash_client_surface(hwnd, surface);
      *client = &surface->client;
  
      TRACE("Created surface=0x%s, client=%p\n", wine_dbgstr_longlong(*handle), *client);
-diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
-index e7a8433dd34..219b1d9af38 100644
---- a/dlls/winewayland.drv/wayland_surface.c
-+++ b/dlls/winewayland.drv/wayland_surface.c
-@@ -1285,7 +1285,7 @@ static void wayland_client_surface_present(struct client_surface *client, HDC hd
-     struct wayland_client_surface *surface = impl_from_client_surface(client);
-     HWND hwnd = client->hwnd, toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
-     ensure_window_surface_contents(toplevel);
--    set_client_surface(hwnd, surface);
-+    set_client_surface(hwnd, surface, FALSE);
- }
- 
- static const struct client_surface_funcs wayland_client_surface_funcs =
 diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
-index 4eb2be4d845..7e2664d544b 100644
+index 4eb2be4d845..c84a9c4ea70 100644
 --- a/dlls/winewayland.drv/waylanddrv.h
 +++ b/dlls/winewayland.drv/waylanddrv.h
 @@ -395,6 +395,8 @@ struct wayland_win_data
@@ -107,17 +89,8 @@ index 4eb2be4d845..7e2664d544b 100644
      /* window rects, relative to parent client area */
      struct window_rects rects;
      BOOL is_fullscreen;
-@@ -409,7 +411,7 @@ struct wayland_win_data *wayland_win_data_get_nolock(HWND hwnd);
- void wayland_win_data_release(struct wayland_win_data *data);
- 
- struct wayland_client_surface *get_client_surface(HWND hwnd);
--void set_client_surface(HWND hwnd, struct wayland_client_surface *client);
-+void set_client_surface(HWND hwnd, struct wayland_client_surface *client, BOOL stash);
- BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region);
- struct wayland_shm_buffer *get_window_surface_contents(HWND hwnd);
- void ensure_window_surface_contents(HWND hwnd);
 diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
-index c8a5cc4e549..0ec2295795f 100644
+index 35955f7cf9b..f97cf1227ab 100644
 --- a/dlls/winewayland.drv/window.c
 +++ b/dlls/winewayland.drv/window.c
 @@ -102,6 +102,7 @@ static void wayland_win_data_destroy(struct wayland_win_data *data)
@@ -128,31 +101,6 @@ index c8a5cc4e549..0ec2295795f 100644
      if (data->wayland_surface) wayland_surface_destroy(data->wayland_surface);
      if (data->window_contents) wayland_shm_buffer_unref(data->window_contents);
      free(data);
-@@ -889,7 +890,7 @@ BOOL WAYLAND_GetWindowStyleMasks(HWND hwnd, UINT style, UINT ex_style, UINT *sty
-     return ret;
- }
- 
--void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
-+void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client, BOOL stash)
- {
-     HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
-     struct wayland_client_surface *old_client;
-@@ -908,7 +909,15 @@ void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
-         if ((data->client_surface = new_client))
-         {
-             if (toplevel && NtUserIsWindowVisible(hwnd))
-+            {
-                 wayland_client_surface_attach(new_client, toplevel);
-+                if (stash && data->stashed_client != new_client)
-+                {
-+                    client_surface_add_ref(&new_client->client);
-+                    if (data->stashed_client) client_surface_release(&data->stashed_client->client);
-+                    data->stashed_client = new_client;
-+                }
-+            }
-             else
-                 wayland_client_surface_attach(new_client, NULL);
-         }
 -- 
 2.54.0
 
