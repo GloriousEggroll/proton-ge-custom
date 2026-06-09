@@ -1,0 +1,298 @@
+From 6d63e2e388f08783ef5004c50598a7a11cf1f15c Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Tue, 9 Jun 2026 16:00:49 -0600
+Subject: [PATCH 6/6] proton: update runtime support for media rework
+
+Carry the remaining runtime and environment support changes needed alongside the winedmo media backend work.
+
+This keeps service/session helper behavior, loader defaults, prefix registration, and build image assumptions aligned with the Proton media tree after winegstreamer was removed.
+
+No game-specific media workaround is introduced here; the gameplay-visible fixes are documented in the preceding media, SourceReader, Quartz, and audio commits.
+---
+ dlls/ntdll/unix/loader.c  |   8 ---
+ dlls/sechost/service.c    | 143 +-------------------------------------
+ dlls/wtsapi32/wtsapi32.c  |   2 +-
+ loader/preloader_mac.c    |   4 +-
+ loader/wine.inf.in        |   2 +-
+ tools/gitlab/image.docker |  16 -----
+ 6 files changed, 5 insertions(+), 170 deletions(-)
+
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index 6f6c2fa8026..2f2eff91028 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -2409,14 +2409,6 @@ static void hacks_init(void)
+     if (kernel_stack_size != 0x100000)
+         ERR( "HACK: setting kernel_stack_size to %luKB.\n", (long)(kernel_stack_size / 1024) );
+ 
+-    if (sgi && (0
+-        || !strcmp(sgi, "1364780") || !strcmp(sgi, "1952120") || !strcmp(sgi, "2154900") /* Street Fighter 6 */
+-        || !strcmp(sgi, "1740720") /* Have a Nice Death  */
+-    ))
+-    {
+-        ERR("HACK: setting WINE_ENABLE_GST_LIVE_LATENCY.\n");
+-        setenv("WINE_ENABLE_GST_LIVE_LATENCY", "1", 0);
+-    }
+ 
+     if (sgi && !strcmp(sgi, "2379390"))
+     {
+diff --git a/dlls/sechost/service.c b/dlls/sechost/service.c
+index 5161815190d..0eea3177dbf 100644
+--- a/dlls/sechost/service.c
++++ b/dlls/sechost/service.c
+@@ -2012,7 +2012,6 @@ BOOL WINAPI DECLSPEC_HOTPATCH StartServiceCtrlDispatcherW( const SERVICE_TABLE_E
+     return service_run_main_thread();
+ }
+ 
+-static HANDLE device_notify_thread;
+ static struct list device_notify_list = LIST_INIT(device_notify_list);
+ 
+ struct device_notify
+@@ -2026,145 +2025,6 @@ struct device_notify
+ 
+ C_ASSERT( sizeof(struct device_notify) == offsetof(struct device_notify, header[0]) );
+ 
+-static struct device_notify *device_notify_copy( struct device_notify *notify, DEV_BROADCAST_HDR *header )
+-{
+-    struct device_notify *event;
+-
+-    if (!(event = calloc( 1, sizeof(*event) + header->dbch_size ))) return NULL;
+-    event->handle = notify->handle;
+-    event->callback = notify->callback;
+-    memcpy( event->header, header, header->dbch_size );
+-
+-    if (header->dbch_devicetype == DBT_DEVTYP_HANDLE)
+-    {
+-        DEV_BROADCAST_HANDLE *notify_handle = (DEV_BROADCAST_HANDLE *)notify->header;
+-        DEV_BROADCAST_HANDLE *event_handle = (DEV_BROADCAST_HANDLE *)event->header;
+-        event_handle->dbch_handle = notify_handle->dbch_handle;
+-        event_handle->dbch_hdevnotify = notify;
+-    }
+-
+-    return event;
+-}
+-
+-static BOOL notification_filter_matches( DEV_BROADCAST_HDR *filter, const WCHAR *path, DEV_BROADCAST_HDR *event, const WCHAR *event_path )
+-{
+-    if (!filter->dbch_devicetype) return TRUE;
+-    if (filter->dbch_devicetype != event->dbch_devicetype) return FALSE;
+-
+-    if (filter->dbch_devicetype == DBT_DEVTYP_DEVICEINTERFACE)
+-    {
+-        DEV_BROADCAST_DEVICEINTERFACE_W *filter_iface = (DEV_BROADCAST_DEVICEINTERFACE_W *)filter;
+-        DEV_BROADCAST_DEVICEINTERFACE_W *event_iface = (DEV_BROADCAST_DEVICEINTERFACE_W *)event;
+-        if (filter_iface->dbcc_size == offsetof(DEV_BROADCAST_DEVICEINTERFACE_W, dbcc_classguid)) return TRUE;
+-        return IsEqualGUID( &filter_iface->dbcc_classguid, &event_iface->dbcc_classguid );
+-    }
+-
+-    if (filter->dbch_devicetype == DBT_DEVTYP_HANDLE) return !wcscmp(path, event_path);
+-
+-    FIXME( "Filter dbch_devicetype %lu not implemented\n", filter->dbch_devicetype );
+-    return TRUE;
+-}
+-
+-static DWORD WINAPI device_notify_proc( void *arg )
+-{
+-    WCHAR endpoint[] = L"\\pipe\\wine_plugplay";
+-    WCHAR protseq[] = L"ncacn_np";
+-    RPC_WSTR binding_str;
+-    DWORD err = ERROR_SUCCESS;
+-    struct device_notify *notify, *event, *next;
+-    struct list events = LIST_INIT(events);
+-    plugplay_rpc_handle handle = NULL;
+-    DWORD code = 0;
+-    unsigned int size;
+-    WCHAR *path;
+-    BYTE *buf;
+-
+-    SetThreadDescription( GetCurrentThread(), L"wine_sechost_device_notify" );
+-
+-    if ((err = RpcStringBindingComposeW( NULL, protseq, NULL, endpoint, NULL, &binding_str )))
+-    {
+-        ERR("RpcStringBindingCompose() failed, error %#lx\n", err);
+-        return err;
+-    }
+-    err = RpcBindingFromStringBindingW( binding_str, &plugplay_binding_handle );
+-    RpcStringFreeW( &binding_str );
+-    if (err)
+-    {
+-        ERR("RpcBindingFromStringBinding() failed, error %#lx\n", err);
+-        return err;
+-    }
+-
+-    __TRY
+-    {
+-        handle = plugplay_register_listener();
+-    }
+-    __EXCEPT(rpc_filter)
+-    {
+-        err = map_exception_code( GetExceptionCode() );
+-    }
+-    __ENDTRY
+-
+-    if (!handle)
+-    {
+-        ERR("failed to open RPC handle, error %lu\n", err);
+-        return 1;
+-    }
+-
+-    for (;;)
+-    {
+-        path = NULL;
+-        buf = NULL;
+-        __TRY
+-        {
+-            code = plugplay_get_event( handle, &path, &buf, &size );
+-            err = ERROR_SUCCESS;
+-        }
+-        __EXCEPT(rpc_filter)
+-        {
+-            err = map_exception_code( GetExceptionCode() );
+-        }
+-        __ENDTRY
+-
+-        if (err)
+-        {
+-            ERR("failed to get event, error %lu\n", err);
+-            break;
+-        }
+-
+-        /* Make a copy to avoid a hang if a callback tries to register or unregister for notifications. */
+-        EnterCriticalSection( &service_cs );
+-        LIST_FOR_EACH_ENTRY( notify, &device_notify_list, struct device_notify, entry )
+-        {
+-            if (!notification_filter_matches( notify->header, notify->path, (DEV_BROADCAST_HDR *)buf, path )) continue;
+-            if (!(event = device_notify_copy( notify, (DEV_BROADCAST_HDR *)buf ))) break;
+-            list_add_tail( &events, &event->entry );
+-        }
+-        LeaveCriticalSection(&service_cs);
+-
+-        LIST_FOR_EACH_ENTRY_SAFE( event, next, &events, struct device_notify, entry )
+-        {
+-            event->callback( event->handle, code, event->header );
+-            list_remove( &event->entry );
+-            free( event );
+-        }
+-
+-        MIDL_user_free(buf);
+-        MIDL_user_free(path);
+-    }
+-
+-    __TRY
+-    {
+-        plugplay_unregister_listener( handle );
+-    }
+-    __EXCEPT(rpc_filter)
+-    {
+-    }
+-    __ENDTRY
+-
+-    RpcBindingFree( &plugplay_binding_handle );
+-    return 0;
+-}
+-
+ /******************************************************************************
+  *     I_ScRegisterDeviceNotification   (sechost.@)
+  */
+@@ -2205,8 +2065,7 @@ HDEVNOTIFY WINAPI I_ScRegisterDeviceNotification( HANDLE handle, DEV_BROADCAST_H
+     EnterCriticalSection( &service_cs );
+     list_add_tail( &device_notify_list, &notify->entry );
+ 
+-    if (!device_notify_thread)
+-        device_notify_thread = CreateThread( NULL, 0, device_notify_proc, NULL, 0, NULL );
++    TRACE("HACK: suppressing plugplay device notification helper thread.\n");
+ 
+     LeaveCriticalSection( &service_cs );
+ 
+diff --git a/dlls/wtsapi32/wtsapi32.c b/dlls/wtsapi32/wtsapi32.c
+index 5a1a87f416e..51db5f16b40 100644
+--- a/dlls/wtsapi32/wtsapi32.c
++++ b/dlls/wtsapi32/wtsapi32.c
+@@ -796,7 +796,7 @@ BOOL WINAPI WTSUnRegisterSessionNotification(HWND hWnd)
+ BOOL WINAPI WTSUnRegisterSessionNotificationEx(HANDLE hServer, HWND hWnd)
+ {
+     FIXME("Stub %p %p\n", hServer, hWnd);
+-    return FALSE;
++    return TRUE;
+ }
+ 
+ 
+diff --git a/loader/preloader_mac.c b/loader/preloader_mac.c
+index e35444fd133..695934610e0 100644
+--- a/loader/preloader_mac.c
++++ b/loader/preloader_mac.c
+@@ -110,8 +110,8 @@ void __stack_chk_fail(void) { return; }
+  * dyld4 (starting in Monterey) does not like it to be missing:
+  * - running vmmap on a Wine process prints this warning:
+  *   "Process exists but has not fully started -- dyld has initialized but libSystem has not"
+- * - because libSystem is not initialized, dlerror() always returns NULL (causing GStreamer
+- *   to crash on init).
++ * - because libSystem is not initialized, dlerror() always returns NULL (any library
++ *   relying on dlerror() to detect load failures will silently malfunction).
+  * - starting with macOS Sonoma, Wine crashes on launch if libSystem is not initialized.
+  *
+  * Adding __program_vars fixes those issues, and also allows more of the vars to
+diff --git a/loader/wine.inf.in b/loader/wine.inf.in
+index 8700cb1fa9a..d16c6a68524 100644
+--- a/loader/wine.inf.in
++++ b/loader/wine.inf.in
+@@ -1010,7 +1010,7 @@ HKLM,SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x86,"Version",2,"14.42.344
+ 11,,urlmon.dll,1
+ 11,,vidreszr.dll,1
+ 11,,windowscodecs.dll,1
+-11,,winegstreamer.dll,1
++11,,winedmo.dll,1
+ 11,,wineopenxr.dll,1
+ 55,,wineps.drv,1
+ 11,,winevulkan.dll,1
+diff --git a/tools/gitlab/image.docker b/tools/gitlab/image.docker
+index eaf19f0cde5..96e3b71a156 100644
+--- a/tools/gitlab/image.docker
++++ b/tools/gitlab/image.docker
+@@ -26,11 +26,6 @@ RUN export DEBIAN_FRONTEND=noninteractive; \
+         fvwm \
+         gettext \
+         git     \
+-        gstreamer1.0-libav \
+-        gstreamer1.0-plugins-bad \
+-        gstreamer1.0-plugins-base \
+-        gstreamer1.0-plugins-good \
+-        gstreamer1.0-plugins-ugly \
+         jq \
+         libasound2-dev \
+         libasound2-plugins \
+@@ -45,8 +40,6 @@ RUN export DEBIAN_FRONTEND=noninteractive; \
+         libgl1-mesa-dev \
+         libgnutls28-dev \
+         libgphoto2-dev \
+-        libgstreamer-plugins-base1.0-dev \
+-        libgstreamer1.0-dev \
+         libice-dev \
+         libkrb5-dev \
+         libpcap-dev \
+@@ -99,11 +92,6 @@ RUN export DEBIAN_FRONTEND=noninteractive; \
+             gcc-mingw-w64-x86-64 \
+             gcc-multilib \
+             libunwind-dev \
+-            gstreamer1.0-libav:i386 \
+-            gstreamer1.0-plugins-bad:i386 \
+-            gstreamer1.0-plugins-base:i386 \
+-            gstreamer1.0-plugins-good:i386 \
+-            gstreamer1.0-plugins-ugly:i386 \
+             libasound2-dev:i386 \
+             libasound2-plugins:i386 \
+             libavcodec-dev:i386 \
+@@ -146,10 +134,6 @@ RUN export DEBIAN_FRONTEND=noninteractive; \
+             mesa-vulkan-drivers:i386 \
+             ocl-icd-opencl-dev:i386 \
+             unixodbc-dev:i386 && \
+-        apt-get download -y libgstreamer-plugins-base1.0-dev:i386 libgstreamer1.0-dev:i386 && \
+-        (for deb in *.deb; do dpkg-deb -x $deb /dpkg; done) && \
+-        cp -a /dpkg/usr/lib/i386-linux-gnu /usr/lib && \
+-        rm -rf /dpkg && \
+         curl -L -o /usr/local/bin/sarif-converter https://gitlab.com/ignis-build/sarif-converter/-/releases/permalink/latest/downloads/bin/sarif-converter-linux-amd64 && \
+         chmod +x /usr/local/bin/sarif-converter ;; \
+     arm64) \
+-- 
+2.54.0
+
