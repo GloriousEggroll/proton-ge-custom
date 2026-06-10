@@ -9,11 +9,12 @@ Two opt-in modes (off by default, no effect on other games):
    without a compositor; binary mask + temporal hysteresis to avoid flicker).
  * WINE_LAYERED_OVERLAY_ALPHA=1 - real per-pixel alpha: give the Vulkan client window AND
    the top-level window a 32-bit ARGB visual + use_alpha so the X compositor blends the
-   alpha (zero flicker). Pairs with the DXVK presenter requesting a non-opaque
-   compositeAlpha. Requires a compositing window manager.
+   alpha (zero flicker). A per-pixel input shape (ShapeInput) makes transparent areas
+   click-through while opaque content stays interactive, without repaint/flicker. Pairs
+   with the DXVK presenter requesting a non-opaque compositeAlpha. Requires a compositor.
 
 Based on the original TBH-specific XShape patch by Solarisfire; generalised, flicker fixed,
-and extended with the real-alpha (ARGB) path.
+extended with the real-alpha (ARGB) path and per-pixel input shaping.
 diff --git a/dlls/winex11.drv/x11drv.h b/dlls/winex11.drv/x11drv.h
 index 9436f35e1c..5975c860b6 100644
 --- a/dlls/winex11.drv/x11drv.h
@@ -28,7 +29,7 @@ index 9436f35e1c..5975c860b6 100644
  extern Drawable get_dc_drawable( HDC hdc, RECT *rect );
  extern HRGN get_dc_monitor_region( HWND hwnd, HDC hdc );
 diff --git a/dlls/winex11.drv/init.c b/dlls/winex11.drv/init.c
-index 479ff421a3..19ea1ef5fa 100644
+index 479ff421a3..c70235e0f2 100644
 --- a/dlls/winex11.drv/init.c
 +++ b/dlls/winex11.drv/init.c
 @@ -33,6 +33,9 @@
@@ -87,7 +88,7 @@ index 479ff421a3..19ea1ef5fa 100644
          needs_offscreen = TRUE;
  
 +    /* Layered overlay (DWM-glass style) painting per-pixel alpha via a 3D client surface. */
-+    if (!needs_offscreen && layered_overlay_shape_enabled() && (ex_style & WS_EX_LAYERED))
++    if (!needs_offscreen && (layered_overlay_shape_enabled() || layered_overlay_alpha_enabled()) && (ex_style & WS_EX_LAYERED))
 +        needs_offscreen = TRUE;
 +
      if (!needs_offscreen && (surface = window_surface_get( hwnd )))
@@ -116,7 +117,7 @@ index 479ff421a3..19ea1ef5fa 100644
  }
  
  static void x11drv_client_surface_detach( struct client_surface *client )
-@@ -464,6 +511,127 @@ static void x11drv_client_surface_update( struct client_surface *client )
+@@ -464,6 +511,132 @@ static void x11drv_client_surface_update( struct client_surface *client )
      client_surface_update_offscreen( hwnd, surface );
  }
  
@@ -131,8 +132,13 @@ index 479ff421a3..19ea1ef5fa 100644
 +    XRectangle *rects;
 +    XImage *image;
 +    Window window;
++    /* SHAPE mode clips the bounding region (visual); ALPHA mode sets the INPUT region
++       (mouse click-through on transparent areas) while the ARGB visual handles the
++       transparency. Input-shape changes don't repaint, so this adds click-through
++       without bringing the reshape flicker back. */
++    const int shape_kind = layered_overlay_alpha_enabled() ? ShapeInput : ShapeBounding;
 +
-+    if (!layered_overlay_shape_enabled()) return TRUE;
++    if (!layered_overlay_shape_enabled() && !layered_overlay_alpha_enabled()) return TRUE;
 +
 +    width = surface->rect.right - surface->rect.left;
 +    height = surface->rect.bottom - surface->rect.top;
@@ -206,21 +212,19 @@ index 479ff421a3..19ea1ef5fa 100644
 +
 +    XDestroyImage( image );
 +
-+    /* Only call XShapeCombineRectangles when the shape actually changed.
-+       Always update on the first call (!shape_rects) — a new or resized window
-+       has the default X11 shape (full rectangle visible), so if the first frame
-+       is all-black (D3D clear colour, count==0) we must explicitly clip it to
-+       nothing, otherwise the black pixels show as an opaque black rectangle. */
++    /* Only call XShapeCombineRectangles when the shape actually changed. On the first call
++       the window has the default full shape, so an all-black first frame (count==0) must be
++       explicitly clipped to nothing. */
 +    if (!surface->shape_rects ||
 +        count != surface->shape_rect_count ||
 +        (count > 0 && memcmp( rects, surface->shape_rects, count * sizeof(*rects) )))
 +    {
 +        if (count)
-+            XShapeCombineRectangles( gdi_display, window, ShapeBounding, 0, 0, rects, count, ShapeSet, YXBanded );
++            XShapeCombineRectangles( gdi_display, window, shape_kind, 0, 0, rects, count, ShapeSet, YXBanded );
 +        else
 +        {
 +            static XRectangle empty;
-+            XShapeCombineRectangles( gdi_display, window, ShapeBounding, 0, 0, &empty, 1, ShapeSet, YXBanded );
++            XShapeCombineRectangles( gdi_display, window, shape_kind, 0, 0, &empty, 1, ShapeSet, YXBanded );
 +        }
 +
 +        TRACE( "layered overlay window %p/%lx shape updated with %u rectangles\n", toplevel, window, count );
@@ -235,7 +239,9 @@ index 479ff421a3..19ea1ef5fa 100644
 +        free( rects );
 +    }
 +
-+    return actually_visible;
++    /* ALPHA mode: always blit (the ARGB content carries its own alpha). SHAPE mode: skip
++       the blit on an all-black frame so the previous correct pixels stay (flicker guard). */
++    return layered_overlay_alpha_enabled() ? TRUE : actually_visible;
 +#else
 +    return TRUE;
 +#endif
@@ -244,7 +250,7 @@ index 479ff421a3..19ea1ef5fa 100644
  static void X11DRV_client_surface_present( struct client_surface *client, HDC hdc )
  {
      struct x11drv_client_surface *surface = impl_from_client_surface( client );
-@@ -494,8 +662,12 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
+@@ -494,8 +667,12 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
          TRACE( "Surface is present.\n" );
          region = get_dc_monitor_region( hwnd, hdc );
          if (region) NtGdiExtSelectClipRgn( hdc, region, RGN_COPY );
@@ -259,7 +265,7 @@ index 479ff421a3..19ea1ef5fa 100644
          if (region) NtGdiDeleteObjectApp( region );
          window_surface_release( win_surface );
          return;
-@@ -528,8 +700,9 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
+@@ -528,8 +705,9 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
          set_dc_drawable( surface->hdc_dst, window, &rect_dst, IncludeInferiors );
      if (region) NtGdiExtSelectClipRgn( surface->hdc_dst, region, RGN_COPY );
  
@@ -271,7 +277,7 @@ index 479ff421a3..19ea1ef5fa 100644
      XFlush( gdi_display );
  
  done:
-@@ -571,6 +744,22 @@ Window x11drv_client_surface_create( HWND hwnd, BOOL raw, int format, struct cli
+@@ -571,6 +749,22 @@ Window x11drv_client_surface_create( HWND hwnd, BOOL raw, int format, struct cli
  
      if (format && !visual_from_pixel_format( format, &visual )) return None;
  
@@ -298,6 +304,23 @@ diff --git a/dlls/winex11.drv/window.c b/dlls/winex11.drv/window.c
 index 63a8536c71..fa0aafe4d4 100644
 --- a/dlls/winex11.drv/window.c
 +++ b/dlls/winex11.drv/window.c
+@@ -431,7 +431,6 @@ static struct x11drv_win_data *alloc_win_data( Display *display, HWND hwnd )
+     return data;
+ }
+ 
+-
+ static BOOL thickframe_managed( DWORD style )
+ {
+     static int cached = -1;
+@@ -537,7 +536,7 @@ static unsigned long get_mwm_decorations_for_style( DWORD style, DWORD ex_style
+     if (X11DRV_HasWindowManager( "Mutter" )) return 0;
+ 
+     if (ex_style & WS_EX_TOOLWINDOW) return 0;
+-    if (ex_style & WS_EX_LAYERED) return 0;
++    if ((ex_style & (WS_EX_LAYERED | WS_EX_COMPOSITED)) == WS_EX_LAYERED) return 0;
+ 
+     if ((style & WS_CAPTION) == WS_CAPTION)
+     {
 @@ -568,6 +567,7 @@ static unsigned long get_mwm_decorations( struct x11drv_win_data *data, DWORD st
  static int get_window_attributes( struct x11drv_win_data *data, XSetWindowAttributes *attr )
  {
@@ -365,3 +388,20 @@ index 63a8536c71..fa0aafe4d4 100644
              sync_window_opacity( data->display, data->whole_window, 0, 0 );
          }
          if (changed & WS_EX_TRANSPARENT) sync_window_style( data );
+@@ -3663,7 +3681,7 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+ 
+     /* layered windows are mapped only once their attributes are set */
+     if (data->pending_state.wm_state == WithdrawnState && (new_style & WS_VISIBLE) &&
+-        (ex_style & WS_EX_LAYERED) && !data->layered && !IsRectEmpty( &new_rects->window ))
++        (ex_style & (WS_EX_LAYERED | WS_EX_COMPOSITED)) == WS_EX_LAYERED && !data->layered && !IsRectEmpty( &new_rects->window ))
+     {
+         WARN( "win %p/%lx is layered, delaying mapping\n", hwnd, data->whole_window );
+         new_style &= ~WS_VISIBLE;
+@@ -4162,6 +4180,7 @@ void net_supporting_wm_check_init( struct x11drv_thread_data *data )
+         char const *sgi = getenv( "SteamGameId" );
+ 
+         if (!strcmp( data->window_manager, "GNOME Shell" )) strcpy( data->window_manager, "Mutter" );
++        if (!strcmp( data->window_manager, "Mutter (Muffin)" )) strcpy( data->window_manager, "Mutter" );
+         TRACE( "Detected window manager: %s\n", debugstr_a(data->window_manager) );
+ 
+         /* Street Fighter V expects a certain sequence of window resizes
