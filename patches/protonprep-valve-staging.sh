@@ -67,7 +67,10 @@ apply_all_in_dir() {
     cp -R ../wineopenxr/* dlls/wineopenxr/
 
     echo "WINE: -CUSTOM- ETAASH WINE-WAYLAND+ PATCHES"
-    apply_all_in_dir "../patches/wine-hotfixes/wine-wayland/"
+   apply_all_in_dir "../patches/wine-hotfixes/wine-wayland/"
+
+    echo "WINE: -CUSTOM- DWPROTON PATCHES"
+   apply_all_in_dir "../patches/wine-hotfixes/dw-proton/"
 
 ### END EM-10/WINE-WAYLAND PATCH SECTION ###
 
@@ -251,6 +254,8 @@ apply_all_in_dir() {
     echo "WINE: -PENDING- add OpenXR patches"
     apply_patch "../patches/wine-hotfixes/pending/0001-decouple-wineopenxr-from-steamvr-and-integrate-it-in.patch"
 
+    echo "WINE: -CUSTOM- Dynamically relocate .exes, improving compatibility with modding / hooking tools"
+    apply_patch "../patches/wine-hotfixes/pending/0001-server-Dynamically-relocate-.exes-by-default-too.patch"
 
 ### END WINE PENDING UPSTREAM SECTION ###
 
@@ -275,9 +280,6 @@ apply_all_in_dir() {
     # https://steamcommunity.com/app/2074920/discussions/0/604168604057160448/
     echo "WINE: --CUSTOM-- add WINE_HOSTBLOCK envvar to allow working around some problematic anticheats (notably eac)"
     apply_patch "../patches/proton/wine_host_block_envvar.patch"
-
-    echo "WINE: -CUSTOM- Dynamically relocate .exes, improving compatibility with modding / hooking tools"
-    apply_patch "../patches/proton/0001-server-Dynamically-relocate-.exes-by-default-too.patch"
 
     echo "WINE: mutter -> cinnamon detection patch for winex11"
     apply_patch "../patches/proton/winex11-mutter-cinnamon.patch"
