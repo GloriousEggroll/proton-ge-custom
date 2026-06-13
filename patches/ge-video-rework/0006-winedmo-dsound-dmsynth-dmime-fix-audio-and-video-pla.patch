@@ -1,0 +1,1060 @@
+From 16c06f592f2525eaaaf3d69a268d07e150f2de02 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Fri, 12 Jun 2026 23:21:16 -0600
+Subject: [PATCH] winedmo, dsound, dmsynth, dmime: fix audio and video playback
+ in metal gear solid 2: substance
+
+---
+ dlls/dmime/audiopath.c               | 121 +++++++++++++++++++++---
+ dlls/dmime/dmime_private.h           |   1 +
+ dlls/dmime/performance.c             | 102 ++++++++++++++++----
+ dlls/dmime/tests/dmime.c             |   8 ++
+ dlls/dmsynth/synth.c                 |  59 ++++++------
+ dlls/dmsynth/synthsink.c             |   5 +-
+ dlls/dsound/buffer.c                 |   2 +-
+ dlls/winedmo/quartz_transform.c      |  35 +++++++
+ dlls/winedmo/unix_demuxer.c          | 134 ++++++++++++++++++++++++++-
+ dlls/winedmo/winedmo_quartz_parser.c |  60 +++++++-----
+ 10 files changed, 438 insertions(+), 89 deletions(-)
+
+diff --git a/dlls/dmime/audiopath.c b/dlls/dmime/audiopath.c
+index 501eecf234c..a748fb52148 100644
+--- a/dlls/dmime/audiopath.c
++++ b/dlls/dmime/audiopath.c
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "dmime_private.h"
++#include "dmksctrl.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(dmime);
+ 
+@@ -28,6 +29,7 @@ struct IDirectMusicAudioPathImpl {
+     IDirectMusicGraph*        pToolGraph;
+     IDirectSoundBuffer*       pDSBuffer;
+     IDirectSoundBuffer*       pPrimary;
++    IDirectMusicPort*         pPort;
+ 
+     BOOL fActive;
+ };
+@@ -64,6 +66,24 @@ static inline struct IDirectMusicAudioPathImpl *impl_from_IDirectMusicAudioPath(
+     return CONTAINING_RECORD(iface, struct IDirectMusicAudioPathImpl, IDirectMusicAudioPath_iface);
+ }
+ 
++static HRESULT audiopath_get_graph(struct IDirectMusicAudioPathImpl *This, IDirectMusicGraph **graph)
++{
++    HRESULT hr;
++
++    if (!This->pToolGraph)
++    {
++        IDirectMusicGraph *new_graph;
++
++        if (FAILED(hr = create_dmgraph(&IID_IDirectMusicGraph, (void **)&new_graph)))
++            return hr;
++        This->pToolGraph = new_graph;
++    }
++
++    *graph = This->pToolGraph;
++    IDirectMusicGraph_AddRef(*graph);
++    return S_OK;
++}
++
+ static inline struct audio_path_config *impl_from_IPersistStream(IPersistStream *iface)
+ {
+     return CONTAINING_RECORD(iface, struct audio_path_config, dmobj.IPersistStream_iface);
+@@ -87,6 +107,17 @@ void set_audiopath_primary_dsound_buffer(IDirectMusicAudioPath *iface, IDirectSo
+     This->pPrimary = buffer;
+ }
+ 
++void set_audiopath_port(IDirectMusicAudioPath *iface, IDirectMusicPort *port)
++{
++    struct IDirectMusicAudioPathImpl *This = impl_from_IDirectMusicAudioPath(iface);
++
++    if (This->pPort)
++        IDirectMusicPort_Release(This->pPort);
++    This->pPort = port;
++    if (This->pPort)
++        IDirectMusicPort_AddRef(This->pPort);
++}
++
+ /*****************************************************************************
+  * IDirectMusicAudioPathImpl implementation
+  */
+@@ -96,10 +127,14 @@ static HRESULT WINAPI IDirectMusicAudioPathImpl_QueryInterface (IDirectMusicAudi
+ 
+     TRACE("(%p, %s, %p)\n", This, debugstr_dmguid(riid), ppobj);
+ 
++    if (!ppobj)
++        return E_POINTER;
+     *ppobj = NULL;
+ 
+     if (IsEqualIID (riid, &IID_IDirectMusicAudioPath) || IsEqualIID (riid, &IID_IUnknown))
+         *ppobj = &This->IDirectMusicAudioPath_iface;
++    else if (IsEqualIID(riid, &IID_IDirectMusicGraph))
++        return audiopath_get_graph(This, (IDirectMusicGraph **)ppobj);
+ 
+     if (*ppobj) {
+         IUnknown_AddRef((IUnknown*)*ppobj);
+@@ -128,10 +163,14 @@ static ULONG WINAPI IDirectMusicAudioPathImpl_Release (IDirectMusicAudioPath *if
+     TRACE("(%p): ref=%ld\n", This, ref);
+ 
+     if (ref == 0) {
++        if (This->pToolGraph)
++            IDirectMusicGraph_Release(This->pToolGraph);
+         if (This->pPrimary)
+             IDirectSoundBuffer_Release(This->pPrimary);
+         if (This->pDSBuffer)
+             IDirectSoundBuffer_Release(This->pDSBuffer);
++        if (This->pPort)
++            IDirectMusicPort_Release(This->pPort);
+         This->pPerf = NULL;
+         free(This);
+     }
+@@ -145,8 +184,12 @@ static HRESULT WINAPI IDirectMusicAudioPathImpl_GetObjectInPath (IDirectMusicAud
+ 	struct IDirectMusicAudioPathImpl *This = impl_from_IDirectMusicAudioPath(iface);
+ 	HRESULT hr;
+ 
+-	FIXME("(%p, %ld, %ld, %ld, %s, %ld, %s, %p): stub\n", This, dwPChannel, dwStage, dwBuffer, debugstr_dmguid(guidObject),
++	TRACE("(%p, %ld, %ld, %ld, %s, %ld, %s, %p)\n", This, dwPChannel, dwStage, dwBuffer, debugstr_dmguid(guidObject),
+             dwIndex, debugstr_dmguid(iidInterface), ppObject);
++
++	if (!ppObject)
++	    return E_POINTER;
++	*ppObject = NULL;
+ 	    
+ 	switch (dwStage) {
+         case DMUS_PATH_BUFFER:
+@@ -178,16 +221,7 @@ static HRESULT WINAPI IDirectMusicAudioPathImpl_GetObjectInPath (IDirectMusicAud
+ 	case DMUS_PATH_AUDIOPATH_GRAPH:
+ 	  {
+ 	    if (IsEqualIID (iidInterface, &IID_IDirectMusicGraph)) {
+-	      if (NULL == This->pToolGraph) {
+-		IDirectMusicGraph* pGraph;
+-		hr = create_dmgraph(&IID_IDirectMusicGraph, (void**)&pGraph);
+-		if (FAILED(hr))
+-		  return hr;
+-		This->pToolGraph = pGraph;
+-	      }
+-	      *ppObject = This->pToolGraph;
+-	      IDirectMusicGraph_AddRef((LPDIRECTMUSICGRAPH) *ppObject);
+-	      return S_OK;
++	      return audiopath_get_graph(This, (IDirectMusicGraph **)ppObject);
+ 	    }
+ 	  }
+ 	  break;
+@@ -198,6 +232,25 @@ static HRESULT WINAPI IDirectMusicAudioPathImpl_GetObjectInPath (IDirectMusicAud
+ 	  }
+ 	  break;
+ 
++	case DMUS_PATH_PORT:
++	  {
++	    IDirectMusicPort *port;
++	    DWORD pchannel = dwPChannel == DMUS_PCHANNEL_ALL ? 0 : dwPChannel;
++
++	    if (This->pPort)
++	      return IDirectMusicPort_QueryInterface(This->pPort, iidInterface, ppObject);
++
++	    if (!This->pPerf)
++	      return DMUS_E_AUDIOPATH_INACTIVE;
++	    if (FAILED(hr = IDirectMusicPerformance8_PChannelInfo(This->pPerf, pchannel, &port, NULL, NULL)))
++	      return hr;
++
++	    hr = IDirectMusicPort_QueryInterface(port, iidInterface, ppObject);
++	    IDirectMusicPort_Release(port);
++	    return hr;
++	  }
++	  break;
++
+ 	case DMUS_PATH_PERFORMANCE:
+ 	  {
+ 	    /* TODO check wanted GUID */
+@@ -236,12 +289,16 @@ static HRESULT WINAPI IDirectMusicAudioPathImpl_GetObjectInPath (IDirectMusicAud
+ static HRESULT WINAPI IDirectMusicAudioPathImpl_Activate(IDirectMusicAudioPath *iface, BOOL activate)
+ {
+     struct IDirectMusicAudioPathImpl *This = impl_from_IDirectMusicAudioPath(iface);
++    HRESULT hr;
+ 
+     FIXME("(%p, %d): semi-stub\n", This, activate);
+ 
+-    if (!!activate == This->fActive)
++    if (!!activate == This->fActive && (activate || !This->pPort))
+         return S_FALSE;
+ 
++    if (This->pPort && FAILED(hr = IDirectMusicPort_Activate(This->pPort, activate)))
++        return hr;
++
+     if (!activate && This->pDSBuffer) {
+         /* Path is being deactivated */
+         IDirectSoundBuffer_Stop(This->pDSBuffer);
+@@ -254,9 +311,43 @@ static HRESULT WINAPI IDirectMusicAudioPathImpl_Activate(IDirectMusicAudioPath *
+ 
+ static HRESULT WINAPI IDirectMusicAudioPathImpl_SetVolume (IDirectMusicAudioPath *iface, LONG lVolume, DWORD dwDuration)
+ {
+-  struct IDirectMusicAudioPathImpl *This = impl_from_IDirectMusicAudioPath(iface);
+-  FIXME("(%p, %li, %ld): stub\n", This, lVolume, dwDuration);
+-  return S_OK;
++    struct IDirectMusicAudioPathImpl *This = impl_from_IDirectMusicAudioPath(iface);
++    HRESULT hr = S_OK;
++
++    TRACE("(%p, %li, %ld)\n", This, lVolume, dwDuration);
++
++    if (dwDuration)
++        FIXME("Volume ramping is not implemented.\n");
++
++    if (This->pDSBuffer)
++    {
++        LONG dsound_volume = max(DSBVOLUME_MIN, min(DSBVOLUME_MAX, lVolume));
++
++        hr = IDirectSoundBuffer_SetVolume(This->pDSBuffer, dsound_volume);
++        if (FAILED(hr) && hr != DSERR_CONTROLUNAVAIL)
++            return hr;
++    }
++
++    if (This->pPort)
++    {
++        KSPROPERTY volume_prop;
++        IKsControl *control;
++        ULONG size;
++        LONG volume = max(DMUS_VOLUME_MIN, min(DMUS_VOLUME_MAX, lVolume));
++
++        if (SUCCEEDED(hr = IDirectMusicPort_QueryInterface(This->pPort, &IID_IKsControl, (void **)&control)))
++        {
++            volume_prop.Set = GUID_DMUS_PROP_Volume;
++            volume_prop.Id = 0;
++            volume_prop.Flags = KSPROPERTY_TYPE_SET;
++            hr = IKsControl_KsProperty(control, &volume_prop, sizeof(volume_prop), &volume, sizeof(volume), &size);
++            IKsControl_Release(control);
++            if (FAILED(hr))
++                return hr;
++        }
++    }
++
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI IDirectMusicAudioPathImpl_ConvertPChannel (IDirectMusicAudioPath *iface, DWORD dwPChannelIn, DWORD* pdwPChannelOut)
+diff --git a/dlls/dmime/dmime_private.h b/dlls/dmime/dmime_private.h
+index b3a297bebe8..d61e09a1da4 100644
+--- a/dlls/dmime/dmime_private.h
++++ b/dlls/dmime/dmime_private.h
+@@ -76,6 +76,7 @@ extern HRESULT parse_midi(IStream *stream, IDirectMusicSegment8 *segment);
+ extern void set_audiopath_perf_pointer(IDirectMusicAudioPath*,IDirectMusicPerformance8*);
+ extern void set_audiopath_dsound_buffer(IDirectMusicAudioPath*,IDirectSoundBuffer*);
+ extern void set_audiopath_primary_dsound_buffer(IDirectMusicAudioPath*,IDirectSoundBuffer*);
++extern void set_audiopath_port(IDirectMusicAudioPath*,IDirectMusicPort*);
+ 
+ extern HRESULT segment_state_create(IDirectMusicSegment *segment, MUSIC_TIME start_time, DWORD segment_flags,
+         IDirectMusicPerformance8 *performance, IDirectMusicSegmentState **ret_iface);
+diff --git a/dlls/dmime/performance.c b/dlls/dmime/performance.c
+index a0c692902b3..abb3d73f185 100644
+--- a/dlls/dmime/performance.c
++++ b/dlls/dmime/performance.c
+@@ -59,6 +59,7 @@ struct performance
+     BOOL fAutoDownload;
+     char cMasterGrooveLevel;
+     float fMasterTempo;
++    double current_tempo;
+     long lMasterVolume;
+     /* performance channels */
+     struct wine_rb_tree channel_blocks;
+@@ -1158,13 +1159,16 @@ static void set_port_volume(IDirectMusicPort *port, LONG volume)
+     IKsControl_Release(control);
+ }
+ 
+-static HRESULT perf_dmport_create(struct performance *perf, DMUS_PORTPARAMS *params)
++static HRESULT perf_dmport_create(struct performance *perf, DMUS_PORTPARAMS *params, IDirectMusicPort **ret_port)
+ {
+     IDirectMusicPort *port;
+     GUID guid;
+     unsigned int i;
+     HRESULT hr;
+ 
++    if (ret_port)
++        *ret_port = NULL;
++
+     if (FAILED(hr = IDirectMusic8_GetDefaultPort(perf->dmusic, &guid)))
+         return hr;
+ 
+@@ -1188,6 +1192,11 @@ static HRESULT perf_dmport_create(struct performance *perf, DMUS_PORTPARAMS *par
+ 
+     performance_update_latency_time(perf, port, NULL);
+     set_port_volume(port, perf->lMasterVolume);
++    if (ret_port)
++    {
++        *ret_port = port;
++        IDirectMusicPort_AddRef(*ret_port);
++    }
+     IDirectMusicPort_Release(port);
+     return S_OK;
+ }
+@@ -1208,7 +1217,7 @@ static HRESULT WINAPI performance_AddPort(IDirectMusicPerformance8 *iface, IDire
+             .dwChannelGroups = 1
+         };
+ 
+-        return perf_dmport_create(This, &params);
++        return perf_dmport_create(This, &params, NULL);
+     }
+ 
+     IDirectMusicPort_AddRef(port);
+@@ -1344,6 +1353,19 @@ static HRESULT WINAPI performance_GetParam(IDirectMusicPerformance8 *iface, REFG
+         else hr = IDirectMusicSegment_GetParam(This->primary_segment, type, group, index, music_time, next_time, param);
+     }
+ 
++    if (FAILED(hr) && IsEqualGUID(type, &GUID_TempoParam))
++    {
++        DMUS_TEMPO_PARAM *tempo = param;
++
++        if (tempo)
++        {
++            tempo->mtTime = 0;
++            tempo->dblTempo = This->current_tempo;
++        }
++        if (next_time) *next_time = 0;
++        hr = S_OK;
++    }
++
+     return hr;
+ }
+ 
+@@ -1352,7 +1374,15 @@ static HRESULT WINAPI performance_SetParam(IDirectMusicPerformance8 *iface, REFG
+ {
+         struct performance *This = impl_from_IDirectMusicPerformance8(iface);
+ 
+-	FIXME("(%p, %s, %ld, %ld, %ld, %p): stub\n", This, debugstr_dmguid(rguidType), dwGroupBits, dwIndex, mtTime, pParam);
++	TRACE("(%p, %s, %ld, %ld, %ld, %p)\n", This, debugstr_dmguid(rguidType), dwGroupBits, dwIndex, mtTime, pParam);
++
++	if (IsEqualGUID(rguidType, &GUID_TempoParam) && pParam)
++	{
++	    DMUS_TEMPO_PARAM *tempo = pParam;
++
++	    if (tempo->dblTempo >= DMUS_TEMPO_MIN && tempo->dblTempo <= DMUS_TEMPO_MAX)
++	        This->current_tempo = tempo->dblTempo;
++	}
+ 	return S_OK;
+ }
+ 
+@@ -1689,6 +1719,7 @@ static HRESULT WINAPI performance_CreateAudioPath(IDirectMusicPerformance8 *ifac
+ {
+     struct performance *This = impl_from_IDirectMusicPerformance8(iface);
+     IDirectMusicAudioPath *pPath;
++    IDirectMusicPort *port;
+     IDirectMusicObject *dmo;
+     IDirectSoundBuffer *buffer, *primary_buffer;
+     DMUS_OBJECTDESC objDesc;
+@@ -1721,13 +1752,16 @@ static HRESULT WINAPI performance_CreateAudioPath(IDirectMusicPerformance8 *ifac
+     if (FAILED(hr))
+         return hr;
+ 
+-    hr = perf_dmport_create(This, &port_params);
++    hr = perf_dmport_create(This, &port_params, &port);
+     if (FAILED(hr))
+         return hr;
+ 
+     hr = IDirectSound_CreateSoundBuffer(This->dsound, &desc, &buffer, NULL);
+     if (FAILED(hr))
++    {
++        IDirectMusicPort_Release(port);
+         return DSERR_BUFFERLOST;
++    }
+ 
+     /* Update description for creating primary buffer */
+     desc.dwFlags |= DSBCAPS_PRIMARYBUFFER;
+@@ -1738,14 +1772,17 @@ static HRESULT WINAPI performance_CreateAudioPath(IDirectMusicPerformance8 *ifac
+     hr = IDirectSound_CreateSoundBuffer(This->dsound, &desc, &primary_buffer, NULL);
+     if (FAILED(hr))
+     {
++        IDirectMusicPort_Release(port);
+         IDirectSoundBuffer_Release(buffer);
+         return DSERR_BUFFERLOST;
+     }
+ 
+     create_dmaudiopath(&IID_IDirectMusicAudioPath, (void **)&pPath);
+     set_audiopath_perf_pointer(pPath, iface);
++    set_audiopath_port(pPath, port);
+     set_audiopath_dsound_buffer(pPath, buffer);
+     set_audiopath_primary_dsound_buffer(pPath, primary_buffer);
++    IDirectMusicPort_Release(port);
+     TRACE(" returning IDirectMusicAudioPath interface at %p.\n", *ret_iface);
+ 
+     *ret_iface = pPath;
+@@ -1757,6 +1794,7 @@ static HRESULT WINAPI performance_CreateStandardAudioPath(IDirectMusicPerformanc
+ {
+     struct performance *This = impl_from_IDirectMusicPerformance8(iface);
+     IDirectMusicAudioPath *pPath;
++    IDirectMusicPort *port;
+     DSBUFFERDESC desc;
+     WAVEFORMATEX format;
+     DMUS_PORTPARAMS params = {0};
+@@ -1808,18 +1846,20 @@ static HRESULT WINAPI performance_CreateStandardAudioPath(IDirectMusicPerformanc
+ 	default:
+ 	        return E_INVALIDARG;
+ 	}
+-
+         /* Create a port */
+         params.dwSize = sizeof(params);
+         params.dwValidParams = DMUS_PORTPARAMS_CHANNELGROUPS | DMUS_PORTPARAMS_AUDIOCHANNELS;
+         params.dwChannelGroups = (pchannel_count + 15) / 16;
+         params.dwAudioChannels = format.nChannels;
+-        if (FAILED(hr = perf_dmport_create(This, &params)))
++        if (FAILED(hr = perf_dmport_create(This, &params, &port)))
+                 return hr;
+ 
+         hr = IDirectSound_CreateSoundBuffer(This->dsound, &desc, &buffer, NULL);
+ 	if (FAILED(hr))
++        {
++                IDirectMusicPort_Release(port);
+ 	        return DSERR_BUFFERLOST;
++        }
+ 
+ 	/* Update description for creating primary buffer */
+ 	desc.dwFlags |= DSBCAPS_PRIMARYBUFFER;
+@@ -1829,14 +1869,17 @@ static HRESULT WINAPI performance_CreateStandardAudioPath(IDirectMusicPerformanc
+ 
+         hr = IDirectSound_CreateSoundBuffer(This->dsound, &desc, &primary_buffer, NULL);
+ 	if (FAILED(hr)) {
++                IDirectMusicPort_Release(port);
+                 IDirectSoundBuffer_Release(buffer);
+ 	        return DSERR_BUFFERLOST;
+ 	}
+ 
+ 	create_dmaudiopath(&IID_IDirectMusicAudioPath, (void**)&pPath);
+ 	set_audiopath_perf_pointer(pPath, iface);
++	set_audiopath_port(pPath, port);
+ 	set_audiopath_dsound_buffer(pPath, buffer);
+ 	set_audiopath_primary_dsound_buffer(pPath, primary_buffer);
++        IDirectMusicPort_Release(port);
+ 
+     *ret_iface = pPath;
+     TRACE(" returning IDirectMusicAudioPath interface at %p.\n", *ret_iface);
+@@ -1981,7 +2024,7 @@ static HRESULT WINAPI performance_graph_StampPMsg(IDirectMusicGraph *iface, DMUS
+ 
+     if (msg->pGraph)
+     {
+-        IDirectMusicTool_Release(msg->pGraph);
++        IDirectMusicGraph_Release(msg->pGraph);
+         msg->pGraph = NULL;
+     }
+ 
+@@ -2000,7 +2043,7 @@ static HRESULT WINAPI performance_graph_StampPMsg(IDirectMusicGraph *iface, DMUS
+     if (SUCCEEDED(hr))
+     {
+         msg->pGraph = &This->IDirectMusicGraph_iface;
+-        IDirectMusicTool_AddRef(msg->pGraph);
++        IDirectMusicGraph_AddRef(msg->pGraph);
+     }
+ 
+     return hr;
+@@ -2127,9 +2170,19 @@ static HRESULT WINAPI performance_tool_ProcessPMsg(IDirectMusicTool *iface,
+         value |= (UINT)midi->bByte1 << 8;
+         value |= (UINT)midi->bByte2 << 16;
+ 
++        if (msg->rtTime < latency_time)
++        {
++            TRACE("clamping stale MIDI rt %s to latency time %s\n",
++                    wine_dbgstr_longlong(msg->rtTime), wine_dbgstr_longlong(latency_time));
++            msg->rtTime = latency_time;
++        }
++
++        TRACE("MIDI pchannel %lu group %lu channel %lu status %#x data %#x %#x flags %#lx rt %s mt %ld\n",
++                msg->dwPChannel, group, channel, midi->bStatus, midi->bByte1, midi->bByte2,
++                msg->dwFlags, wine_dbgstr_longlong(msg->rtTime), msg->mtTime);
++
+         if (SUCCEEDED(hr = IDirectMusic_CreateMusicBuffer(This->dmusic, &desc, &buffer, NULL)))
+         {
+-            if (msg->rtTime == -1) msg->rtTime = latency_time;
+             hr = IDirectMusicBuffer_PackStructured(buffer, msg->rtTime, group, value);
+             if (SUCCEEDED(hr)) hr = IDirectMusicPort_PlayBuffer(port, buffer);
+             IDirectMusicBuffer_Release(buffer);
+@@ -2144,6 +2197,9 @@ static HRESULT WINAPI performance_tool_ProcessPMsg(IDirectMusicTool *iface,
+         DMUS_NOTE_PMSG *note = (DMUS_NOTE_PMSG *)msg;
+ 
+         msg->mtTime += note->nOffset;
++        TRACE("NOTE pchannel %lu midi %#x velocity %#x flags %#x duration %ld offset %d mt %ld\n",
++                msg->dwPChannel, note->bMidiValue, note->bVelocity, note->bFlags,
++                note->mtDuration, note->nOffset, msg->mtTime);
+ 
+         if (note->bFlags & DMUS_NOTEF_NOTEON)
+         {
+@@ -2151,15 +2207,15 @@ static HRESULT WINAPI performance_tool_ProcessPMsg(IDirectMusicTool *iface,
+                     MIDI_NOTE_ON, note->bMidiValue, note->bVelocity)))
+                 WARN("Failed to translate message to MIDI, hr %#lx\n", hr);
+ 
+-            if (note->mtDuration)
+-            {
+-                msg->mtTime -= note->nOffset;
+-                msg->mtTime += max(1, note->mtDuration - 1);
+-                if (FAILED(hr = IDirectMusicPerformance8_MusicToReferenceTime(performance, msg->mtTime, &msg->rtTime)))
+-                    return hr;
+-                note->bFlags &= ~DMUS_NOTEF_NOTEON;
+-                return DMUS_S_REQUEUE;
+-            }
++            if (!note->mtDuration)
++                break;
++
++            msg->mtTime -= note->nOffset;
++            msg->mtTime += max(1, note->mtDuration - 1);
++            if (FAILED(hr = IDirectMusicPerformance8_MusicToReferenceTime(performance, msg->mtTime, &msg->rtTime)))
++                return hr;
++            note->bFlags &= ~DMUS_NOTEF_NOTEON;
++            return DMUS_S_REQUEUE;
+         }
+ 
+         if (FAILED(hr = performance_send_midi_pmsg(This, msg, DMUS_PMSGF_MUSICTIME | DMUS_PMSGF_TOOL_IMMEDIATE,
+@@ -2263,6 +2319,15 @@ static HRESULT WINAPI performance_tool_ProcessPMsg(IDirectMusicTool *iface,
+             WARN("Failed to play wave buffer, hr %#lx\n", hr);
+         break;
+ 
++    case DMUS_PMSGT_TEMPO:
++    {
++        DMUS_TEMPO_PMSG *tempo = (DMUS_TEMPO_PMSG *)msg;
++
++        if (tempo->dblTempo >= DMUS_TEMPO_MIN && tempo->dblTempo <= DMUS_TEMPO_MAX)
++            This->current_tempo = tempo->dblTempo;
++        break;
++    }
++
+     case DMUS_PMSGT_INTERNAL_SEGMENT_TICK:
+         msg->rtTime += 10000000;
+         msg->dwFlags &= ~DMUS_PMSGF_MUSICTIME;
+@@ -2339,6 +2404,7 @@ HRESULT create_dmperformance(REFIID iid, void **ret_iface)
+     obj->latency_offset = 50;
+     obj->dwBumperLength =   50; /* 50 ms default */
+     obj->dwPrepareTime  = 1000; /* 1000 ms default */
++    obj->current_tempo = 120.0;
+ 
+     hr = IDirectMusicPerformance8_QueryInterface(&obj->IDirectMusicPerformance8_iface, iid, ret_iface);
+     IDirectMusicPerformance_Release(&obj->IDirectMusicPerformance8_iface);
+diff --git a/dlls/dmime/tests/dmime.c b/dlls/dmime/tests/dmime.c
+index 389f2546c01..81478bb9464 100644
+--- a/dlls/dmime/tests/dmime.c
++++ b/dlls/dmime/tests/dmime.c
+@@ -891,6 +891,7 @@ static void test_COM_audiopath(void)
+     IDirectSoundBuffer8 *dsound8;
+     IDirectSoundNotify *notify;
+     IDirectSound3DBuffer *dsound3d;
++    IDirectMusicPort *port = NULL;
+     IKsPropertySet *propset;
+     ULONG refcount;
+     HRESULT hr;
+@@ -967,6 +968,13 @@ static void test_COM_audiopath(void)
+                 0, &GUID_NULL, (void**)&unk);
+     ok(hr == E_NOINTERFACE, "Failed: %#lx\n", hr);
+ 
++    hr = IDirectMusicAudioPath_GetObjectInPath(dmap, 0, DMUS_PATH_PORT, 0, &GUID_All_Objects,
++                0, &IID_IDirectMusicPort, (void**)&port);
++    ok(hr == S_OK, "Failed: %#lx\n", hr);
++    ok(port != NULL, "Got NULL port\n");
++    if (port)
++        IDirectMusicPort_Release(port);
++
+     while (IDirectMusicAudioPath_Release(dmap) > 1); /* performance has a reference too */
+     IDirectMusicPerformance8_CloseDown(performance);
+     IDirectMusicPerformance8_Release(performance);
+diff --git a/dlls/dmsynth/synth.c b/dlls/dmsynth/synth.c
+index ff862b62984..624f0660f02 100644
+--- a/dlls/dmsynth/synth.c
++++ b/dlls/dmsynth/synth.c
+@@ -471,41 +471,41 @@ static void synth_reset_default_values(struct synth *This)
+     {
+         fluid_synth_program_select(This->fluid_synth, chan, fluid_sfont_get_id(This->fluid_sfont), 0, 0);
+ 
+-        fluid_synth_cc(This->fluid_synth, chan | 0xe0 /* PITCH_BEND */, 0, 0);
+-        fluid_synth_cc(This->fluid_synth, chan | 0xd0 /* CHANNEL_PRESSURE */, 0, 0);
+-
+-        fluid_synth_cc(This->fluid_synth, chan | 0xb0 /* CONTROL_CHANGE */, 0x01 /* MODULATION_MSB */, 0);
+-        fluid_synth_cc(This->fluid_synth, chan | 0xb0 /* CONTROL_CHANGE */, 0x21 /* MODULATION_LSB */, 0);
+-        fluid_synth_cc(This->fluid_synth, chan | 0xb0 /* CONTROL_CHANGE */, 0x07 /* VOLUME_MSB */, 0);
+-        fluid_synth_cc(This->fluid_synth, chan | 0xb0 /* CONTROL_CHANGE */, 0x27 /* VOLUME_LSB */, 100);
+-        fluid_synth_cc(This->fluid_synth, chan | 0xb0 /* CONTROL_CHANGE */, 0x0a /* PAN_MSB */, 0);
+-        fluid_synth_cc(This->fluid_synth, chan | 0xb0 /* CONTROL_CHANGE */, 0x0a /* PAN_LSB */, 64);
+-        fluid_synth_cc(This->fluid_synth, chan | 0xb0 /* CONTROL_CHANGE */, 0x0b /* EXPRESSION_MSB */, 0);
+-        fluid_synth_cc(This->fluid_synth, chan | 0xb0 /* CONTROL_CHANGE */, 0x2b /* EXPRESSION_LSB */, 127);
+-        fluid_synth_cc(This->fluid_synth, chan | 0xb0 /* CONTROL_CHANGE */, 0x40 /* SUSTAIN_SWITCH */, 0);
+-        fluid_synth_cc(This->fluid_synth, chan | 0xb0 /* CONTROL_CHANGE */, 0x5b /* EFFECTS_DEPTH1 / Reverb Send */, 40);
+-        fluid_synth_cc(This->fluid_synth, chan | 0xb0 /* CONTROL_CHANGE */, 0x5d /* EFFECTS_DEPTH3 / Chorus Send */, 0);
++        fluid_synth_pitch_bend(This->fluid_synth, chan, 0x2000);
++        fluid_synth_channel_pressure(This->fluid_synth, chan, 0);
++
++        fluid_synth_cc(This->fluid_synth, chan, 0x01 /* MODULATION_MSB */, 0);
++        fluid_synth_cc(This->fluid_synth, chan, 0x21 /* MODULATION_LSB */, 0);
++        fluid_synth_cc(This->fluid_synth, chan, 0x07 /* VOLUME_MSB */, 100);
++        fluid_synth_cc(This->fluid_synth, chan, 0x27 /* VOLUME_LSB */, 0);
++        fluid_synth_cc(This->fluid_synth, chan, 0x0a /* PAN_MSB */, 64);
++        fluid_synth_cc(This->fluid_synth, chan, 0x2a /* PAN_LSB */, 0);
++        fluid_synth_cc(This->fluid_synth, chan, 0x0b /* EXPRESSION_MSB */, 127);
++        fluid_synth_cc(This->fluid_synth, chan, 0x2b /* EXPRESSION_LSB */, 0);
++        fluid_synth_cc(This->fluid_synth, chan, 0x40 /* SUSTAIN_SWITCH */, 0);
++        fluid_synth_cc(This->fluid_synth, chan, 0x5b /* EFFECTS_DEPTH1 / Reverb Send */, 40);
++        fluid_synth_cc(This->fluid_synth, chan, 0x5d /* EFFECTS_DEPTH3 / Chorus Send */, 0);
+ 
+         /* RPN0 Pitch Bend Range */
+-        fluid_synth_cc(This->fluid_synth, chan | 0xb0 /* CONTROL_CHANGE */, 0x64 /* RPN_LSB */, 0);
+-        fluid_synth_cc(This->fluid_synth, chan | 0xb0 /* CONTROL_CHANGE */, 0x65 /* RPN_MSB */, 0);
+-        fluid_synth_cc(This->fluid_synth, chan | 0xb0 /* CONTROL_CHANGE */, 0x06 /* DATA_ENTRY_MSB */, 0);
+-        fluid_synth_cc(This->fluid_synth, chan | 0xb0 /* CONTROL_CHANGE */, 0x26 /* DATA_ENTRY_LSB */, 2);
++        fluid_synth_cc(This->fluid_synth, chan, 0x64 /* RPN_LSB */, 0);
++        fluid_synth_cc(This->fluid_synth, chan, 0x65 /* RPN_MSB */, 0);
++        fluid_synth_cc(This->fluid_synth, chan, 0x06 /* DATA_ENTRY_MSB */, 2);
++        fluid_synth_cc(This->fluid_synth, chan, 0x26 /* DATA_ENTRY_LSB */, 0);
+ 
+         /* RPN1 Fine Tuning */
+-        fluid_synth_cc(This->fluid_synth, chan | 0xb0 /* CONTROL_CHANGE */, 0x64 /* RPN_LSB */, 0);
+-        fluid_synth_cc(This->fluid_synth, chan | 0xb0 /* CONTROL_CHANGE */, 0x65 /* RPN_MSB */, 1);
+-        fluid_synth_cc(This->fluid_synth, chan | 0xb0 /* CONTROL_CHANGE */, 0x06 /* DATA_ENTRY_MSB */, 0);
+-        fluid_synth_cc(This->fluid_synth, chan | 0xb0 /* CONTROL_CHANGE */, 0x26 /* DATA_ENTRY_LSB */, 0);
++        fluid_synth_cc(This->fluid_synth, chan, 0x64 /* RPN_LSB */, 1);
++        fluid_synth_cc(This->fluid_synth, chan, 0x65 /* RPN_MSB */, 0);
++        fluid_synth_cc(This->fluid_synth, chan, 0x06 /* DATA_ENTRY_MSB */, 0x40);
++        fluid_synth_cc(This->fluid_synth, chan, 0x26 /* DATA_ENTRY_LSB */, 0);
+ 
+         /* RPN2 Coarse Tuning */
+-        fluid_synth_cc(This->fluid_synth, chan | 0xb0 /* CONTROL_CHANGE */, 0x64 /* RPN_LSB */, 0);
+-        fluid_synth_cc(This->fluid_synth, chan | 0xb0 /* CONTROL_CHANGE */, 0x65 /* RPN_MSB */, 1);
+-        fluid_synth_cc(This->fluid_synth, chan | 0xb0 /* CONTROL_CHANGE */, 0x06 /* DATA_ENTRY_MSB */, 0);
+-        fluid_synth_cc(This->fluid_synth, chan | 0xb0 /* CONTROL_CHANGE */, 0x26 /* DATA_ENTRY_LSB */, 0);
++        fluid_synth_cc(This->fluid_synth, chan, 0x64 /* RPN_LSB */, 2);
++        fluid_synth_cc(This->fluid_synth, chan, 0x65 /* RPN_MSB */, 0);
++        fluid_synth_cc(This->fluid_synth, chan, 0x06 /* DATA_ENTRY_MSB */, 0x40);
++        fluid_synth_cc(This->fluid_synth, chan, 0x26 /* DATA_ENTRY_LSB */, 0);
+ 
+-        fluid_synth_cc(This->fluid_synth, chan | 0xb0 /* CONTROL_CHANGE */, 0x64 /* RPN_LSB */, 127);
+-        fluid_synth_cc(This->fluid_synth, chan | 0xb0 /* CONTROL_CHANGE */, 0x65 /* RPN_MSB */, 127);
++        fluid_synth_cc(This->fluid_synth, chan, 0x64 /* RPN_LSB */, 127);
++        fluid_synth_cc(This->fluid_synth, chan, 0x65 /* RPN_MSB */, 127);
+ 
+         update_channel_volume(This, chan);
+     }
+@@ -1011,6 +1011,9 @@ static HRESULT WINAPI synth_PlayBuffer(IDirectMusicSynth8 *iface,
+             memcpy(event->midi, data, head->cbEvent);
+             event->time = time + head->rtDelta;
+             event->position = position;
++            TRACE("queue midi %#x %#x %#x at %s sample %I64d\n",
++                    event->midi[0], event->midi[1], event->midi[2],
++                    wine_dbgstr_longlong(event->time), event->position);
+ 
+             EnterCriticalSection(&This->cs);
+             LIST_FOR_EACH_ENTRY(next_event, &This->events, struct event, entry)
+diff --git a/dlls/dmsynth/synthsink.c b/dlls/dmsynth/synthsink.c
+index 5388e481845..553b4d467a2 100644
+--- a/dlls/dmsynth/synthsink.c
++++ b/dlls/dmsynth/synthsink.c
+@@ -237,6 +237,7 @@ static DWORD CALLBACK synth_sink_render_thread(void *args)
+     WAVEFORMATEX format;
+     HANDLE buffer_event;
+     DWORD samples_size;
++    BOOL stopped = FALSE;
+     short *samples;
+     HRESULT hr;
+ 
+@@ -296,6 +297,7 @@ static DWORD CALLBACK synth_sink_render_thread(void *args)
+ 
+         if (S_OK != (wait_hr = synth_sink_wait_write(sink, buffer_event)))
+         {
++            stopped = wait_hr == S_FALSE;
+             hr = wait_hr;
+             break;
+         }
+@@ -307,7 +309,8 @@ static DWORD CALLBACK synth_sink_render_thread(void *args)
+         return hr;
+     }
+ 
+-    synth_sink_wait_play_end(sink, buffer, &caps, &format, buffer_event);
++    if (!stopped)
++        synth_sink_wait_play_end(sink, buffer, &caps, &format, buffer_event);
+     free(samples);
+ 
+ done:
+diff --git a/dlls/dsound/buffer.c b/dlls/dsound/buffer.c
+index e24d6bf0b80..36559307a5e 100644
+--- a/dlls/dsound/buffer.c
++++ b/dlls/dsound/buffer.c
+@@ -803,7 +803,7 @@ static HRESULT WINAPI IDirectSoundBufferImpl_SetFX(IDirectSoundBuffer8 *iface, D
+ 	dmt.subtype = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+ 	dmt.bFixedSizeSamples = TRUE;
+ 	dmt.bTemporalCompression = FALSE;
+-	dmt.lSampleSize = sizeof(float) * This->pwfx->nChannels / 8;
++	dmt.lSampleSize = wfx.nBlockAlign;
+ 	dmt.formattype = FORMAT_WaveFormatEx;
+ 	dmt.pUnk = NULL;
+ 	dmt.cbFormat = sizeof(WAVEFORMATEX);
+diff --git a/dlls/winedmo/quartz_transform.c b/dlls/winedmo/quartz_transform.c
+index 6f5c0a01340..1b89aefa4e7 100644
+--- a/dlls/winedmo/quartz_transform.c
++++ b/dlls/winedmo/quartz_transform.c
+@@ -46,6 +46,9 @@ struct transform
+     struct winedmo_transform winedmo_transform;
+ 
+     const struct transform_ops *ops;
++    bool synthesize_video_timestamps;
++    bool have_next_output_time;
++    REFERENCE_TIME next_output_time;
+ };
+ 
+ struct transform_ops
+@@ -411,7 +414,10 @@ static HRESULT WINAPI transform_sink_receive(struct strmbase_sink *pin, IMediaSa
+     if (IMediaSample_IsSyncPoint(sample) == S_OK)
+         push_flags |= WINEDMO_SAMPLE_FLAG_SYNC_POINT;
+     if (IMediaSample_IsDiscontinuity(sample) == S_OK)
++    {
+         push_flags |= WINEDMO_SAMPLE_FLAG_DISCONTINUITY;
++        filter->have_next_output_time = false;
++    }
+ 
+     EnterCriticalSection(&filter->filter.stream_cs);
+     if (!filter->winedmo_transform.handle)
+@@ -471,6 +477,33 @@ static HRESULT WINAPI transform_sink_receive(struct strmbase_sink *pin, IMediaSa
+         }
+ 
+         IMediaSample_SetActualDataLength(output_sample, out_size);
++        if (out_pts == INT64_MIN && filter->synthesize_video_timestamps
++                && IsEqualGUID(&filter->source.pin.mt.formattype, &FORMAT_VideoInfo)
++                && filter->source.pin.mt.cbFormat >= sizeof(VIDEOINFOHEADER))
++        {
++            const VIDEOINFOHEADER *format = (const VIDEOINFOHEADER *)filter->source.pin.mt.pbFormat;
++            bool first_sample = !filter->have_next_output_time;
++
++            if (format->AvgTimePerFrame)
++            {
++                if (first_sample)
++                {
++                    filter->next_output_time = 0;
++                    filter->have_next_output_time = true;
++                }
++                out_pts = filter->next_output_time;
++                out_dur = format->AvgTimePerFrame;
++                filter->next_output_time += format->AvgTimePerFrame;
++                if (first_sample)
++                    out_flags |= WINEDMO_SAMPLE_FLAG_DISCONTINUITY;
++            }
++        }
++
++        IMediaSample_SetSyncPoint(output_sample, (out_flags & WINEDMO_SAMPLE_FLAG_SYNC_POINT)
++                || IsEqualGUID(&filter->source.pin.mt.majortype, &MEDIATYPE_Video));
++        IMediaSample_SetDiscontinuity(output_sample, !!(out_flags & WINEDMO_SAMPLE_FLAG_DISCONTINUITY));
++        IMediaSample_SetPreroll(output_sample, FALSE);
++
+         if (out_pts != INT64_MIN)
+         {
+             REFERENCE_TIME pts_rt = out_pts, end_rt = out_pts + out_dur;
+@@ -1093,6 +1126,7 @@ static HRESULT mpeg_video_codec_source_get_media_type(struct transform *filter,
+     if (video_format->AvgTimePerFrame)
+         video_format->dwBitRate = MulDiv(image_size * 8, 10000000, video_format->AvgTimePerFrame);
+     SetRect(&video_format->rcSource, 0, 0, width, height);
++    SetRect(&video_format->rcTarget, 0, 0, width, height);
+ 
+     memset(mt, 0, sizeof(*mt));
+     mt->majortype = MEDIATYPE_Video;
+@@ -1139,6 +1173,7 @@ HRESULT mpeg_video_codec_create(IUnknown *outer, IUnknown **out)
+ 
+     wcscpy(object->sink.pin.name, L"Input");
+     wcscpy(object->source.pin.name, L"Output");
++    object->synthesize_video_timestamps = true;
+ 
+     TRACE("Created MPEG video decoder %p.\n", object);
+     *out = &object->filter.IUnknown_inner;
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+index 98562f24457..86156f5625c 100644
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -53,6 +53,7 @@ struct demuxer
+     AVFormatContext *ctx;
+     struct stream_context *stream_context;
+     struct stream *streams;
++    INT64 duration;
+ 
+     AVPacket *last_packet; /* last read packet */
+     struct stream *last_stream; /* last read packet stream */
+@@ -300,6 +301,14 @@ static AVRational get_video_display_frame_rate( const AVFormatContext *ctx, AVSt
+ {
+     AVRational frame_rate = avstream->avg_frame_rate;
+ 
++    if (ctx->iformat && !strcmp( ctx->iformat->name, "mpegvideo" ))
++    {
++        frame_rate = av_guess_frame_rate( (AVFormatContext *)ctx, avstream, NULL );
++        if (frame_rate.num <= 0 || frame_rate.den <= 0)
++            frame_rate = avstream->r_frame_rate;
++        return frame_rate;
++    }
++
+     if (frame_rate.num <= 0 || frame_rate.den <= 0)
+         frame_rate = av_guess_frame_rate( (AVFormatContext *)ctx, avstream, NULL );
+     if (frame_rate.num <= 0 || frame_rate.den <= 0)
+@@ -317,6 +326,114 @@ static INT64 get_video_frame_duration( const AVFormatContext *ctx, AVStream *avs
+     return av_rescale_q( 1, av_inv_q( frame_rate ), (AVRational){1, 10000000} );
+ }
+ 
++static INT64 get_raw_mpegvideo_duration( const AVFormatContext *ctx )
++{
++    struct stream_context *context = ctx->pb ? ctx->pb->opaque : NULL;
++    const UINT32 buffer_size = 64 * 1024;
++    UINT64 offset, length;
++    AVStream *video = NULL;
++    UINT64 picture_count = 0;
++    INT64 frame_duration;
++    BYTE *buffer;
++    UINT32 state = 0xffffffff;
++    unsigned int i, j;
++
++    if (!ctx->iformat || strcmp( ctx->iformat->name, "mpegvideo" )) return AV_NOPTS_VALUE;
++    if (!context || context->length == (UINT64)-1) return AV_NOPTS_VALUE;
++
++    for (i = 0; i < ctx->nb_streams; ++i)
++    {
++        AVStream *stream = ctx->streams[i];
++
++        if (stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
++        {
++            video = stream;
++            break;
++        }
++    }
++    if (!video) return AV_NOPTS_VALUE;
++    if ((frame_duration = get_video_frame_duration( ctx, video )) <= 0) return AV_NOPTS_VALUE;
++    if (!(buffer = malloc( buffer_size ))) return AV_NOPTS_VALUE;
++
++    length = context->length;
++    for (offset = 0; offset < length; offset += buffer_size)
++    {
++        UINT32 chunk = (UINT32)min( (UINT64)buffer_size, length - offset );
++
++        if (!read_stream_at( context, offset, buffer, chunk ))
++        {
++            free( buffer );
++            return AV_NOPTS_VALUE;
++        }
++
++        for (j = 0; j < chunk; ++j)
++        {
++            state = (state << 8) | buffer[j];
++            if (state == 0x00000100)
++                ++picture_count;
++        }
++    }
++
++    free( buffer );
++    if (!picture_count) return AV_NOPTS_VALUE;
++
++    TRACE( "raw MPEG video picture count %s, frame duration %s, duration %s.\n",
++            wine_dbgstr_longlong( (LONGLONG)picture_count ), wine_dbgstr_longlong( frame_duration ),
++            wine_dbgstr_longlong( (LONGLONG)(picture_count * frame_duration) ) );
++
++    return picture_count * frame_duration;
++}
++
++static NTSTATUS raw_mpegvideo_seek( struct demuxer *demuxer, INT64 timestamp )
++{
++    struct stream_context *context = demuxer->stream_context;
++    const UINT32 buffer_size = 64 * 1024;
++    UINT64 target, offset, length, last_gop = 0, last_picture = 0;
++    BYTE *buffer;
++    UINT32 state = 0xffffffff;
++    unsigned int i;
++
++    if (!demuxer->ctx->iformat || strcmp( demuxer->ctx->iformat->name, "mpegvideo" ))
++        return STATUS_NOT_SUPPORTED;
++    if (!context || context->length == (UINT64)-1 || demuxer->duration <= 0)
++        return STATUS_NOT_SUPPORTED;
++
++    length = context->length;
++    target = min( length, (UINT64)av_rescale( timestamp, length, demuxer->duration ) );
++    if (!(buffer = malloc( buffer_size ))) return STATUS_NO_MEMORY;
++
++    for (offset = 0; offset < target; offset += buffer_size)
++    {
++        UINT32 chunk = (UINT32)min( (UINT64)buffer_size, target - offset );
++
++        if (!read_stream_at( context, offset, buffer, chunk ))
++        {
++            free( buffer );
++            return STATUS_UNSUCCESSFUL;
++        }
++
++        for (i = 0; i < chunk; ++i)
++        {
++            state = (state << 8) | buffer[i];
++            if (state == 0x000001b8)
++                last_gop = offset + i - 3;
++            else if (state == 0x00000100)
++                last_picture = offset + i - 3;
++        }
++    }
++
++    free( buffer );
++    offset = last_gop ? last_gop : last_picture;
++    TRACE( "raw MPEG video seek timestamp %s, target offset %s, seek offset %s.\n",
++            wine_dbgstr_longlong( timestamp ), wine_dbgstr_longlong( target ), wine_dbgstr_longlong( offset ) );
++
++    avformat_flush( demuxer->ctx );
++    if (avio_seek( demuxer->ctx->pb, offset, SEEK_SET ) < 0)
++        return STATUS_UNSUCCESSFUL;
++
++    return STATUS_SUCCESS;
++}
++
+ static void fixup_asf_vc1_timestamps( const AVFormatContext *ctx, AVStream *avstream,
+         struct stream *stream, struct sample *sample )
+ {
+@@ -384,7 +501,14 @@ static INT64 get_context_duration( const AVFormatContext *ctx )
+     if (ctx->duration_estimation_method == AVFMT_DURATION_FROM_BITRATE)
+     {
+         duration = get_asf_header_duration( (AVFormatContext *)ctx );
+-        return duration != AV_NOPTS_VALUE ? duration : AV_NOPTS_VALUE;
++        if (duration != AV_NOPTS_VALUE)
++            return duration;
++
++        duration = get_raw_mpegvideo_duration( ctx );
++        if (duration != AV_NOPTS_VALUE)
++            return duration;
++
++        return AV_NOPTS_VALUE;
+     }
+ 
+     for (i = 0; i < ctx->nb_streams; i++)
+@@ -613,6 +737,7 @@ NTSTATUS demuxer_create( void *arg )
+         }
+         params->duration = get_context_duration( demuxer->ctx );
+     }
++    demuxer->duration = params->duration;
+     if (!(demuxer->streams = calloc( demuxer->ctx->nb_streams, sizeof(*demuxer->streams) ))) goto failed;
+     if (demuxer_create_streams( demuxer )) goto failed;
+ 
+@@ -803,16 +928,23 @@ NTSTATUS demuxer_seek( void *arg )
+     struct demuxer_seek_params *params = arg;
+     struct demuxer *demuxer = get_demuxer( params->demuxer );
+     int64_t timestamp = params->timestamp * AV_TIME_BASE / 10000000;
++    NTSTATUS status;
+     int i, ret;
+ 
+     TRACE( "demuxer %p, timestamp 0x%s\n", demuxer, wine_dbgstr_longlong( params->timestamp ) );
+ 
++    if (!(status = raw_mpegvideo_seek( demuxer, params->timestamp )))
++        goto done;
++    if (status != STATUS_NOT_SUPPORTED)
++        return status;
++
+     if ((ret = avformat_seek_file( demuxer->ctx, -1, INT64_MIN, timestamp, timestamp, AVSEEK_FLAG_BACKWARD )) < 0)
+     {
+         ERR( "Failed to seek demuxer %p, error %s.\n", demuxer, debugstr_averr(ret) );
+         return STATUS_UNSUCCESSFUL;
+     }
+ 
++done:
+     for (i = 0; i < demuxer->ctx->nb_streams; i++)
+     {
+         av_bsf_flush( demuxer->streams[i].filter );
+diff --git a/dlls/winedmo/winedmo_quartz_parser.c b/dlls/winedmo/winedmo_quartz_parser.c
+index 39544124009..28056419e62 100644
+--- a/dlls/winedmo/winedmo_quartz_parser.c
++++ b/dlls/winedmo/winedmo_quartz_parser.c
+@@ -258,6 +258,9 @@ static inline struct dmo_parser_source *dmo_impl_from_strmbase_source(struct str
+     return CONTAINING_RECORD(iface, struct dmo_parser_source, pin.pin);
+ }
+ 
++static void dmo_parser_begin_downstream_flush(struct dmo_parser *filter);
++static void dmo_parser_end_downstream_flush(struct dmo_parser *filter);
++
+ static inline struct dmo_parser *dmo_impl_from_IAMStreamSelect(IAMStreamSelect *iface)
+ {
+     return CONTAINING_RECORD(iface, struct dmo_parser, IAMStreamSelect_iface);
+@@ -486,6 +489,26 @@ static HRESULT WINAPI dmo_seeking_ChangeRate(IMediaSeeking *iface)
+     return S_OK;
+ }
+ 
++static HRESULT WINAPI dmo_seeking_GetDuration(IMediaSeeking *iface, LONGLONG *duration)
++{
++    struct dmo_parser_source *pin = dmo_impl_from_IMediaSeeking(iface);
++
++    if (pin->seek.llDuration < 0)
++        return E_NOTIMPL;
++
++    return SourceSeekingImpl_GetDuration(iface, duration);
++}
++
++static HRESULT WINAPI dmo_seeking_GetStopPosition(IMediaSeeking *iface, LONGLONG *stop)
++{
++    struct dmo_parser_source *pin = dmo_impl_from_IMediaSeeking(iface);
++
++    if (pin->seek.llStop < 0)
++        return E_NOTIMPL;
++
++    return SourceSeekingImpl_GetStopPosition(iface, stop);
++}
++
+ static HRESULT WINAPI dmo_seeking_SetPositions(IMediaSeeking *iface,
+         LONGLONG *current, DWORD current_flags, LONGLONG *stop, DWORD stop_flags)
+ {
+@@ -503,17 +526,6 @@ static HRESULT WINAPI dmo_seeking_SetPositions(IMediaSeeking *iface,
+         return S_OK;
+     }
+ 
+-    if (!(current_flags & AM_SEEKING_NoFlush))
+-    {
+-        for (i = 0; i < filter->source_count; ++i)
+-        {
+-            if (filter->sources[i]->pin.pin.peer)
+-                IPin_BeginFlush(filter->sources[i]->pin.pin.peer);
+-        }
+-        if (filter->reader)
+-            IAsyncReader_BeginFlush(filter->reader);
+-    }
+-
+     /* Tell the read callback to return 0 bytes so the demux thread unblocks. */
+     EnterCriticalSection(&filter->streaming_cs);
+     filter->flushing = true;
+@@ -528,6 +540,9 @@ static HRESULT WINAPI dmo_seeking_SetPositions(IMediaSeeking *iface,
+         WakeConditionVariable(&filter->sources[i]->queue_space_cv);
+     }
+ 
++    if (!(current_flags & AM_SEEKING_NoFlush))
++        dmo_parser_begin_downstream_flush(filter);
++
+     /* Acquire per-pin flushing_cs to ensure no Receive is in progress. */
+     for (i = 0; i < filter->source_count; ++i)
+     {
+@@ -558,15 +573,7 @@ static HRESULT WINAPI dmo_seeking_SetPositions(IMediaSeeking *iface,
+     }
+ 
+     if (!(current_flags & AM_SEEKING_NoFlush))
+-    {
+-        for (i = 0; i < filter->source_count; ++i)
+-        {
+-            if (filter->sources[i]->pin.pin.peer)
+-                IPin_EndFlush(filter->sources[i]->pin.pin.peer);
+-        }
+-        if (filter->reader)
+-            IAsyncReader_EndFlush(filter->reader);
+-    }
++        dmo_parser_end_downstream_flush(filter);
+ 
+     /* Release per-pin locks in reverse order. */
+     for (i = filter->source_count; i-- > 0;)
+@@ -601,8 +608,8 @@ static const IMediaSeekingVtbl dmo_seeking_vtbl =
+     SourceSeekingImpl_GetTimeFormat,
+     SourceSeekingImpl_IsUsingTimeFormat,
+     SourceSeekingImpl_SetTimeFormat,
+-    SourceSeekingImpl_GetDuration,
+-    SourceSeekingImpl_GetStopPosition,
++    dmo_seeking_GetDuration,
++    dmo_seeking_GetStopPosition,
+     SourceSeekingImpl_GetCurrentPosition,
+     SourceSeekingImpl_ConvertTimeFormat,
+     dmo_seeking_SetPositions,
+@@ -1375,9 +1382,12 @@ static HRESULT dmo_parser_init_stream(struct strmbase_filter *iface)
+     /* Seek to the current position (retain seek state across Stop/Pause/Run). */
+     {
+         LONGLONG seek_time = filter->source_count ? filter->sources[0]->seek.llCurrent : 0;
+-        NTSTATUS status = winedmo_demuxer_seek(filter->winedmo_demuxer, seek_time);
+-        if (status)
+-            WARN("Initial seek failed, status %#lx.\n", status);
++        if (seek_time)
++        {
++            NTSTATUS status = winedmo_demuxer_seek(filter->winedmo_demuxer, seek_time);
++            if (status)
++                WARN("Initial seek failed, status %#lx.\n", status);
++        }
+     }
+ 
+     filter->streaming = true;
+-- 
+2.54.0
+
