@@ -1,0 +1,1711 @@
+From 08462b74ee7ecc33575bc36a93ebc37954df767c Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Wed, 17 Jun 2026 00:15:18 -0600
+Subject: [PATCH] fix for arcania games video playback
+
+---
+ dlls/mfsrcsnk/media_source.c         |  28 ++-
+ dlls/winedmo/main.c                  |   4 +-
+ dlls/winedmo/media_source.c          |   1 +
+ dlls/winedmo/quartz_transform.c      | 281 +++++++++++++++++++++------
+ dlls/winedmo/unix_demuxer.c          |  31 ++-
+ dlls/winedmo/unix_transform.c        |  69 ++++++-
+ dlls/winedmo/unixlib.h               |   1 +
+ dlls/winedmo/winedmo_quartz_parser.c |  70 +++++--
+ dlls/winedmo/wm_reader.c             | 268 +++++++++++++++++--------
+ dlls/wmvcore/async_reader.c          |  61 ++++--
+ 10 files changed, 640 insertions(+), 174 deletions(-)
+
+diff --git a/dlls/mfsrcsnk/media_source.c b/dlls/mfsrcsnk/media_source.c
+index 882af0d565a..d9ec10ef44f 100644
+--- a/dlls/mfsrcsnk/media_source.c
++++ b/dlls/mfsrcsnk/media_source.c
+@@ -346,6 +346,7 @@ struct media_source
+         SOURCE_SHUTDOWN,
+     } state;
+     BOOL eop_queued;
++    BOOL demux_eos;
+     UINT pending_reads;
+ };
+ 
+@@ -524,7 +525,10 @@ static HRESULT media_source_start(struct media_source *source, IMFPresentationDe
+         position->hVal.QuadPart = 0;
+     }
+     if (starting || position->vt != VT_EMPTY)
++    {
+         source->eop_queued = FALSE;
++        source->demux_eos = FALSE;
++    }
+ 
+     for (i = 0; i < source->stream_count; i++)
+     {
+@@ -560,14 +564,18 @@ static HRESULT media_source_start(struct media_source *source, IMFPresentationDe
+         IMFStreamDescriptor_Release(stream_descriptor);
+     }
+ 
++    if (position->vt == VT_I8)
++    {
++        WARN("MF media source seek to %s before starting streams.\n", debugstr_time(position->hVal.QuadPart));
++        if ((status = winedmo_demuxer_seek(source->winedmo_demuxer, position->hVal.QuadPart)))
++            WARN("Failed to seek to %I64d, status %#lx\n", position->hVal.QuadPart, status);
++    }
++
+     for (i = 0; i < source->stream_count; i++)
+     {
+         struct media_stream *stream = source->streams[i];
+         media_stream_start(stream, source->stream_map[i], position);
+     }
+-
+-    if (position->vt == VT_I8 && (status = winedmo_demuxer_seek(source->winedmo_demuxer, position->hVal.QuadPart)))
+-        WARN("Failed to seek to %I64d, status %#lx\n", position->hVal.QuadPart, status);
+     source->state = SOURCE_RUNNING;
+ 
+     queue_media_event_value(source->queue, seeking ? MESourceSeeked : MESourceStarted, position);
+@@ -746,6 +754,7 @@ static void media_source_queue_end_of_presentation(struct media_source *source)
+         return;
+ 
+     source->eop_queued = TRUE;
++    WARN("Queueing MEEndOfPresentation for source %p.\n", source);
+     queue_media_event_value(source->queue, MEEndOfPresentation, &empty);
+ }
+ 
+@@ -754,8 +763,10 @@ static HRESULT media_source_send_eos(struct media_source *source, struct media_s
+     PROPVARIANT empty = {.vt = VT_EMPTY};
+     UINT i;
+ 
+-    if (stream->active && !stream->eos && list_empty(&stream->samples))
++    if (stream->active && !stream->eos)
+     {
++        WARN("Queueing MEEndOfStream for stream %p, queued samples %u.\n",
++                stream, list_count(&stream->samples));
+         queue_media_event_value(stream->queue, MEEndOfStream, &empty);
+         stream->eos = TRUE;
+     }
+@@ -788,6 +799,7 @@ static HRESULT media_source_read(struct media_source *source)
+ 
+     if (hr == MF_E_END_OF_STREAM)
+     {
++        source->demux_eos = TRUE;
+         for (i = 0; i < source->stream_count; i++)
+             media_source_send_eos(source, source->streams[i]);
+         return S_OK;
+@@ -979,6 +991,14 @@ static HRESULT media_source_request_stream_sample(struct media_source *source, s
+     {
+         media_stream_send_sample(stream, sample, token);
+         IMFSample_Release(sample);
++        if (source->demux_eos)
++            media_source_send_eos(source, stream);
++        return S_OK;
++    }
++
++    if (source->demux_eos)
++    {
++        media_source_send_eos(source, stream);
+         return S_OK;
+     }
+ 
+diff --git a/dlls/winedmo/main.c b/dlls/winedmo/main.c
+index fd829c7d7e3..6c9682ebf86 100644
+--- a/dlls/winedmo/main.c
++++ b/dlls/winedmo/main.c
+@@ -300,6 +300,7 @@ static void buffer_unlock( DMO_OUTPUT_DATA_BUFFER *buffer, struct sample *sample
+     if ((buffer->rtTimestamp = buffer_time) != INT64_MIN) buffer->dwStatus |= DMO_OUTPUT_DATA_BUFFERF_TIME;
+     if ((buffer->rtTimelength = sample->duration) != INT64_MIN) buffer->dwStatus |= DMO_OUTPUT_DATA_BUFFERF_TIMELENGTH;
+     if (sample->flags & SAMPLE_FLAG_SYNC_POINT) buffer->dwStatus |= DMO_OUTPUT_DATA_BUFFERF_SYNCPOINT;
++    if (sample->flags & SAMPLE_FLAG_DISCONTINUITY) buffer->dwStatus |= DMO_OUTPUT_DATA_BUFFERF_DISCONTINUITY;
+     if (sample->flags & SAMPLE_FLAG_INCOMPLETE) buffer->dwStatus |= DMO_OUTPUT_DATA_BUFFERF_INCOMPLETE;
+ }
+ 
+@@ -521,7 +522,7 @@ NTSTATUS CDECL winedmo_demuxer_read( struct winedmo_demuxer demuxer, UINT *strea
+ 
+     if (status)
+     {
+-        if (status == STATUS_END_OF_FILE) WARN( "Reached end of media file.\n" );
++        if (status == STATUS_END_OF_FILE) WARN( "Reached end of media file on demuxer %#I64x.\n", demuxer.handle );
+         else if (status != STATUS_BUFFER_TOO_SMALL) ERR( "Failed to read sample, status %#lx\n", status );
+         return status;
+     }
+@@ -720,6 +721,7 @@ NTSTATUS CDECL winedmo_transform_drain( struct winedmo_transform transform )
+     NTSTATUS status;
+ 
+     TRACE( "transform %#I64x\n", transform.handle );
++    WARN( "Draining transform %#I64x.\n", transform.handle );
+     if ((status = UNIX_CALL( transform_drain, &params )))
+         WARN( "transform_drain failed, status %#lx\n", status );
+     return status;
+diff --git a/dlls/winedmo/media_source.c b/dlls/winedmo/media_source.c
+index 35530e7f78d..85cc9b6359a 100644
+--- a/dlls/winedmo/media_source.c
++++ b/dlls/winedmo/media_source.c
+@@ -912,6 +912,7 @@ static HRESULT media_source_start(struct media_source *source, IMFPresentationDe
+             WakeConditionVariable(&stream->queue_cv);
+         }
+ 
++        WARN("MF media source seek to %s.\n", debugstr_time(position->hVal.QuadPart));
+         winedmo_demuxer_seek(source->demuxer, position->hVal.QuadPart);
+ 
+         source->flushing = FALSE;
+diff --git a/dlls/winedmo/quartz_transform.c b/dlls/winedmo/quartz_transform.c
+index 1b89aefa4e7..8eb3f817002 100644
+--- a/dlls/winedmo/quartz_transform.c
++++ b/dlls/winedmo/quartz_transform.c
+@@ -44,10 +44,13 @@ struct transform
+     IQualityControl *qc_sink;
+ 
+     struct winedmo_transform winedmo_transform;
++    CRITICAL_SECTION receive_cs;
+ 
+     const struct transform_ops *ops;
+     bool synthesize_video_timestamps;
+     bool have_next_output_time;
++    bool have_video_input;
++    bool have_decoded_output;
+     REFERENCE_TIME next_output_time;
+ };
+ 
+@@ -110,10 +113,37 @@ static BOOL is_mpeg4_part2_video_subtype(const GUID *subtype)
+     return FALSE;
+ }
+ 
++static BOOL is_windows_media_video_subtype(const GUID *subtype)
++{
++    if (subtype->Data2 != 0x0000 || subtype->Data3 != 0x0010
++            || subtype->Data4[0] != 0x80 || subtype->Data4[1] != 0x00
++            || subtype->Data4[2] != 0x00 || subtype->Data4[3] != 0xaa
++            || subtype->Data4[4] != 0x00 || subtype->Data4[5] != 0x38
++            || subtype->Data4[6] != 0x9b || subtype->Data4[7] != 0x71)
++        return FALSE;
++
++    switch (subtype->Data1)
++    {
++        case MAKEFOURCC('W','M','V','1'):
++        case MAKEFOURCC('W','M','V','2'):
++        case MAKEFOURCC('W','M','V','3'):
++        case MAKEFOURCC('W','M','V','A'):
++        case MAKEFOURCC('W','M','V','P'):
++        case MAKEFOURCC('W','V','C','1'):
++        case MAKEFOURCC('V','C','1','S'):
++            return TRUE;
++    }
++
++    return FALSE;
++}
++
+ static void transform_destroy(struct strmbase_filter *iface)
+ {
+     struct transform *filter = impl_from_strmbase_filter(iface);
+ 
++    filter->receive_cs.DebugInfo->Spare[0] = 0;
++    DeleteCriticalSection(&filter->receive_cs);
++
+     strmbase_passthrough_cleanup(&filter->passthrough);
+     strmbase_source_cleanup(&filter->source);
+     strmbase_sink_cleanup(&filter->sink);
+@@ -191,6 +221,8 @@ static HRESULT transform_init_stream(struct strmbase_filter *iface)
+             WARN("Failed to create winedmo transform, status %#lx.\n", status);
+             return E_FAIL;
+         }
++        filter->have_decoded_output = false;
++        filter->have_video_input = false;
+ 
+         hr = IMemAllocator_Commit(filter->source.pAllocator);
+         if (FAILED(hr))
+@@ -208,10 +240,12 @@ static HRESULT transform_cleanup_stream(struct strmbase_filter *iface)
+     {
+         IMemAllocator_Decommit(filter->source.pAllocator);
+ 
++        EnterCriticalSection(&filter->receive_cs);
+         EnterCriticalSection(&filter->filter.stream_cs);
+         winedmo_transform_destroy(filter->winedmo_transform);
+         filter->winedmo_transform.handle = 0;
+         LeaveCriticalSection(&filter->filter.stream_cs);
++        LeaveCriticalSection(&filter->receive_cs);
+     }
+ 
+     return S_OK;
+@@ -370,68 +404,14 @@ static HRESULT transform_sink_query_interface(struct strmbase_pin *pin, REFIID i
+     return S_OK;
+ }
+ 
+-static HRESULT WINAPI transform_sink_receive(struct strmbase_sink *pin, IMediaSample *sample)
++static HRESULT transform_drain_output(struct transform *filter, BOOL *delivered)
+ {
+-    struct transform *filter = impl_from_strmbase_filter(pin->pin.filter);
+-    REFERENCE_TIME start_time = 0, end_time = 0;
+-    INT64 pts = INT64_MIN, duration = INT64_MIN;
+-    DWORD push_flags = 0, out_flags;
++    DWORD out_flags;
+     UINT32 out_size;
+     NTSTATUS status;
+-    BYTE *data;
+-    LONG size;
+     HRESULT hr;
+ 
+-    /* We do not expect pin connection state to change while the filter is
+-     * running. This guarantee is necessary, since otherwise we would have to
+-     * take the filter lock, and we can't take the filter lock from a streaming
+-     * thread. */
+-    if (!filter->source.pMemInputPin)
+-    {
+-        WARN("Source is not connected, returning VFW_E_NOT_CONNECTED.\n");
+-        return VFW_E_NOT_CONNECTED;
+-    }
+-
+-    if (filter->filter.state == State_Stopped)
+-        return VFW_E_WRONG_STATE;
+-
+-    if (filter->sink.flushing)
+-        return S_FALSE;
+-
+-    if (FAILED(hr = IMediaSample_GetPointer(sample, &data)))
+-        return hr;
+-    size = IMediaSample_GetActualDataLength(sample);
+-
+-    hr = IMediaSample_GetTime(sample, &start_time, &end_time);
+-    if (hr == S_OK)
+-    {
+-        pts = start_time;
+-        duration = end_time - start_time;
+-    }
+-    else if (hr == VFW_S_NO_STOP_TIME)
+-        pts = start_time;
+-
+-    if (IMediaSample_IsSyncPoint(sample) == S_OK)
+-        push_flags |= WINEDMO_SAMPLE_FLAG_SYNC_POINT;
+-    if (IMediaSample_IsDiscontinuity(sample) == S_OK)
+-    {
+-        push_flags |= WINEDMO_SAMPLE_FLAG_DISCONTINUITY;
+-        filter->have_next_output_time = false;
+-    }
+-
+-    EnterCriticalSection(&filter->filter.stream_cs);
+-    if (!filter->winedmo_transform.handle)
+-    {
+-        LeaveCriticalSection(&filter->filter.stream_cs);
+-        return S_FALSE;
+-    }
+-    status = winedmo_transform_push_input(filter->winedmo_transform, data, size,
+-            pts, INT64_MIN, duration, push_flags);
+-    LeaveCriticalSection(&filter->filter.stream_cs);
+-    if (status == STATUS_DEVICE_BUSY)
+-        return MF_E_NOTACCEPTING;
+-    if (status)
+-        return E_FAIL;
++    *delivered = FALSE;
+ 
+     for (;;)
+     {
+@@ -470,6 +450,12 @@ static HRESULT WINAPI transform_sink_receive(struct strmbase_sink *pin, IMediaSa
+             return E_FAIL;
+         }
+ 
++        if (filter->sink.flushing)
++        {
++            IMediaSample_Release(output_sample);
++            break;
++        }
++
+         if (out_flags & WINEDMO_SAMPLE_FLAG_FORMAT_CHANGED)
+         {
+             IMediaSample_Release(output_sample);
+@@ -510,12 +496,186 @@ static HRESULT WINAPI transform_sink_receive(struct strmbase_sink *pin, IMediaSa
+             IMediaSample_SetTime(output_sample, &pts_rt, out_dur != INT64_MIN ? &end_rt : NULL);
+         }
+ 
+-        hr = IMemInputPin_Receive(filter->source.pMemInputPin, output_sample);
++        if (filter->sink.flushing)
++            hr = S_FALSE;
++        else
++            hr = IMemInputPin_Receive(filter->source.pMemInputPin, output_sample);
+         IMediaSample_Release(output_sample);
+         if (FAILED(hr))
+             return hr;
++        *delivered = TRUE;
++        filter->have_decoded_output = true;
++    }
++
++    return S_OK;
++}
++
++static HRESULT WINAPI transform_sink_receive(struct strmbase_sink *pin, IMediaSample *sample)
++{
++    struct transform *filter = impl_from_strmbase_filter(pin->pin.filter);
++    REFERENCE_TIME start_time = 0, end_time = 0;
++    INT64 pts = INT64_MIN, duration = INT64_MIN;
++    DWORD push_flags = 0;
++    NTSTATUS status;
++    BOOL delivered;
++    BYTE *data;
++    LONG size;
++    HRESULT hr = S_OK;
++
++    /* We do not expect pin connection state to change while the filter is
++     * running. This guarantee is necessary, since otherwise we would have to
++     * take the filter lock, and we can't take the filter lock from a streaming
++     * thread. */
++    if (!filter->source.pMemInputPin)
++    {
++        WARN("Source is not connected, returning VFW_E_NOT_CONNECTED.\n");
++        return VFW_E_NOT_CONNECTED;
++    }
++
++    if (filter->filter.state == State_Stopped)
++        return VFW_E_WRONG_STATE;
++
++    if (filter->sink.flushing)
++        return S_FALSE;
++
++    EnterCriticalSection(&filter->receive_cs);
++    if (filter->sink.flushing)
++    {
++        hr = S_FALSE;
++        goto done;
++    }
++
++    if (FAILED(hr = IMediaSample_GetPointer(sample, &data)))
++        goto done;
++    size = IMediaSample_GetActualDataLength(sample);
++
++    hr = IMediaSample_GetTime(sample, &start_time, &end_time);
++    if (hr == S_OK)
++    {
++        pts = start_time;
++        duration = end_time - start_time;
++    }
++    else if (hr == VFW_S_NO_STOP_TIME)
++        pts = start_time;
++
++    if (IMediaSample_IsSyncPoint(sample) == S_OK)
++        push_flags |= WINEDMO_SAMPLE_FLAG_SYNC_POINT;
++    if (IMediaSample_IsDiscontinuity(sample) == S_OK)
++    {
++        push_flags |= WINEDMO_SAMPLE_FLAG_DISCONTINUITY;
++        filter->have_next_output_time = false;
++    }
++
++    if (IsEqualGUID(&filter->sink.pin.mt.majortype, &MEDIATYPE_Video)
++            && filter->have_video_input && pts == 0 && (push_flags & WINEDMO_SAMPLE_FLAG_SYNC_POINT))
++    {
++        push_flags |= WINEDMO_SAMPLE_FLAG_DISCONTINUITY;
++        filter->have_next_output_time = false;
+     }
+ 
++    if ((push_flags & WINEDMO_SAMPLE_FLAG_DISCONTINUITY)
++            && is_windows_media_video_subtype(&filter->sink.pin.mt.subtype))
++    {
++        EnterCriticalSection(&filter->filter.stream_cs);
++        if (filter->winedmo_transform.handle)
++            status = winedmo_transform_flush(filter->winedmo_transform);
++        else
++            status = STATUS_SUCCESS;
++        LeaveCriticalSection(&filter->filter.stream_cs);
++        if (status)
++        {
++            hr = E_FAIL;
++            goto done;
++        }
++    }
++
++    for (;;)
++    {
++        EnterCriticalSection(&filter->filter.stream_cs);
++        if (!filter->winedmo_transform.handle)
++        {
++            LeaveCriticalSection(&filter->filter.stream_cs);
++            hr = S_FALSE;
++            goto done;
++        }
++        status = winedmo_transform_push_input(filter->winedmo_transform, data, size,
++                pts, INT64_MIN, duration, push_flags);
++        LeaveCriticalSection(&filter->filter.stream_cs);
++        if (status != STATUS_DEVICE_BUSY)
++            break;
++        if (!is_windows_media_video_subtype(&filter->sink.pin.mt.subtype))
++        {
++            hr = MF_E_NOTACCEPTING;
++            goto done;
++        }
++
++        if (FAILED(hr = transform_drain_output(filter, &delivered)))
++            goto done;
++        if (!delivered)
++        {
++            hr = MF_E_NOTACCEPTING;
++            goto done;
++        }
++    }
++    if (status)
++    {
++        hr = E_FAIL;
++        goto done;
++    }
++
++    if (IsEqualGUID(&filter->sink.pin.mt.majortype, &MEDIATYPE_Video))
++        filter->have_video_input = true;
++
++    hr = transform_drain_output(filter, &delivered);
++
++done:
++    LeaveCriticalSection(&filter->receive_cs);
++    return hr;
++}
++
++static HRESULT transform_sink_begin_flush(struct strmbase_sink *pin)
++{
++    struct transform *filter = impl_from_strmbase_filter(pin->pin.filter);
++    NTSTATUS status = STATUS_SUCCESS;
++
++    EnterCriticalSection(&filter->receive_cs);
++    EnterCriticalSection(&filter->filter.stream_cs);
++    filter->have_next_output_time = false;
++    if (filter->winedmo_transform.handle)
++        status = winedmo_transform_flush(filter->winedmo_transform);
++    LeaveCriticalSection(&filter->filter.stream_cs);
++    LeaveCriticalSection(&filter->receive_cs);
++
++    return status ? E_FAIL : S_OK;
++}
++
++static HRESULT transform_sink_eos(struct strmbase_sink *pin)
++{
++    struct transform *filter = impl_from_strmbase_filter(pin->pin.filter);
++    BOOL delivered;
++    NTSTATUS status = STATUS_SUCCESS;
++    HRESULT hr;
++
++    TRACE("filter %p.\n", filter);
++
++    EnterCriticalSection(&filter->receive_cs);
++    EnterCriticalSection(&filter->filter.stream_cs);
++    if (filter->winedmo_transform.handle)
++        status = winedmo_transform_drain(filter->winedmo_transform);
++    LeaveCriticalSection(&filter->filter.stream_cs);
++
++    if (status)
++        hr = E_FAIL;
++    else
++        hr = transform_drain_output(filter, &delivered);
++    LeaveCriticalSection(&filter->receive_cs);
++
++    if (FAILED(hr))
++        return hr;
++
++    if (filter->source.pin.peer)
++        return IPin_EndOfStream(filter->source.pin.peer);
++
+     return S_OK;
+ }
+ 
+@@ -524,6 +684,8 @@ static const struct strmbase_sink_ops sink_ops =
+     .base.pin_query_accept = transform_sink_query_accept,
+     .base.pin_query_interface = transform_sink_query_interface,
+     .pfnReceive = transform_sink_receive,
++    .sink_eos = transform_sink_eos,
++    .sink_begin_flush = transform_sink_begin_flush,
+ };
+ 
+ static HRESULT transform_source_query_accept(struct strmbase_pin *pin, const AM_MEDIA_TYPE *mt)
+@@ -684,6 +846,9 @@ static HRESULT transform_create(IUnknown *outer, const CLSID *clsid, const struc
+         return E_OUTOFMEMORY;
+ 
+     strmbase_filter_init(&object->filter, outer, clsid, &filter_ops);
++    InitializeCriticalSectionEx(&object->receive_cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
++    object->receive_cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": transform.receive_cs");
++
+     strmbase_sink_init(&object->sink, &object->filter, L"In", &sink_ops, NULL);
+     strmbase_source_init(&object->source, &object->filter, L"Out", &source_ops);
+ 
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+index 86156f5625c..bfcde7e3437 100644
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -326,6 +326,26 @@ static INT64 get_video_frame_duration( const AVFormatContext *ctx, AVStream *avs
+     return av_rescale_q( 1, av_inv_q( frame_rate ), (AVRational){1, 10000000} );
+ }
+ 
++static BOOL context_has_video_missing_frame_rate( const AVFormatContext *ctx )
++{
++    UINT i;
++
++    for (i = 0; i < ctx->nb_streams; i++)
++    {
++        AVStream *stream = ctx->streams[i];
++        AVRational frame_rate;
++
++        if (stream->codecpar->codec_type != AVMEDIA_TYPE_VIDEO)
++            continue;
++
++        frame_rate = get_video_display_frame_rate( ctx, stream );
++        if (frame_rate.num <= 0 || frame_rate.den <= 0)
++            return TRUE;
++    }
++
++    return FALSE;
++}
++
+ static INT64 get_raw_mpegvideo_duration( const AVFormatContext *ctx )
+ {
+     struct stream_context *context = ctx->pb ? ctx->pb->opaque : NULL;
+@@ -451,7 +471,7 @@ static void fixup_asf_vc1_timestamps( const AVFormatContext *ctx, AVStream *avst
+ 
+     sample->duration = duration;
+ 
+-    if (sample->pts != AV_NOPTS_VALUE)
++    if (sample->pts != AV_NOPTS_VALUE && (stream->next_pts == INT64_MIN || sample->pts > stream->last_pts))
+     {
+         if (sample->dts != AV_NOPTS_VALUE && sample->dts > sample->pts)
+             sample->dts = AV_NOPTS_VALUE;
+@@ -728,7 +748,8 @@ NTSTATUS demuxer_create( void *arg )
+     }
+     format = demuxer->ctx->iformat;
+     if ((params->duration = get_context_duration( demuxer->ctx )) == AV_NOPTS_VALUE ||
+-        strstr( format->name, "mp3" ) || strstr( format->name, "mpeg" ))
++        strstr( format->name, "mp3" ) || strstr( format->name, "mpeg" ) ||
++        context_has_video_missing_frame_rate( demuxer->ctx ))
+     {
+         if ((ret = avformat_find_stream_info( demuxer->ctx, NULL )) < 0)
+         {
+@@ -874,6 +895,9 @@ NTSTATUS demuxer_read( void *arg )
+ 
+     TRACE( "demuxer %p, capacity %#x\n", demuxer, capacity );
+ 
++    sample->flags = 0;
++    packet_prefix = 0;
++    packet_skip = 0;
+     if ((status = demuxer_filter_packet( demuxer, &packet ))) return status;
+ 
+     stream = demuxer->ctx->streams[packet->stream_index];
+@@ -919,7 +943,6 @@ NTSTATUS demuxer_read( void *arg )
+     params->stream = packet->stream_index;
+     av_packet_free( &packet );
+     demuxer->last_packet = NULL;
+-
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -949,6 +972,8 @@ done:
+     {
+         av_bsf_flush( demuxer->streams[i].filter );
+         demuxer->streams[i].eos = FALSE;
++        demuxer->streams[i].timestamp_base = 0;
++        demuxer->streams[i].timestamp_base_set = FALSE;
+         demuxer->streams[i].last_pts = INT64_MIN;
+         demuxer->streams[i].next_pts = INT64_MIN;
+         demuxer->streams[i].final_last_pts = INT64_MIN;
+diff --git a/dlls/winedmo/unix_transform.c b/dlls/winedmo/unix_transform.c
+index f7781420877..490a4a78d6d 100644
+--- a/dlls/winedmo/unix_transform.c
++++ b/dlls/winedmo/unix_transform.c
+@@ -112,6 +112,8 @@ struct unix_transform
+     enum AVSampleFormat last_sample_fmt;
+ };
+ 
++static inline BOOL is_wmv_video_codec( enum AVCodecID codec_id );
++
+ /* -------------------------------------------------------------------------
+  * Codec-ID helpers
+  * ------------------------------------------------------------------------- */
+@@ -509,6 +511,11 @@ static INT64 get_video_frame_duration( struct unix_transform *t )
+     return duration;
+ }
+ 
++static inline BOOL is_wmv_video_codec( enum AVCodecID codec_id )
++{
++    return codec_id == AV_CODEC_ID_WMV3 || codec_id == AV_CODEC_ID_VC1;
++}
++
+ static UINT32 mpeg_find_picture_start( const BYTE *data, UINT32 size, UINT32 offset )
+ {
+     UINT32 i;
+@@ -770,6 +777,7 @@ NTSTATUS transform_create( void *arg )
+         free( t );
+         return STATUS_NO_MEMORY;
+     }
++    t->avctx->pkt_timebase = (AVRational){1, 10000000};
+ 
+     /* ---- Populate codec context from input format ---- */
+ 
+@@ -791,8 +799,10 @@ NTSTATUS transform_create( void *arg )
+         const MFVIDEOFORMAT *mfvf = &in_fmt->video;
+         t->avctx->width  = mfvf->videoInfo.dwWidth;
+         t->avctx->height = mfvf->videoInfo.dwHeight;
++        t->avctx->codec_tag = mfvf->guidFormat.Data1;
++        t->avctx->bit_rate = mfvf->compressedInfo.AvgBitrate;
+ #ifdef AV_CODEC_CAP_TRUNCATED
+-        if (codec->capabilities & AV_CODEC_CAP_TRUNCATED)
++        if (!is_wmv_video_codec( codec_id ) && (codec->capabilities & AV_CODEC_CAP_TRUNCATED))
+             t->avctx->flags |= AV_CODEC_FLAG_TRUNCATED;
+ #endif
+         if (mfvf->videoInfo.FramesPerSecond.Numerator && mfvf->videoInfo.FramesPerSecond.Denominator)
+@@ -800,6 +810,12 @@ NTSTATUS transform_create( void *arg )
+             t->avctx->framerate.num = t->input_fps_num;
+             t->avctx->framerate.den = t->input_fps_den;
+         }
++
++        if (is_wmv_video_codec( codec_id ))
++        {
++            t->avctx->thread_count = 1;
++            t->avctx->thread_type = 0;
++        }
+     }
+ 
+     /* ---- Set extradata ---- */
+@@ -822,11 +838,13 @@ NTSTATUS transform_create( void *arg )
+         return STATUS_NOT_SUPPORTED;
+     }
+ 
+-    if (!t->is_audio && (codec_id == AV_CODEC_ID_MPEG1VIDEO || codec_id == AV_CODEC_ID_MPEG2VIDEO))
++    if (!t->is_audio && (codec_id == AV_CODEC_ID_MPEG1VIDEO || codec_id == AV_CODEC_ID_MPEG2VIDEO
++            || is_wmv_video_codec( codec_id )))
+     {
+         t->parser = av_parser_init( codec_id );
+         t->parser_codec_id = codec_id;
+-        t->mpeg_es_assemble = !t->parser;
++        t->mpeg_es_assemble = !t->parser
++                && (codec_id == AV_CODEC_ID_MPEG1VIDEO || codec_id == AV_CODEC_ID_MPEG2VIDEO);
+     }
+ 
+     if (!(t->frame = av_frame_alloc()) || !(t->packet = av_packet_alloc())
+@@ -923,8 +941,14 @@ NTSTATUS transform_push_input( void *arg )
+ 
+     if (!t->is_audio)
+     {
++        bool reset_decoder = false;
++
+         if (params->pts != INT64_MIN && prev_input_pts != INT64_MIN && params->pts < prev_input_pts)
+         {
++            if (t->avctx->codec_id == AV_CODEC_ID_VC1
++                    || (t->avctx->codec_id == AV_CODEC_ID_WMV3
++                    && (params->flags & WINEDMO_SAMPLE_FLAG_SYNC_POINT)))
++                reset_decoder = true;
+             t->video_input_anchor_pts = params->pts;
+             t->video_pts_offset = INT64_MIN;
+             t->last_video_pts = INT64_MIN;
+@@ -933,6 +957,10 @@ NTSTATUS transform_push_input( void *arg )
+         }
+         else if ((params->flags & WINEDMO_SAMPLE_FLAG_DISCONTINUITY) && params->pts != INT64_MIN)
+         {
++            if (t->avctx->codec_id == AV_CODEC_ID_VC1
++                    || (t->avctx->codec_id == AV_CODEC_ID_WMV3
++                    && (params->flags & WINEDMO_SAMPLE_FLAG_SYNC_POINT)))
++                reset_decoder = true;
+             t->video_input_anchor_pts = params->pts;
+             t->video_pts_offset = INT64_MIN;
+             t->last_video_pts = INT64_MIN;
+@@ -943,10 +971,26 @@ NTSTATUS transform_push_input( void *arg )
+         {
+             t->video_input_anchor_pts = params->pts;
+         }
++
++        if (reset_decoder)
++        {
++            TRACE( "resetting %s decoder on segment restart, previous pts %"PRId64", new pts %"PRId64"\n",
++                   avcodec_get_name( t->avctx->codec_id ), prev_input_pts, (INT64)params->pts );
++            avcodec_flush_buffers( t->avctx );
++            if (t->frame) av_frame_unref( t->frame );
++            if (t->parsed_packet) av_packet_unref( t->parsed_packet );
++            t->frame_pending = false;
++            t->draining = false;
++            t->video_buf_filled = 0;
++            t->mpeg_es_size = 0;
++        }
+     }
+ 
+-    t->packet->dts = (params->dts != INT64_MIN) ? params->dts : t->packet->pts;
++    t->packet->dts = (params->dts != INT64_MIN) ? params->dts
++            : is_wmv_video_codec( t->avctx->codec_id ) ? AV_NOPTS_VALUE : t->packet->pts;
+     t->packet->duration = params->duration != INT64_MIN ? params->duration : 0;
++    if (is_wmv_video_codec( t->avctx->codec_id ))
++        t->packet->duration = 0;
+     if (params->flags & WINEDMO_SAMPLE_FLAG_SYNC_POINT)
+         t->packet->flags |= AV_PKT_FLAG_KEY;
+     t->last_input_pts = params->pts; /* track for codecs that don't propagate pts to output frames */
+@@ -1058,12 +1102,20 @@ NTSTATUS transform_push_input( void *arg )
+         return STATUS_SUCCESS;
+     }
+ 
++    if (is_wmv_video_codec( t->avctx->codec_id ))
++        TRACE( "sending %s packet size %d pts %"PRId64" dts %"PRId64" duration %"PRId64" flags %#x\n",
++               avcodec_get_name( t->avctx->codec_id ), t->packet->size,
++               (INT64)t->packet->pts, (INT64)t->packet->dts, (INT64)t->packet->duration, t->packet->flags );
++
+     if ((ret = avcodec_send_packet( t->avctx, t->packet )) < 0)
+     {
+         if (ret == AVERROR(EAGAIN)) return STATUS_DEVICE_BUSY;
+         WARN( "avcodec_send_packet: %d\n", ret );
+         return STATUS_UNSUCCESSFUL;
+     }
++    if (is_wmv_video_codec( t->avctx->codec_id ))
++        TRACE( "sent %s packet size %d pts %"PRId64"\n",
++               avcodec_get_name( t->avctx->codec_id ), t->packet->size, (INT64)t->packet->pts );
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -1155,6 +1207,10 @@ NTSTATUS transform_get_output( void *arg )
+         {
+             av_frame_unref( t->frame );
+             ret = avcodec_receive_frame( t->avctx, t->frame );
++            if (is_wmv_video_codec( t->avctx->codec_id ))
++                TRACE( "receive %s frame ret %d pkt_dts %"PRId64" pts %"PRId64" duration %"PRId64"\n",
++                       avcodec_get_name( t->avctx->codec_id ), ret,
++                       (INT64)t->frame->pkt_dts, (INT64)t->frame->pts, (INT64)t->frame->duration );
+             if (ret == AVERROR(EAGAIN)) { params->size = 0; return STATUS_MORE_PROCESSING_REQUIRED; }
+             if (ret == AVERROR_EOF)     { params->size = 0; return STATUS_END_OF_FILE; }
+             if (ret < 0)
+@@ -1226,11 +1282,12 @@ NTSTATUS transform_get_output( void *arg )
+ 
+         if (video_pts != AV_NOPTS_VALUE)
+         {
+-            if (t->avctx->codec_id == AV_CODEC_ID_VC1 && t->last_video_pts != INT64_MIN
++            if ((t->avctx->codec_id == AV_CODEC_ID_VC1 || t->avctx->codec_id == AV_CODEC_ID_WMV3)
++                    && t->last_video_pts != INT64_MIN
+                     && params->duration > 0 && video_pts <= t->last_video_pts)
+                 video_pts = t->last_video_pts + params->duration;
+             params->pts = video_pts;
+-            if (t->avctx->codec_id == AV_CODEC_ID_VC1)
++            if (t->avctx->codec_id == AV_CODEC_ID_VC1 || t->avctx->codec_id == AV_CODEC_ID_WMV3)
+             {
+                 t->last_video_pts = video_pts;
+                 t->last_video_duration = params->duration;
+diff --git a/dlls/winedmo/unixlib.h b/dlls/winedmo/unixlib.h
+index 31b4cf2d8fe..b2b6a30fbb1 100644
+--- a/dlls/winedmo/unixlib.h
++++ b/dlls/winedmo/unixlib.h
+@@ -70,6 +70,7 @@ enum sample_flag
+ {
+     SAMPLE_FLAG_SYNC_POINT = 1,
+     SAMPLE_FLAG_INCOMPLETE = 2,
++    SAMPLE_FLAG_DISCONTINUITY = 4,
+ };
+ 
+ struct sample
+diff --git a/dlls/winedmo/winedmo_quartz_parser.c b/dlls/winedmo/winedmo_quartz_parser.c
+index 28056419e62..15c34ffe286 100644
+--- a/dlls/winedmo/winedmo_quartz_parser.c
++++ b/dlls/winedmo/winedmo_quartz_parser.c
+@@ -139,6 +139,7 @@ struct dmo_packet
+     struct list entry;
+     BYTE *data;
+     DWORD size;
++    unsigned int generation;
+     bool has_pts, has_duration, sync_point;
+     REFERENCE_TIME pts, duration;
+ };
+@@ -216,6 +217,7 @@ struct dmo_parser
+ 
+     /* Set TRUE to make the read callback return 0 bytes (interrupts demuxer). */
+     BOOL read_flushing;
++    unsigned int read_flush_generation;
+ 
+     CRITICAL_SECTION streaming_cs;
+     CONDITION_VARIABLE flushing_cv;
+@@ -514,6 +516,8 @@ static HRESULT WINAPI dmo_seeking_SetPositions(IMediaSeeking *iface,
+ {
+     struct dmo_parser_source *pin = dmo_impl_from_IMediaSeeking(iface);
+     struct dmo_parser *filter = dmo_impl_from_strmbase_filter(pin->pin.pin.filter);
++    DWORD current_positioning = current_flags & AM_SEEKING_PositioningBitsMask;
++    bool current_unchanged;
+     unsigned int i;
+ 
+     TRACE("pin %p, current %s, current_flags %#lx, stop %s, stop_flags %#lx.\n",
+@@ -526,10 +530,18 @@ static HRESULT WINAPI dmo_seeking_SetPositions(IMediaSeeking *iface,
+         return S_OK;
+     }
+ 
++    current_unchanged = !current || current_positioning == AM_SEEKING_NoPositioning
++            || (current_positioning == AM_SEEKING_AbsolutePositioning && *current == pin->seek.llCurrent)
++            || (current_positioning == AM_SEEKING_RelativePositioning && !*current)
++            || (current_positioning == AM_SEEKING_IncrementalPositioning && !*current);
++    if (current_unchanged)
++        return SourceSeekingImpl_SetPositions(iface, current, current_flags, stop, stop_flags);
++
+     /* Tell the read callback to return 0 bytes so the demux thread unblocks. */
+     EnterCriticalSection(&filter->streaming_cs);
+     filter->flushing = true;
+     filter->read_flushing = TRUE;
++    ++filter->read_flush_generation;
+     LeaveCriticalSection(&filter->streaming_cs);
+     WakeAllConditionVariable(&filter->flushing_cv);
+ 
+@@ -540,9 +552,6 @@ static HRESULT WINAPI dmo_seeking_SetPositions(IMediaSeeking *iface,
+         WakeConditionVariable(&filter->sources[i]->queue_space_cv);
+     }
+ 
+-    if (!(current_flags & AM_SEEKING_NoFlush))
+-        dmo_parser_begin_downstream_flush(filter);
+-
+     /* Acquire per-pin flushing_cs to ensure no Receive is in progress. */
+     for (i = 0; i < filter->source_count; ++i)
+     {
+@@ -550,12 +559,17 @@ static HRESULT WINAPI dmo_seeking_SetPositions(IMediaSeeking *iface,
+             EnterCriticalSection(&filter->sources[i]->flushing_cs);
+     }
+ 
++    if (!(current_flags & AM_SEEKING_NoFlush))
++        dmo_parser_begin_downstream_flush(filter);
++
+     SourceSeekingImpl_SetPositions(iface, current, current_flags, stop, stop_flags);
+ 
+     /* Perform the actual seek. */
+     {
+         LONGLONG seek_time = filter->sources[0]->seek.llCurrent;
+-        NTSTATUS status = winedmo_demuxer_seek(filter->winedmo_demuxer, seek_time);
++        NTSTATUS status;
++        WARN("DirectShow parser SetPositions seek to %s.\n", debugstr_time(seek_time));
++        status = winedmo_demuxer_seek(filter->winedmo_demuxer, seek_time);
+         if (status)
+             WARN("winedmo_demuxer_seek failed, status %#lx.\n", status);
+     }
+@@ -572,9 +586,6 @@ static HRESULT WINAPI dmo_seeking_SetPositions(IMediaSeeking *iface,
+         LeaveCriticalSection(&src->queue_cs);
+     }
+ 
+-    if (!(current_flags & AM_SEEKING_NoFlush))
+-        dmo_parser_end_downstream_flush(filter);
+-
+     /* Release per-pin locks in reverse order. */
+     for (i = filter->source_count; i-- > 0;)
+     {
+@@ -587,6 +598,9 @@ static HRESULT WINAPI dmo_seeking_SetPositions(IMediaSeeking *iface,
+         }
+     }
+ 
++    if (!(current_flags & AM_SEEKING_NoFlush))
++        dmo_parser_end_downstream_flush(filter);
++
+     EnterCriticalSection(&filter->streaming_cs);
+     filter->flushing = false;
+     filter->read_flushing = FALSE;
+@@ -949,6 +963,7 @@ static DWORD CALLBACK dmo_demux_thread(void *arg)
+         struct dmo_packet *pkt;
+         BYTE *pkt_data;
+         DWORD data_len;
++        unsigned int flush_generation;
+ 
+         /* Check flushing / stop. */
+         EnterCriticalSection(&filter->streaming_cs);
+@@ -959,6 +974,7 @@ static DWORD CALLBACK dmo_demux_thread(void *arg)
+             LeaveCriticalSection(&filter->streaming_cs);
+             break;
+         }
++        flush_generation = filter->read_flush_generation;
+         LeaveCriticalSection(&filter->streaming_cs);
+ 
+         dmo_parser_wait_for_queue_space(filter);
+@@ -984,6 +1000,15 @@ static DWORD CALLBACK dmo_demux_thread(void *arg)
+ 
+         status = winedmo_demuxer_read(filter->winedmo_demuxer, &stream_idx, &output, &needed_size);
+ 
++        EnterCriticalSection(&filter->streaming_cs);
++        if (!filter->streaming || filter->flushing || flush_generation != filter->read_flush_generation)
++        {
++            LeaveCriticalSection(&filter->streaming_cs);
++            IMediaBuffer_Release(&sbuf->IMediaBuffer_iface);
++            continue;
++        }
++        LeaveCriticalSection(&filter->streaming_cs);
++
+         if (status == STATUS_BUFFER_TOO_SMALL)
+         {
+             IMediaBuffer_Release(&sbuf->IMediaBuffer_iface);
+@@ -1006,17 +1031,21 @@ static DWORD CALLBACK dmo_demux_thread(void *arg)
+                 }
+                 LeaveCriticalSection(&filter->streaming_cs);
+ 
+-                /* Real EOF: signal all connected pins. */
+-                TRACE("Demuxer reached end of file.\n");
++                /* Real EOF: signal all connected pins once their queued data drains. */
++                WARN("Demuxer reached end of file for filter %p.\n", filter);
+                 for (UINT i = 0; i < filter->source_count; ++i)
+                 {
+                     bool send_eos;
++                    unsigned int queued_packets;
+ 
+                     pin = filter->sources[i];
+                     EnterCriticalSection(&pin->queue_cs);
+                     pin->eos = true;
++                    queued_packets = pin->queued_packets;
+                     send_eos = list_empty(&pin->packet_queue);
+                     LeaveCriticalSection(&pin->queue_cs);
++                    WARN("Stream %u EOF, queued packets %u, send_eos %u, peer %p.\n",
++                            i, queued_packets, send_eos, pin->pin.pin.peer);
+                     WakeConditionVariable(&pin->queue_cv);
+ 
+                     if (send_eos)
+@@ -1086,6 +1115,7 @@ static DWORD CALLBACK dmo_demux_thread(void *arg)
+ 
+         pkt->data = pkt_data;
+         pkt->size = data_len;
++        pkt->generation = flush_generation;
+         pkt->has_pts = !!(output.dwStatus & DMO_OUTPUT_DATA_BUFFERF_TIME);
+         pkt->has_duration = !!(output.dwStatus & DMO_OUTPUT_DATA_BUFFERF_TIMELENGTH);
+         pkt->sync_point = !!(output.dwStatus & DMO_OUTPUT_DATA_BUFFERF_SYNCPOINT);
+@@ -1108,10 +1138,13 @@ static void dmo_parser_source_send_eos(struct dmo_parser_source *pin)
+     EnterCriticalSection(&pin->flushing_cs);
+     if (!pin->eos_sent && pin->pin.pin.peer)
+     {
+-        TRACE("Pin %p sending EndOfStream.\n", pin);
++        WARN("Pin %p sending EndOfStream to peer %p.\n", pin, pin->pin.pin.peer);
+         IPin_EndOfStream(pin->pin.pin.peer);
+         pin->eos_sent = true;
+     }
++    else
++        WARN("Pin %p not sending EndOfStream, eos_sent %u, peer %p.\n",
++                pin, pin->eos_sent, pin->pin.pin.peer);
+     LeaveCriticalSection(&pin->flushing_cs);
+ }
+ 
+@@ -1205,6 +1238,7 @@ static DWORD CALLBACK dmo_stream_thread(void *arg)
+         {
+             LeaveCriticalSection(&pin->queue_cs);
+ 
++            WARN("Stream thread for pin %p reached drained EOS.\n", pin);
+             dmo_parser_source_send_eos(pin);
+ 
+             /* Sleep until a seek resets things. */
+@@ -1222,6 +1256,16 @@ static DWORD CALLBACK dmo_stream_thread(void *arg)
+ 
+         /* Send the packet under flushing_cs (seeking blocks here). */
+         EnterCriticalSection(&pin->flushing_cs);
++        EnterCriticalSection(&filter->streaming_cs);
++        if (!filter->streaming || filter->flushing || pkt->generation != filter->read_flush_generation)
++        {
++            LeaveCriticalSection(&filter->streaming_cs);
++            LeaveCriticalSection(&pin->flushing_cs);
++            dmo_packet_free(pkt);
++            continue;
++        }
++        LeaveCriticalSection(&filter->streaming_cs);
++
+         if (pin->pin.pin.peer)
+         {
+             IMediaSample *sample;
+@@ -1384,7 +1428,9 @@ static HRESULT dmo_parser_init_stream(struct strmbase_filter *iface)
+         LONGLONG seek_time = filter->source_count ? filter->sources[0]->seek.llCurrent : 0;
+         if (seek_time)
+         {
+-            NTSTATUS status = winedmo_demuxer_seek(filter->winedmo_demuxer, seek_time);
++            NTSTATUS status;
++            WARN("DirectShow parser init seek to %s.\n", debugstr_time(seek_time));
++            status = winedmo_demuxer_seek(filter->winedmo_demuxer, seek_time);
+             if (status)
+                 WARN("Initial seek failed, status %#lx.\n", status);
+         }
+@@ -1454,6 +1500,7 @@ static HRESULT dmo_parser_stop_stream(struct strmbase_filter *iface)
+     EnterCriticalSection(&filter->streaming_cs);
+     filter->flushing = true;
+     filter->read_flushing = TRUE;
++    ++filter->read_flush_generation;
+     LeaveCriticalSection(&filter->streaming_cs);
+ 
+     dmo_parser_begin_downstream_flush(filter);
+@@ -1494,6 +1541,7 @@ static HRESULT dmo_parser_cleanup_stream(struct strmbase_filter *iface)
+     filter->streaming = false;
+     filter->flushing = false;
+     filter->read_flushing = TRUE;
++    ++filter->read_flush_generation;
+     LeaveCriticalSection(&filter->streaming_cs);
+     WakeAllConditionVariable(&filter->flushing_cv);
+ 
+diff --git a/dlls/winedmo/wm_reader.c b/dlls/winedmo/wm_reader.c
+index af4bac37d1b..86f40acef63 100644
+--- a/dlls/winedmo/wm_reader.c
++++ b/dlls/winedmo/wm_reader.c
+@@ -68,6 +68,7 @@ struct wm_stream
+     INT64 last_decoded_pts;
+     INT64 observed_decoded_duration;
+     INT64 nominal_decoded_duration;
++    bool next_decoded_cleanpoint;
+ 
+     IWMReaderAllocatorEx *output_allocator;
+     IWMReaderAllocatorEx *stream_allocator;
+@@ -218,6 +219,11 @@ static void winedmo_decoded_format_from_winedmo(const GUID *major, const union w
+         wg->u.video.format = WINEDMO_VIDEO_FORMAT_BGR;
+         wg->u.video.width = fmt->video.videoInfo.dwWidth;
+         wg->u.video.height = (int32_t)fmt->video.videoInfo.dwHeight;
++        /* Match the old WM reader: RGB output exposed to WMSDK callers is
++         * bottom-up, and the decoder output must be configured the same way
++         * as the media type returned by GetOutputProps(). */
++        if (wg->u.video.height > 0)
++            wg->u.video.height = -wg->u.video.height;
+         wg->u.video.fps_n = fmt->video.videoInfo.FramesPerSecond.Numerator;
+         wg->u.video.fps_d = fmt->video.videoInfo.FramesPerSecond.Denominator
+                 ? fmt->video.videoInfo.FramesPerSecond.Denominator : 1;
+@@ -269,6 +275,8 @@ static void wm_stream_create_decoder(struct wm_stream *stream)
+         out_fmt.video.videoInfo = stream->compressed_fmt->video.videoInfo;
+         out_fmt.video.videoInfo.dwWidth = stream->decoded_winedmo_format.u.video.width;
+         out_fmt.video.videoInfo.dwHeight = abs(stream->decoded_winedmo_format.u.video.height);
++        out_fmt.video.videoInfo.FramesPerSecond.Numerator = stream->decoded_winedmo_format.u.video.fps_n;
++        out_fmt.video.videoInfo.FramesPerSecond.Denominator = stream->decoded_winedmo_format.u.video.fps_d;
+         if (stream->decoded_winedmo_format.u.video.height < 0
+                 && winedmo_video_format_is_rgb(stream->decoded_winedmo_format.u.video.format))
+             out_fmt.video.videoInfo.VideoFlags |= MFVideoFlag_BottomUpLinearRep;
+@@ -304,6 +312,23 @@ static void wm_stream_reset_decoded_timing(struct wm_stream *stream)
+ {
+     stream->last_decoded_pts = INT64_MIN;
+     stream->observed_decoded_duration = 0;
++    stream->next_decoded_cleanpoint = false;
++}
++
++static void wm_stream_set_nominal_video_duration(struct wm_stream *stream, INT64 duration)
++{
++    if (duration <= 0 || !IsEqualGUID(&stream->major_type, &MFMediaType_Video))
++        return;
++
++    stream->nominal_decoded_duration = duration;
++    stream->decoded_winedmo_format.u.video.fps_n = 10000000;
++    stream->decoded_winedmo_format.u.video.fps_d = duration;
++
++    if (stream->compressed_fmt)
++    {
++        stream->compressed_fmt->video.videoInfo.FramesPerSecond.Numerator = 10000000;
++        stream->compressed_fmt->video.videoInfo.FramesPerSecond.Denominator = duration;
++    }
+ }
+ 
+ static INT64 wm_stream_get_video_duration(const struct wm_stream *stream)
+@@ -331,7 +356,11 @@ static BOOL wm_stream_update_decoded_video_timing(struct wm_stream *stream, INT6
+     {
+         delta = *pts - stream->last_decoded_pts;
+         if (delta > 100000 && delta < 1000000 && delta > stream->observed_decoded_duration)
++        {
+             stream->observed_decoded_duration = delta;
++            if (!stream->nominal_decoded_duration)
++                wm_stream_set_nominal_video_duration(stream, delta);
++        }
+         else if (delta <= 0)
+             return FALSE;
+     }
+@@ -549,7 +578,6 @@ static ULONG WINAPI buffer_Release(INSSBuffer *iface)
+     ULONG refcount = InterlockedDecrement(&buffer->refcount);
+ 
+     TRACE("%p decreasing refcount to %lu.\n", buffer, refcount);
+-
+     if (!refcount)
+         free(buffer);
+ 
+@@ -558,8 +586,14 @@ static ULONG WINAPI buffer_Release(INSSBuffer *iface)
+ 
+ static HRESULT WINAPI buffer_GetLength(INSSBuffer *iface, DWORD *size)
+ {
+-    FIXME("iface %p, size %p, stub!\n", iface, size);
+-    return E_NOTIMPL;
++    struct buffer *buffer = impl_from_INSSBuffer(iface);
++
++    TRACE("buffer %p, size %p.\n", buffer, size);
++    if (!size)
++        return E_INVALIDARG;
++
++    *size = buffer->size;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI buffer_SetLength(INSSBuffer *iface, DWORD size)
+@@ -580,6 +614,8 @@ static HRESULT WINAPI buffer_GetMaxLength(INSSBuffer *iface, DWORD *size)
+     struct buffer *buffer = impl_from_INSSBuffer(iface);
+ 
+     TRACE("buffer %p, size %p.\n", buffer, size);
++    if (!size)
++        return E_INVALIDARG;
+ 
+     *size = buffer->capacity;
+     return S_OK;
+@@ -590,6 +626,8 @@ static HRESULT WINAPI buffer_GetBuffer(INSSBuffer *iface, BYTE **data)
+     struct buffer *buffer = impl_from_INSSBuffer(iface);
+ 
+     TRACE("buffer %p, data %p.\n", buffer, data);
++    if (!data)
++        return E_INVALIDARG;
+ 
+     *data = buffer->data;
+     return S_OK;
+@@ -600,9 +638,11 @@ static HRESULT WINAPI buffer_GetBufferAndLength(INSSBuffer *iface, BYTE **data,
+     struct buffer *buffer = impl_from_INSSBuffer(iface);
+ 
+     TRACE("buffer %p, data %p, size %p.\n", buffer, data, size);
++    if (!data || !size)
++        return E_INVALIDARG;
+ 
+-    *size = buffer->size;
+     *data = buffer->data;
++    *size = buffer->size;
+     return S_OK;
+ }
+ 
+@@ -1012,6 +1052,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+         DWORD data_len;
+         struct wm_stream *s;
+         struct wm_packet *pkt;
++        unsigned int read_generation;
+ 
+         /* Don't call the demuxer while reinit_stream is seeking it. */
+         if (reader->read_flushing)
+@@ -1026,6 +1067,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+             continue;
+         }
+ 
++        read_generation = reader->read_flush_generation;
+         memset(&output, 0, sizeof(output));
+         output.pBuffer = &sbuf->IMediaBuffer_iface;
+         stream_idx = 0;
+@@ -1069,16 +1111,21 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+                     for (;;)
+                     {
+                         INT64 dec_pts, dec_dur;
++                        UINT32 out_size = dec_size;
+                         DWORD dec_flags;
+                         BYTE *dec_buf;
+ 
+-                        if (!(dec_buf = malloc(dec_size)))
++                        if (!out_size) out_size = winedmo_format_get_max_size(&s->decoded_winedmo_format);
++                        if (!out_size) out_size = 0x40000;
++
++                        if (!(dec_buf = malloc(out_size)))
+                             break;
+ 
+-                        dec_status = winedmo_transform_get_output(s->decoder, dec_buf, &dec_size,
++                        dec_status = winedmo_transform_get_output(s->decoder, dec_buf, &out_size,
+                                                                   &dec_pts, &dec_dur, &dec_flags);
+                         if (dec_status == STATUS_BUFFER_TOO_SMALL)
+                         {
++                            dec_size = out_size;
+                             free(dec_buf);
+                             continue;
+                         }
+@@ -1088,7 +1135,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+                             break;
+                         }
+ 
+-                        if (dec_flags & WINEDMO_SAMPLE_FLAG_FORMAT_CHANGED || !dec_size)
++                        if (dec_flags & WINEDMO_SAMPLE_FLAG_FORMAT_CHANGED || !out_size)
+                         {
+                             free(dec_buf);
+                             continue;
+@@ -1102,7 +1149,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+                         if ((pkt = malloc(sizeof(*pkt))))
+                         {
+                             pkt->data = dec_buf;
+-                            pkt->size = dec_size;
++                            pkt->size = out_size;
+                             pkt->pts = dec_pts;
+                             pkt->duration = dec_dur;
+                             pkt->flags = 0;
+@@ -1158,6 +1205,12 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+             continue;
+         }
+ 
++        if (read_generation != reader->read_flush_generation || reader->read_flushing)
++        {
++            IMediaBuffer_Release(&sbuf->IMediaBuffer_iface);
++            continue;
++        }
++
+         IMediaBuffer_SetLength(&sbuf->IMediaBuffer_iface, needed_size);
+         data_len = needed_size;
+         IMediaBuffer_GetBufferAndLength(&sbuf->IMediaBuffer_iface, &src, NULL);
+@@ -1177,6 +1230,13 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+         }
+ 
+         EnterCriticalSection(&s->decoder_cs);
++        if (read_generation != reader->read_flush_generation || reader->read_flushing)
++        {
++            LeaveCriticalSection(&s->decoder_cs);
++            IMediaBuffer_Release(&sbuf->IMediaBuffer_iface);
++            continue;
++        }
++
+         if (s->decode_stream && s->decoder.handle)
+         {
+             INT64 in_pts = (output.dwStatus & DMO_OUTPUT_DATA_BUFFERF_TIME) ? output.rtTimestamp : INT64_MIN;
+@@ -1187,6 +1247,8 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+             NTSTATUS dec_status;
+ 
+             if (!dec_size) dec_size = 0x40000;
++            if ((in_flags & WINEDMO_SAMPLE_FLAG_SYNC_POINT) && IsEqualGUID(&s->major_type, &MFMediaType_Video))
++                s->next_decoded_cleanpoint = true;
+ 
+             if ((dec_status = winedmo_transform_push_input(s->decoder, src, data_len,
+                     in_pts, INT64_MIN, in_dur, in_flags))
+@@ -1203,17 +1265,22 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+             for (;;)
+             {
+                 INT64 dec_pts, dec_dur;
++                UINT32 out_size = dec_size;
+                 DWORD dec_flags;
+                 BYTE *dec_buf;
+ 
+-                if (!(dec_buf = malloc(dec_size)))
++                if (!out_size) out_size = winedmo_format_get_max_size(&s->decoded_winedmo_format);
++                if (!out_size) out_size = 0x40000;
++
++                if (!(dec_buf = malloc(out_size)))
+                     break;
+ 
+-                dec_status = winedmo_transform_get_output(s->decoder, dec_buf, &dec_size,
++                dec_status = winedmo_transform_get_output(s->decoder, dec_buf, &out_size,
+                                                           &dec_pts, &dec_dur, &dec_flags);
+                 if (dec_status == STATUS_BUFFER_TOO_SMALL)
+                 {
+                     /* dec_size updated by transform; retry with that allocation */
++                    dec_size = out_size;
+                     free(dec_buf);
+                     continue;
+                 }
+@@ -1223,7 +1290,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+                     break;
+                 }
+ 
+-                if (dec_flags & WINEDMO_SAMPLE_FLAG_FORMAT_CHANGED || !dec_size)
++                if (dec_flags & WINEDMO_SAMPLE_FLAG_FORMAT_CHANGED || !out_size)
+                 {
+                     /* format change: frame_pending stays true, re-read on next iteration */
+                     free(dec_buf);
+@@ -1238,13 +1305,18 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+                 if ((pkt = malloc(sizeof(*pkt))))
+                 {
+                     pkt->data = dec_buf;
+-                    pkt->size = dec_size;
++                    pkt->size = out_size;
+                     pkt->pts = dec_pts;
+                     pkt->duration = dec_dur;
+                     pkt->flags = 0;
+                     if (IsEqualGUID(&s->major_type, &MFMediaType_Video))
+                         pkt->flags |= WM_SF_CLEANPOINT;
+                     if (dec_flags & WINEDMO_SAMPLE_FLAG_SYNC_POINT) pkt->flags |= WM_SF_CLEANPOINT;
++                    if (s->next_decoded_cleanpoint)
++                    {
++                        pkt->flags |= WM_SF_CLEANPOINT;
++                        s->next_decoded_cleanpoint = false;
++                    }
+                     if (dec_flags & WINEDMO_SAMPLE_FLAG_DISCONTINUITY) pkt->flags |= WM_SF_DISCONTINUITY;
+                     EnterCriticalSection(&s->queue_cs);
+                     if (!s->queue_flushing)
+@@ -1285,8 +1357,6 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+             pkt->pts = (output.dwStatus & DMO_OUTPUT_DATA_BUFFERF_TIME) ? output.rtTimestamp : -1;
+             pkt->duration = (output.dwStatus & DMO_OUTPUT_DATA_BUFFERF_TIMELENGTH) ? output.rtTimelength : -1;
+             pkt->flags = 0;
+-            if (IsEqualGUID(&s->major_type, &MFMediaType_Video))
+-                pkt->flags |= WM_SF_CLEANPOINT;
+             if (output.dwStatus & DMO_OUTPUT_DATA_BUFFERF_SYNCPOINT) pkt->flags |= WM_SF_CLEANPOINT;
+             if (output.dwStatus & DMO_OUTPUT_DATA_BUFFERF_DISCONTINUITY) pkt->flags |= WM_SF_DISCONTINUITY;
+             EnterCriticalSection(&s->queue_cs);
+@@ -2181,10 +2251,12 @@ static HRESULT init_stream(struct wm_reader *reader)
+     return S_OK;
+ }
+ 
+-static HRESULT reinit_stream(struct wm_reader *reader)
++static HRESULT reinit_stream(struct wm_reader *reader, const char *reason)
+ {
+     WORD i;
+ 
++    WARN("Reinitializing WM reader stream for %s, start_time %s.\n", reason, debugstr_time(reader->start_time));
++
+     /* Signal flushing so the demux thread's read callback returns empty */
+     reader->read_flushing = true;
+     reader->read_flush_generation++;
+@@ -2212,10 +2284,12 @@ static HRESULT reinit_stream(struct wm_reader *reader)
+     {
+         struct wm_stream *stream = &reader->streams[i];
+ 
++        EnterCriticalSection(&stream->decoder_cs);
+         wm_stream_destroy_decoder(stream);
+         wm_stream_reset_decoded_timing(stream);
+         if (stream->decode_stream)
+             wm_stream_create_decoder(stream);
++        LeaveCriticalSection(&stream->decoder_cs);
+ 
+         stream->eos = false;
+         EnterCriticalSection(&stream->queue_cs);
+@@ -2283,6 +2357,7 @@ static HRESULT wm_reader_read_stream_sample(struct wm_reader *reader, struct wm_
+     BYTE *raw_data = NULL;
+     UINT32 raw_size = 0;
+     INT64 raw_pts, raw_dur;
++    QWORD sample_pts, sample_duration;
+     DWORD raw_flags;
+     HRESULT hr;
+     BYTE *buf_data;
+@@ -2322,15 +2397,20 @@ static HRESULT wm_reader_read_stream_sample(struct wm_reader *reader, struct wm_
+     INSSBuffer_SetLength(*sample, capacity);
+ 
+     if (stream->current_pts >= 0)
+-        *pts = (QWORD)(stream->current_pts + (INT64)stream->current_duration * stream->current_offset / stream->current_size);
++        sample_pts = (QWORD)(stream->current_pts + (INT64)stream->current_duration * stream->current_offset / stream->current_size);
+     else
+-        *pts = 0;
++        sample_pts = 0;
+     if (stream->current_duration >= 0)
+-        *duration = (QWORD)((INT64)stream->current_duration * capacity / stream->current_size);
++        sample_duration = (QWORD)((INT64)stream->current_duration * capacity / stream->current_size);
+     else
+-        *duration = 0;
+-
+-    *flags = stream->current_flags;
++        sample_duration = 0;
++
++    if (pts)
++        *pts = sample_pts;
++    if (duration)
++        *duration = sample_duration;
++    if (flags)
++        *flags = stream->current_flags;
+     /* Only first chunk gets discontinuity/cleanpoint */
+     stream->current_flags &= ~(WM_SF_DISCONTINUITY | WM_SF_CLEANPOINT);
+ 
+@@ -2375,6 +2455,16 @@ static BOOL wm_stream_peek_pending_sample(struct wm_stream *stream, INT64 *pts)
+     return has_sample;
+ }
+ 
++static BOOL wm_stream_queue_is_eos(struct wm_stream *stream)
++{
++    BOOL eos;
++
++    EnterCriticalSection(&stream->queue_cs);
++    eos = stream->queue_eos && list_empty(&stream->packet_queue) && !stream->current_data;
++    LeaveCriticalSection(&stream->queue_cs);
++    return eos;
++}
++
+ static const enum winedmo_video_format video_formats[] =
+ {
+     /* Try to prefer YUV formats over RGB ones. Most decoders output in the
+@@ -2398,12 +2488,16 @@ static HRESULT wm_stream_allocate_sample(struct wm_stream *stream, DWORD size, I
+     struct buffer *buffer;
+ 
+     if (!stream->read_compressed && stream->output_allocator)
++    {
+         return IWMReaderAllocatorEx_AllocateForOutputEx(stream->output_allocator, stream->index,
+                 size, sample, 0, 0, 0, NULL);
++    }
+ 
+     if (stream->read_compressed && stream->stream_allocator)
++    {
+         return IWMReaderAllocatorEx_AllocateForStreamEx(stream->stream_allocator, stream->index + 1,
+                 size, sample, 0, 0, 0, NULL);
++    }
+ 
+     /* FIXME: Should these be pooled? */
+     if (!(buffer = calloc(1, offsetof(struct buffer, data[size]))))
+@@ -2590,9 +2684,25 @@ static HRESULT WINAPI reader_Close(IWMSyncReader2 *iface)
+ 
+ static HRESULT WINAPI reader_GetMaxOutputSampleSize(IWMSyncReader2 *iface, DWORD output, DWORD *max)
+ {
+-    struct wm_reader *This = impl_from_IWMSyncReader2(iface);
+-    FIXME("(%p)->(%lu %p): stub!\n", This, output, max);
+-    return E_NOTIMPL;
++    struct wm_reader *reader = impl_from_IWMSyncReader2(iface);
++    struct wm_stream *stream;
++
++    TRACE("reader %p, output %lu, max %p.\n", reader, output, max);
++
++    if (!max)
++        return E_INVALIDARG;
++
++    EnterCriticalSection(&reader->cs);
++
++    if (!(stream = get_stream_by_output_number(reader, output)))
++    {
++        LeaveCriticalSection(&reader->cs);
++        return E_INVALIDARG;
++    }
++
++    *max = winedmo_format_get_max_size(&stream->decoded_winedmo_format);
++    LeaveCriticalSection(&reader->cs);
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI reader_GetMaxStreamSampleSize(IWMSyncReader2 *iface, WORD stream_number, DWORD *size)
+@@ -2622,87 +2732,70 @@ static HRESULT WINAPI reader_GetNextSample(IWMSyncReader2 *iface,
+ {
+     struct wm_reader *reader = impl_from_IWMSyncReader2(iface);
+     struct wm_stream *stream;
++    BOOL reader_locked = FALSE;
+     HRESULT hr;
+ 
+     TRACE("reader %p, stream_number %u, sample %p, pts %p, duration %p,"
+             " flags %p, output_number %p, ret_stream_number %p.\n",
+             reader, stream_number, sample, pts, duration, flags, output_number, ret_stream_number);
+-
++    if (!sample)
++        return E_INVALIDARG;
+     if (!stream_number && !output_number && !ret_stream_number)
+         return E_INVALIDARG;
+ 
+     if (reader->outer == &reader->IUnknown_inner)
++    {
+         EnterCriticalSection(&reader->cs);
++        reader_locked = TRUE;
++    }
+ 
+     if (!stream_number)
+     {
+-        /* Any-stream read: pick the pending sample with the earliest timestamp
+-         * across all selected streams instead of starving later streams by
+-         * always returning the first stream in index order. */
+-        struct wm_stream *best_stream = NULL;
+-        WORD i, first_active = reader->stream_count;
+-        INT64 best_pts = INT64_MAX;
+-        BOOL best_has_pts = FALSE;
+-
+-        for (i = 0; i < reader->stream_count; ++i)
++        for (;;)
+         {
+-            INT64 candidate_pts = INT64_MIN;
+-            BOOL has_sample;
++            struct wm_stream *first_active = NULL;
++            WORD i;
+ 
+-            stream = &reader->streams[i];
+-            if (stream->selection == WMT_OFF || stream->eos) continue;
+-
+-            if (first_active == reader->stream_count)
+-                first_active = i;
++            for (i = 0; i < reader->stream_count; ++i)
++            {
++                stream = &reader->streams[i];
++                if (stream->selection == WMT_OFF || stream->eos) continue;
+ 
+-            has_sample = wm_stream_peek_pending_sample(stream, &candidate_pts);
+-            if (!has_sample)
+-                continue;
++                if (!first_active)
++                    first_active = stream;
+ 
+-            if (!best_stream)
+-            {
+-                best_stream = stream;
+-                best_pts = candidate_pts;
+-                best_has_pts = (candidate_pts >= 0);
+-                continue;
+-            }
++                if (wm_stream_peek_pending_sample(stream, NULL))
++                {
++                    hr = wm_reader_read_stream_sample(reader, stream, sample, pts, duration, flags);
++                    if (hr == S_OK)
++                        stream_number = stream->index + 1;
++                    else if (hr == NS_E_NO_MORE_SAMPLES)
++                        stream->eos = true;
++                    goto done;
++                }
+ 
+-            if (candidate_pts >= 0)
+-            {
+-                if (!best_has_pts || candidate_pts < best_pts)
++                if (wm_stream_queue_is_eos(stream))
+                 {
+-                    best_stream = stream;
+-                    best_pts = candidate_pts;
+-                    best_has_pts = TRUE;
++                    stream->eos = true;
++                    if (first_active == stream)
++                        first_active = NULL;
+                 }
+             }
+-        }
+ 
+-        if (best_stream)
+-        {
+-            hr = wm_reader_read_stream_sample(reader, best_stream, sample, pts, duration, flags);
+-            if (hr == S_OK)
++            if (!first_active)
+             {
+-                stream_number = best_stream->index + 1;
++                hr = NS_E_NO_MORE_SAMPLES;
+                 goto done;
+             }
+-            if (hr == NS_E_NO_MORE_SAMPLES)
+-                best_stream->eos = true;
+-        }
+-        else if (first_active < reader->stream_count)
+-        {
+-            stream = &reader->streams[first_active];
+-            hr = wm_reader_read_stream_sample(reader, stream, sample, pts, duration, flags);
+-            if (hr == S_OK)
++
++            if (reader->demux_shutdown)
+             {
+-                stream_number = stream->index + 1;
++                hr = NS_E_NO_MORE_SAMPLES;
+                 goto done;
+             }
+-            if (hr == NS_E_NO_MORE_SAMPLES)
+-                stream->eos = true;
++
++            Sleep(1);
+         }
+-        else
+-            hr = NS_E_NO_MORE_SAMPLES;
+ 
+         goto done;
+     }
+@@ -2723,9 +2816,17 @@ static HRESULT WINAPI reader_GetNextSample(IWMSyncReader2 *iface,
+         goto done;
+     }
+ 
++    if (reader_locked)
++    {
++        LeaveCriticalSection(&reader->cs);
++        reader_locked = FALSE;
++    }
++
+     hr = wm_reader_read_stream_sample(reader, stream, sample, pts, duration, flags);
+     if (hr == NS_E_NO_MORE_SAMPLES)
++    {
+         stream->eos = true;
++    }
+ 
+ done:
+     if (output_number && hr == S_OK)
+@@ -2733,7 +2834,7 @@ done:
+     if (ret_stream_number && (hr == S_OK || stream_number))
+         *ret_stream_number = stream_number;
+ 
+-    if (reader->outer == &reader->IUnknown_inner)
++    if (reader_locked)
+         LeaveCriticalSection(&reader->cs);
+     return hr;
+ }
+@@ -3089,9 +3190,16 @@ static HRESULT WINAPI reader_SetOutputProps(IWMSyncReader2 *iface, DWORD output,
+         return hr;
+     }
+ 
++    if (!memcmp(&stream->decoded_winedmo_format, &format, sizeof(format)))
++    {
++        TRACE("Output format unchanged, keeping current stream state.\n");
++        LeaveCriticalSection(&reader->cs);
++        return S_OK;
++    }
++
+     stream->decoded_winedmo_format = format;
+ 
+-    reinit_stream(reader);
++    reinit_stream(reader, "SetOutputProps");
+ 
+     LeaveCriticalSection(&reader->cs);
+     return S_OK;
+@@ -3136,7 +3244,7 @@ static HRESULT WINAPI reader_SetRange(IWMSyncReader2 *iface, QWORD start, LONGLO
+     EnterCriticalSection(&reader->cs);
+ 
+     reader->start_time = start;
+-    reinit_stream(reader);
++    reinit_stream(reader, "SetRange");
+ 
+     LeaveCriticalSection(&reader->cs);
+     return S_OK;
+@@ -3173,7 +3281,7 @@ static HRESULT WINAPI reader_SetReadStreamSamples(IWMSyncReader2 *iface, WORD st
+     if (stream->decode_stream != decode)
+     {
+         stream->decode_stream = decode;
+-        reinit_stream(reader);
++        reinit_stream(reader, "SetReadStreamSamples");
+     }
+ 
+     LeaveCriticalSection(&reader->cs);
+diff --git a/dlls/wmvcore/async_reader.c b/dlls/wmvcore/async_reader.c
+index cec97f42eab..279258be98b 100644
+--- a/dlls/wmvcore/async_reader.c
++++ b/dlls/wmvcore/async_reader.c
+@@ -110,6 +110,8 @@ struct async_reader
+ 
+     REFERENCE_TIME clock_start;
+     LARGE_INTEGER clock_frequency;
++    QWORD active_start;
++    QWORD active_duration;
+ 
+     HANDLE callback_thread;
+     CRITICAL_SECTION callback_cs;
+@@ -123,6 +125,7 @@ struct async_reader
+ 
+     bool user_clock;
+     QWORD user_time;
++    bool manual_stream_selection;
+ };
+ 
+ struct allocator
+@@ -662,10 +665,29 @@ static DWORD WINAPI async_reader_callback_thread(void *arg)
+                 case ASYNC_OP_START:
+                 {
+                     reader->context = op->u.start.context;
+-                    if (SUCCEEDED(hr))
++                    if (SUCCEEDED(hr) && reader->clock_start
++                            && reader->active_start == op->u.start.start
++                            && reader->active_duration == op->u.start.duration)
++                    {
++                        TRACE("Ignoring duplicate start for active range %s, duration %s.\n",
++                                debugstr_time(op->u.start.start), debugstr_time(op->u.start.duration));
++                    }
++                    else if (SUCCEEDED(hr))
++                    {
++                        if (reader->clock_start)
++                        {
++                            LeaveCriticalSection(&reader->callback_cs);
++                            async_reader_close_all_streams(reader);
++                            EnterCriticalSection(&reader->callback_cs);
++                            reader->clock_start = 0;
++                        }
++
+                         hr = IWMSyncReader2_SetRange(reader->reader, op->u.start.start, op->u.start.duration);
+-                    if (SUCCEEDED(hr))
++                    }
++                    if (SUCCEEDED(hr) && !reader->clock_start)
+                     {
++                        reader->active_start = op->u.start.start;
++                        reader->active_duration = op->u.start.duration;
+                         reader->clock_start = get_current_time(reader);
+ 
+                         if (FAILED(hr = async_reader_open_all_streams(reader)))
+@@ -1141,16 +1163,31 @@ static HRESULT WINAPI WMReaderAdvanced_DeliverTime(IWMReaderAdvanced6 *iface, QW
+ 
+ static HRESULT WINAPI WMReaderAdvanced_SetManualStreamSelection(IWMReaderAdvanced6 *iface, BOOL selection)
+ {
+-    struct async_reader *This = impl_from_IWMReaderAdvanced6(iface);
+-    FIXME("(%p)->(%x)\n", This, selection);
+-    return E_NOTIMPL;
++    struct async_reader *reader = impl_from_IWMReaderAdvanced6(iface);
++
++    TRACE("reader %p, selection %d.\n", reader, selection);
++
++    EnterCriticalSection(&reader->callback_cs);
++    reader->manual_stream_selection = !!selection;
++    LeaveCriticalSection(&reader->callback_cs);
++
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI WMReaderAdvanced_GetManualStreamSelection(IWMReaderAdvanced6 *iface, BOOL *selection)
+ {
+-    struct async_reader *This = impl_from_IWMReaderAdvanced6(iface);
+-    FIXME("(%p)->(%p)\n", This, selection);
+-    return E_NOTIMPL;
++    struct async_reader *reader = impl_from_IWMReaderAdvanced6(iface);
++
++    TRACE("reader %p, selection %p.\n", reader, selection);
++
++    if (!selection)
++        return E_INVALIDARG;
++
++    EnterCriticalSection(&reader->callback_cs);
++    *selection = reader->manual_stream_selection;
++    LeaveCriticalSection(&reader->callback_cs);
++
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI WMReaderAdvanced_SetStreamsSelected(IWMReaderAdvanced6 *iface,
+@@ -1274,9 +1311,11 @@ static HRESULT WINAPI WMReaderAdvanced_SetClientInfo(IWMReaderAdvanced6 *iface,
+ 
+ static HRESULT WINAPI WMReaderAdvanced_GetMaxOutputSampleSize(IWMReaderAdvanced6 *iface, DWORD output, DWORD *max)
+ {
+-    struct async_reader *This = impl_from_IWMReaderAdvanced6(iface);
+-    FIXME("(%p)->(%lu %p)\n", This, output, max);
+-    return E_NOTIMPL;
++    struct async_reader *reader = impl_from_IWMReaderAdvanced6(iface);
++
++    TRACE("reader %p, output %lu, max %p.\n", reader, output, max);
++
++    return IWMSyncReader2_GetMaxOutputSampleSize(reader->reader, output, max);
+ }
+ 
+ static HRESULT WINAPI WMReaderAdvanced_GetMaxStreamSampleSize(IWMReaderAdvanced6 *iface,
+-- 
+2.54.0
+
