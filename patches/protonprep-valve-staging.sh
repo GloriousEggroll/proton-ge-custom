@@ -284,6 +284,9 @@ apply_all_in_dir() {
     echo "WINE: mutter -> cinnamon detection patch for winex11"
     apply_patch "../patches/proton/winex11-mutter-cinnamon.patch"
 
+    echo "WINE: mutter -> cinnamon detection patch for winex11"
+    apply_patch "../patches/proton/0001-HACK-kernelbase-allow-overriding-dlls-for-DLSS-XeSS-.patch"
+
     echo "WINE: -HOTFIX- Implement GE-Proton ffmpeg + winedmo only video playback rework patches"
     apply_all_in_dir "../patches/ge-video-rework/"
 
