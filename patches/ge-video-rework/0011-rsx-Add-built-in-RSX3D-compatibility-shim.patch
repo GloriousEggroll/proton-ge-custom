@@ -1,0 +1,2771 @@
+From 19b21ace1187ead773ea1e0b1a83c6b7298affca Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Sat, 20 Jun 2026 15:00:03 -0600
+Subject: [PATCH] rsx: Add built-in RSX3D compatibility shim
+
+Purpose:
+
+Tex Murphy: Overseer requires Intel RSX 3D for its startup probing and in-game voice playback. The original redistributable is proprietary and external wrappers only work around parts of the behavior, so add a built-in rsx.dll implementation instead.
+
+Development:
+
+The implementation was developed by comparing Wine traces against the native RSX3D runtime, collecting focused RSX method logs, and dumping waveOut buffers from both native RSX3D and Wine. Those captures showed that the game configures RSX for wave output, streams voice buffers through RSX emitter/listener style COM objects, and expects SQSH/WAVE voice assets to be decoded into 22050 Hz mono PCM before submission to waveOut.
+
+Keep the waveOut dump hook guarded behind WINE_DUMP_WAVEOUT=1, with WINE_DUMP_WAVEOUT_DIR selecting the output directory, so the native-vs-Wine PCM comparison can be reproduced without affecting normal playback.
+
+Function:
+
+- Register the RSX COM classes and install the Intel Realistic Sound Experience registry key with Device Type set to wave so games do not show the missing RSX3D warning dialog.
+
+- Provide the exported entry points and class factory plumbing needed by applications that probe CreateRSX, DllGetClassObject, and the RSX listener/emitter CLSIDs.
+
+- For playback, queue RIFF/WAVE buffers through winmm waveOut, keep enough shared state to emulate RSX stream completion, and support the stream-ring/source refill patterns observed from the original DLL.
+
+- The SQSH decoder handles the game's block format directly; the final fix came from comparing native waveOut dumps against our decoded output and correcting the special-command bit reader so it reads the 2-bit SQSH control command instead of reusing the previous sample width.
+
+This allows Overseer to run without installing native rsx.dll/aaudio.dll, removes the RSX warning popup, and restores in-game voice line playback.
+---
+ configure                |    2 +-
+ configure.ac             |    1 +
+ dlls/rsx/Makefile.in     |    6 +
+ dlls/rsx/rsx.c           | 2506 ++++++++++++++++++++++++++++++++++++++
+ dlls/rsx/rsx.spec        |    5 +
+ dlls/rsx/rsx_classes.idl |   72 ++
+ dlls/winmm/waveform.c    |   34 +
+ loader/wine.inf.in       |    2 +
+ loader/wine.inf.in.orig  |    1 +
+ 9 files changed, 2628 insertions(+), 1 deletion(-)
+ create mode 100644 dlls/rsx/Makefile.in
+ create mode 100644 dlls/rsx/rsx.c
+ create mode 100644 dlls/rsx/rsx.spec
+ create mode 100644 dlls/rsx/rsx_classes.idl
+
+diff --git a/configure b/configure
+index b88906b58f5..bd18f3c3b69 100755
+--- a/configure
++++ b/configure
+@@ -23676,6 +23676,7 @@ wine_fn_config_makefile dlls/rsabase enable_rsabase
+ wine_fn_config_makefile dlls/rsaenh enable_rsaenh
+ wine_fn_config_makefile dlls/rsaenh/tests enable_tests
+ wine_fn_config_makefile dlls/rstrtmgr enable_rstrtmgr
++wine_fn_config_makefile dlls/rsx enable_rsx
+ wine_fn_config_makefile dlls/rtutils enable_rtutils
+ wine_fn_config_makefile dlls/rtworkq enable_rtworkq
+ wine_fn_config_makefile dlls/rtworkq/tests enable_tests
+@@ -25713,4 +25714,3 @@ printf "%s\n" "
+ $as_me: Finished.  Do '${MAKE-make}' to compile Wine.
+ " >&6
+ 
+-
+diff --git a/configure.ac b/configure.ac
+index d559aaf0948..48b79f42cdf 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -3188,6 +3188,7 @@ WINE_CONFIG_MAKEFILE(dlls/rsabase)
+ WINE_CONFIG_MAKEFILE(dlls/rsaenh)
+ WINE_CONFIG_MAKEFILE(dlls/rsaenh/tests)
+ WINE_CONFIG_MAKEFILE(dlls/rstrtmgr)
++WINE_CONFIG_MAKEFILE(dlls/rsx)
+ WINE_CONFIG_MAKEFILE(dlls/rtutils)
+ WINE_CONFIG_MAKEFILE(dlls/rtworkq)
+ WINE_CONFIG_MAKEFILE(dlls/rtworkq/tests)
+diff --git a/dlls/rsx/Makefile.in b/dlls/rsx/Makefile.in
+new file mode 100644
+index 00000000000..13f5272d796
+--- /dev/null
++++ b/dlls/rsx/Makefile.in
+@@ -0,0 +1,6 @@
++MODULE    = rsx.dll
++IMPORTS   = advapi32 ole32 uuid winmm
++
++SOURCES = \
++	rsx.c \
++	rsx_classes.idl
+diff --git a/dlls/rsx/rsx.c b/dlls/rsx/rsx.c
+new file mode 100644
+index 00000000000..7a1ac254bf9
+--- /dev/null
++++ b/dlls/rsx/rsx.c
+@@ -0,0 +1,2506 @@
++/*
++ * Intel RSX 3D compatibility shim
++ *
++ * Copyright 2026 Geoffrey McRae
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#define COBJMACROS
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "winreg.h"
++#include "mmsystem.h"
++#include "objbase.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(rsx);
++
++#include "initguid.h"
++
++DEFINE_GUID(CLSID_RSX20,              0xe78f7620, 0x96cb, 0x11cf, 0xa0,0x0b,0x44,0x45,0x53,0x54,0x00,0x00);
++DEFINE_GUID(CLSID_RSXCachedEmitter,  0xe78f7629, 0x96cb, 0x11cf, 0xa0,0x0b,0x44,0x45,0x53,0x54,0x00,0x00);
++DEFINE_GUID(CLSID_RSXStreamingEmitter,0xe78f762d, 0x96cb, 0x11cf, 0xa0,0x0b,0x44,0x45,0x53,0x54,0x00,0x00);
++DEFINE_GUID(CLSID_RSXDirectListener,  0xe78f7630, 0x96cb, 0x11cf, 0xa0,0x0b,0x44,0x45,0x53,0x54,0x00,0x00);
++DEFINE_GUID(CLSID_RSXStreamingListener,0xe78f7634, 0x96cb, 0x11cf, 0xa0,0x0b,0x44,0x45,0x53,0x54,0x00,0x00);
++DEFINE_GUID(CLSID_RSXCompatibility,   0xe78f7638, 0x96cb, 0x11cf, 0xa0,0x0b,0x44,0x45,0x53,0x54,0x00,0x00);
++DEFINE_GUID(CLSID_RSXWaveEmitter,     0x4b2ce920, 0x1c45, 0x11d0, 0x98,0x5d,0x00,0xaa,0x00,0x3b,0x43,0xaf);
++DEFINE_GUID(CLSID_RSXWaveListener,    0x4b2ce921, 0x1c45, 0x11d0, 0x98,0x5d,0x00,0xaa,0x00,0x3b,0x43,0xaf);
++DEFINE_GUID(CLSID_RSXDirectSound,     0x4b2ce922, 0x1c45, 0x11d0, 0x98,0x5d,0x00,0xaa,0x00,0x3b,0x43,0xaf);
++DEFINE_GUID(CLSID_RSXWaveStream,      0x4b2ce923, 0x1c45, 0x11d0, 0x98,0x5d,0x00,0xaa,0x00,0x3b,0x43,0xaf);
++
++DEFINE_GUID(IID_IRSX20,               0xb5b40681, 0x1ac8, 0x11d0, 0x98,0x5d,0x00,0xaa,0x00,0x3b,0x43,0xaf);
++DEFINE_GUID(IID_IRSXDirectListener,   0xe78f7630, 0x96cb, 0x11cf, 0xa0,0x0b,0x44,0x45,0x53,0x54,0x00,0x00);
++DEFINE_GUID(IID_IRSXStreamingListener,0xe78f7634, 0x96cb, 0x11cf, 0xa0,0x0b,0x44,0x45,0x53,0x54,0x00,0x00);
++DEFINE_GUID(IID_IRSXDirectSound,      0xda044e00, 0x69b2, 0x11d0, 0xa1,0xd5,0x00,0xaa,0x00,0xb8,0xdf,0xbb);
++
++struct rsx_object
++{
++    void *lpVtbl;
++    LONG ref;
++    struct rsx_shared *shared;
++};
++
++struct rsx_shared
++{
++    LONG ref;
++    HWAVEOUT wave;
++    WAVEFORMATEX *wave_format;
++    struct rsx_wave_header *wave_headers;
++    BYTE *stream_base;
++    HANDLE stream_thread;
++    HANDLE stream_stop;
++    WAVEFORMATEX *stream_format;
++    DWORD stream_stride;
++    DWORD stream_total_size;
++    IUnknown *stream_source;
++    BYTE *stream_ring_entry[32];
++    DWORD stream_ring_checksum[32];
++    DWORD stream_ring_count;
++    DWORD stream_ring_next;
++};
++
++struct class_factory
++{
++    IClassFactory IClassFactory_iface;
++};
++
++struct rsx_wave_playback
++{
++    WAVEFORMATEX *format;
++    BYTE *data;
++    DWORD size;
++};
++
++struct rsx_wave_header
++{
++    WAVEHDR header;
++    DWORD *stream_status;
++    BYTE *stream_entry;
++    const WAVEFORMATEX *format;
++    struct rsx_wave_header *next;
++};
++
++struct rsx_source_playback
++{
++    IUnknown *source;
++    WAVEFORMATEX *format;
++    DWORD expected_size;
++};
++
++struct rsx_sqsh_bits
++{
++    const BYTE *data;
++    DWORD size;
++    DWORD bitpos;
++    BOOL special;
++    DWORD bits[3];
++    DWORD mask[3];
++    DWORD flag[3];
++    DWORD low_mask[3];
++    DWORD sign_fill[3];
++};
++
++static void rsx_trace_bytes(const char *prefix, const BYTE *data, DWORD size);
++static struct rsx_shared *rsx_global_shared;
++
++static void set_rsx_wave_device_key(HKEY root, const char *root_name)
++{
++    static const char key_name[] = "Software\\Intel\\Realistic Sound Experience\\2.0";
++    static const char value[] = "wave";
++    HKEY key;
++    LONG ret;
++
++    ret = RegCreateKeyA(root, key_name, &key);
++    if (ret)
++    {
++        WARN("Failed to create %s\\%s, error %ld.\n", root_name, key_name, ret);
++        return;
++    }
++
++    ret = RegSetValueExA(key, "Device Type", 0, REG_SZ, (const BYTE *)value, sizeof(value));
++    if (ret)
++        WARN("Failed to set %s\\%s Device Type, error %ld.\n", root_name, key_name, ret);
++    else
++        TRACE("Set %s\\%s Device Type to %s.\n", root_name, key_name, value);
++
++    RegCloseKey(key);
++}
++
++static void set_rsx_wave_device(void)
++{
++    set_rsx_wave_device_key(HKEY_LOCAL_MACHINE, "HKLM");
++    set_rsx_wave_device_key(HKEY_CURRENT_USER, "HKCU");
++}
++
++static struct rsx_object *impl_from_IUnknown(IUnknown *iface)
++{
++    return CONTAINING_RECORD(iface, struct rsx_object, lpVtbl);
++}
++
++static void rsx_cleanup_done_wave_headers(struct rsx_shared *shared)
++{
++    struct rsx_wave_header **entry = &shared->wave_headers;
++
++    while (*entry)
++    {
++        struct rsx_wave_header *wave_header = *entry;
++
++        if (!(wave_header->header.dwFlags & WHDR_DONE))
++        {
++            entry = &wave_header->next;
++            continue;
++        }
++
++        *entry = wave_header->next;
++        waveOutUnprepareHeader(shared->wave, &wave_header->header, sizeof(wave_header->header));
++        if (wave_header->stream_status)
++            *wave_header->stream_status = 0;
++        if (wave_header->stream_entry && !IsBadReadPtr(wave_header->stream_entry, 0x28))
++            rsx_trace_bytes("RSX completed stream header", wave_header->stream_entry, 0x28);
++        free(wave_header->header.lpData);
++        free(wave_header);
++    }
++}
++
++static void rsx_cleanup_wave_output(struct rsx_shared *shared)
++{
++    struct rsx_wave_header *wave_header, *next;
++
++    if (shared->stream_stop)
++    {
++        SetEvent(shared->stream_stop);
++        if (shared->stream_thread)
++            WaitForSingleObject(shared->stream_thread, 1000);
++        CloseHandle(shared->stream_stop);
++        shared->stream_stop = NULL;
++    }
++    if (shared->stream_thread)
++    {
++        CloseHandle(shared->stream_thread);
++        shared->stream_thread = NULL;
++    }
++
++    if (shared->wave)
++        waveOutReset(shared->wave);
++
++    for (wave_header = shared->wave_headers; wave_header; wave_header = next)
++    {
++        next = wave_header->next;
++        if (shared->wave)
++            waveOutUnprepareHeader(shared->wave, &wave_header->header, sizeof(wave_header->header));
++        if (wave_header->stream_status)
++            *wave_header->stream_status = 0;
++        free(wave_header->header.lpData);
++        free(wave_header);
++    }
++
++    if (shared->wave)
++        waveOutClose(shared->wave);
++
++    if (shared->stream_source)
++        IUnknown_Release(shared->stream_source);
++    free(shared->wave_format);
++    free(shared->stream_format);
++}
++
++static ULONG rsx_shared_release(struct rsx_shared *shared)
++{
++    ULONG ref = InterlockedDecrement(&shared->ref);
++
++    if (!ref)
++    {
++        if (rsx_global_shared == shared)
++            rsx_global_shared = NULL;
++        rsx_cleanup_wave_output(shared);
++        free(shared);
++    }
++
++    return ref;
++}
++
++static struct rsx_shared *rsx_shared_acquire(void)
++{
++    struct rsx_shared *shared = rsx_global_shared;
++
++    if (shared)
++    {
++        InterlockedIncrement(&shared->ref);
++        return shared;
++    }
++
++    if (!(shared = calloc(1, sizeof(*shared))))
++        return NULL;
++
++    shared->ref = 1;
++    rsx_global_shared = shared;
++    return shared;
++}
++
++static HRESULT WINAPI rsx_QueryInterface(IUnknown *iface, REFIID iid, void **out)
++{
++    struct rsx_object *object = impl_from_IUnknown(iface);
++
++    TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
++
++    if (!out) return E_POINTER;
++
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IRSX20)
++            || IsEqualGUID(iid, &IID_IRSXDirectListener)
++            || IsEqualGUID(iid, &IID_IRSXStreamingListener)
++            || IsEqualGUID(iid, &IID_IRSXDirectSound))
++    {
++        *out = &object->lpVtbl;
++        IUnknown_AddRef(iface);
++        return S_OK;
++    }
++
++    /* Overseer probes these RSX interfaces before falling back to standard audio. */
++    *out = NULL;
++    FIXME("RSX interface %s is not implemented.\n", debugstr_guid(iid));
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI rsx_AddRef(IUnknown *iface)
++{
++    struct rsx_object *object = impl_from_IUnknown(iface);
++    return InterlockedIncrement(&object->ref);
++}
++
++static ULONG WINAPI rsx_Release(IUnknown *iface)
++{
++    struct rsx_object *object = impl_from_IUnknown(iface);
++    ULONG ref = InterlockedDecrement(&object->ref);
++
++    if (!ref)
++    {
++        rsx_shared_release(object->shared);
++        free(object);
++    }
++    return ref;
++}
++
++static HRESULT WINAPI rsx_stub_0(IUnknown *iface)
++{
++    TRACE("iface %p, stub.\n", iface);
++    return S_OK;
++}
++
++#define DEFINE_RSX_STUB_1(method) \
++static HRESULT WINAPI rsx_stub_method##method(IUnknown *iface, void *arg1) \
++{ \
++    TRACE("method" #method " iface %p, arg1 %p, stub.\n", iface, arg1); \
++    return S_OK; \
++}
++
++DEFINE_RSX_STUB_1(9)
++DEFINE_RSX_STUB_1(10)
++DEFINE_RSX_STUB_1(12)
++DEFINE_RSX_STUB_1(13)
++DEFINE_RSX_STUB_1(14)
++DEFINE_RSX_STUB_1(15)
++DEFINE_RSX_STUB_1(16)
++DEFINE_RSX_STUB_1(17)
++DEFINE_RSX_STUB_1(20)
++DEFINE_RSX_STUB_1(21)
++DEFINE_RSX_STUB_1(23)
++DEFINE_RSX_STUB_1(24)
++DEFINE_RSX_STUB_1(26)
++DEFINE_RSX_STUB_1(27)
++DEFINE_RSX_STUB_1(29)
++DEFINE_RSX_STUB_1(30)
++DEFINE_RSX_STUB_1(31)
++
++#undef DEFINE_RSX_STUB_1
++
++static HRESULT WINAPI rsx_stub_method7(IUnknown *iface, void *arg1)
++{
++    struct rsx_object *object = impl_from_IUnknown(iface);
++    static LONG trace_count;
++
++    TRACE("method7 iface %p, arg1 %p, stub.\n", iface, arg1);
++
++    rsx_cleanup_done_wave_headers(object->shared);
++
++    if (arg1 && trace_count < 8 && !IsBadReadPtr(arg1, 12))
++    {
++        const DWORD *state = arg1;
++
++        InterlockedIncrement(&trace_count);
++        TRACE("method7 state %#lx %#lx %#lx.\n", state[0], state[1], state[2]);
++    }
++
++    return S_OK;
++}
++
++static HRESULT WINAPI rsx_poll_stub(IUnknown *iface, void *arg1)
++{
++    struct rsx_object *object = impl_from_IUnknown(iface);
++
++    TRACE("iface %p, arg1 %p, stub.\n", iface, arg1);
++
++    rsx_cleanup_done_wave_headers(object->shared);
++    return S_OK;
++}
++
++static HRESULT WINAPI rsx_create_child(IUnknown *iface, void *desc, IUnknown **out, void *arg3)
++{
++    static LONG trace_count;
++
++    TRACE("iface %p, desc %p, out %p, arg3 %p, stub.\n", iface, desc, out, arg3);
++
++    if (!out) return E_POINTER;
++
++    rsx_cleanup_done_wave_headers(impl_from_IUnknown(iface)->shared);
++
++    if (desc && trace_count < 8 && !IsBadReadPtr(desc, 12))
++    {
++        const DWORD *state = desc;
++
++        InterlockedIncrement(&trace_count);
++        TRACE("create child desc %#lx %#lx %#lx.\n", state[0], state[1], state[2]);
++    }
++
++    *out = iface;
++    IUnknown_AddRef(iface);
++    return S_OK;
++}
++
++static BOOL rsx_data_is_riff_wave(const void *data)
++{
++    const BYTE *bytes = data;
++
++    return bytes && !memcmp(bytes, "RIFF", 4) && !memcmp(bytes + 8, "WAVE", 4);
++}
++
++static DWORD rsx_riff_size(const void *data)
++{
++    const BYTE *bytes = data;
++    DWORD size;
++
++    memcpy(&size, bytes + 4, sizeof(size));
++    return size + 8;
++}
++
++static DWORD rsx_read_dword(const BYTE *data)
++{
++    DWORD value;
++
++    memcpy(&value, data, sizeof(value));
++    return value;
++}
++
++static void rsx_queue_wave_data(struct rsx_shared *shared, const WAVEFORMATEX *format,
++        const void *data, DWORD size, DWORD *stream_status);
++static BOOL rsx_buffer_is_silent(const BYTE *data, DWORD size);
++
++static HRESULT rsx_stream_source_fill(IUnknown *source, void *buffer)
++{
++    void **vtbl;
++    HRESULT (WINAPI *fill)(IUnknown *iface, void *buffer, void *arg2, void *arg3);
++
++    if (!source || !buffer || IsBadReadPtr(source, sizeof(void *)))
++        return E_FAIL;
++
++    vtbl = *(void ***)source;
++    if (!vtbl || IsBadReadPtr(vtbl, 0x24) || !vtbl[0x20 / sizeof(void *)])
++        return E_FAIL;
++
++    fill = (void *)vtbl[0x20 / sizeof(void *)];
++    TRACE("Calling RSX stream source %p fill into %p.\n", source, buffer);
++    return fill(source, buffer, NULL, NULL);
++}
++
++static BOOL rsx_valid_stream_source(IUnknown *source)
++{
++    void **vtbl;
++
++    if (!source || IsBadReadPtr(source, sizeof(void *)))
++        return FALSE;
++
++    vtbl = *(void ***)source;
++    return vtbl && !IsBadReadPtr(vtbl, 0x24) && vtbl[1] && vtbl[2]
++            && vtbl[0x20 / sizeof(void *)];
++}
++
++static void CALLBACK rsx_wave_out_proc(HWAVEOUT wave, UINT msg, DWORD_PTR instance,
++        DWORD_PTR param1, DWORD_PTR param2)
++{
++    WAVEHDR *header = (WAVEHDR *)param1;
++    struct rsx_shared *shared = (struct rsx_shared *)instance;
++    struct rsx_wave_header *wave_header;
++    HRESULT hr;
++    MMRESULT ret;
++
++    (void)wave;
++    (void)param2;
++
++    if (msg != WOM_DONE || !header)
++        return;
++
++    wave_header = CONTAINING_RECORD(header, struct rsx_wave_header, header);
++    if (shared && shared->stream_source && wave_header->stream_status)
++    {
++        ret = waveOutUnprepareHeader(shared->wave, &wave_header->header, sizeof(wave_header->header));
++        if (ret == MMSYSERR_NOERROR)
++        {
++            hr = rsx_stream_source_fill(shared->stream_source, wave_header->header.lpData);
++            if (SUCCEEDED(hr))
++            {
++                ret = waveOutPrepareHeader(shared->wave, &wave_header->header, sizeof(wave_header->header));
++                if (ret == MMSYSERR_NOERROR)
++                {
++                    ret = waveOutWrite(shared->wave, &wave_header->header, sizeof(wave_header->header));
++                    if (ret == MMSYSERR_NOERROR)
++                        return;
++                    WARN("waveOutWrite after RSX source refill failed %#x.\n", ret);
++                    waveOutUnprepareHeader(shared->wave, &wave_header->header, sizeof(wave_header->header));
++                }
++                else
++                    WARN("waveOutPrepareHeader after RSX source refill failed %#x.\n", ret);
++            }
++            else
++                TRACE("RSX stream source refill returned %#lx.\n", hr);
++        }
++        else
++            WARN("waveOutUnprepareHeader before RSX source refill failed %#x.\n", ret);
++    }
++
++    if (wave_header->stream_status)
++        *wave_header->stream_status = 0;
++    if (wave_header->stream_entry && !IsBadReadPtr(wave_header->stream_entry, 0x28))
++        rsx_trace_bytes("RSX callback completed stream header", wave_header->stream_entry, 0x28);
++}
++
++static void rsx_trace_bytes(const char *prefix, const BYTE *data, DWORD size)
++{
++    char buffer[3 * 128 + 1];
++    DWORD i, count = min(size, 128);
++
++    for (i = 0; i < count; ++i)
++        sprintf(buffer + i * 3, "%02x ", data[i]);
++
++    buffer[count * 3] = 0;
++    TRACE("%s first %lu bytes: %s\n", prefix, count, buffer);
++}
++
++static void rsx_sqsh_set_bits(struct rsx_sqsh_bits *bits, unsigned int index, DWORD count)
++{
++    if (!count || count >= 32)
++    {
++        bits->bits[index] = 0;
++        return;
++    }
++
++    bits->bits[index] = count;
++    bits->flag[index] = 1u << (count - 1);
++    bits->low_mask[index] = bits->flag[index] - 1;
++    bits->mask[index] = (1u << count) - 1;
++    bits->sign_fill[index] = ~bits->mask[index];
++}
++
++static BOOL rsx_sqsh_get_bits(struct rsx_sqsh_bits *bits, unsigned int index, INT *value)
++{
++    DWORD byte_offset, raw;
++
++    bits->special = FALSE;
++    byte_offset = bits->bitpos >> 3;
++    if (byte_offset + sizeof(raw) > bits->size || !bits->bits[index])
++        return FALSE;
++
++    memcpy(&raw, bits->data + byte_offset, sizeof(raw));
++    raw >>= bits->bitpos & 7;
++    raw &= bits->mask[index];
++    if (raw & bits->flag[index])
++    {
++        if (!(raw & bits->low_mask[index]))
++            bits->special = TRUE;
++        raw |= bits->sign_fill[index];
++    }
++
++    bits->bitpos += bits->bits[index];
++    *value = raw;
++    return TRUE;
++}
++
++static void rsx_sqsh_write_sample(BYTE *out, DWORD *out_pos, DWORD out_size, INT sample, DWORD sample_bytes)
++{
++    if (*out_pos >= out_size)
++        return;
++
++    if (sample_bytes == 2)
++    {
++        WORD word = sample;
++
++        if (*out_pos + sizeof(word) > out_size)
++            return;
++
++        memcpy(out + *out_pos, &word, sizeof(word));
++        *out_pos += sizeof(word);
++    }
++    else
++    {
++        out[(*out_pos)++] = sample;
++    }
++}
++
++static DWORD rsx_sqsh_decode_block(const BYTE *data, DWORD size, BYTE *out, DWORD out_size)
++{
++    struct rsx_sqsh_bits bits = {data, size};
++    DWORD channels = 1, sample_bytes = 2, sample_bits = 16, shift, repeat[2] = {0};
++    INT sample, candidate, last[2] = {0};
++    DWORD out_pos = 0;
++
++    rsx_sqsh_set_bits(&bits, 2, 4);
++    if (!rsx_sqsh_get_bits(&bits, 2, &sample))
++        return 0;
++
++    if (sample & 2)
++        channels = 2;
++    if (sample & 4)
++    {
++        sample_bytes = 1;
++        sample_bits = 8;
++    }
++
++    rsx_sqsh_set_bits(&bits, 2, 4);
++    if (!rsx_sqsh_get_bits(&bits, 2, &sample))
++        return 0;
++    shift = sample & 0xf;
++
++    if (!rsx_sqsh_get_bits(&bits, 2, &sample))
++        return 0;
++    rsx_sqsh_set_bits(&bits, 0, (sample & 0xf) + 1);
++
++    rsx_sqsh_set_bits(&bits, 2, sample_bits);
++    if (!rsx_sqsh_get_bits(&bits, 2, &sample))
++        return 0;
++    last[0] = sample;
++    rsx_sqsh_write_sample(out, &out_pos, out_size, sample << shift, sample_bytes);
++
++    if (channels == 2)
++    {
++        if (!rsx_sqsh_get_bits(&bits, 2, &sample))
++            return out_pos;
++        rsx_sqsh_set_bits(&bits, 1, (sample & 0xf) + 1);
++
++        rsx_sqsh_set_bits(&bits, 2, sample_bits);
++        if (!rsx_sqsh_get_bits(&bits, 2, &sample))
++            return out_pos;
++        last[1] = sample;
++        rsx_sqsh_write_sample(out, &out_pos, out_size, sample << shift, sample_bytes);
++    }
++
++    while (out_pos < out_size)
++    {
++        unsigned int channel;
++
++        for (channel = 0; channel < channels && out_pos < out_size; ++channel)
++        {
++            for (;;)
++            {
++                if (repeat[channel])
++                {
++                    --repeat[channel];
++                    sample = last[channel];
++                    break;
++                }
++
++                if (!rsx_sqsh_get_bits(&bits, channel, &sample))
++                    return out_pos;
++
++                candidate = sample;
++                if (bits.bits[channel] != sample_bits)
++                    candidate += last[channel];
++                else if (sample_bits == 8)
++                    candidate &= 0xff;
++
++                if (!bits.special)
++                {
++                    sample = candidate;
++                    break;
++                }
++
++                rsx_sqsh_set_bits(&bits, 2, 2);
++                if (!rsx_sqsh_get_bits(&bits, 2, &sample))
++                    return out_pos;
++
++                switch (sample & 3)
++                {
++                    case 0:
++                        rsx_sqsh_set_bits(&bits, 2, 4);
++                        if (!rsx_sqsh_get_bits(&bits, 2, &sample))
++                            return out_pos;
++                        sample &= 0xf;
++                        if (!sample)
++                            return out_pos;
++                        if (sample >= 2)
++                            rsx_sqsh_set_bits(&bits, channel, sample + 1);
++                        else
++                        {
++                            rsx_sqsh_set_bits(&bits, 2, 8);
++                            if (!rsx_sqsh_get_bits(&bits, 2, &sample))
++                                return out_pos;
++                            repeat[channel] = sample & 0xff;
++                        }
++                        continue;
++                    case 1:
++                        rsx_sqsh_set_bits(&bits, channel, bits.bits[channel] + 1);
++                        continue;
++                    case 2:
++                        if (bits.bits[channel] <= 1)
++                            return out_pos;
++                        rsx_sqsh_set_bits(&bits, channel, bits.bits[channel] - 1);
++                        continue;
++                }
++
++                sample = candidate;
++                break;
++            }
++
++            last[channel] = sample;
++            rsx_sqsh_write_sample(out, &out_pos, out_size, sample << shift, sample_bytes);
++        }
++    }
++
++    return out_pos;
++}
++
++static BYTE *rsx_decode_sqsh_wave_data(const BYTE *data, DWORD size, DWORD decoded_size,
++        DWORD *actual_size)
++{
++    BYTE *best = NULL;
++    DWORD best_size = 0;
++    DWORD best_offset = 0;
++    DWORD start_offset;
++
++    if (actual_size)
++        *actual_size = 0;
++
++    if (!decoded_size || decoded_size > 16 * 1024 * 1024)
++        return NULL;
++
++    rsx_trace_bytes("RSX SQSH data", data, size);
++    if (size > 12)
++    {
++        DWORD first_block = rsx_read_dword(data + 12);
++
++        TRACE("RSX SQSH wrapper magic %#lx, flags %#lx, packed size %lu, first block %lu.\n",
++                rsx_read_dword(data), rsx_read_dword(data + 4), rsx_read_dword(data + 8), first_block);
++        if (first_block && first_block < size - 16)
++            rsx_trace_bytes("RSX SQSH after first wrapper block", data + 16 + first_block,
++                    size - 16 - first_block);
++        if (size > 0x80)
++            rsx_trace_bytes("RSX SQSH descriptor tail", data + 0x40, size - 0x40);
++    }
++
++    for (start_offset = 0; start_offset < 64 && start_offset + sizeof(DWORD) <= size; ++start_offset)
++    {
++        BYTE *decoded;
++        DWORD in_pos = start_offset, out_pos = 0;
++        DWORD block_index = 0;
++        BOOL trace_failures = start_offset == 0;
++
++        if (!(decoded = calloc(1, decoded_size)))
++            break;
++
++        while (in_pos + sizeof(DWORD) <= size && out_pos < decoded_size)
++        {
++            DWORD block_size = rsx_read_dword(data + in_pos);
++            DWORD written;
++            DWORD block_offset = in_pos;
++
++            in_pos += sizeof(DWORD);
++            if (!block_size || block_size > size - in_pos)
++            {
++                if (trace_failures)
++                    TRACE("Stopping RSX SQSH decode at offset %lu, invalid block size %lu, remaining %lu.\n",
++                            (DWORD)(in_pos - sizeof(DWORD)), block_size, size - in_pos);
++                break;
++            }
++
++            written = rsx_sqsh_decode_block(data + in_pos, block_size, decoded + out_pos,
++                    decoded_size - out_pos);
++            if (trace_failures && block_index < 16)
++                TRACE("RSX SQSH block %lu at offset %lu compressed %lu decoded %lu, output %lu/%lu.\n",
++                        block_index, block_offset, block_size, written, out_pos + written, decoded_size);
++            if (!written)
++            {
++                if (trace_failures)
++                    TRACE("Stopping RSX SQSH decode at offset %lu, block size %lu produced no output.\n",
++                            in_pos, block_size);
++                break;
++            }
++
++            in_pos += block_size;
++            out_pos += written;
++            ++block_index;
++        }
++
++        if (out_pos > best_size)
++        {
++            free(best);
++            best = decoded;
++            best_size = out_pos;
++            best_offset = start_offset;
++        }
++        else
++        {
++            free(decoded);
++        }
++
++        if (out_pos == decoded_size)
++            break;
++    }
++
++    if (best_size != decoded_size)
++    {
++        WARN("Decoded RSX SQSH wave data from offset %lu to %lu bytes, expected %lu.\n",
++                best_offset, best_size, decoded_size);
++        if (!best_size)
++        {
++            free(best);
++            return NULL;
++        }
++        if (actual_size)
++            *actual_size = best_size;
++        return best;
++    }
++
++    TRACE("Decoded RSX SQSH wave data from offset %lu to %lu bytes.\n", best_offset, best_size);
++
++    if (actual_size)
++        *actual_size = best_size;
++    return best;
++}
++
++static BYTE *rsx_load_matching_sqsh_wave_file_from_dir(const char *dir, DWORD packed_size,
++        DWORD decoded_size, DWORD *payload_size, unsigned int depth)
++{
++    char pattern[MAX_PATH], path[MAX_PATH];
++    WIN32_FIND_DATAA data;
++    HANDLE find;
++
++    snprintf(pattern, sizeof(pattern), "%s\\*", dir);
++    find = FindFirstFileA(pattern, &data);
++    if (find == INVALID_HANDLE_VALUE)
++        return NULL;
++
++    do
++    {
++        BYTE header[44], *payload = NULL;
++        DWORD file_size, read;
++        HANDLE file;
++
++        if (!strcmp(data.cFileName, ".") || !strcmp(data.cFileName, ".."))
++            continue;
++
++        snprintf(path, sizeof(path), "%s\\%s", dir, data.cFileName);
++
++        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
++        {
++            if (depth)
++            {
++                payload = rsx_load_matching_sqsh_wave_file_from_dir(path, packed_size,
++                        decoded_size, payload_size, depth - 1);
++                if (payload)
++                {
++                    FindClose(find);
++                    return payload;
++                }
++            }
++            continue;
++        }
++
++        file_size = data.nFileSizeLow;
++        if (data.nFileSizeHigh || file_size <= sizeof(header))
++            continue;
++
++        file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
++        if (file == INVALID_HANDLE_VALUE)
++            continue;
++
++        if (ReadFile(file, header, sizeof(header), &read, NULL) && read == sizeof(header)
++                && !memcmp(header, "SQSH", 4) && !memcmp(header + 8, "WAVE", 4)
++                && !memcmp(header + 12, "fmt ", 4) && !memcmp(header + 36, "data", 4)
++                && rsx_read_dword(header + 40) == decoded_size)
++        {
++            DWORD file_payload_size = packed_size;
++
++            if (file_size < sizeof(header) + file_payload_size)
++            {
++                CloseHandle(file);
++                continue;
++            }
++
++            if ((payload = malloc(file_payload_size)))
++            {
++                if (ReadFile(file, payload, file_payload_size, &read, NULL) && read == file_payload_size)
++                {
++                    *payload_size = file_payload_size;
++                    TRACE("Using RSX SQSH WAVE file %s for packed size %lu decoded size %lu payload size %lu.\n",
++                            debugstr_a(path), packed_size, decoded_size, *payload_size);
++                    CloseHandle(file);
++                    FindClose(find);
++                    return payload;
++                }
++
++                free(payload);
++            }
++        }
++
++        CloseHandle(file);
++    } while (FindNextFileA(find, &data));
++
++    FindClose(find);
++    return NULL;
++}
++
++static BYTE *rsx_load_matching_sqsh_wave_file_by_decoded_size_from_dir(const char *dir,
++        DWORD decoded_size, WAVEFORMATEX **format, DWORD *payload_size, unsigned int depth)
++{
++    char pattern[MAX_PATH], path[MAX_PATH];
++    WIN32_FIND_DATAA data;
++    HANDLE find;
++
++    snprintf(pattern, sizeof(pattern), "%s\\*", dir);
++    find = FindFirstFileA(pattern, &data);
++    if (find == INVALID_HANDLE_VALUE)
++        return NULL;
++
++    do
++    {
++        BYTE header[44], *payload = NULL;
++        DWORD file_size, read;
++        HANDLE file;
++
++        if (!strcmp(data.cFileName, ".") || !strcmp(data.cFileName, ".."))
++            continue;
++
++        snprintf(path, sizeof(path), "%s\\%s", dir, data.cFileName);
++
++        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
++        {
++            if (depth)
++            {
++                payload = rsx_load_matching_sqsh_wave_file_by_decoded_size_from_dir(path,
++                        decoded_size, format, payload_size, depth - 1);
++                if (payload)
++                {
++                    FindClose(find);
++                    return payload;
++                }
++            }
++            continue;
++        }
++
++        file_size = data.nFileSizeLow;
++        if (data.nFileSizeHigh || file_size <= sizeof(header))
++            continue;
++
++        file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
++        if (file == INVALID_HANDLE_VALUE)
++            continue;
++
++        if (ReadFile(file, header, sizeof(header), &read, NULL) && read == sizeof(header)
++                && !memcmp(header, "SQSH", 4) && !memcmp(header + 8, "WAVE", 4)
++                && !memcmp(header + 12, "fmt ", 4) && !memcmp(header + 36, "data", 4)
++                && rsx_read_dword(header + 40) == decoded_size)
++        {
++            DWORD file_payload_size = file_size - sizeof(header);
++
++            if ((payload = malloc(file_payload_size)) && (*format = calloc(1, sizeof(**format))))
++            {
++                if (ReadFile(file, payload, file_payload_size, &read, NULL) && read == file_payload_size)
++                {
++                    memcpy(*format, header + 20, sizeof(PCMWAVEFORMAT));
++                    (*format)->wFormatTag = WAVE_FORMAT_PCM;
++                    *payload_size = file_payload_size;
++                    TRACE("Using RSX SQSH WAVE file %s for decoded size %lu payload size %lu.\n",
++                            debugstr_a(path), decoded_size, *payload_size);
++                    CloseHandle(file);
++                    FindClose(find);
++                    return payload;
++                }
++
++                free(*format);
++                *format = NULL;
++                free(payload);
++            }
++            else
++            {
++                free(payload);
++                free(*format);
++                *format = NULL;
++            }
++        }
++
++        CloseHandle(file);
++    } while (FindNextFileA(find, &data));
++
++    FindClose(find);
++    return NULL;
++}
++
++static BYTE *rsx_decode_matching_sqsh_wave_file(DWORD packed_size, DWORD decoded_size,
++        DWORD *actual_size)
++{
++    char module_path[MAX_PATH], *slash, data_dir[MAX_PATH];
++    DWORD payload_size = 0;
++    BYTE *payload, *decoded;
++
++    if (actual_size)
++        *actual_size = 0;
++
++    if (!packed_size || !decoded_size || packed_size > 16 * 1024 * 1024
++            || decoded_size > 16 * 1024 * 1024)
++        return NULL;
++
++    if (!GetModuleFileNameA(NULL, module_path, sizeof(module_path)))
++        return NULL;
++
++    if (!(slash = strrchr(module_path, '\\')) && !(slash = strrchr(module_path, '/')))
++        return NULL;
++    *slash = 0;
++
++    snprintf(data_dir, sizeof(data_dir), "%s\\DATA", module_path);
++    if (!(payload = rsx_load_matching_sqsh_wave_file_from_dir(data_dir, packed_size,
++            decoded_size, &payload_size, 2)))
++    {
++        TRACE("Could not find matching RSX SQSH WAVE file under %s for packed size %lu decoded size %lu.\n",
++                debugstr_a(data_dir), packed_size, decoded_size);
++        return NULL;
++    }
++
++    decoded = rsx_decode_sqsh_wave_data(payload, payload_size, decoded_size, actual_size);
++    free(payload);
++    return decoded;
++}
++
++static BYTE *rsx_decode_matching_sqsh_wave_file_by_decoded_size(DWORD decoded_size,
++        WAVEFORMATEX **format, DWORD *actual_size)
++{
++    char module_path[MAX_PATH], *slash, data_dir[MAX_PATH];
++    DWORD payload_size = 0;
++    BYTE *payload, *decoded;
++
++    if (actual_size)
++        *actual_size = 0;
++
++    if (!decoded_size || decoded_size > 16 * 1024 * 1024)
++        return NULL;
++
++    if (!GetModuleFileNameA(NULL, module_path, sizeof(module_path)))
++        return NULL;
++
++    if (!(slash = strrchr(module_path, '\\')) && !(slash = strrchr(module_path, '/')))
++        return NULL;
++    *slash = 0;
++
++    snprintf(data_dir, sizeof(data_dir), "%s\\DATA", module_path);
++    if (!(payload = rsx_load_matching_sqsh_wave_file_by_decoded_size_from_dir(data_dir,
++            decoded_size, format, &payload_size, 2)))
++    {
++        TRACE("Could not find matching RSX SQSH WAVE file under %s for decoded size %lu.\n",
++                debugstr_a(data_dir), decoded_size);
++        return NULL;
++    }
++
++    decoded = rsx_decode_sqsh_wave_data(payload, payload_size, decoded_size, actual_size);
++    free(payload);
++    if (!decoded)
++    {
++        free(*format);
++        *format = NULL;
++    }
++    return decoded;
++}
++
++static BOOL rsx_parse_wave_data(const void *data, DWORD fallback_size, struct rsx_wave_playback *playback)
++{
++    const BYTE *bytes = data;
++    const BYTE *fmt = NULL, *wave_data = NULL;
++    DWORD fmt_end = 0;
++    DWORD riff_size, scan_size, fmt_size = 0, data_size = 0, offset = 12;
++    BOOL truncated_data = FALSE;
++
++    riff_size = rsx_riff_size(data);
++    if (riff_size < 12 || riff_size > 16 * 1024 * 1024)
++    {
++        WARN("Ignoring invalid RSX RIFF/WAVE size %lu.\n", riff_size);
++        return FALSE;
++    }
++    scan_size = riff_size;
++
++    /* Overseer passes other RSX method arguments that can look like sizes.
++     * Do not truncate a sane RIFF chunk to those values; the voice buffers use
++     * the RIFF data size for their decoded PCM length. */
++    if (fallback_size >= riff_size && fallback_size <= 16 * 1024 * 1024)
++        scan_size = fallback_size;
++
++    while (offset + 8 <= scan_size)
++    {
++        DWORD chunk_size = rsx_read_dword(bytes + offset + 4);
++        const BYTE *chunk_data = bytes + offset + 8;
++
++        if (offset + 8 + chunk_size > scan_size)
++        {
++            if (!memcmp(bytes + offset, "data", 4) && offset + 8 < scan_size)
++            {
++                DWORD available = scan_size - offset - 8;
++
++                truncated_data = TRUE;
++                WARN("Ignoring truncated RSX RIFF/WAVE data chunk at offset %lu, claimed size %lu, available %lu.\n",
++                        offset, chunk_size, available);
++
++                if (fmt && fmt_size >= sizeof(PCMWAVEFORMAT)
++                        && ((wave_data = rsx_decode_sqsh_wave_data(chunk_data, available, chunk_size, &data_size))
++                            || (wave_data = rsx_decode_matching_sqsh_wave_file(available, chunk_size, &data_size))))
++                {
++                    TRACE("Decoded RSX SQSH RIFF/WAVE data chunk at offset %lu, size %lu.\n",
++                            offset, data_size);
++                }
++            }
++            break;
++        }
++
++        if (!memcmp(bytes + offset, "fmt ", 4))
++        {
++            fmt = chunk_data;
++            fmt_size = chunk_size;
++            fmt_end = offset + 8 + chunk_size;
++        }
++        else if (!memcmp(bytes + offset, "data", 4))
++        {
++            wave_data = chunk_data;
++            data_size = chunk_size;
++        }
++
++        offset += 8 + ((chunk_size + 1) & ~1);
++    }
++
++    if (!wave_data)
++    {
++        for (offset = 12; offset + 8 <= scan_size; ++offset)
++        {
++            DWORD chunk_size;
++
++            if (memcmp(bytes + offset, "data", 4))
++                continue;
++
++            chunk_size = rsx_read_dword(bytes + offset + 4);
++            if (offset + 8 + chunk_size > scan_size)
++                continue;
++
++            wave_data = bytes + offset + 8;
++            data_size = chunk_size;
++            TRACE("Found unaligned RSX RIFF/WAVE data chunk at offset %lu, size %lu.\n",
++                    offset, data_size);
++            break;
++        }
++    }
++
++    if (!wave_data && !truncated_data && fmt && fmt_size >= sizeof(PCMWAVEFORMAT))
++    {
++        if (fallback_size <= fmt_end || fallback_size > 16 * 1024 * 1024)
++        {
++            WARN("Ignoring RSX RIFF/WAVE without data chunk and invalid fallback size %lu.\n",
++                    fallback_size);
++            return FALSE;
++        }
++
++        wave_data = bytes + fmt_end;
++        data_size = fallback_size - fmt_end;
++        TRACE("Using RSX RIFF/WAVE raw PCM data after fmt chunk at offset %lu, size %lu.\n",
++                fmt_end, data_size);
++    }
++
++    if (!fmt || fmt_size < sizeof(PCMWAVEFORMAT) || !wave_data || !data_size)
++    {
++        WARN("Ignoring unsupported RSX RIFF/WAVE data fmt %p/%lu data %p/%lu.\n",
++                fmt, fmt_size, wave_data, data_size);
++        return FALSE;
++    }
++
++    if (!(playback->format = calloc(1, fmt_size > sizeof(WAVEFORMATEX) ? fmt_size : sizeof(WAVEFORMATEX))))
++        return FALSE;
++
++    if ((ULONG_PTR)wave_data >= (ULONG_PTR)bytes
++            && (ULONG_PTR)wave_data < (ULONG_PTR)(bytes + scan_size))
++    {
++        if (!(playback->data = malloc(data_size)))
++        {
++            free(playback->format);
++            playback->format = NULL;
++            return FALSE;
++        }
++
++        memcpy(playback->data, wave_data, data_size);
++    }
++    else
++    {
++        playback->data = (BYTE *)wave_data;
++    }
++
++    memcpy(playback->format, fmt, fmt_size);
++    playback->size = data_size;
++
++    TRACE("Parsed RSX wave format tag %#x channels %u rate %lu align %u bits %u data size %lu.\n",
++            playback->format->wFormatTag, playback->format->nChannels,
++            playback->format->nSamplesPerSec, playback->format->nBlockAlign,
++            playback->format->wBitsPerSample, playback->size);
++    return TRUE;
++}
++
++static BOOL rsx_parse_wave_format(const void *data, WAVEFORMATEX **format)
++{
++    const BYTE *bytes = data;
++    DWORD riff_size, offset = 12;
++
++    if (!rsx_data_is_riff_wave(data))
++        return FALSE;
++
++    riff_size = rsx_riff_size(data);
++    if (riff_size < 12 || riff_size > 16 * 1024 * 1024)
++        return FALSE;
++
++    while (offset + 8 <= riff_size)
++    {
++        DWORD chunk_size = rsx_read_dword(bytes + offset + 4);
++        const BYTE *chunk_data = bytes + offset + 8;
++
++        if (offset + 8 + chunk_size > riff_size)
++            return FALSE;
++
++        if (!memcmp(bytes + offset, "fmt ", 4))
++        {
++            DWORD size = max(chunk_size, sizeof(WAVEFORMATEX));
++
++            if (chunk_size < sizeof(PCMWAVEFORMAT))
++                return FALSE;
++
++            if (!(*format = calloc(1, size)))
++                return FALSE;
++
++            memcpy(*format, chunk_data, chunk_size);
++            return TRUE;
++        }
++
++        offset += 8 + ((chunk_size + 1) & ~1);
++    }
++
++    return FALSE;
++}
++
++static BOOL rsx_get_stream_buffer_info(void *buffer, DWORD *header_size, DWORD *size, BYTE **data)
++{
++    BYTE *bytes = buffer;
++    BYTE *data_ptr;
++
++    if (!buffer)
++        return FALSE;
++
++    *header_size = rsx_read_dword(bytes);
++    *size = rsx_read_dword(bytes + 8);
++    if (*header_size < 0x20 || *header_size > 0x100 || !*size || *size > 0x20000)
++        return FALSE;
++
++    data_ptr = (BYTE *)(ULONG_PTR)rsx_read_dword(bytes + 12);
++    if (data_ptr && !IsBadReadPtr(data_ptr, *size))
++        *data = data_ptr;
++    else
++        *data = bytes + *header_size;
++    return TRUE;
++}
++
++static BOOL rsx_queue_stream_buffer(IUnknown *iface, const void *desc, void *buffer)
++{
++    WAVEFORMATEX *format;
++    DWORD header_size, size;
++    BYTE *data;
++
++    if (!buffer || !rsx_parse_wave_format(desc, &format))
++        return FALSE;
++
++    if (!rsx_get_stream_buffer_info(buffer, &header_size, &size, &data))
++    {
++        free(format);
++        return FALSE;
++    }
++
++    /* Overseer submits RSX voice buffers as decoded PCM chunks behind a small
++     * stream header, while the descriptor keeps the original SQSH WAVE tag. */
++    if (format->wFormatTag != WAVE_FORMAT_PCM)
++        format->wFormatTag = WAVE_FORMAT_PCM;
++
++    rsx_queue_wave_data(impl_from_IUnknown(iface)->shared, format, data, size, (DWORD *)((BYTE *)buffer + 4));
++    TRACE("Queued RSX stream buffer header %lu size %lu format tag %#x channels %u rate %lu bits %u.\n",
++            header_size, size, format->wFormatTag, format->nChannels,
++            format->nSamplesPerSec, format->wBitsPerSample);
++    free(format);
++    return TRUE;
++}
++
++static BOOL rsx_queue_stream_buffers_from_range(IUnknown *iface, void *base, DWORD range_size)
++{
++    struct rsx_object *object = impl_from_IUnknown(iface);
++    BYTE *bytes = base;
++    BOOL queued = FALSE;
++    DWORD offset;
++
++    if (!object->shared->stream_format || !base || range_size < 0x28 || range_size > 16 * 1024 * 1024)
++        return FALSE;
++
++    for (offset = 0; offset + 0x28 <= range_size; ++offset)
++    {
++        BYTE *entry = bytes + offset;
++        BYTE *data;
++        DWORD header_size, size, *status;
++
++        if (rsx_read_dword(entry) != 0x28)
++            continue;
++        if (!rsx_get_stream_buffer_info(entry, &header_size, &size, &data))
++            continue;
++        if (header_size != 0x28 || size != 0x2000)
++            continue;
++        if (data != entry + header_size)
++            continue;
++        if (offset + header_size + size > range_size)
++            continue;
++        if (rsx_buffer_is_silent(data, size))
++            continue;
++
++        status = (DWORD *)(entry + 4);
++        rsx_queue_wave_data(object->shared, object->shared->stream_format, data, size, status);
++        TRACE("Queued RSX stream range entry at offset %lu, size %lu.\n", offset, size);
++        queued = TRUE;
++        offset += header_size + size - 1;
++    }
++
++    return queued;
++}
++
++static DWORD rsx_checksum_data(const BYTE *data, DWORD size)
++{
++    DWORD checksum = 2166136261u, i;
++
++    for (i = 0; i < size; ++i)
++        checksum = (checksum ^ data[i]) * 16777619u;
++
++    return checksum;
++}
++
++static BOOL rsx_buffer_is_silent(const BYTE *data, DWORD size)
++{
++    DWORD i;
++
++    for (i = 0; i < size; ++i)
++    {
++        if (data[i])
++            return FALSE;
++    }
++
++    return TRUE;
++}
++
++static BOOL rsx_fill_next_stream_ring_buffer(struct rsx_shared *shared, void *buffer, DWORD buffer_size)
++{
++    DWORD waited;
++
++    if (!shared->stream_base || !shared->stream_total_size || !buffer || !buffer_size)
++        return FALSE;
++
++    for (waited = 0; waited < 500; waited += 5)
++    {
++        DWORD offset, i, attempts;
++
++        for (offset = 0; offset + 0x28 <= shared->stream_total_size; ++offset)
++        {
++            BYTE *entry = shared->stream_base + offset;
++            BYTE *data;
++            DWORD header_size, size;
++
++            if (IsBadReadPtr(entry, 0x28) || rsx_read_dword(entry) != 0x28)
++                continue;
++            if (!rsx_get_stream_buffer_info(entry, &header_size, &size, &data)
++                    || header_size != 0x28 || size != 0x2000)
++                continue;
++            if (data != entry + header_size || offset + header_size + size > shared->stream_total_size)
++                continue;
++
++            for (i = 0; i < shared->stream_ring_count; ++i)
++            {
++                if (shared->stream_ring_entry[i] == entry)
++                    break;
++            }
++            if (i == shared->stream_ring_count && shared->stream_ring_count < ARRAY_SIZE(shared->stream_ring_entry))
++                shared->stream_ring_entry[shared->stream_ring_count++] = entry;
++        }
++
++        for (attempts = 0; attempts < shared->stream_ring_count; ++attempts)
++        {
++            BYTE *entry, *data;
++            DWORD header_size, size, checksum, copy_size, index;
++            DWORD *status;
++
++            index = (shared->stream_ring_next + attempts) % shared->stream_ring_count;
++            entry = shared->stream_ring_entry[index];
++            if (IsBadReadPtr(entry, 0x28) || !rsx_get_stream_buffer_info(entry, &header_size, &size, &data))
++                continue;
++            if (IsBadReadPtr(data, size) || rsx_buffer_is_silent(data, size))
++                continue;
++
++            checksum = rsx_checksum_data(data, size);
++            if (checksum == shared->stream_ring_checksum[index])
++                continue;
++
++            copy_size = min(size, buffer_size);
++            memcpy(buffer, data, copy_size);
++            if (copy_size < buffer_size)
++                memset((BYTE *)buffer + copy_size, 0, buffer_size - copy_size);
++
++            status = (DWORD *)(entry + 4);
++            *status = 0;
++            shared->stream_ring_checksum[index] = checksum;
++            shared->stream_ring_next = (index + 1) % shared->stream_ring_count;
++
++            TRACE("Filled RSX source buffer from stream ring entry %p, size %lu/%lu, checksum %#lx.\n",
++                    entry, copy_size, buffer_size, checksum);
++            return TRUE;
++        }
++
++        Sleep(5);
++    }
++
++    TRACE("No fresh RSX stream ring data available for source buffer.\n");
++    return FALSE;
++}
++
++struct rsx_stream_thread_params
++{
++    struct rsx_shared *shared;
++};
++
++static DWORD CALLBACK rsx_stream_thread(void *param)
++{
++    struct rsx_stream_thread_params *params = param;
++    struct rsx_shared *shared = params->shared;
++    enum { max_entries = 128 };
++    BYTE *known_entry[max_entries] = {0};
++    DWORD last_checksum[max_entries] = {0};
++    BOOL traced_invalid[max_entries] = {0};
++    BOOL traced_unchanged[max_entries] = {0};
++    BOOL queued[max_entries] = {0};
++    DWORD known_count = 0;
++
++    free(params);
++
++    TRACE("Started RSX stream ring worker for range %lu bytes.\n", shared->stream_total_size);
++
++    while (WaitForSingleObject(shared->stream_stop, 5) == WAIT_TIMEOUT)
++    {
++        DWORD offset;
++
++        for (offset = 0; offset + 0x28 <= shared->stream_total_size; ++offset)
++        {
++            BYTE *entry = shared->stream_base + offset;
++            BYTE *data;
++            DWORD header_size, size, checksum, i;
++            DWORD *status = (DWORD *)(entry + 4);
++
++            if (IsBadReadPtr(entry, 0x28) || rsx_read_dword(entry) != 0x28)
++                continue;
++
++            if (!rsx_get_stream_buffer_info(entry, &header_size, &size, &data)
++                    || header_size != 0x28 || size != 0x2000)
++            {
++                if (known_count < max_entries && !traced_invalid[known_count])
++                {
++                    traced_invalid[known_count] = TRUE;
++                    rsx_trace_bytes("RSX stream invalid entry", entry, 0x28);
++                }
++                continue;
++            }
++
++            if (data != entry + header_size)
++                continue;
++
++            if (IsBadReadPtr(data, size))
++            {
++                if (known_count < max_entries && !traced_invalid[known_count])
++                {
++                    traced_invalid[known_count] = TRUE;
++                    rsx_trace_bytes("RSX stream entry with unreadable data", entry, 0x28);
++                }
++                continue;
++            }
++
++            for (i = 0; i < known_count; ++i)
++            {
++                if (known_entry[i] == entry)
++                    break;
++            }
++            if (i == known_count)
++            {
++                if (known_count == max_entries)
++                    continue;
++                known_entry[known_count++] = entry;
++            }
++
++            if (rsx_buffer_is_silent(data, size))
++            {
++                if (!traced_unchanged[i])
++                {
++                    traced_unchanged[i] = TRUE;
++                    TRACE("RSX stream entry at offset %lu is silent placeholder data, status %lu.\n",
++                            offset, *status);
++                    rsx_trace_bytes("RSX stream silent entry", entry, 0x28);
++                }
++                continue;
++            }
++
++            checksum = rsx_checksum_data(data, size);
++            if (queued[i] && checksum == last_checksum[i] && !*status)
++            {
++                if (!traced_unchanged[i])
++                {
++                    traced_unchanged[i] = TRUE;
++                    TRACE("RSX stream entry at offset %lu unchanged and completed, status %lu, checksum %#lx.\n",
++                            offset, *status, checksum);
++                    rsx_trace_bytes("RSX stream unchanged entry", entry, 0x28);
++                }
++                continue;
++            }
++
++            if (queued[i] && checksum == last_checksum[i])
++            {
++                if (!traced_unchanged[i])
++                {
++                    traced_unchanged[i] = TRUE;
++                    TRACE("RSX stream entry at offset %lu unchanged and pending, status %lu, checksum %#lx.\n",
++                            offset, *status, checksum);
++                    rsx_trace_bytes("RSX stream unchanged entry", entry, 0x28);
++                }
++                continue;
++            }
++
++            last_checksum[i] = checksum;
++            queued[i] = TRUE;
++            traced_unchanged[i] = FALSE;
++            rsx_queue_wave_data(shared, shared->stream_format, data, size, status);
++            TRACE("Queued RSX stream worker entry at offset %lu, size %lu, checksum %#lx.\n",
++                    offset, size, checksum);
++
++            offset += header_size + size - 1;
++        }
++    }
++
++    TRACE("Stopped RSX stream ring worker.\n");
++    return 0;
++}
++
++static BOOL rsx_start_stream_ring(IUnknown *iface, const void *desc, void *buffer, DWORD total_size)
++{
++    struct rsx_object *object = impl_from_IUnknown(iface);
++    struct rsx_stream_thread_params *params;
++    WAVEFORMATEX *format;
++    DWORD header_size, size, stride;
++    BYTE *data;
++
++    if (!object->shared->stream_base || !total_size || total_size > 16 * 1024 * 1024)
++        return FALSE;
++
++    if ((BYTE *)buffer < object->shared->stream_base)
++        return FALSE;
++
++    if (!rsx_parse_wave_format(desc, &format))
++        return FALSE;
++
++    if (format->wFormatTag != WAVE_FORMAT_PCM)
++        format->wFormatTag = WAVE_FORMAT_PCM;
++
++    if (!rsx_get_stream_buffer_info(object->shared->stream_base, &header_size, &size, &data))
++    {
++        free(format);
++        return FALSE;
++    }
++    stride = header_size + size;
++
++    if ((BYTE *)buffer - object->shared->stream_base != stride)
++    {
++        free(format);
++        return FALSE;
++    }
++
++    if (object->shared->stream_thread)
++    {
++        free(format);
++        return TRUE;
++    }
++
++    if (!(object->shared->stream_stop = CreateEventW(NULL, TRUE, FALSE, NULL)))
++    {
++        free(format);
++        return FALSE;
++    }
++
++    object->shared->stream_format = format;
++    object->shared->stream_stride = stride;
++    object->shared->stream_total_size = object->shared->stream_source ? stride * 2 : total_size;
++
++    if (!(params = calloc(1, sizeof(*params))))
++    {
++        CloseHandle(object->shared->stream_stop);
++        object->shared->stream_stop = NULL;
++        object->shared->stream_format = NULL;
++        free(format);
++        return FALSE;
++    }
++    params->shared = object->shared;
++
++    if (!(object->shared->stream_thread = CreateThread(NULL, 0, rsx_stream_thread, params, 0, NULL)))
++    {
++        free(params);
++        CloseHandle(object->shared->stream_stop);
++        object->shared->stream_stop = NULL;
++        object->shared->stream_format = NULL;
++        free(format);
++        return FALSE;
++    }
++
++    TRACE("Started RSX stream ring from %p, stride %lu, total size %lu.\n",
++            object->shared->stream_base, stride, total_size);
++    return TRUE;
++}
++
++static BOOL rsx_queue_matching_sqsh_stream(IUnknown *iface, const void *desc)
++{
++    struct rsx_object *object = impl_from_IUnknown(iface);
++    const BYTE *bytes = desc;
++    WAVEFORMATEX *format = NULL;
++    BYTE *decoded;
++    DWORD decoded_size;
++    DWORD riff_size, offset = 12;
++
++    if (!rsx_data_is_riff_wave(desc))
++        return FALSE;
++
++    riff_size = rsx_riff_size(desc);
++    while (offset + 8 <= riff_size)
++    {
++        DWORD chunk_size = rsx_read_dword(bytes + offset + 4);
++
++        if (!memcmp(bytes + offset, "data", 4))
++        {
++            if ((decoded = rsx_decode_matching_sqsh_wave_file_by_decoded_size(chunk_size,
++                    &format, &decoded_size)))
++            {
++                if (format->wFormatTag != WAVE_FORMAT_PCM)
++                    format->wFormatTag = WAVE_FORMAT_PCM;
++
++                rsx_queue_wave_data(object->shared, format, decoded, decoded_size, NULL);
++                TRACE("Queued decoded RSX SQSH stream for expected size %lu actual size %lu.\n",
++                        chunk_size, decoded_size);
++                free(format);
++                free(decoded);
++                return TRUE;
++            }
++            return FALSE;
++        }
++
++        if (offset + 8 + chunk_size > riff_size)
++            return FALSE;
++
++        offset += 8 + ((chunk_size + 1) & ~1);
++    }
++
++    return FALSE;
++}
++
++static DWORD CALLBACK rsx_play_wave_thread(void *param)
++{
++    struct rsx_wave_playback *playback = param;
++    WAVEHDR header = {0};
++    HWAVEOUT wave = NULL;
++    DWORD duration;
++    MMRESULT ret;
++
++    ret = waveOutOpen(&wave, WAVE_MAPPER, playback->format, 0, 0, CALLBACK_NULL);
++    if (ret == MMSYSERR_NOERROR)
++    {
++        header.lpData = (char *)playback->data;
++        header.dwBufferLength = playback->size;
++
++        ret = waveOutPrepareHeader(wave, &header, sizeof(header));
++        if (ret == MMSYSERR_NOERROR)
++        {
++            ret = waveOutWrite(wave, &header, sizeof(header));
++            if (ret == MMSYSERR_NOERROR)
++            {
++                DWORD waited = 0;
++
++                duration = MulDiv(playback->size, 1000, playback->format->nAvgBytesPerSec);
++                while (!(header.dwFlags & WHDR_DONE) && waited < duration + 2000)
++                {
++                    Sleep(10);
++                    waited += 10;
++                }
++
++                if (!(header.dwFlags & WHDR_DONE))
++                {
++                    WARN("RSX wave playback timed out after %lu ms, resetting device.\n", waited);
++                    waveOutReset(wave);
++                }
++            }
++            else
++                WARN("waveOutWrite failed %#x.\n", ret);
++
++            waveOutUnprepareHeader(wave, &header, sizeof(header));
++        }
++        else
++            WARN("waveOutPrepareHeader failed %#x.\n", ret);
++
++        waveOutClose(wave);
++    }
++    else
++        WARN("waveOutOpen failed %#x.\n", ret);
++
++    free(playback->format);
++    free(playback->data);
++    free(playback);
++    return 0;
++}
++
++static void rsx_play_wave_data(const void *data, DWORD fallback_size)
++{
++    struct rsx_wave_playback *playback;
++    HANDLE thread;
++
++    if (!rsx_data_is_riff_wave(data))
++        return;
++
++    if (!(playback = calloc(1, sizeof(*playback))))
++        return;
++
++    if (!rsx_parse_wave_data(data, fallback_size, playback))
++    {
++        free(playback);
++        return;
++    }
++
++    if (!(thread = CreateThread(NULL, 0, rsx_play_wave_thread, playback, 0, NULL)))
++    {
++        free(playback->format);
++        free(playback->data);
++        free(playback);
++        return;
++    }
++
++    CloseHandle(thread);
++}
++
++static void rsx_play_wave_data_from_stub(void *size_arg, void *data)
++{
++    DWORD size = (DWORD)(ULONG_PTR)size_arg;
++
++    if (size < 12 || size > 16 * 1024 * 1024 || !rsx_data_is_riff_wave(data))
++        return;
++
++    rsx_play_wave_data(data, size);
++}
++
++static DWORD CALLBACK rsx_play_source_thread(void *param)
++{
++    struct rsx_source_playback *playback = param;
++    enum { buffer_count = 3, buffer_size = 10240 };
++    BYTE buffers[buffer_count][buffer_size];
++    WAVEHDR headers[buffer_count] = {{0}};
++    BOOL active[buffer_count] = {FALSE};
++    DWORD submitted = 0, completed = 0, queued = 0, index = 0;
++    HWAVEOUT wave = NULL;
++    BOOL source_done = FALSE;
++    MMRESULT ret;
++    unsigned int i;
++
++    ret = waveOutOpen(&wave, WAVE_MAPPER, playback->format, 0, 0, CALLBACK_NULL);
++    if (ret != MMSYSERR_NOERROR)
++    {
++        WARN("waveOutOpen for RSX source stream failed %#x.\n", ret);
++        goto done;
++    }
++
++    for (i = 0; i < buffer_count; ++i)
++    {
++        headers[i].lpData = (char *)buffers[i];
++        headers[i].dwBufferLength = buffer_size;
++    }
++
++    for (i = 0; i < buffer_count && submitted < playback->expected_size; ++i)
++    {
++        HRESULT hr;
++
++        memset(buffers[i], 0, buffer_size);
++        hr = rsx_stream_source_fill(playback->source, buffers[i]);
++        if (FAILED(hr))
++        {
++            TRACE("RSX source stream fill returned %#lx after %lu bytes.\n", hr, submitted);
++            source_done = TRUE;
++            break;
++        }
++
++        headers[i].dwFlags = 0;
++        ret = waveOutPrepareHeader(wave, &headers[i], sizeof(headers[i]));
++        if (ret != MMSYSERR_NOERROR)
++        {
++            WARN("waveOutPrepareHeader for RSX source stream failed %#x.\n", ret);
++            source_done = TRUE;
++            break;
++        }
++
++        active[i] = TRUE;
++        ret = waveOutWrite(wave, &headers[i], sizeof(headers[i]));
++        if (ret != MMSYSERR_NOERROR)
++        {
++            WARN("waveOutWrite for RSX source stream failed %#x.\n", ret);
++            waveOutUnprepareHeader(wave, &headers[i], sizeof(headers[i]));
++            active[i] = FALSE;
++            source_done = TRUE;
++            break;
++        }
++
++        submitted += buffer_size;
++        queued += buffer_size;
++    }
++
++    while (completed < queued)
++    {
++        DWORD waited = 0;
++
++        if (!active[index])
++        {
++            index = (index + 1) % buffer_count;
++            continue;
++        }
++
++        while (!(headers[index].dwFlags & WHDR_DONE) && waited < 2000)
++        {
++            Sleep(5);
++            waited += 5;
++        }
++
++        if (!(headers[index].dwFlags & WHDR_DONE))
++        {
++            WARN("RSX source stream buffer timed out after %lu ms.\n", waited);
++            waveOutReset(wave);
++            break;
++        }
++
++        waveOutUnprepareHeader(wave, &headers[index], sizeof(headers[index]));
++        active[index] = FALSE;
++        completed += buffer_size;
++
++        if (!source_done && submitted < playback->expected_size)
++        {
++            HRESULT hr;
++
++            memset(buffers[index], 0, buffer_size);
++            hr = rsx_stream_source_fill(playback->source, buffers[index]);
++            if (FAILED(hr))
++            {
++                TRACE("RSX source stream fill returned %#lx after %lu bytes.\n", hr, submitted);
++                source_done = TRUE;
++            }
++            else
++            {
++                headers[index].dwFlags = 0;
++                ret = waveOutPrepareHeader(wave, &headers[index], sizeof(headers[index]));
++                if (ret != MMSYSERR_NOERROR)
++                {
++                    WARN("waveOutPrepareHeader for RSX source stream failed %#x.\n", ret);
++                    source_done = TRUE;
++                }
++                else
++                {
++                    active[index] = TRUE;
++                    ret = waveOutWrite(wave, &headers[index], sizeof(headers[index]));
++                    if (ret != MMSYSERR_NOERROR)
++                    {
++                        WARN("waveOutWrite for RSX source stream failed %#x.\n", ret);
++                        waveOutUnprepareHeader(wave, &headers[index], sizeof(headers[index]));
++                        active[index] = FALSE;
++                        source_done = TRUE;
++                    }
++                    else
++                    {
++                        submitted += buffer_size;
++                        queued += buffer_size;
++                    }
++                }
++            }
++        }
++
++        index = (index + 1) % buffer_count;
++    }
++
++    TRACE("Stopped RSX source stream after %lu/%lu bytes.\n", submitted, playback->expected_size);
++
++done:
++    if (wave)
++    {
++        for (i = 0; i < buffer_count; ++i)
++        {
++            if (active[i])
++                waveOutUnprepareHeader(wave, &headers[i], sizeof(headers[i]));
++        }
++    }
++    if (wave)
++        waveOutClose(wave);
++    IUnknown_Release(playback->source);
++    free(playback->format);
++    free(playback);
++    return 0;
++}
++
++static BOOL rsx_play_source_stream(IUnknown *iface, const void *desc)
++{
++    struct rsx_object *object = impl_from_IUnknown(iface);
++    struct rsx_source_playback *playback;
++    const BYTE *bytes = desc;
++    WAVEFORMATEX *format;
++    DWORD riff_size, offset = 12, expected_size = 0;
++    HANDLE thread;
++
++    if (!object->shared->stream_source || !rsx_parse_wave_format(desc, &format))
++        return FALSE;
++
++    riff_size = rsx_riff_size(desc);
++    while (offset + 8 <= riff_size)
++    {
++        DWORD chunk_size = rsx_read_dword(bytes + offset + 4);
++
++        if (!memcmp(bytes + offset, "data", 4))
++        {
++            expected_size = chunk_size;
++            break;
++        }
++
++        if (offset + 8 + chunk_size > riff_size)
++            break;
++
++        offset += 8 + ((chunk_size + 1) & ~1);
++    }
++
++    if (!expected_size || expected_size > 32 * 1024 * 1024)
++    {
++        free(format);
++        return FALSE;
++    }
++
++    format->wFormatTag = WAVE_FORMAT_PCM;
++    format->cbSize = 0;
++    if (!format->nChannels)
++        format->nChannels = 1;
++    if (!format->wBitsPerSample)
++        format->wBitsPerSample = 16;
++    format->nBlockAlign = format->nChannels * format->wBitsPerSample / 8;
++    format->nAvgBytesPerSec = format->nSamplesPerSec * format->nBlockAlign;
++
++    if (!(playback = calloc(1, sizeof(*playback))))
++    {
++        free(format);
++        return FALSE;
++    }
++
++    playback->source = object->shared->stream_source;
++    IUnknown_AddRef(playback->source);
++    playback->format = format;
++    playback->expected_size = expected_size;
++
++    if (!(thread = CreateThread(NULL, 0, rsx_play_source_thread, playback, 0, NULL)))
++    {
++        IUnknown_Release(playback->source);
++        free(playback->format);
++        free(playback);
++        return FALSE;
++    }
++
++    CloseHandle(thread);
++    TRACE("Started RSX source stream playback for %lu bytes.\n", expected_size);
++    return TRUE;
++}
++
++static void rsx_queue_wave_data(struct rsx_shared *shared, const WAVEFORMATEX *format,
++        const void *data, DWORD size, DWORD *stream_status)
++{
++    struct rsx_wave_header *wave_header;
++    MMRESULT ret;
++
++    if (!data || !size)
++        return;
++
++    if (!shared->wave)
++    {
++        if (!(shared->wave_format = malloc(format->cbSize + sizeof(*format))))
++            return;
++
++        memcpy(shared->wave_format, format, format->cbSize + sizeof(*format));
++
++        ret = waveOutOpen(&shared->wave, WAVE_MAPPER, shared->wave_format,
++                (DWORD_PTR)rsx_wave_out_proc, (DWORD_PTR)shared, CALLBACK_FUNCTION);
++        if (ret != MMSYSERR_NOERROR)
++        {
++            WARN("waveOutOpen failed %#x.\n", ret);
++            free(shared->wave_format);
++            shared->wave_format = NULL;
++            return;
++        }
++    }
++
++    rsx_cleanup_done_wave_headers(shared);
++
++    if (!(wave_header = calloc(1, sizeof(*wave_header))))
++        return;
++
++    if (!(wave_header->header.lpData = malloc(size)))
++    {
++        free(wave_header);
++        return;
++    }
++
++    memcpy(wave_header->header.lpData, data, size);
++    wave_header->header.dwBufferLength = size;
++    wave_header->stream_status = stream_status;
++    if (stream_status)
++        *stream_status = 1;
++    if (stream_status)
++        wave_header->stream_entry = (BYTE *)stream_status - 4;
++
++    ret = waveOutPrepareHeader(shared->wave, &wave_header->header, sizeof(wave_header->header));
++    if (ret != MMSYSERR_NOERROR)
++    {
++        WARN("waveOutPrepareHeader failed %#x.\n", ret);
++        if (stream_status)
++            *stream_status = 0;
++        free(wave_header->header.lpData);
++        free(wave_header);
++        return;
++    }
++
++    ret = waveOutWrite(shared->wave, &wave_header->header, sizeof(wave_header->header));
++    if (ret != MMSYSERR_NOERROR)
++    {
++        WARN("waveOutWrite failed %#x.\n", ret);
++        waveOutUnprepareHeader(shared->wave, &wave_header->header, sizeof(wave_header->header));
++        if (stream_status)
++            *stream_status = 0;
++        free(wave_header->header.lpData);
++        free(wave_header);
++        return;
++    }
++
++    wave_header->next = shared->wave_headers;
++    shared->wave_headers = wave_header;
++}
++
++static void rsx_queue_wave_data_from_stub(IUnknown *iface, void *size_arg, void *data)
++{
++    struct rsx_object *object = impl_from_IUnknown(iface);
++    struct rsx_wave_playback playback = {0};
++    DWORD size = (DWORD)(ULONG_PTR)size_arg;
++
++    if (size > 16 * 1024 * 1024)
++        return;
++
++    if (rsx_data_is_riff_wave(data))
++    {
++        if (!rsx_parse_wave_data(data, size, &playback))
++            return;
++
++        rsx_queue_wave_data(object->shared, playback.format, playback.data, playback.size, NULL);
++        free(playback.format);
++        free(playback.data);
++    }
++    else if (object->shared->wave_format && size)
++    {
++        rsx_queue_wave_data(object->shared, object->shared->wave_format, data, size, NULL);
++    }
++}
++
++static HRESULT WINAPI rsx_play_wave_stub(IUnknown *iface, void *arg1, void *arg2, void *arg3)
++{
++    TRACE("iface %p, arg1 %p, arg2 %p, arg3 %p, stub.\n", iface, arg1, arg2, arg3);
++
++    rsx_play_wave_data_from_stub(arg2, arg3);
++
++    return S_OK;
++}
++
++static HRESULT WINAPI rsx_stub_method8(IUnknown *iface, void *arg1, void *arg2, void *arg3)
++{
++    struct rsx_object *object = impl_from_IUnknown(iface);
++    static LONG trace_count;
++    DWORD i;
++
++    TRACE("iface %p, arg1 %p, arg2 %p, arg3 %p, stub.\n", iface, arg1, arg2, arg3);
++
++    if (arg1 && !arg2 && !arg3)
++    {
++        if (rsx_fill_next_stream_ring_buffer(object->shared, arg1, 10240))
++            return S_OK;
++        return E_FAIL;
++    }
++
++    if (trace_count < 16)
++    {
++        InterlockedIncrement(&trace_count);
++        if (arg1 && !IsBadReadPtr(arg1, 64))
++            rsx_trace_bytes("RSX method8 arg1", arg1, 64);
++        if (arg3 && !IsBadReadPtr(arg3, 64))
++        {
++            rsx_trace_bytes("RSX method8 arg3", arg3, 64);
++            for (i = 0; i < 16; ++i)
++            {
++                BYTE *ptr = (BYTE *)(ULONG_PTR)rsx_read_dword((const BYTE *)arg3 + i * sizeof(DWORD));
++
++                if (!ptr || IsBadReadPtr(ptr, 64))
++                    continue;
++
++                TRACE("RSX method8 arg3[%lu] points to %p.\n", i, ptr);
++                rsx_trace_bytes("RSX method8 arg3 target", ptr, 64);
++            }
++        }
++    }
++
++    if ((ULONG_PTR)arg2 == 5 && arg3 && !object->shared->stream_source)
++    {
++        IUnknown *source = NULL;
++
++        if (!IsBadReadPtr(arg3, 16 * sizeof(DWORD)))
++        {
++            for (i = 0; i < 16; ++i)
++            {
++                IUnknown *candidate = (IUnknown *)(ULONG_PTR)rsx_read_dword((const BYTE *)arg3
++                        + i * sizeof(DWORD));
++
++                if (candidate && candidate != iface && rsx_valid_stream_source(candidate))
++                {
++                    source = candidate;
++                    TRACE("Using RSX method8 arg3[%lu] source %p for stream refill.\n", i, source);
++                    break;
++                }
++            }
++        }
++
++        if (!source)
++            source = iface;
++
++        object->shared->stream_source = source;
++        IUnknown_AddRef(object->shared->stream_source);
++        TRACE("Stored RSX method8 source %p for stream refill.\n", object->shared->stream_source);
++    }
++
++    rsx_play_wave_data_from_stub(arg2, arg3);
++
++    return S_OK;
++}
++
++static HRESULT WINAPI rsx_stub_method18(IUnknown *iface, void *arg1, void *arg2, void *arg3)
++{
++    struct rsx_object *object = impl_from_IUnknown(iface);
++    const BYTE *desc = arg3;
++
++    TRACE("iface %p, arg1 %p, arg2 %p, arg3 %p, stub.\n", iface, arg1, arg2, arg3);
++
++    if (arg2 && !rsx_data_is_riff_wave(arg3))
++    {
++        if (arg1 && !IsBadReadPtr(arg1, 64))
++            rsx_trace_bytes("RSX method18 non-wave arg1", arg1, 64);
++        if (arg2 && !IsBadReadPtr(arg2, 64))
++            rsx_trace_bytes("RSX method18 non-wave arg2", arg2, 64);
++        if (arg3 && !IsBadReadPtr(arg3, 64))
++            rsx_trace_bytes("RSX method18 non-wave arg3", arg3, 64);
++
++        if ((ULONG_PTR)arg3 > 0x28 && (ULONG_PTR)arg3 <= 16 * 1024 * 1024
++                && !IsBadReadPtr(arg2, (ULONG_PTR)arg3)
++                && rsx_queue_stream_buffers_from_range(iface, arg2, (DWORD)(ULONG_PTR)arg3))
++            return S_OK;
++
++        if (arg1 && rsx_valid_stream_source(arg2)
++                && (ULONG_PTR)arg3 > 0x1000 && (ULONG_PTR)arg3 <= 16 * 1024 * 1024)
++        {
++            if (object->shared->stream_source)
++                IUnknown_Release(object->shared->stream_source);
++            object->shared->stream_source = arg2;
++            IUnknown_AddRef(object->shared->stream_source);
++            object->shared->stream_base = arg1;
++            object->shared->stream_total_size = (DWORD)(ULONG_PTR)arg3;
++            TRACE("Stored RSX stream source %p, base %p, total size %lu.\n",
++                    object->shared->stream_source, object->shared->stream_base,
++                    object->shared->stream_total_size);
++            return S_OK;
++        }
++    }
++
++    /* Overseer calls this once with arg2 == NULL and a non-pointer state value
++     * in arg3 before the later wave-buffer submit. Do not inspect arg3 there. */
++    if (!arg2)
++    {
++        if (arg1 && !IsBadReadPtr(arg1, 64))
++        {
++            rsx_trace_bytes("RSX method18 initial state", arg1, 64);
++            object->shared->stream_base = arg1;
++            object->shared->stream_ring_count = 0;
++            object->shared->stream_ring_next = 0;
++            memset(object->shared->stream_ring_entry, 0, sizeof(object->shared->stream_ring_entry));
++            memset(object->shared->stream_ring_checksum, 0, sizeof(object->shared->stream_ring_checksum));
++        }
++        return S_OK;
++    }
++
++    if (rsx_data_is_riff_wave(arg3))
++    {
++        BOOL queued_stream_buffer, started_stream_ring;
++
++        rsx_trace_bytes("RSX method18 submit buffer", arg1, 128);
++        if (rsx_riff_size(arg3) >= 0x50)
++        {
++            TRACE("RSX method18 descriptor values: %#lx %#lx %#lx %#lx %#lx %#lx %#lx %#lx.\n",
++                    rsx_read_dword(desc + 0x24), rsx_read_dword(desc + 0x28),
++                    rsx_read_dword(desc + 0x2c), rsx_read_dword(desc + 0x30),
++                    rsx_read_dword(desc + 0x34), rsx_read_dword(desc + 0x38),
++                    rsx_read_dword(desc + 0x3c), rsx_read_dword(desc + 0x40));
++            if (rsx_read_dword(desc + 0x34))
++                rsx_trace_bytes("RSX method18 descriptor data pointer",
++                        (const BYTE *)(ULONG_PTR)rsx_read_dword(desc + 0x34), 128);
++        }
++
++        if (object->shared->stream_base && (ULONG_PTR)arg2 > 0x28
++                && (ULONG_PTR)arg2 <= 16 * 1024 * 1024)
++            object->shared->stream_total_size = (DWORD)(ULONG_PTR)arg2;
++
++        if (rsx_queue_matching_sqsh_stream(iface, arg3) || rsx_play_source_stream(iface, arg3))
++            return S_OK;
++
++        queued_stream_buffer = rsx_queue_stream_buffer(iface, arg3, arg1);
++        started_stream_ring = rsx_start_stream_ring(iface, arg3, arg1, (DWORD)(ULONG_PTR)arg2);
++
++        if (queued_stream_buffer || started_stream_ring)
++            return S_OK;
++
++        rsx_queue_wave_data_from_stub(iface, arg2, arg3);
++
++        return S_OK;
++    }
++
++    rsx_queue_wave_data_from_stub(iface, arg2, arg3);
++
++    return S_OK;
++}
++
++static HRESULT WINAPI rsx_stub_method22(IUnknown *iface, void *arg1, void *arg2, void *arg3)
++{
++    TRACE("iface %p, arg1 %p, arg2 %p, arg3 %p, stub.\n", iface, arg1, arg2, arg3);
++
++    rsx_play_wave_data_from_stub(arg2, arg3);
++
++    return S_OK;
++}
++
++static HRESULT WINAPI rsx_stub_method25(IUnknown *iface, void *arg1, void *arg2, void *arg3)
++{
++    TRACE("iface %p, arg1 %p, arg2 %p, arg3 %p, stub.\n", iface, arg1, arg2, arg3);
++
++    rsx_play_wave_data_from_stub(arg2, arg3);
++
++    return S_OK;
++}
++
++static HRESULT WINAPI rsx_stub_method28(IUnknown *iface, void *arg1, void *arg2, void *arg3)
++{
++    TRACE("iface %p, arg1 %p, arg2 %p, arg3 %p, stub.\n", iface, arg1, arg2, arg3);
++
++    rsx_play_wave_data_from_stub(arg2, arg3);
++
++    return S_OK;
++}
++
++static HRESULT WINAPI rsx_listener_set_vector(IUnknown *iface, void *arg1, void *arg2)
++{
++    TRACE("iface %p, arg1 %p, arg2 %p, stub.\n", iface, arg1, arg2);
++
++    return S_OK;
++}
++
++static const struct
++{
++    HRESULT (WINAPI *QueryInterface)(IUnknown *iface, REFIID iid, void **out);
++    ULONG (WINAPI *AddRef)(IUnknown *iface);
++    ULONG (WINAPI *Release)(IUnknown *iface);
++    HRESULT (WINAPI *method3)(IUnknown *iface);
++    HRESULT (WINAPI *method4)(IUnknown *iface, void *arg1);
++    HRESULT (WINAPI *method5)(IUnknown *iface, void *arg1);
++    HRESULT (WINAPI *method6)(IUnknown *iface, void *arg1, IUnknown **out, void *arg3);
++    HRESULT (WINAPI *method7)(IUnknown *iface, void *arg1);
++    HRESULT (WINAPI *method8)(IUnknown *iface, void *arg1, void *arg2, void *arg3);
++    HRESULT (WINAPI *method9)(IUnknown *iface, void *arg1);
++    HRESULT (WINAPI *method10)(IUnknown *iface, void *arg1);
++    HRESULT (WINAPI *method11)(IUnknown *iface, void *arg1, void *arg2, void *arg3);
++    HRESULT (WINAPI *method12)(IUnknown *iface, void *arg1);
++    HRESULT (WINAPI *method13)(IUnknown *iface, void *arg1);
++    HRESULT (WINAPI *method14)(IUnknown *iface, void *arg1);
++    HRESULT (WINAPI *method15)(IUnknown *iface, void *arg1);
++    HRESULT (WINAPI *method16)(IUnknown *iface, void *arg1);
++    HRESULT (WINAPI *method17)(IUnknown *iface, void *arg1);
++    HRESULT (WINAPI *method18)(IUnknown *iface, void *arg1, void *arg2, void *arg3);
++    HRESULT (WINAPI *method19)(IUnknown *iface, void *arg1, void *arg2);
++    HRESULT (WINAPI *method20)(IUnknown *iface, void *arg1);
++    HRESULT (WINAPI *method21)(IUnknown *iface, void *arg1);
++    HRESULT (WINAPI *method22)(IUnknown *iface, void *arg1, void *arg2, void *arg3);
++    HRESULT (WINAPI *method23)(IUnknown *iface, void *arg1);
++    HRESULT (WINAPI *method24)(IUnknown *iface, void *arg1);
++    HRESULT (WINAPI *method25)(IUnknown *iface, void *arg1, void *arg2, void *arg3);
++    HRESULT (WINAPI *method26)(IUnknown *iface, void *arg1);
++    HRESULT (WINAPI *method27)(IUnknown *iface, void *arg1);
++    HRESULT (WINAPI *method28)(IUnknown *iface, void *arg1, void *arg2, void *arg3);
++    HRESULT (WINAPI *method29)(IUnknown *iface, void *arg1);
++    HRESULT (WINAPI *method30)(IUnknown *iface, void *arg1);
++    HRESULT (WINAPI *method31)(IUnknown *iface, void *arg1);
++} rsx_vtbl =
++{
++    rsx_QueryInterface,
++    rsx_AddRef,
++    rsx_Release,
++    rsx_stub_0,
++    rsx_poll_stub,
++    rsx_poll_stub,
++    rsx_create_child,
++    rsx_stub_method7,
++    rsx_stub_method8,
++    rsx_stub_method9,
++    rsx_stub_method10,
++    rsx_play_wave_stub,
++    rsx_stub_method12,
++    rsx_stub_method13,
++    rsx_stub_method14,
++    rsx_stub_method15,
++    rsx_stub_method16,
++    rsx_stub_method17,
++    rsx_stub_method18,
++    rsx_listener_set_vector,
++    rsx_stub_method20,
++    rsx_stub_method21,
++    rsx_stub_method22,
++    rsx_stub_method23,
++    rsx_stub_method24,
++    rsx_stub_method25,
++    rsx_stub_method26,
++    rsx_stub_method27,
++    rsx_stub_method28,
++    rsx_stub_method29,
++    rsx_stub_method30,
++    rsx_stub_method31,
++};
++
++static HRESULT rsx_create(REFIID iid, void **out)
++{
++    struct rsx_object *object;
++    HRESULT hr;
++
++    if (!out) return E_POINTER;
++    *out = NULL;
++
++    if (!(object = calloc(1, sizeof(*object))))
++        return E_OUTOFMEMORY;
++
++    if (!(object->shared = rsx_shared_acquire()))
++    {
++        free(object);
++        return E_OUTOFMEMORY;
++    }
++
++    object->lpVtbl = (void *)&rsx_vtbl;
++    object->ref = 1;
++
++    hr = IUnknown_QueryInterface((IUnknown *)&object->lpVtbl, iid, out);
++    IUnknown_Release((IUnknown *)&object->lpVtbl);
++    return hr;
++}
++
++static HRESULT WINAPI factory_QueryInterface(IClassFactory *iface, REFIID iid, void **out)
++{
++    TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
++
++    if (!out) return E_POINTER;
++
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IClassFactory))
++    {
++        *out = iface;
++        IClassFactory_AddRef(iface);
++        return S_OK;
++    }
++
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI factory_AddRef(IClassFactory *iface)
++{
++    return 2;
++}
++
++static ULONG WINAPI factory_Release(IClassFactory *iface)
++{
++    return 1;
++}
++
++static HRESULT WINAPI factory_CreateInstance(IClassFactory *iface, IUnknown *outer,
++        REFIID iid, void **out)
++{
++    TRACE("iface %p, outer %p, iid %s, out %p.\n", iface, outer, debugstr_guid(iid), out);
++
++    if (outer) return CLASS_E_NOAGGREGATION;
++    return rsx_create(iid, out);
++}
++
++static HRESULT WINAPI factory_LockServer(IClassFactory *iface, BOOL lock)
++{
++    TRACE("iface %p, lock %d.\n", iface, lock);
++    return S_OK;
++}
++
++static const IClassFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    factory_CreateInstance,
++    factory_LockServer,
++};
++
++static IClassFactory rsx_factory = { &factory_vtbl };
++
++static const struct
++{
++    const char *guid;
++    const char *name;
++}
++rsx_classes[] =
++{
++    {"{e78f7620-96cb-11cf-a00b-444553540000}", "RSX20 Class"},
++    {"{e78f7629-96cb-11cf-a00b-444553540000}", "RSX CachedEmitter Class"},
++    {"{e78f762d-96cb-11cf-a00b-444553540000}", "RSX StreamingEmitter Class"},
++    {"{e78f7630-96cb-11cf-a00b-444553540000}", "RSX DirectListener Class"},
++    {"{e78f7634-96cb-11cf-a00b-444553540000}", "RSX StreamingListener Class"},
++    {"{e78f7638-96cb-11cf-a00b-444553540000}", "RSX Compatibility Class"},
++    {"{4b2ce920-1c45-11d0-985d-00aa003b43af}", "RSX WaveEmitter Class"},
++    {"{4b2ce921-1c45-11d0-985d-00aa003b43af}", "RSX WaveListener Class"},
++    {"{4b2ce922-1c45-11d0-985d-00aa003b43af}", "RSX DirectSound Class"},
++    {"{4b2ce923-1c45-11d0-985d-00aa003b43af}", "RSX WaveStream Class"},
++};
++
++static BOOL is_rsx_class(REFCLSID clsid)
++{
++    return IsEqualGUID(clsid, &CLSID_RSX20)
++            || IsEqualGUID(clsid, &CLSID_RSXCachedEmitter)
++            || IsEqualGUID(clsid, &CLSID_RSXStreamingEmitter)
++            || IsEqualGUID(clsid, &CLSID_RSXDirectListener)
++            || IsEqualGUID(clsid, &CLSID_RSXStreamingListener)
++            || IsEqualGUID(clsid, &CLSID_RSXCompatibility)
++            || IsEqualGUID(clsid, &CLSID_RSXWaveEmitter)
++            || IsEqualGUID(clsid, &CLSID_RSXWaveListener)
++            || IsEqualGUID(clsid, &CLSID_RSXDirectSound)
++            || IsEqualGUID(clsid, &CLSID_RSXWaveStream);
++}
++
++BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
++{
++    if (reason == DLL_PROCESS_ATTACH)
++        DisableThreadLibraryCalls(instance);
++    return TRUE;
++}
++
++HRESULT WINAPI DllGetClassObject(REFCLSID clsid, REFIID iid, void **out)
++{
++    TRACE("clsid %s, iid %s, out %p.\n", debugstr_guid(clsid), debugstr_guid(iid), out);
++
++    if (!out) return E_POINTER;
++    *out = NULL;
++
++    if (is_rsx_class(clsid))
++    {
++        set_rsx_wave_device();
++        return IClassFactory_QueryInterface(&rsx_factory, iid, out);
++    }
++
++    return CLASS_E_CLASSNOTAVAILABLE;
++}
++
++HRESULT WINAPI DllCanUnloadNow(void)
++{
++    return S_FALSE;
++}
++
++HRESULT WINAPI DllRegisterServer(void)
++{
++    static const char threading_model[] = "Both";
++    static const char module[] = "rsx.dll";
++    char key_name[128];
++    unsigned int i;
++    HKEY class_key;
++    HKEY server_key;
++    LONG ret;
++
++    for (i = 0; i < ARRAY_SIZE(rsx_classes); ++i)
++    {
++        snprintf(key_name, sizeof(key_name), "CLSID\\%s", rsx_classes[i].guid);
++        if ((ret = RegCreateKeyA(HKEY_CLASSES_ROOT, key_name, &class_key)))
++            return HRESULT_FROM_WIN32(ret);
++
++        ret = RegSetValueExA(class_key, NULL, 0, REG_SZ,
++                (const BYTE *)rsx_classes[i].name, strlen(rsx_classes[i].name) + 1);
++        if (!ret && !(ret = RegCreateKeyA(class_key, "InprocServer32", &server_key)))
++        {
++            ret = RegSetValueExA(server_key, NULL, 0, REG_SZ, (const BYTE *)module, sizeof(module));
++            if (!ret)
++                ret = RegSetValueExA(server_key, "ThreadingModel", 0, REG_SZ,
++                        (const BYTE *)threading_model, sizeof(threading_model));
++            RegCloseKey(server_key);
++        }
++        RegCloseKey(class_key);
++
++        if (ret) return HRESULT_FROM_WIN32(ret);
++    }
++
++    set_rsx_wave_device();
++    return S_OK;
++}
++
++HRESULT WINAPI DllUnregisterServer(void)
++{
++    char key_name[128];
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(rsx_classes); ++i)
++    {
++        snprintf(key_name, sizeof(key_name), "CLSID\\%s", rsx_classes[i].guid);
++        RegDeleteTreeA(HKEY_CLASSES_ROOT, key_name);
++    }
++
++    return S_OK;
++}
++
++HRESULT WINAPI CreateRSX(void *param, void **out)
++{
++    FIXME("param %p, out %p, semi-stub.\n", param, out);
++
++    return rsx_create(&IID_IUnknown, out);
++}
+diff --git a/dlls/rsx/rsx.spec b/dlls/rsx/rsx.spec
+new file mode 100644
+index 00000000000..c8954e59a51
+--- /dev/null
++++ b/dlls/rsx/rsx.spec
+@@ -0,0 +1,5 @@
++@ stdcall -private CreateRSX(ptr ptr)
++@ stdcall -private DllCanUnloadNow()
++@ stdcall -private DllGetClassObject(ptr ptr ptr)
++@ stdcall -private DllRegisterServer()
++@ stdcall -private DllUnregisterServer()
+diff --git a/dlls/rsx/rsx_classes.idl b/dlls/rsx/rsx_classes.idl
+new file mode 100644
+index 00000000000..1151d510007
+--- /dev/null
++++ b/dlls/rsx/rsx_classes.idl
+@@ -0,0 +1,72 @@
++/*
++ * Intel RSX 3D compatibility classes
++ *
++ * Copyright 2026 Geoffrey McRae
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#pragma makedep register
++
++[
++    threading(both),
++    uuid(e78f7620-96cb-11cf-a00b-444553540000),
++]
++coclass RSX20 {}
++
++[
++    threading(both),
++    uuid(e78f7629-96cb-11cf-a00b-444553540000),
++]
++coclass RSXCachedEmitter {}
++
++[
++    threading(both),
++    uuid(e78f762d-96cb-11cf-a00b-444553540000),
++]
++coclass RSXStreamingEmitter {}
++
++[
++    threading(both),
++    uuid(e78f7630-96cb-11cf-a00b-444553540000),
++]
++coclass RSXDirectListener {}
++
++[
++    threading(both),
++    uuid(e78f7634-96cb-11cf-a00b-444553540000),
++]
++coclass RSXStreamingListener {}
++
++[
++    threading(both),
++    uuid(e78f7638-96cb-11cf-a00b-444553540000),
++]
++coclass RSXCompatibility {}
++
++[
++    threading(both),
++    uuid(4b2ce920-1c45-11d0-985d-00aa003b43af),
++]
++coclass RSXWaveEmitter {}
++
++[
++    threading(both),
++    uuid(4b2ce921-1c45-11d0-985d-00aa003b43af),
++]
++coclass RSXWaveListener {}
++
++[
++    threading(both),
++    uuid(4b2ce922-1c45-11d0-985d-00aa003b43af),
++]
++coclass RSXDirectSound {}
++
++[
++    threading(both),
++    uuid(4b2ce923-1c45-11d0-985d-00aa003b43af),
++]
++coclass RSXWaveStream {}
+diff --git a/dlls/winmm/waveform.c b/dlls/winmm/waveform.c
+index fa1c446ff91..31b4e6c9d5b 100644
+--- a/dlls/winmm/waveform.c
++++ b/dlls/winmm/waveform.c
+@@ -2830,6 +2830,39 @@ UINT WINAPI waveOutUnprepareHeader(HWAVEOUT hWaveOut,
+ /**************************************************************************
+  * 				waveOutWrite		[WINMM.@]
+  */
++static void WINMM_DumpWaveOutBuffer(const WAVEHDR *header)
++{
++    static LONG dump_index;
++    char enabled[8], path[MAX_PATH], filename[MAX_PATH + 64];
++    DWORD len, written;
++    HANDLE file;
++
++    if (!header->lpData || !header->dwBufferLength)
++        return;
++    if (!GetEnvironmentVariableA("WINE_DUMP_WAVEOUT", enabled, sizeof(enabled))
++            || strcmp(enabled, "1"))
++        return;
++
++    len = GetEnvironmentVariableA("WINE_DUMP_WAVEOUT_DIR", path, sizeof(path));
++    if (!len || len >= sizeof(path))
++    {
++        len = GetTempPathA(sizeof(path), path);
++        if (!len || len >= sizeof(path))
++            return;
++    }
++
++    snprintf(filename, sizeof(filename), "%s\\wine-waveout-%04ld-%08lx.raw",
++            path, InterlockedIncrement(&dump_index), header->dwBufferLength);
++    file = CreateFileA(filename, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
++            FILE_ATTRIBUTE_NORMAL, NULL);
++    if (file == INVALID_HANDLE_VALUE)
++        return;
++
++    WriteFile(file, header->lpData, header->dwBufferLength, &written, NULL);
++    CloseHandle(file);
++    TRACE("Dumped waveOutWrite buffer to %s.\n", debugstr_a(filename));
++}
++
+ UINT WINAPI waveOutWrite(HWAVEOUT hWaveOut, WAVEHDR *header, UINT uSize)
+ {
+     WINMM_Device *device;
+@@ -2853,6 +2886,7 @@ UINT WINAPI waveOutWrite(HWAVEOUT hWaveOut, WAVEHDR *header, UINT uSize)
+     }
+ 
+     TRACE("dwBufferLength: %lu\n", header->dwBufferLength);
++    WINMM_DumpWaveOutBuffer(header);
+ 
+     if(device->acm_handle){
+         ACMSTREAMHEADER *ash = (ACMSTREAMHEADER*)header->reserved;
+diff --git a/loader/wine.inf.in b/loader/wine.inf.in
+index becadabd906..df42daae8c3 100644
+--- a/loader/wine.inf.in
++++ b/loader/wine.inf.in
+@@ -619,6 +619,7 @@ HKLM,Software\Microsoft\DFS,,16
+ HKLM,Software\Microsoft\Driver Signing,,16
+ HKLM,Software\Microsoft\EnterpriseCertificates,,16
+ HKLM,Software\Microsoft\EventSystem,,16
++HKLM,Software\Intel\Realistic Sound Experience\2.0,"Device Type",2,"wave"
+ HKLM,Software\Microsoft\MediaPlayer,"Installation DirectoryLFN",2,"%16422%\Windows Media Player"
+ HKLM,Software\Microsoft\MediaPlayer\PlayerUpgrade,"PlayerVersion",2,"12,0,7601,18840"
+ HKLM,Software\Microsoft\MSMQ,,16
+@@ -1009,6 +1010,7 @@ HKLM,SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x86,"Version",2,"14.42.344
+ 11,,qcap.dll,1
+ 11,,qedit.dll,1
+ 11,,resampledmo.dll,1
++11,,rsx.dll,1
+ 11,,urlmon.dll,1
+ 11,,vidreszr.dll,1
+ 11,,windowscodecs.dll,1
+diff --git a/loader/wine.inf.in.orig b/loader/wine.inf.in.orig
+index b9ebd2c5932..becadabd906 100644
+--- a/loader/wine.inf.in.orig
++++ b/loader/wine.inf.in.orig
+@@ -986,6 +986,7 @@ HKLM,SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x86,"Version",2,"14.42.344
+ 
+ [RegisterDllsSection]
+ ;;some dlls have to be registered first
++;; GE: keep DirectShow filter registration refreshed for bundled media filters.
+ 11,,shell32.dll,1
+ 11,,quartz.dll,1
+ 
+-- 
+2.54.0
+

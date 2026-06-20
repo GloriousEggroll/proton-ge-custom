@@ -1,0 +1,1010 @@
+From 916f77ccf8495d7ec50e2ccd49a3bfa132c56c56 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Thu, 18 Jun 2026 17:27:34 -0600
+Subject: [PATCH] fix video playback in tex murphy: overseer
+
+---
+ dlls/quartz/dsoundrender.c           | 123 ++++++++---------
+ dlls/quartz/filtergraph.c            | 155 +++++++++++++++++++++
+ dlls/quartz/main.c                   |   6 +
+ dlls/winedmo/main.c                  |  32 +++++
+ dlls/winedmo/quartz_transform.c      | 193 +++++++++++++++++++++++++--
+ dlls/winedmo/unix_demuxer.c          |  52 +++++++-
+ dlls/winedmo/unix_media_type.c       |   3 +
+ dlls/winedmo/unix_transform.c        |   5 +-
+ dlls/winedmo/winedmo_classes.idl     |   6 +
+ dlls/winedmo/winedmo_guids.h         |   1 +
+ dlls/winedmo/winedmo_private.h       |   1 +
+ dlls/winedmo/winedmo_quartz_parser.c |  25 +++-
+ loader/wine.inf.in                   |   1 +
+ 13 files changed, 516 insertions(+), 87 deletions(-)
+
+diff --git a/dlls/quartz/dsoundrender.c b/dlls/quartz/dsoundrender.c
+index 75037a85aff..96eb5db6101 100644
+--- a/dlls/quartz/dsoundrender.c
++++ b/dlls/quartz/dsoundrender.c
+@@ -348,6 +348,55 @@ static HRESULT render_sample(struct dsound_render *filter, IMediaSample *pSample
+     return send_sample_data(filter, start, pbSrcStream, cbSrcStream);
+ }
+ 
++static HRESULT dsound_render_init_dsound(struct dsound_render *filter)
++{
++    const WAVEFORMATEX *format = (WAVEFORMATEX *)filter->sink.pin.mt.pbFormat;
++    DSBUFFERDESC buf_desc;
++    HRESULT hr;
++
++    if (filter->dsbuffer)
++        return S_OK;
++
++    if (!filter->dsound)
++    {
++        if (FAILED(hr = DirectSoundCreate8(NULL, &filter->dsound, NULL)))
++            return hr == DSERR_NODRIVER ? VFW_E_NO_AUDIO_HARDWARE : hr;
++
++        if (FAILED(hr = IDirectSound8_SetCooperativeLevel(filter->dsound,
++                GetDesktopWindow(), DSSCL_PRIORITY)))
++            return hr;
++    }
++
++    filter->buf_size = format->nAvgBytesPerSec * 4;
++
++    memset(&buf_desc, 0, sizeof(buf_desc));
++    buf_desc.dwSize = sizeof(buf_desc);
++    buf_desc.dwFlags = DSBCAPS_CTRLVOLUME | DSBCAPS_CTRLPAN |
++            DSBCAPS_CTRLFREQUENCY | DSBCAPS_GLOBALFOCUS |
++            DSBCAPS_GETCURRENTPOSITION2;
++    buf_desc.dwBufferBytes = filter->buf_size;
++    buf_desc.lpwfxFormat = (WAVEFORMATEX *)format;
++
++    if (FAILED(hr = IDirectSound8_CreateSoundBuffer(filter->dsound, &buf_desc, &filter->dsbuffer, NULL)))
++    {
++        ERR("Failed to create sound buffer, hr %#lx.\n", hr);
++        strmbase_dump_media_type(&filter->sink.pin.mt);
++        return hr;
++    }
++
++    filter->writepos = filter->buf_size;
++
++    hr = IDirectSoundBuffer_SetVolume(filter->dsbuffer, filter->volume);
++    if (FAILED(hr))
++        ERR("Failed to set volume to %ld, hr %#lx.\n", filter->volume, hr);
++
++    hr = IDirectSoundBuffer_SetPan(filter->dsbuffer, filter->pan);
++    if (FAILED(hr))
++        ERR("Failed to set pan to %ld, hr %#lx.\n", filter->pan, hr);
++
++    return S_OK;
++}
++
+ static void complete_eos(struct dsound_render *filter)
+ {
+     IFilterGraph *graph = filter->filter.graph;
+@@ -476,46 +525,10 @@ static HRESULT dsound_render_sink_connect(struct strmbase_sink *iface, IPin *pee
+ {
+     struct dsound_render *filter = impl_from_strmbase_pin(&iface->pin);
+     const WAVEFORMATEX *format = (WAVEFORMATEX *)mt->pbFormat;
+-    HRESULT hr = S_OK;
+-    DSBUFFERDESC buf_desc;
+ 
+     filter->buf_size = format->nAvgBytesPerSec;
+-
+-    memset(&buf_desc,0,sizeof(DSBUFFERDESC));
+-    buf_desc.dwSize = sizeof(DSBUFFERDESC);
+-    buf_desc.dwFlags = DSBCAPS_CTRLVOLUME | DSBCAPS_CTRLPAN |
+-                       DSBCAPS_CTRLFREQUENCY | DSBCAPS_GLOBALFOCUS |
+-                       DSBCAPS_GETCURRENTPOSITION2;
+-    buf_desc.dwBufferBytes = filter->buf_size;
+-    buf_desc.lpwfxFormat = (WAVEFORMATEX *)format;
+-    hr = IDirectSound8_CreateSoundBuffer(filter->dsound, &buf_desc, &filter->dsbuffer, NULL);
+     filter->writepos = filter->buf_size;
+-    if (FAILED(hr))
+-    {
+-        ERR("Failed to create sound buffer, hr %#lx.\n", hr);
+-        strmbase_dump_media_type(mt);
+-    }
+-
+-    if (SUCCEEDED(hr))
+-    {
+-        hr = IDirectSoundBuffer_SetVolume(filter->dsbuffer, filter->volume);
+-        if (FAILED(hr))
+-            ERR("Failed to set volume to %ld, hr %#lx.\n", filter->volume, hr);
+-
+-        hr = IDirectSoundBuffer_SetPan(filter->dsbuffer, filter->pan);
+-        if (FAILED(hr))
+-            ERR("Failed to set pan to %ld, hr %#lx.\n", filter->pan, hr);
+-        hr = S_OK;
+-    }
+-
+-    if (FAILED(hr) && hr != VFW_E_ALREADY_CONNECTED)
+-    {
+-        if (filter->dsbuffer)
+-            IDirectSoundBuffer_Release(filter->dsbuffer);
+-        filter->dsbuffer = NULL;
+-    }
+-
+-    return hr;
++    return S_OK;
+ }
+ 
+ static void dsound_render_sink_disconnect(struct strmbase_sink *iface)
+@@ -686,9 +699,13 @@ static HRESULT dsound_render_start_stream(struct strmbase_filter *iface, REFEREN
+     struct dsound_render *filter = impl_from_strmbase_filter(iface);
+     IFilterGraph *graph = filter->filter.graph;
+     IMediaEventSink *event_sink;
++    HRESULT hr;
+ 
+     filter->stream_start = start;
+ 
++    if (filter->sink.pin.peer && FAILED(hr = dsound_render_init_dsound(filter)))
++        return hr;
++
+     SetEvent(filter->state_event);
+ 
+     if (filter->sink.pin.peer)
+@@ -1082,14 +1099,7 @@ static const IQualityControlVtbl quality_control_vtbl =
+ 
+ HRESULT dsound_render_create(IUnknown *outer, IUnknown **out)
+ {
+-    static const DSBUFFERDESC buffer_desc =
+-    {
+-        .dwSize = sizeof(DSBUFFERDESC),
+-        .dwFlags = DSBCAPS_PRIMARYBUFFER,
+-    };
+-
+     struct dsound_render *object;
+-    IDirectSoundBuffer *buffer;
+     HRESULT hr;
+ 
+     TRACE("outer %p, out %p.\n", outer, out);
+@@ -1106,31 +1116,6 @@ HRESULT dsound_render_create(IUnknown *outer, IUnknown **out)
+         return hr;
+     }
+ 
+-    if (FAILED(hr = DirectSoundCreate8(NULL, &object->dsound, NULL)))
+-    {
+-        IUnknown_Release(object->system_clock);
+-        strmbase_filter_cleanup(&object->filter);
+-        free(object);
+-        return hr == DSERR_NODRIVER ? VFW_E_NO_AUDIO_HARDWARE : hr;
+-    }
+-
+-    if (FAILED(hr = IDirectSound8_SetCooperativeLevel(object->dsound,
+-            GetDesktopWindow(), DSSCL_PRIORITY)))
+-    {
+-        IDirectSound8_Release(object->dsound);
+-        IUnknown_Release(object->system_clock);
+-        strmbase_filter_cleanup(&object->filter);
+-        free(object);
+-        return hr;
+-    }
+-
+-    if (SUCCEEDED(hr = IDirectSound8_CreateSoundBuffer(object->dsound,
+-            &buffer_desc, &buffer, NULL)))
+-    {
+-        IDirectSoundBuffer_Play(buffer, 0, 0, DSBPLAY_LOOPING);
+-        IDirectSoundBuffer_Release(buffer);
+-    }
+-
+     strmbase_passthrough_init(&object->passthrough, (IUnknown *)&object->filter.IBaseFilter_iface);
+     ISeekingPassThru_Init(&object->passthrough.ISeekingPassThru_iface, TRUE, &object->sink.pin.IPin_iface);
+ 
+diff --git a/dlls/quartz/filtergraph.c b/dlls/quartz/filtergraph.c
+index bd6729ff364..d6f944c6b5f 100644
+--- a/dlls/quartz/filtergraph.c
++++ b/dlls/quartz/filtergraph.c
+@@ -41,6 +41,9 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(quartz);
+ 
++static const CLSID CLSID_winedmo_ac3_audio_decoder =
++    {0x31d3ec21, 0x457d, 0x406f, {0x87, 0x84, 0x3d, 0x1a, 0x41, 0xe0, 0x7a, 0x6c}};
++
+ DECLARE_CRITICAL_SECTION(message_cs);
+ 
+ struct filter_create_params
+@@ -1284,6 +1287,138 @@ out:
+     return hr;
+ }
+ 
++static BOOL autoplug_types_include_mpeg_stream(unsigned int type_count, const GUID *types)
++{
++    unsigned int i;
++
++    for (i = 0; i < type_count; ++i)
++    {
++        const GUID *major = &types[i * 2], *subtype = &types[i * 2 + 1];
++
++        if (!IsEqualGUID(major, &MEDIATYPE_Stream))
++            continue;
++
++        if (IsEqualGUID(subtype, &MEDIASUBTYPE_MPEG1System)
++                || IsEqualGUID(subtype, &MEDIASUBTYPE_MPEG1VideoCD)
++                || IsEqualGUID(subtype, &MEDIASUBTYPE_MPEG2_PROGRAM))
++            return TRUE;
++    }
++
++    return FALSE;
++}
++
++static BOOL autoplug_types_include_mpeg_video(unsigned int type_count, const GUID *types)
++{
++    unsigned int i;
++
++    for (i = 0; i < type_count; ++i)
++    {
++        const GUID *major = &types[i * 2], *subtype = &types[i * 2 + 1];
++
++        if (!IsEqualGUID(major, &MEDIATYPE_Video))
++            continue;
++
++        if (IsEqualGUID(subtype, &MEDIASUBTYPE_MPEG1Packet)
++                || IsEqualGUID(subtype, &MEDIASUBTYPE_MPEG1Payload)
++                || IsEqualGUID(subtype, &MEDIASUBTYPE_MPEG2_VIDEO))
++            return TRUE;
++    }
++
++    return FALSE;
++}
++
++static BOOL autoplug_types_include_ac3_audio(unsigned int type_count, const GUID *types)
++{
++    unsigned int i;
++
++    for (i = 0; i < type_count; ++i)
++    {
++        const GUID *major = &types[i * 2], *subtype = &types[i * 2 + 1];
++
++        if (!IsEqualGUID(major, &MEDIATYPE_Audio))
++            continue;
++
++        if (IsEqualGUID(subtype, &MEDIASUBTYPE_DOLBY_AC3)
++                || IsEqualGUID(subtype, &MEDIASUBTYPE_DOLBY_AC3_SPDIF))
++            return TRUE;
++    }
++
++    return FALSE;
++}
++
++static BOOL autoplug_types_include_uncompressed_audio(unsigned int type_count, const GUID *types)
++{
++    unsigned int i;
++
++    for (i = 0; i < type_count; ++i)
++    {
++        const GUID *major = &types[i * 2], *subtype = &types[i * 2 + 1];
++
++        if (!IsEqualGUID(major, &MEDIATYPE_Audio))
++            continue;
++
++        if (IsEqualGUID(subtype, &MEDIASUBTYPE_PCM)
++                || IsEqualGUID(subtype, &MEDIASUBTYPE_IEEE_FLOAT))
++            return TRUE;
++    }
++
++    return FALSE;
++}
++
++static HRESULT autoplug_filter_by_clsid(struct filter_graph *graph, IPin *source, IPin *sink,
++        const CLSID *clsid, const WCHAR *name, IAMGraphBuilderCallback *callback,
++        BOOL render_to_existing, unsigned int recursion_depth)
++{
++    IBaseFilter *filter;
++    IMoniker *moniker = NULL;
++    HRESULT hr;
++
++    TRACE("Trying %s before generic filter enumeration.\n", debugstr_w(name));
++
++    if (callback && SUCCEEDED(CreateClassMoniker(clsid, &moniker)))
++    {
++        hr = IAMGraphBuilderCallback_SelectedFilter(callback, moniker);
++        IMoniker_Release(moniker);
++        if (FAILED(hr))
++        {
++            TRACE("%s rejected by IAMGraphBuilderCallback::SelectedFilter(), hr %#lx.\n", debugstr_w(name), hr);
++            return hr;
++        }
++    }
++
++    if (FAILED(hr = CoCreateInstance(clsid, NULL, CLSCTX_INPROC_SERVER,
++            &IID_IBaseFilter, (void **)&filter)))
++        return hr;
++
++    if (callback && FAILED(hr = IAMGraphBuilderCallback_CreatedFilter(callback, filter)))
++    {
++        TRACE("%s rejected by IAMGraphBuilderCallback::CreatedFilter(), hr %#lx.\n", debugstr_w(name), hr);
++        IBaseFilter_Release(filter);
++        return hr;
++    }
++
++    hr = IFilterGraph2_AddFilter(&graph->IFilterGraph2_iface, filter, name);
++    if (FAILED(hr))
++    {
++        IBaseFilter_Release(filter);
++        return hr;
++    }
++
++    hr = autoplug_through_filter(graph, source, filter, sink, render_to_existing, recursion_depth);
++    if (FAILED(hr))
++        IFilterGraph2_RemoveFilter(&graph->IFilterGraph2_iface, filter);
++
++    IBaseFilter_Release(filter);
++    return hr;
++}
++
++static HRESULT autoplug_mpeg_stream_splitter(struct filter_graph *graph, IPin *source, IPin *sink,
++        IAMGraphBuilderCallback *callback, BOOL render_to_existing, unsigned int recursion_depth)
++{
++    return autoplug_filter_by_clsid(graph, source, sink, &CLSID_MPEG1Splitter,
++            L"MPEG-I Stream Splitter", callback, render_to_existing, recursion_depth);
++}
++
+ /* Common helper for IGraphBuilder::Connect() and IGraphBuilder::Render(), which
+  * share most of the same code. Render() calls this with a NULL sink. */
+ static HRESULT autoplug(struct filter_graph *graph, IPin *source, IPin *sink,
+@@ -1338,6 +1473,26 @@ static HRESULT autoplug(struct filter_graph *graph, IPin *source, IPin *sink,
+     if (graph->pSite)
+         IUnknown_QueryInterface(graph->pSite, &IID_IAMGraphBuilderCallback, (void **)&callback);
+ 
++    if (autoplug_types_include_mpeg_stream(type_count, types)
++            && SUCCEEDED(hr = autoplug_mpeg_stream_splitter(graph, source, sink, callback,
++                    render_to_existing, recursion_depth)))
++        goto out;
++
++    if (autoplug_types_include_mpeg_video(type_count, types)
++            && SUCCEEDED(hr = autoplug_filter_by_clsid(graph, source, sink, &CLSID_CMpegVideoCodec,
++                    L"MPEG Video Decoder", callback, render_to_existing, recursion_depth)))
++        goto out;
++
++    if (autoplug_types_include_ac3_audio(type_count, types)
++            && SUCCEEDED(hr = autoplug_filter_by_clsid(graph, source, sink, &CLSID_winedmo_ac3_audio_decoder,
++                    L"winedmo AC3 decoder", callback, render_to_existing, recursion_depth)))
++        goto out;
++
++    if (autoplug_types_include_uncompressed_audio(type_count, types)
++            && SUCCEEDED(hr = autoplug_filter_by_clsid(graph, source, sink, &CLSID_DSoundRender,
++                    L"Default DirectSound Device", callback, render_to_existing, recursion_depth)))
++        goto out;
++
+     if (FAILED(hr = IFilterMapper2_EnumMatchingFilters(mapper, &enummoniker,
+             0, FALSE, MERIT_UNLIKELY, TRUE, type_count, types, NULL, NULL, FALSE,
+             render_to_existing, 0, NULL, NULL, NULL)))
+diff --git a/dlls/quartz/main.c b/dlls/quartz/main.c
+index a19346d7aaf..9bd0a4bafbd 100644
+--- a/dlls/quartz/main.c
++++ b/dlls/quartz/main.c
+@@ -359,16 +359,19 @@ HRESULT WINAPI DllRegisterServer(void)
+         {&MEDIATYPE_Stream, &MEDIASUBTYPE_MPEG1Video},
+         {&MEDIATYPE_Stream, &MEDIASUBTYPE_MPEG1System},
+         {&MEDIATYPE_Stream, &MEDIASUBTYPE_MPEG1VideoCD},
++        {&MEDIATYPE_Stream, &MEDIASUBTYPE_MPEG2_PROGRAM},
+     };
+     static const REGPINTYPES mpeg_splitter_audio_outputs[] =
+     {
+         {&MEDIATYPE_Audio, &MEDIASUBTYPE_MPEG1Packet},
+         {&MEDIATYPE_Audio, &MEDIASUBTYPE_MPEG1AudioPayload},
++        {&MEDIATYPE_Audio, &MEDIASUBTYPE_DOLBY_AC3},
+     };
+     static const REGPINTYPES mpeg_splitter_video_outputs[] =
+     {
+         {&MEDIATYPE_Video, &MEDIASUBTYPE_MPEG1Packet},
+         {&MEDIATYPE_Video, &MEDIASUBTYPE_MPEG1Payload},
++        {&MEDIATYPE_Video, &MEDIASUBTYPE_MPEG2_VIDEO},
+     };
+     static const REGFILTERPINS2 mpeg_splitter_pins[] =
+     {
+@@ -491,10 +494,13 @@ HRESULT WINAPI DllRegisterServer(void)
+     static const GUID MEDIASUBTYPE_MP4V = {MAKEFOURCC('M','P','4','V'),0x0000,0x0010,{0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71}};
+     static const GUID MEDIASUBTYPE_XVID = {MAKEFOURCC('X','V','I','D'),0x0000,0x0010,{0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71}};
+     static const GUID MEDIASUBTYPE_mp4v = {MAKEFOURCC('m','p','4','v'),0x0000,0x0010,{0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71}};
++    static const GUID MEDIASUBTYPE_mpg2 = {MAKEFOURCC('m','p','g','2'),0x0000,0x0010,{0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71}};
+     static const REGPINTYPES mpeg_video_codec_inputs[] =
+     {
+         {&MEDIATYPE_Video, &MEDIASUBTYPE_MPEG1Packet},
+         {&MEDIATYPE_Video, &MEDIASUBTYPE_MPEG1Payload},
++        {&MEDIATYPE_Video, &MEDIASUBTYPE_MPEG2_VIDEO},
++        {&MEDIATYPE_Video, &MEDIASUBTYPE_mpg2},
+         {&MEDIATYPE_Video, &MEDIASUBTYPE_DIVX},
+         {&MEDIATYPE_Video, &MEDIASUBTYPE_DX50},
+         {&MEDIATYPE_Video, &MEDIASUBTYPE_FMP4},
+diff --git a/dlls/winedmo/main.c b/dlls/winedmo/main.c
+index 6c9682ebf86..f4ea143e67e 100644
+--- a/dlls/winedmo/main.c
++++ b/dlls/winedmo/main.c
+@@ -844,6 +844,7 @@ static struct class_factory avi_splitter_cf = {{&class_factory_vtbl}, avi_splitt
+ static struct class_factory asf_splitter_cf = {{&class_factory_vtbl}, asf_splitter_create};
+ static struct class_factory decodebin_parser_cf = {{&class_factory_vtbl}, decodebin_parser_create};
+ static struct class_factory aac_audio_decoder_cf = {{&class_factory_vtbl}, aac_audio_decoder_create};
++static struct class_factory ac3_audio_decoder_cf = {{&class_factory_vtbl}, ac3_audio_decoder_create};
+ static struct class_factory mpeg_audio_codec_cf = {{&class_factory_vtbl}, mpeg_audio_codec_create};
+ static struct class_factory mpeg_video_codec_cf = {{&class_factory_vtbl}, mpeg_video_codec_create};
+ static struct class_factory mpeg_layer3_decoder_cf = {{&class_factory_vtbl}, mpeg_layer3_decoder_create};
+@@ -887,6 +888,8 @@ HRESULT WINAPI DllGetClassObject(REFCLSID clsid, REFIID iid, void **out)
+         factory = &decodebin_parser_cf;
+     else if (IsEqualGUID(clsid, &CLSID_winedmo_aac_audio_decoder))
+         factory = &aac_audio_decoder_cf;
++    else if (IsEqualGUID(clsid, &CLSID_winedmo_ac3_audio_decoder))
++        factory = &ac3_audio_decoder_cf;
+     else if (IsEqualGUID(clsid, &CLSID_winedmo_mpeg_audio_decoder))
+         factory = &mpeg_audio_codec_cf;
+     else if (IsEqualGUID(clsid, &CLSID_winedmo_mpeg_video_decoder))
+@@ -933,6 +936,11 @@ static const REGPINTYPES reg_aac_decoder_inputs[] =
+     {&MEDIATYPE_Audio, &MEDIASUBTYPE_VODAFONE_MPEG_RAW_AAC},
+     {&MEDIATYPE_Audio, &MEDIASUBTYPE_MPEG4_AAC},
+ };
++static const REGPINTYPES reg_ac3_decoder_inputs[] =
++{
++    {&MEDIATYPE_Audio, &MFAudioFormat_Dolby_AC3},
++    {&MEDIATYPE_Audio, &MFAudioFormat_Dolby_AC3_SPDIF},
++};
+ static const REGPINTYPES reg_pcm_audio_mt = {&MEDIATYPE_Audio, &MEDIASUBTYPE_PCM};
+ static const REGPINTYPES reg_asf_stream_mt = {&MEDIATYPE_Stream, &MEDIASUBTYPE_Asf};
+ static const REGPINTYPES reg_stream_mt = {&MEDIATYPE_Stream, &GUID_NULL};
+@@ -985,6 +993,27 @@ static const REGFILTER2 reg_aac_decoder =
+     .u.s2.rgPins2 = reg_aac_decoder_pins,
+ };
+ 
++static const REGFILTERPINS2 reg_ac3_decoder_pins[2] =
++{
++    {
++        .nMediaTypes = ARRAY_SIZE(reg_ac3_decoder_inputs),
++        .lpMediaType = reg_ac3_decoder_inputs,
++    },
++    {
++        .dwFlags = REG_PINFLAG_B_OUTPUT,
++        .nMediaTypes = 1,
++        .lpMediaType = &reg_pcm_audio_mt,
++    },
++};
++
++static const REGFILTER2 reg_ac3_decoder =
++{
++    .dwVersion = 2,
++    .dwMerit = MERIT_NORMAL,
++    .u.s2.cPins2 = 2,
++    .u.s2.rgPins2 = reg_ac3_decoder_pins,
++};
++
+ static const REGFILTERPINS2 reg_decodebin_parser_pins[3] =
+ {
+     {
+@@ -1031,6 +1060,8 @@ HRESULT WINAPI DllRegisterServer(void)
+             L"winedmo ASF splitter", NULL, NULL, NULL, &reg_asf_splitter);
+     IFilterMapper2_RegisterFilter(mapper, &CLSID_winedmo_aac_audio_decoder,
+             L"winedmo AAC decoder", NULL, NULL, NULL, &reg_aac_decoder);
++    IFilterMapper2_RegisterFilter(mapper, &CLSID_winedmo_ac3_audio_decoder,
++            L"winedmo AC3 decoder", NULL, NULL, NULL, &reg_ac3_decoder);
+ 
+     IFilterMapper2_Release(mapper);
+ 
+@@ -1054,6 +1085,7 @@ HRESULT WINAPI DllUnregisterServer(void)
+     IFilterMapper2_UnregisterFilter(mapper, NULL, NULL, &CLSID_decodebin_parser);
+     IFilterMapper2_UnregisterFilter(mapper, NULL, NULL, &CLSID_winedmo_asf_splitter);
+     IFilterMapper2_UnregisterFilter(mapper, NULL, NULL, &CLSID_winedmo_aac_audio_decoder);
++    IFilterMapper2_UnregisterFilter(mapper, NULL, NULL, &CLSID_winedmo_ac3_audio_decoder);
+ 
+     IFilterMapper2_Release(mapper);
+ 
+diff --git a/dlls/winedmo/quartz_transform.c b/dlls/winedmo/quartz_transform.c
+index 2554ae5e626..09bcc9a10a5 100644
+--- a/dlls/winedmo/quartz_transform.c
++++ b/dlls/winedmo/quartz_transform.c
+@@ -30,6 +30,8 @@
+ WINE_DEFAULT_DEBUG_CHANNEL(quartz);
+ WINE_DECLARE_DEBUG_CHANNEL(winediag);
+ 
++#define AC3_SPEAKER_5POINT1_SURROUND 0x60f
++
+ struct transform
+ {
+     struct strmbase_filter filter;
+@@ -113,6 +115,14 @@ static BOOL is_mpeg4_part2_video_subtype(const GUID *subtype)
+     return FALSE;
+ }
+ 
++static BOOL is_mpeg2_video_subtype(const GUID *subtype)
++{
++    static const GUID MEDIASUBTYPE_mpg2 = {MAKEFOURCC('m','p','g','2'),0x0000,0x0010,{0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71}};
++
++    return IsEqualGUID(subtype, &MEDIASUBTYPE_MPEG2_VIDEO)
++            || IsEqualGUID(subtype, &MEDIASUBTYPE_mpg2);
++}
++
+ static BOOL is_windows_media_video_subtype(const GUID *subtype)
+ {
+     if (subtype->Data2 != 0x0000 || subtype->Data3 != 0x0010
+@@ -463,7 +473,7 @@ static HRESULT transform_drain_output(struct transform *filter, BOOL *delivered)
+         }
+ 
+         IMediaSample_SetActualDataLength(output_sample, out_size);
+-        if (out_pts == INT64_MIN && filter->synthesize_video_timestamps
++        if (filter->synthesize_video_timestamps
+                 && IsEqualGUID(&filter->source.pin.mt.formattype, &FORMAT_VideoInfo)
+                 && filter->source.pin.mt.cbFormat >= sizeof(VIDEOINFOHEADER))
+         {
+@@ -472,16 +482,40 @@ static HRESULT transform_drain_output(struct transform *filter, BOOL *delivered)
+ 
+             if (format->AvgTimePerFrame)
+             {
+-                if (first_sample)
++                bool synthesize_time = out_pts == INT64_MIN;
++
++                if (!synthesize_time && filter->have_next_output_time)
+                 {
+-                    filter->next_output_time = 0;
++                    REFERENCE_TIME delta = out_pts - filter->next_output_time;
++
++                    if (delta < 0)
++                        delta = -delta;
++                    if (out_dur == INT64_MIN || out_dur <= 0
++                            || out_dur > format->AvgTimePerFrame * 3 / 2
++                            || delta > format->AvgTimePerFrame * 3)
++                        synthesize_time = true;
++                }
++
++                if (synthesize_time)
++                {
++                    if (first_sample)
++                    {
++                        filter->next_output_time = 0;
++                        filter->have_next_output_time = true;
++                    }
++                    out_pts = filter->next_output_time;
++                    out_dur = format->AvgTimePerFrame;
++                    filter->next_output_time += format->AvgTimePerFrame;
++                    if (first_sample)
++                        out_flags |= WINEDMO_SAMPLE_FLAG_DISCONTINUITY;
++                }
++                else
++                {
++                    if (out_dur == INT64_MIN || out_dur <= 0)
++                        out_dur = format->AvgTimePerFrame;
++                    filter->next_output_time = out_pts + out_dur;
+                     filter->have_next_output_time = true;
+                 }
+-                out_pts = filter->next_output_time;
+-                out_dur = format->AvgTimePerFrame;
+-                filter->next_output_time += format->AvgTimePerFrame;
+-                if (first_sample)
+-                    out_flags |= WINEDMO_SAMPLE_FLAG_DISCONTINUITY;
+             }
+         }
+ 
+@@ -952,6 +986,15 @@ static BOOL is_aac_audio_subtype(const GUID *subtype)
+             || is_wave_format_subtype(subtype, WAVE_FORMAT_MPEG4_AAC);
+ }
+ 
++static BOOL is_ac3_audio_subtype(const GUID *subtype)
++{
++    static const GUID dolby_ac3 = {0xe06d802c, 0xdb46, 0x11cf, {0xb4, 0xd1, 0x00, 0x80, 0x5f, 0x6c, 0xbb, 0xea}};
++
++    return IsEqualGUID(subtype, &MFAudioFormat_Dolby_AC3)
++            || IsEqualGUID(subtype, &dolby_ac3)
++            || is_wave_format_subtype(subtype, WAVE_FORMAT_DOLBY_AC3_SPDIF);
++}
++
+ static HRESULT aac_audio_decoder_sink_query_accept(struct transform *filter, const AM_MEDIA_TYPE *mt)
+ {
+     const WAVEFORMATEX *format;
+@@ -968,6 +1011,30 @@ static HRESULT aac_audio_decoder_sink_query_accept(struct transform *filter, con
+     return S_OK;
+ }
+ 
++static HRESULT ac3_audio_decoder_sink_query_accept(struct transform *filter, const AM_MEDIA_TYPE *mt)
++{
++    const WAVEFORMATEX *format;
++
++    if (!IsEqualGUID(&mt->majortype, &MEDIATYPE_Audio)
++            || !IsEqualGUID(&mt->formattype, &FORMAT_WaveFormatEx)
++            || mt->cbFormat < sizeof(WAVEFORMATEX) || !mt->pbFormat)
++        return S_FALSE;
++
++    format = (const WAVEFORMATEX *)mt->pbFormat;
++    if (format->wFormatTag == WAVE_FORMAT_EXTENSIBLE && format->cbSize >= sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX))
++    {
++        const WAVEFORMATEXTENSIBLE *ext = (const WAVEFORMATEXTENSIBLE *)format;
++
++        if (is_ac3_audio_subtype(&ext->SubFormat))
++            return S_OK;
++    }
++
++    if (format->wFormatTag == WAVE_FORMAT_DOLBY_AC3_SPDIF || is_ac3_audio_subtype(&mt->subtype))
++        return S_OK;
++
++    return S_FALSE;
++}
++
+ static HRESULT aac_audio_decoder_source_query_accept(struct transform *filter, const AM_MEDIA_TYPE *mt)
+ {
+     const WAVEFORMATEX *input_format;
+@@ -996,6 +1063,37 @@ static HRESULT aac_audio_decoder_source_query_accept(struct transform *filter, c
+     return S_OK;
+ }
+ 
++static HRESULT ac3_audio_decoder_source_query_accept(struct transform *filter, const AM_MEDIA_TYPE *mt)
++{
++    const WAVEFORMATEX *output_format;
++    const WAVEFORMATEXTENSIBLE *ext;
++
++    if (!filter->sink.pin.peer)
++        return S_FALSE;
++
++    if (!IsEqualGUID(&mt->majortype, &MEDIATYPE_Audio)
++            || !IsEqualGUID(&mt->subtype, &MEDIASUBTYPE_IEEE_FLOAT)
++            || !IsEqualGUID(&mt->formattype, &FORMAT_WaveFormatEx)
++            || mt->cbFormat < sizeof(WAVEFORMATEXTENSIBLE) || !mt->pbFormat)
++        return S_FALSE;
++
++    output_format = (const WAVEFORMATEX *)mt->pbFormat;
++    ext = (const WAVEFORMATEXTENSIBLE *)output_format;
++    if (output_format->wFormatTag != WAVE_FORMAT_EXTENSIBLE
++            || output_format->nSamplesPerSec != 48000
++            || output_format->nChannels != 6
++            || output_format->wBitsPerSample != 32
++            || output_format->nBlockAlign != output_format->nChannels * output_format->wBitsPerSample / 8
++            || output_format->nAvgBytesPerSec != output_format->nBlockAlign * output_format->nSamplesPerSec
++            || output_format->cbSize < sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)
++            || ext->Samples.wValidBitsPerSample != output_format->wBitsPerSample
++            || ext->dwChannelMask != AC3_SPEAKER_5POINT1_SURROUND
++            || !IsEqualGUID(&ext->SubFormat, &MEDIASUBTYPE_IEEE_FLOAT))
++        return S_FALSE;
++
++    return S_OK;
++}
++
+ static HRESULT aac_audio_decoder_source_get_media_type(struct transform *filter, unsigned int index, AM_MEDIA_TYPE *mt)
+ {
+     const WAVEFORMATEX *input_format;
+@@ -1025,7 +1123,45 @@ static HRESULT aac_audio_decoder_source_get_media_type(struct transform *filter,
+     mt->majortype = MEDIATYPE_Audio;
+     mt->subtype = MEDIASUBTYPE_PCM;
+     mt->bFixedSizeSamples = TRUE;
+-    mt->lSampleSize = 1024 * output_format->nBlockAlign;
++    mt->lSampleSize = 1536 * output_format->nBlockAlign;
++    mt->formattype = FORMAT_WaveFormatEx;
++    mt->cbFormat = sizeof(*output_format);
++    mt->pbFormat = (BYTE *)output_format;
++
++    return S_OK;
++}
++
++static HRESULT ac3_audio_decoder_source_get_media_type(struct transform *filter, unsigned int index, AM_MEDIA_TYPE *mt)
++{
++    WAVEFORMATEXTENSIBLE *output_format;
++
++    if (!filter->sink.pin.peer)
++        return VFW_S_NO_MORE_ITEMS;
++
++    if (index > 0)
++        return VFW_S_NO_MORE_ITEMS;
++
++    output_format = CoTaskMemAlloc(sizeof(*output_format));
++    if (!output_format)
++        return E_OUTOFMEMORY;
++
++    memset(output_format, 0, sizeof(*output_format));
++    output_format->Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
++    output_format->Format.nSamplesPerSec = 48000;
++    output_format->Format.nChannels = 6;
++    output_format->Format.wBitsPerSample = 32;
++    output_format->Format.nBlockAlign = output_format->Format.nChannels * output_format->Format.wBitsPerSample / 8;
++    output_format->Format.nAvgBytesPerSec = output_format->Format.nBlockAlign * output_format->Format.nSamplesPerSec;
++    output_format->Format.cbSize = sizeof(*output_format) - sizeof(output_format->Format);
++    output_format->Samples.wValidBitsPerSample = output_format->Format.wBitsPerSample;
++    output_format->dwChannelMask = AC3_SPEAKER_5POINT1_SURROUND;
++    output_format->SubFormat = MEDIASUBTYPE_IEEE_FLOAT;
++
++    memset(mt, 0, sizeof(*mt));
++    mt->majortype = MEDIATYPE_Audio;
++    mt->subtype = MEDIASUBTYPE_IEEE_FLOAT;
++    mt->bFixedSizeSamples = TRUE;
++    mt->lSampleSize = output_format->Format.nBlockAlign;
+     mt->formattype = FORMAT_WaveFormatEx;
+     mt->cbFormat = sizeof(*output_format);
+     mt->pbFormat = (BYTE *)output_format;
+@@ -1033,6 +1169,18 @@ static HRESULT aac_audio_decoder_source_get_media_type(struct transform *filter,
+     return S_OK;
+ }
+ 
++static HRESULT ac3_audio_decoder_source_decide_buffer_size(struct transform *filter, IMemAllocator *allocator,
++        ALLOCATOR_PROPERTIES *props)
++{
++    ALLOCATOR_PROPERTIES ret_props;
++
++    props->cBuffers = max(props->cBuffers, 8);
++    props->cbBuffer = max(props->cbBuffer, 65536);
++    props->cbAlign = max(props->cbAlign, 1);
++
++    return IMemAllocator_SetProperties(allocator, props, &ret_props);
++}
++
+ static HRESULT aac_audio_decoder_source_decide_buffer_size(struct transform *filter, IMemAllocator *allocator,
+         ALLOCATOR_PROPERTIES *props)
+ {
+@@ -1054,6 +1202,15 @@ static const struct transform_ops aac_audio_decoder_transform_ops =
+     passthrough_source_qc_notify,
+ };
+ 
++static const struct transform_ops ac3_audio_decoder_transform_ops =
++{
++    ac3_audio_decoder_sink_query_accept,
++    ac3_audio_decoder_source_query_accept,
++    ac3_audio_decoder_source_get_media_type,
++    ac3_audio_decoder_source_decide_buffer_size,
++    passthrough_source_qc_notify,
++};
++
+ HRESULT aac_audio_decoder_create(IUnknown *outer, IUnknown **out)
+ {
+     struct transform *object;
+@@ -1071,6 +1228,23 @@ HRESULT aac_audio_decoder_create(IUnknown *outer, IUnknown **out)
+     return hr;
+ }
+ 
++HRESULT ac3_audio_decoder_create(IUnknown *outer, IUnknown **out)
++{
++    struct transform *object;
++    HRESULT hr;
++
++    hr = transform_create(outer, &CLSID_winedmo_ac3_audio_decoder, &ac3_audio_decoder_transform_ops, &object);
++    if (FAILED(hr))
++        return hr;
++
++    wcscpy(object->sink.pin.name, L"XForm In");
++    wcscpy(object->source.pin.name, L"XForm Out");
++
++    TRACE("Created AC3 audio decoder %p.\n", object);
++    *out = &object->filter.IUnknown_inner;
++    return hr;
++}
++
+ 
+ static HRESULT mpeg_audio_codec_sink_query_accept(struct transform *filter, const AM_MEDIA_TYPE *mt)
+ {
+@@ -1217,6 +1391,7 @@ static HRESULT mpeg_video_codec_sink_query_accept(struct transform *filter, cons
+ {
+     if (!IsEqualGUID(&mt->majortype, &MEDIATYPE_Video)
+             || (!IsEqualGUID(&mt->subtype, &MEDIASUBTYPE_MPEG1Payload)
++                    && !is_mpeg2_video_subtype(&mt->subtype)
+                     && !is_mpeg4_part2_video_subtype(&mt->subtype))
+             || !mt->pbFormat)
+         return S_FALSE;
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+index bfcde7e3437..1fc9a2551b4 100644
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -297,15 +297,63 @@ static void fixup_asf_mpeg4_final_timestamps( const AVFormatContext *ctx, AVStre
+     stream->final_repeated_pts = 0;
+ }
+ 
++static AVRational get_mpeg_sequence_frame_rate( const AVCodecParameters *params )
++{
++    static const AVRational rates[] =
++    {
++        {0, 1},
++        {24000, 1001},
++        {24, 1},
++        {25, 1},
++        {30000, 1001},
++        {30, 1},
++        {50, 1},
++        {60000, 1001},
++        {60, 1},
++    };
++    unsigned int i;
++
++    if (params->codec_id != AV_CODEC_ID_MPEG1VIDEO && params->codec_id != AV_CODEC_ID_MPEG2VIDEO)
++        return (AVRational){0, 1};
++
++    for (i = 0; i + 7 < params->extradata_size; ++i)
++    {
++        if (params->extradata[i] == 0x00 && params->extradata[i + 1] == 0x00
++                && params->extradata[i + 2] == 0x01 && params->extradata[i + 3] == 0xb3)
++        {
++            unsigned int frame_rate_code = params->extradata[i + 7] & 0x0f;
++
++            if (frame_rate_code < ARRAY_SIZE(rates))
++                return rates[frame_rate_code];
++            break;
++        }
++    }
++
++    return (AVRational){0, 1};
++}
++
+ static AVRational get_video_display_frame_rate( const AVFormatContext *ctx, AVStream *avstream )
+ {
+     AVRational frame_rate = avstream->avg_frame_rate;
+ 
+-    if (ctx->iformat && !strcmp( ctx->iformat->name, "mpegvideo" ))
++    if (ctx->iformat && (!strcmp( ctx->iformat->name, "mpegvideo" )
++            || !strcmp( ctx->iformat->name, "mpeg" )))
+     {
++        AVRational header_rate;
++
+         frame_rate = av_guess_frame_rate( (AVFormatContext *)ctx, avstream, NULL );
+-        if (frame_rate.num <= 0 || frame_rate.den <= 0)
++        if (frame_rate.num <= 0 || frame_rate.den <= 0
++                || (frame_rate.num < frame_rate.den * 5
++                    && avstream->avg_frame_rate.num > 0 && avstream->avg_frame_rate.den > 0))
++            frame_rate = avstream->avg_frame_rate;
++        if (frame_rate.num <= 0 || frame_rate.den <= 0
++                || (frame_rate.num < frame_rate.den * 5
++                    && avstream->r_frame_rate.num > 0 && avstream->r_frame_rate.den > 0))
+             frame_rate = avstream->r_frame_rate;
++        if (frame_rate.num > 0 && frame_rate.den > 0 && frame_rate.num >= frame_rate.den * 5)
++            return frame_rate;
++        if ((header_rate = get_mpeg_sequence_frame_rate( avstream->codecpar )).num > 0)
++            return header_rate;
+         return frame_rate;
+     }
+ 
+diff --git a/dlls/winedmo/unix_media_type.c b/dlls/winedmo/unix_media_type.c
+index 913859c76e5..cd1b9223171 100644
+--- a/dlls/winedmo/unix_media_type.c
++++ b/dlls/winedmo/unix_media_type.c
+@@ -187,6 +187,7 @@ static NTSTATUS audio_format_from_codec_params( const AVCodecParameters *params,
+ 
+     format_tag = wave_format_tag_from_codec_id( params->codec_id );
+     if (params->codec_id == AV_CODEC_ID_OPUS) format_tag = WAVE_FORMAT_OPUS;
++    else if (params->codec_id == AV_CODEC_ID_AC3) format_tag = WAVE_FORMAT_EXTENSIBLE;
+     /* Big-endian PCM in native Windows is given the usual WAVE_FORMAT_PCM tag. */
+     else if (params->codec_id == AV_CODEC_ID_PCM_S16BE) format_tag = WAVE_FORMAT_PCM;
+ 
+@@ -196,6 +197,7 @@ static NTSTATUS audio_format_from_codec_params( const AVCodecParameters *params,
+         GUID subtype = MFAudioFormat_Base;
+ 
+         if (params->codec_id == AV_CODEC_ID_VORBIS) subtype = MFAudioFormat_Vorbis;
++        else if (params->codec_id == AV_CODEC_ID_AC3) subtype = MFAudioFormat_Dolby_AC3;
+         else subtype.Data1 = format_tag;
+ 
+         wave_format_size += sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+@@ -361,6 +363,7 @@ static void mf_video_format_init( const AVCodecParameters *params, MFVIDEOFORMAT
+     {
+         format->guidFormat = MFVideoFormat_Base;
+         if (params->codec_id == AV_CODEC_ID_MPEG1VIDEO) format->guidFormat = MEDIASUBTYPE_MPEG1Payload;
++        else if (params->codec_id == AV_CODEC_ID_MPEG2VIDEO) format->guidFormat = MFVideoFormat_MPEG2;
+         else if (params->codec_id == AV_CODEC_ID_H264) format->guidFormat.Data1 = MFVideoFormat_H264.Data1;
+         else if (params->codec_id == AV_CODEC_ID_VP9) format->guidFormat.Data1 = MFVideoFormat_VP90.Data1;
+         else if (params->codec_id == AV_CODEC_ID_AV1) format->guidFormat.Data1 = MFVideoFormat_AV1.Data1;
+diff --git a/dlls/winedmo/unix_transform.c b/dlls/winedmo/unix_transform.c
+index bfbc59761c2..c39f7dc94f7 100644
+--- a/dlls/winedmo/unix_transform.c
++++ b/dlls/winedmo/unix_transform.c
+@@ -153,6 +153,7 @@ static enum AVCodecID codec_id_from_audio_format( const WAVEFORMATEX *wfx )
+         /* MFAudioFormat_Vorbis has a non-standard Data1 (0x8D2FD10B); its
+          * lower WORD (0xD10B) is not a valid WAVE tag, so check the full GUID. */
+         if (IsEqualGUID( &ext->SubFormat, &MFAudioFormat_Vorbis )) return AV_CODEC_ID_VORBIS;
++        if (IsEqualGUID( &ext->SubFormat, &MFAudioFormat_Dolby_AC3 )) return AV_CODEC_ID_AC3;
+         tag = (WORD)ext->SubFormat.Data1;
+     }
+ 
+@@ -195,7 +196,9 @@ static enum AVCodecID codec_id_from_video_format( const MFVIDEOFORMAT *mfvf )
+     case MAKEFOURCC('M','P','G','1'): case MAKEFOURCC('M','P','E','G'):
+     case 0xe436eb81: /* MEDIASUBTYPE_MPEG1Payload */
+         return AV_CODEC_ID_MPEG1VIDEO;
+-    case MAKEFOURCC('M','P','G','2'): case MAKEFOURCC('M','2','V','S'):
++    case MAKEFOURCC('M','P','G','2'): case MAKEFOURCC('m','p','g','2'):
++    case MAKEFOURCC('M','2','V','S'):
++    case 0xe06d8026: /* MEDIASUBTYPE_MPEG2_VIDEO */
+         return AV_CODEC_ID_MPEG2VIDEO;
+     default: return AV_CODEC_ID_NONE;
+     }
+diff --git a/dlls/winedmo/winedmo_classes.idl b/dlls/winedmo/winedmo_classes.idl
+index e45829438f7..34c94ace729 100644
+--- a/dlls/winedmo/winedmo_classes.idl
++++ b/dlls/winedmo/winedmo_classes.idl
+@@ -45,6 +45,12 @@ coclass wg_mpeg_audio_decoder {}
+ ]
+ coclass wg_aac_audio_decoder {}
+ 
++[
++    threading(both),
++    uuid(31d3ec21-457d-406f-8784-3d1a41e07a6c)
++]
++coclass wg_ac3_audio_decoder {}
++
+ [
+     threading(both),
+     uuid(5ed2e5f6-bf3e-4180-83a4-4847cc5b4ea3)
+diff --git a/dlls/winedmo/winedmo_guids.h b/dlls/winedmo/winedmo_guids.h
+index 5011f490396..8ec9b27ded3 100644
+--- a/dlls/winedmo/winedmo_guids.h
++++ b/dlls/winedmo/winedmo_guids.h
+@@ -22,5 +22,6 @@
+ DEFINE_GUID(CLSID_decodebin_parser, 0xf9d8d64e, 0xa144, 0x47dc, 0x8e, 0xe0, 0xf5, 0x34, 0x98, 0x37, 0x2c, 0x29);
+ DEFINE_GUID(CLSID_winedmo_asf_splitter, 0x6d3cd6e1, 0x5862, 0x4d7e, 0xb4, 0xb7, 0x25, 0x27, 0x6b, 0x59, 0x76, 0x22);
+ DEFINE_GUID(CLSID_winedmo_aac_audio_decoder, 0xb3f22059, 0xf775, 0x4c5a, 0x9b, 0x66, 0x3c, 0xe6, 0x13, 0x75, 0x6d, 0x1d);
++DEFINE_GUID(CLSID_winedmo_ac3_audio_decoder, 0x31d3ec21, 0x457d, 0x406f, 0x87, 0x84, 0x3d, 0x1a, 0x41, 0xe0, 0x7a, 0x6c);
+ DEFINE_GUID(CLSID_mpeg_layer3_decoder, 0x38be3000, 0xdbf4, 0x11d0, 0x86, 0x0e, 0x00, 0xa0, 0x24, 0xcf, 0xef, 0x6d);
+ DEFINE_GUID(WINESUBTYPE_Winedmo, 0xffffffff, 0x128f, 0x4dd1, 0xad, 0x22, 0xbe, 0xcf, 0xa6, 0x6c, 0xe7, 0xaa);
+diff --git a/dlls/winedmo/winedmo_private.h b/dlls/winedmo/winedmo_private.h
+index 9f1dcbaa52e..90ca5afeb2a 100644
+--- a/dlls/winedmo/winedmo_private.h
++++ b/dlls/winedmo/winedmo_private.h
+@@ -80,6 +80,7 @@ HRESULT avi_splitter_create(IUnknown *outer, IUnknown **out);
+ HRESULT asf_splitter_create(IUnknown *outer, IUnknown **out);
+ HRESULT decodebin_parser_create(IUnknown *outer, IUnknown **out);
+ HRESULT aac_audio_decoder_create(IUnknown *outer, IUnknown **out);
++HRESULT ac3_audio_decoder_create(IUnknown *outer, IUnknown **out);
+ HRESULT mpeg_audio_codec_create(IUnknown *outer, IUnknown **out);
+ HRESULT mpeg_video_codec_create(IUnknown *outer, IUnknown **out);
+ HRESULT mpeg_layer3_decoder_create(IUnknown *outer, IUnknown **out);
+diff --git a/dlls/winedmo/winedmo_quartz_parser.c b/dlls/winedmo/winedmo_quartz_parser.c
+index 15c34ffe286..115403e1f88 100644
+--- a/dlls/winedmo/winedmo_quartz_parser.c
++++ b/dlls/winedmo/winedmo_quartz_parser.c
+@@ -945,6 +945,19 @@ static void dmo_parser_wait_for_queue_space(struct dmo_parser *filter)
+     }
+ }
+ 
++static struct dmo_parser_source *dmo_parser_find_source_for_stream(struct dmo_parser *filter, UINT stream_index)
++{
++    unsigned int i;
++
++    for (i = 0; i < filter->source_count; ++i)
++    {
++        if (filter->sources[i]->stream_index == stream_index)
++            return filter->sources[i];
++    }
++
++    return NULL;
++}
++
+ static DWORD CALLBACK dmo_demux_thread(void *arg)
+ {
+     struct dmo_parser *filter = arg;
+@@ -1065,18 +1078,16 @@ static DWORD CALLBACK dmo_demux_thread(void *arg)
+             continue;
+         }
+ 
+-        /* Route the packet to the appropriate stream. */
+-        if (stream_idx >= filter->source_count)
++        /* Route by demuxer stream id; some containers expose unsupported streams
++         * that do not get output pins, so source array indices may not match. */
++        if (!(pin = dmo_parser_find_source_for_stream(filter, stream_idx)))
+         {
+-            WARN("Stream index %u out of range (count %u).\n", stream_idx, filter->source_count);
+             IMediaBuffer_Release(&sbuf->IMediaBuffer_iface);
+             continue;
+         }
+ 
+         IMediaBuffer_SetLength(&sbuf->IMediaBuffer_iface, needed_size);
+ 
+-        pin = filter->sources[stream_idx];
+-
+         /* Only queue if the pin is connected. */
+         if (!pin->pin.pin.peer)
+         {
+@@ -1900,7 +1911,8 @@ static HRESULT mpeg_sink_query_accept(struct strmbase_pin *iface, const AM_MEDIA
+     if (!IsEqualGUID(&mt->majortype, &MEDIATYPE_Stream))
+         return S_FALSE;
+     if (IsEqualGUID(&mt->subtype, &MEDIASUBTYPE_MPEG1Audio)
+-            || IsEqualGUID(&mt->subtype, &MEDIASUBTYPE_MPEG1System))
++            || IsEqualGUID(&mt->subtype, &MEDIASUBTYPE_MPEG1System)
++            || IsEqualGUID(&mt->subtype, &MEDIASUBTYPE_MPEG2_PROGRAM))
+         return S_OK;
+     if (IsEqualGUID(&mt->subtype, &MEDIASUBTYPE_MPEG1Video)
+             || IsEqualGUID(&mt->subtype, &MEDIASUBTYPE_MPEG1VideoCD))
+@@ -1914,6 +1926,7 @@ static HRESULT mpeg_sink_get_media_type(struct strmbase_pin *pin,
+     static const GUID * const subtypes[] =
+     {
+         &MEDIASUBTYPE_MPEG1System,
++        &MEDIASUBTYPE_MPEG2_PROGRAM,
+         &MEDIASUBTYPE_MPEG1VideoCD,
+         &MEDIASUBTYPE_MPEG1Video,
+         &MEDIASUBTYPE_MPEG1Audio,
+diff --git a/loader/wine.inf.in b/loader/wine.inf.in
+index ab49f45c7c5..df42daae8c3 100644
+--- a/loader/wine.inf.in
++++ b/loader/wine.inf.in
+@@ -987,6 +987,7 @@ HKLM,SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x86,"Version",2,"14.42.344
+ 
+ [RegisterDllsSection]
+ ;;some dlls have to be registered first
++;; GE: keep DirectShow filter registration refreshed for bundled media filters.
+ 11,,shell32.dll,1
+ 11,,quartz.dll,1
+ 
+-- 
+2.54.0
+
