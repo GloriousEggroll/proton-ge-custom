@@ -1,0 +1,113 @@
+From 88e79b933c23e921160977c1ad0ef8b9cb1370a7 Mon Sep 17 00:00:00 2001
+From: Etaash Mathamsetty
+ <45927311+Etaash-mathamsetty@users.noreply.github.com>
+Date: Tue, 2 Jun 2026 19:23:49 -0400
+Subject: [PATCH 142/153] winewayland: Detect ownership/parent cycles.
+
+---
+ dlls/winewayland.drv/window.c | 71 ++++++++++++++++++++++++-----------
+ 1 file changed, 50 insertions(+), 21 deletions(-)
+
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index 5bdcfc3dfd5..7be99a6b267 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -524,6 +524,34 @@ BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const str
+     return TRUE;
+ }
+ 
++BOOL has_owner_cycle(HWND hwnd, struct wayland_surface *owner)
++{
++    struct wayland_win_data *grandparent_data;
++    struct wayland_surface *grandparent;
++
++    if (!wayland_surface_is_popup(owner)) return FALSE;
++    if (owner->owner_hwnd == hwnd) return TRUE;
++
++    grandparent_data = wayland_win_data_get_nolock(owner->owner_hwnd);
++    if (!grandparent_data) return FALSE;
++    if (!(grandparent = grandparent_data->wayland_surface)) return FALSE;
++    return has_owner_cycle(hwnd, grandparent);
++}
++
++BOOL has_parent_cycle(HWND hwnd, struct wayland_surface *parent)
++{
++    struct wayland_win_data *grandparent_data;
++    struct wayland_surface *grandparent;
++
++    if (parent->role != WAYLAND_SURFACE_ROLE_SUBSURFACE) return FALSE;
++    if (parent->toplevel_hwnd == hwnd) return TRUE;
++
++    grandparent_data = wayland_win_data_get_nolock(parent->toplevel_hwnd);
++    if (!grandparent_data) return FALSE;
++    if (!(grandparent = grandparent_data->wayland_surface)) return FALSE;
++    return has_parent_cycle(hwnd, grandparent);
++}
++
+ /***********************************************************************
+  *           WAYLAND_WindowPosChanged
+  */
+@@ -539,38 +567,39 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+     /* Get the managed state with win_data unlocked, as is_window_managed
+      * may need to query win_data information about other HWNDs and thus
+      * acquire the lock itself internally. */
+-    if (!(managed = is_window_managed(hwnd, swp_flags, fullscreen)) && surface) owner = owner_hint;
++    if (!(managed = is_window_managed(hwnd, swp_flags, fullscreen)) && surface)
++    {
++        toplevel = NULL;
++        owner = owner_hint;
++    }
+ 
+-    TRACE("hwnd %p toplevel %p new_rects %s after %p flags %08x\n", hwnd, toplevel, debugstr_window_rects(new_rects),
+-                                                                    insert_after, swp_flags);
++    TRACE("hwnd %p toplevel %p owner %p new_rects %s after %p flags %08x\n", hwnd, toplevel, owner,
++          debugstr_window_rects(new_rects), insert_after, swp_flags);
+ 
+     if (!(data = wayland_win_data_get(hwnd))) return;
+     toplevel_data = toplevel && toplevel != hwnd ? wayland_win_data_get_nolock(toplevel) : NULL;
+     toplevel_surface = toplevel_data ? toplevel_data->wayland_surface : NULL;
+     owner_data = owner && owner != hwnd ? wayland_win_data_get_nolock(owner) : NULL;
+     owner_surface = owner_data ? owner_data->wayland_surface : NULL;
+-    if (owner_surface && owner_surface->xdg_surface)
++    /* for it to be a popup, we need a valid xdg surface.
++     * Demote to subsurface instead if this condition is not met. */
++    if (owner_surface && !owner_surface->xdg_surface)
+     {
+-        toplevel_data = NULL;
+-        toplevel_surface = NULL;
+-        /* There are cases where we can have a circular parent relation with unmanaged windows.
+-         * There are also cases where the toplevel is not yet mapped.
+-         * So, we need to check if there is a circular relationship here,
+-         * if there is then continue treating this hwnd as a toplevel */
+-        if ((owner_surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE &&
+-            owner_surface->toplevel_hwnd == hwnd) ||
+-            (owner_surface->role == WAYLAND_SURFACE_ROLE_POPUP &&
+-             owner_surface->owner_hwnd == hwnd))
+-        {
+-            WARN("owner %p forms a cycle!\n", owner);
+-            owner_surface = NULL;
+-            owner_surface = NULL;
+-        }
++        toplevel_surface = owner_surface;
++        owner_surface = NULL;
+     }
+-    else
++    /* Cycles can occur during some transition states.
++     * They can be corrected the next time their position updates (after the toplevel gets its role)
++     * otherwise these windows will remain as toplevels. */
++    if (owner_surface && has_owner_cycle(hwnd, owner_surface))
+     {
++        ERR("hwnd=%p owner=%p forms a cycle!\n", hwnd, owner);
+         owner_surface = NULL;
+-        owner_data = NULL;
++    }
++    if (toplevel_surface && has_parent_cycle(hwnd, toplevel_surface))
++    {
++        ERR("hwnd=%p parent=%p forms a cycle!\n", hwnd, toplevel);
++        toplevel_surface = NULL;
+     }
+ 
+     data->rects = *new_rects;
+-- 
+2.54.0
+
