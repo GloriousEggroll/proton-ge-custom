@@ -319,7 +319,7 @@ PROTON_ENABLE_HDR=1 %command%
 > Please also note that Steam Input also does not work properly with the wine-wayland driver due to the overlay being broken.
 
 ##### Enabling NTSync
-For NTSync to work, your kernel must be version 6.14 or newer and built with `CONFIG_NTSYNC=y` or `CONFIG_NTSYNC=m`.
+For NTSync to work, your kernel must be version 6.14 or newer and built with `CONFIG_NTSYNC=y` or `CONFIG_NTSYNC=m`. On non-systemd systems, you must also have a `ulimit -Hn` of 524288 or higher.
 If using `CONFIG_NTSYNC=m`, a module loading configuration is required followed by a reboot:
 
 /etc/modules-load.d/ntsync.conf
@@ -330,7 +330,12 @@ You can also manually enable the module without reboot, just keep in mind the ab
 ```
 sudo modprobe ntsync
 ```
+If on a non-systemd system with an inadequate `ulimit -Hn`, adjusting limits is required followed by a reboot:
 
+/etc/security/limits.d/26-steam-nofile.conf
+```
+*               hard    nofile             524288
+```
 
 Environment variable options:
 
