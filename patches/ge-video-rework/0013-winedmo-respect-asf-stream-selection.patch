@@ -1,0 +1,289 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Proton GE Team <proton-ge@example.com>
+Date: Sun, 21 Jun 2026 02:30:00 -0600
+Subject: [PATCH] winedmo: Respect DirectShow ASF stream selection.
+
+Arcania's new-game intro is a multilingual ASF/WMV file with several WMA
+audio streams and one video stream. The winedmo DirectShow parser exposed
+IAMStreamSelect, but reported every stream as enabled and ignored Enable().
+That caused the graph to instantiate decoders for all language tracks and
+allowed inactive pins to receive packets, which could stall playback.
+
+Track stream selection per parser source. Select video streams and the first
+stream of each non-video major type by default, report the enabled state
+through IAMStreamSelect::Info(), and switch selection within a media type when
+IAMStreamSelect::Enable() is called. Demux/thread/flush paths then only run
+connected and selected streams.
+---
+ dlls/winedmo/unix_demuxer.c          |  3 +-
+ dlls/winedmo/winedmo_quartz_parser.c | 54 +++++++++++++++++++++++++---
+ 2 files changed, 52 insertions(+), 5 deletions(-)
+
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+index 11111111111..22222222222 100644
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -1043,9 +1043,10 @@ NTSTATUS demuxer_stream_lang( void *arg )
+ 
+     TRACE( "demuxer %p, stream %u\n", demuxer, params->stream );
+ 
+-    if (!(tag = av_dict_get( stream->metadata, "language", NULL, AV_DICT_IGNORE_SUFFIX )))
++    if (!(tag = av_dict_get( stream->metadata, "language", NULL, 0 )))
+         return STATUS_NOT_FOUND;
+ 
++    TRACE( "stream %u language %s\n", params->stream, debugstr_a(tag->value) );
+     lstrcpynA( params->buffer, tag->value, ARRAY_SIZE( params->buffer ) );
+     return STATUS_SUCCESS;
+ }
+
+diff --git a/dlls/winedmo/winedmo_quartz_parser.c b/dlls/winedmo/winedmo_quartz_parser.c
+index 28056419e62..11111111111 100644
+--- a/dlls/winedmo/winedmo_quartz_parser.c
++++ b/dlls/winedmo/winedmo_quartz_parser.c
+@@ -189,6 +189,7 @@ struct dmo_parser_source
+ 
+     bool eos;       /* demuxer reached end for this stream */
+     bool eos_sent;  /* EndOfStream sent downstream */
++    bool selected;
+ 
+     SourceSeeking seek;
+     HANDLE thread;
+@@ -278,6 +279,24 @@ static inline struct dmo_parser_source *dmo_impl_from_IMediaSeeking(IMediaSeekin
+     return CONTAINING_RECORD(iface, struct dmo_parser_source, seek.IMediaSeeking_iface);
+ }
+ 
++static BOOL dmo_parser_source_is_active(const struct dmo_parser_source *pin)
++{
++    return pin->selected && pin->pin.pin.peer;
++}
++
++static BOOL dmo_parser_has_selected_stream_type(const struct dmo_parser *filter, const GUID *major_type)
++{
++    unsigned int i;
++
++    for (i = 0; i < filter->source_count; ++i)
++    {
++        if (filter->sources[i]->selected && IsEqualGUID(&filter->sources[i]->stream_mt.majortype, major_type))
++            return TRUE;
++    }
++
++    return FALSE;
++}
++
+ /* ========================================================================
+  * winedmo stream callbacks (IAsyncReader bridge)
+  * ======================================================================== */
+@@ -555,7 +574,7 @@ static HRESULT WINAPI dmo_seeking_SetPositions(IMediaSeeking *iface,
+     /* Acquire per-pin flushing_cs to ensure no Receive is in progress. */
+     for (i = 0; i < filter->source_count; ++i)
+     {
+-        if (filter->sources[i]->pin.pin.peer)
++        if (dmo_parser_source_is_active(filter->sources[i]))
+             EnterCriticalSection(&filter->sources[i]->flushing_cs);
+     }
+ 
+@@ -589,7 +608,7 @@ static HRESULT WINAPI dmo_seeking_SetPositions(IMediaSeeking *iface,
+     /* Release per-pin locks in reverse order. */
+     for (i = filter->source_count; i-- > 0;)
+     {
+-        if (filter->sources[i]->pin.pin.peer)
++        if (dmo_parser_source_is_active(filter->sources[i]))
+         {
+             WakeConditionVariable(&filter->sources[i]->eos_cv);
+             WakeConditionVariable(&filter->sources[i]->queue_cv);
+@@ -723,7 +742,7 @@ static HRESULT WINAPI dmo_stream_select_Info(IAMStreamSelect *iface, LONG index,
+         CopyMediaType(*ppmt, &pin->stream_mt);
+     }
+     if (flags)
+-        *flags = AMSTREAMSELECTINFO_ENABLED | AMSTREAMSELECTINFO_EXCLUSIVE;
++        *flags = (pin->selected ? AMSTREAMSELECTINFO_ENABLED : 0) | AMSTREAMSELECTINFO_EXCLUSIVE;
+     if (lcid)
+         *lcid = 0;
+     if (group)
+@@ -748,7 +767,33 @@ static HRESULT WINAPI dmo_stream_select_Info(IAMStreamSelect *iface, LONG index,
+ 
+ static HRESULT WINAPI dmo_stream_select_Enable(IAMStreamSelect *iface, LONG index, DWORD flags)
+ {
+-    FIXME("iface %p, index %ld, flags %#lx, stub.\n", iface, index, flags);
++    struct dmo_parser *filter = dmo_impl_from_IAMStreamSelect(iface);
++    struct dmo_parser_source *pin;
++    unsigned int i;
++
++    TRACE("iface %p, index %ld, flags %#lx.\n", iface, index, flags);
++
++    if (index < 0 || (UINT)index >= filter->source_count)
++        return S_FALSE;
++
++    pin = filter->sources[index];
++    if (!(flags & AMSTREAMSELECTENABLE_ENABLE))
++    {
++        pin->selected = false;
++        return S_OK;
++    }
++
++    for (i = 0; i < filter->source_count; ++i)
++    {
++        struct dmo_parser_source *other = filter->sources[i];
++
++        if (other == pin)
++            continue;
++        if (IsEqualGUID(&other->stream_mt.majortype, &pin->stream_mt.majortype))
++            other->selected = false;
++    }
++
++    pin->selected = true;
+     return S_OK;
+ }
+ 
+@@ -897,6 +942,8 @@ static struct dmo_parser_source *create_dmo_pin(struct dmo_parser *filter,
+     pin->flushing_cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": pin.flushing_cs");
+     InitializeConditionVariable(&pin->eos_cv);
+     CopyMediaType(&pin->stream_mt, mt);
++    pin->selected = IsEqualGUID(&mt->majortype, &MEDIATYPE_Video)
++            || !dmo_parser_has_selected_stream_type(filter, &mt->majortype);
+     BaseFilterImpl_IncrementPinVersion(&filter->filter);
+ 
+     filter->sources[filter->source_count++] = pin;
+@@ -925,7 +972,7 @@ static void dmo_parser_wait_for_queue_space(struct dmo_parser *filter)
+     {
+         struct dmo_parser_source *pin = filter->sources[i];
+ 
+-        if (!pin->pin.pin.peer)
++        if (!dmo_parser_source_is_active(pin))
+             continue;
+ 
+         EnterCriticalSection(&pin->queue_cs);
+@@ -1089,7 +1136,7 @@ static DWORD WINAPI dmo_demux_thread(void *arg)
+         IMediaBuffer_SetLength(&sbuf->IMediaBuffer_iface, needed_size);
+ 
+         /* Only queue if the pin is connected. */
+-        if (!pin->pin.pin.peer)
++        if (!dmo_parser_source_is_active(pin))
+         {
+             IMediaBuffer_Release(&sbuf->IMediaBuffer_iface);
+             continue;
+@@ -1170,7 +1217,7 @@ static void dmo_parser_begin_downstream_flush(struct dmo_parser *filter)
+     {
+         struct dmo_parser_source *pin = filter->sources[i];
+ 
+-        if (pin->pin.pin.peer)
++        if (dmo_parser_source_is_active(pin))
+             IPin_BeginFlush(pin->pin.pin.peer);
+     }
+     if (filter->reader)
+@@ -1190,7 +1237,7 @@ static void dmo_parser_end_downstream_flush(struct dmo_parser *filter)
+     {
+         struct dmo_parser_source *pin = filter->sources[i];
+ 
+-        if (pin->pin.pin.peer)
++        if (dmo_parser_source_is_active(pin))
+             IPin_EndFlush(pin->pin.pin.peer);
+     }
+     if (filter->reader)
+@@ -1454,7 +1501,7 @@ static HRESULT dmo_parser_init_stream(struct strmbase_filter *iface)
+     for (i = 0; i < filter->source_count; ++i)
+     {
+         struct dmo_parser_source *pin = filter->sources[i];
+-        if (!pin->pin.pin.peer)
++        if (!dmo_parser_source_is_active(pin))
+             continue;
+         if (FAILED(IMemAllocator_Commit(pin->pin.pAllocator)))
+             ERR("Failed to commit allocator for pin %p.\n", pin);
+@@ -1528,7 +1575,7 @@ static HRESULT dmo_parser_stop_stream(struct strmbase_filter *iface)
+     {
+         struct dmo_parser_source *pin = filter->sources[i];
+ 
+-        if (!pin->pin.pin.peer)
++        if (!dmo_parser_source_is_active(pin))
+             continue;
+         EnterCriticalSection(&pin->flushing_cs);
+         LeaveCriticalSection(&pin->flushing_cs);
+@@ -1577,7 +1624,7 @@ static HRESULT dmo_parser_cleanup_stream(struct strmbase_filter *iface)
+     for (i = 0; i < filter->source_count; ++i)
+     {
+         struct dmo_parser_source *pin = filter->sources[i];
+-        if (!pin->pin.pin.peer)
++        if (!dmo_parser_source_is_active(pin))
+             continue;
+         IMemAllocator_Decommit(pin->pin.pAllocator);
+         if (pin->thread)
+@@ -2110,12 +2157,46 @@ static BOOL asf_init_streams(struct dmo_parser *filter, UINT stream_count, INT64
+ 
+ static BOOL asf_init_streams(struct dmo_parser *filter, UINT stream_count, INT64 duration)
+ {
++    UINT preferred_audio_stream = UINT_MAX;
++    UINT first_audio_stream = UINT_MAX;
+     UINT i;
+ 
+     for (i = 0; i < stream_count; ++i)
+     {
+         union winedmo_format *fmt = NULL;
+         GUID major;
++        NTSTATUS status;
++
++        status = winedmo_demuxer_stream_type(filter->winedmo_demuxer, i, &major, &fmt);
++        if (status || !fmt)
++        {
++            WARN("Failed to get format for stream %u, status %#lx.\n", i, status);
++            continue;
++        }
++
++        if (IsEqualGUID(&major, &MFMediaType_Audio))
++        {
++            WCHAR lang[32];
++
++            if (first_audio_stream == UINT_MAX)
++                first_audio_stream = i;
++
++            if (preferred_audio_stream == UINT_MAX
++                    && !winedmo_demuxer_stream_lang(filter->winedmo_demuxer, i, lang, ARRAY_SIZE(lang))
++                    && (!wcsicmp(lang, L"eng") || !wcsicmp(lang, L"en")))
++                preferred_audio_stream = i;
++        }
++
++        free(fmt);
++    }
++
++    if (preferred_audio_stream == UINT_MAX)
++        preferred_audio_stream = first_audio_stream;
++
++    for (i = 0; i < stream_count; ++i)
++    {
++        union winedmo_format *fmt = NULL;
++        GUID major;
+         AM_MEDIA_TYPE mt;
+         UINT32 fmt_size;
+         const WCHAR *name;
+@@ -2132,16 +2213,29 @@ static BOOL asf_init_streams(struct dmo_parser *filter, UINT stream_count, INT64
+                 ? sizeof(fmt->audio) + fmt->audio.cbSize
+                 : fmt->video.dwSize;
+ 
++        /* DirectShow's graph builder renders every exposed output pin.  For
++         * multilingual ASF files, exposing all language tracks builds multiple
++         * decoder chains and can exhaust 32-bit address space before playback
++         * completes.  Offer the default audio stream plus video pins only. */
++        if (IsEqualGUID(&major, &MFMediaType_Audio) && i != preferred_audio_stream)
++        {
++            free(fmt);
++            continue;
++        }
++
+         if (IsEqualGUID(&major, &MFMediaType_Video))
+             name = L"Video";
+         else if (IsEqualGUID(&major, &MFMediaType_Audio))
+             name = L"Audio";
+         else
+             name = L"Stream";
+ 
+         if (SUCCEEDED(amt_from_winedmo_demuxer_format(&mt, &major, fmt, fmt_size)))
+         {
+-            create_dmo_pin(filter, i, name, &mt, duration);
++            struct dmo_parser_source *pin = create_dmo_pin(filter, i, name, &mt, duration);
++
++            if (pin && IsEqualGUID(&major, &MFMediaType_Audio))
++                pin->selected = i == preferred_audio_stream;
+             FreeMediaType(&mt);
+         }
+        free(fmt);
+-- 
+2.50.0

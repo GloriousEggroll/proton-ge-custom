@@ -1,0 +1,601 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Proton GE Team <proton-ge@example.com>
+Date: Sun, 21 Jun 2026 05:20:00 -0600
+Subject: [PATCH] winedmo: Pace DirectShow video transform draining.
+
+Arcania's new-game intro can produce decoded 1280x720 RGB frames faster
+than the renderer consumes them.  Yield after one delivered video frame during
+normal Receive() flow, keep full draining for explicit EOS, and avoid
+decoding unselected ASF audio streams so downstream backpressure can pace
+decode before the graph exhausts 32-bit address space with queued RGB frames.
+---
+ dlls/winedmo/quartz_transform.c | 21 +++++++++++++++++----
+ dlls/winedmo/unix_transform.c   | 18 ++++++++++++++++++
+ dlls/winedmo/wm_reader.c        | 38 +++++++++++++++++++++++++++++++++++++-
+ dlls/winedmo/winedmo_quartz_parser.c | 53 ++++++++++++++++++++++++++++++++++++
+ dlls/qasf/asfreader.c           | 68 ++++++++++++++++++++++++++++++++++++++---
+ dlls/wmvcore/async_reader.c     |  4 ++--
+ 6 files changed, 195 insertions(+), 11 deletions(-)
+
+diff --git a/dlls/qasf/asfreader.c b/dlls/qasf/asfreader.c
+index 99999999999..aaaaaaaaaaa 100644
+--- a/dlls/qasf/asfreader.c
++++ b/dlls/qasf/asfreader.c
+@@ -165,6 +165,7 @@ struct asf_stream
+     struct strmbase_source source;
+     struct SourceSeeking seek;
+     DWORD index;
++    BOOL hidden;
+ };
+ 
+ struct asf_reader
+@@ -433,14 +434,24 @@ static struct strmbase_pin *asf_reader_get_pin(struct strmbase_filter *iface, un
+ {
+     struct asf_reader *filter = impl_from_strmbase_filter(iface);
+     struct strmbase_pin *pin = NULL;
++    unsigned int i, visible = 0;
+ 
+     TRACE("iface %p, index %u.\n", iface, index);
+ 
+     EnterCriticalSection(&filter->filter.filter_cs);
+-    if (index < filter->stream_count)
+-        pin = &filter->streams[index].source.pin;
++    for (i = 0; i < filter->stream_count; ++i)
++    {
++        if (filter->streams[i].hidden)
++            continue;
++
++        if (visible++ == index)
++        {
++            pin = &filter->streams[i].source.pin;
++            break;
++        }
++    }
+     LeaveCriticalSection(&filter->filter.filter_cs);
+ 
+     return pin;
+ }
+ 
+@@ -499,15 +510,24 @@ static HRESULT asf_reader_init_stream(struct strmbase_filter *iface)
+     WMT_STREAM_SELECTION selections[ARRAY_SIZE(filter->streams)];
+     WORD stream_numbers[ARRAY_SIZE(filter->streams)];
+     IWMReaderAdvanced2 *reader_advanced;
++    UINT preferred_audio_output = UINT_MAX;
+     HRESULT hr = S_OK;
+     BOOL value;
+     int i;
+ 
+     TRACE("iface %p\n", iface);
+ 
+     if (FAILED(hr = IWMReader_QueryInterface(filter->reader, &IID_IWMReaderAdvanced2, (void **)&reader_advanced)))
+         return hr;
+ 
++    for (i = 0; i < filter->stream_count; ++i)
++    {
++        struct asf_stream *stream = filter->streams + i;
++
++        if (IsEqualGUID(&stream->source.pin.mt.majortype, &MEDIATYPE_Audio))
++            preferred_audio_output = i;
++    }
++
+     for (i = 0; i < filter->stream_count; ++i)
+     {
+         struct asf_stream *stream = filter->streams + i;
+@@ -555,8 +577,12 @@ static HRESULT asf_reader_init_stream(struct strmbase_filter *iface)
+             break;
+         }
+ 
+-        selections[i] = WMT_ON;
++        selections[i] = IsEqualGUID(&stream->source.pin.mt.majortype, &MEDIATYPE_Audio)
++                && preferred_audio_output != UINT_MAX && i != preferred_audio_output ? WMT_OFF : WMT_ON;
+     }
++
++    if (preferred_audio_output != UINT_MAX)
++        selections[preferred_audio_output] = WMT_ON;
+ 
+     if (SUCCEEDED(hr) && FAILED(hr = IWMReaderAdvanced2_SetStreamsSelected(reader_advanced,
+             filter->stream_count, stream_numbers, selections)))
+
+@@ -833,6 +847,7 @@ static HRESULT WINAPI reader_callback_OnStatus(IWMReaderCallback *iface, WMT_STA
+     AM_MEDIA_TYPE stream_media_type = {{0}};
+     IWMHeaderInfo *header_info;
+     DWORD i, stream_count;
++    UINT preferred_audio_output = UINT_MAX, audio_output_count = 0;
+     WCHAR name[MAX_PATH];
+     QWORD duration;
+     HRESULT hr;
+@@ -862,6 +877,21 @@ static HRESULT WINAPI reader_callback_OnStatus(IWMReaderCallback *iface, WMT_STA
+                 IWMHeaderInfo_Release(header_info);
+             }
+ 
++            for (i = 0; i < stream_count; ++i)
++            {
++                if (FAILED(hr = asf_stream_get_media_type(&filter->streams[i].source.pin, 0, &stream_media_type)))
++                {
++                    WARN("Failed to get stream media type, hr %#lx.\n", hr);
++                    continue;
++                }
++                if (IsEqualGUID(&stream_media_type.majortype, &MEDIATYPE_Audio))
++                {
++                    ++audio_output_count;
++                    preferred_audio_output = i;
++                }
++                FreeMediaType(&stream_media_type);
++            }
++
+             for (i = 0; i < stream_count; ++i)
+             {
+                 struct asf_stream *stream = filter->streams + i;
+@@ -865,9 +879,24 @@ static HRESULT WINAPI reader_callback_OnStatus(IWMReaderCallback *iface, WMT_STA
+             {
+                 struct asf_stream *stream = filter->streams + i;
+                 const char *sgi = getenv("SteamGameId");
++                WMT_STREAM_SELECTION selection = WMT_ON;
++                IWMReaderAdvanced2 *reader_advanced;
+ 
+                 if (FAILED(hr = asf_stream_get_media_type(&stream->source.pin, 0, &stream_media_type)))
+                     WARN("Failed to get stream media type, hr %#lx.\n", hr);
++                stream->hidden = FALSE;
++                if (IsEqualGUID(&stream_media_type.majortype, &MEDIATYPE_Audio)
++                        && SUCCEEDED(IWMReader_QueryInterface(filter->reader, &IID_IWMReaderAdvanced2,
++                        (void **)&reader_advanced)))
++                {
++                    if (SUCCEEDED(IWMReaderAdvanced2_GetStreamSelected(reader_advanced, i + 1, &selection))
++                            && selection == WMT_OFF)
++                        stream->hidden = TRUE;
++                    IWMReaderAdvanced2_Release(reader_advanced);
++                }
++                if (IsEqualGUID(&stream_media_type.majortype, &MEDIATYPE_Audio)
++                        && audio_output_count > 1 && i != preferred_audio_output)
++                    stream->hidden = TRUE;
+                 if (IsEqualGUID(&stream_media_type.majortype, &MEDIATYPE_Video))
+                 {
+                     /* King of Fighters XIII requests the WMV decoder filter pins by name
+@@ -880,5 +908,7 @@ static HRESULT WINAPI reader_callback_OnStatus(IWMReaderCallback *iface, WMT_STA
+                 }
+                 else
+                     swprintf(name, ARRAY_SIZE(name), L"Raw Audio %u", stream->index);
++                if (stream->hidden)
++                    TRACE("Hiding deselected ASF audio stream %lu.\n", i);
+                 FreeMediaType(&stream_media_type);
+ 
+                 strmbase_source_init(&stream->source, &filter->filter, name, &source_ops);
+
+diff --git a/dlls/winedmo/winedmo_quartz_parser.c b/dlls/winedmo/winedmo_quartz_parser.c
+index 77777777777..88888888888 100644
+--- a/dlls/winedmo/winedmo_quartz_parser.c
++++ b/dlls/winedmo/winedmo_quartz_parser.c
+@@ -225,6 +225,7 @@ struct dmo_parser
+     bool sink_connected;
+     bool flushing;
+     bool downstream_flushing;
++    REFERENCE_TIME stream_start;
+ 
+     HANDLE demux_thread;
+ 
+@@ -279,6 +280,55 @@ static inline struct dmo_parser_source *dmo_impl_from_IMediaSeeking(IMediaSeekin
+ {
+     return CONTAINING_RECORD(iface, struct dmo_parser_source, seek.IMediaSeeking_iface);
+ }
++
++static void dmo_parser_source_wait_for_video_time(struct dmo_parser_source *pin, struct dmo_packet *pkt)
++{
++    struct dmo_parser *filter = dmo_impl_from_strmbase_filter(pin->pin.pin.filter);
++    IReferenceClock *clock;
++    REFERENCE_TIME sample_time, target;
++
++    if (!pkt->has_pts || !IsEqualGUID(&pin->stream_mt.majortype, &MEDIATYPE_Video))
++        return;
++
++    sample_time = pkt->pts - pin->seek.llCurrent;
++    if (sample_time < 0)
++        return;
++
++    EnterCriticalSection(&filter->filter.filter_cs);
++    clock = filter->filter.clock;
++    if (clock)
++        IReferenceClock_AddRef(clock);
++    target = filter->stream_start + sample_time;
++    LeaveCriticalSection(&filter->filter.filter_cs);
++
++    if (!clock)
++        return;
++
++    for (;;)
++    {
++        REFERENCE_TIME now, remaining;
++        DWORD sleep_ms;
++
++        EnterCriticalSection(&filter->streaming_cs);
++        if (!filter->streaming || filter->flushing)
++        {
++            LeaveCriticalSection(&filter->streaming_cs);
++            break;
++        }
++        LeaveCriticalSection(&filter->streaming_cs);
++
++        if (FAILED(IReferenceClock_GetTime(clock, &now)))
++            break;
++        remaining = target - now;
++        if (remaining <= 0)
++            break;
++
++        sleep_ms = remaining / 10000;
++        Sleep(min(max(sleep_ms, 1), 10));
++    }
++
++    IReferenceClock_Release(clock);
++}
+ 
+ static BOOL dmo_parser_source_is_active(const struct dmo_parser_source *pin)
+ {
+@@ -1315,6 +1365,8 @@ static DWORD CALLBACK dmo_stream_thread(void *arg)
+         WakeConditionVariable(&pin->queue_space_cv);
+         LeaveCriticalSection(&pin->queue_cs);
+ 
++        dmo_parser_source_wait_for_video_time(pin, pkt);
++
+         /* Send the packet under flushing_cs (seeking blocks here). */
+         EnterCriticalSection(&pin->flushing_cs);
+         EnterCriticalSection(&filter->streaming_cs);
+@@ -1539,6 +1591,7 @@ static HRESULT dmo_parser_start_stream(struct strmbase_filter *iface, REFERENCE_
+     EnterCriticalSection(&filter->streaming_cs);
+     filter->flushing = false;
+     filter->read_flushing = FALSE;
++    filter->stream_start = start;
+     LeaveCriticalSection(&filter->streaming_cs);
+ 
+     for (i = 0; i < filter->source_count; ++i)
+diff --git a/dlls/winedmo/quartz_transform.c b/dlls/winedmo/quartz_transform.c
+index 11111111111..22222222222 100644
+--- a/dlls/winedmo/quartz_transform.c
++++ b/dlls/winedmo/quartz_transform.c
+@@ -417,7 +417,7 @@ static HRESULT transform_sink_query_interface(struct strmbase_pin *pin, REFIID i
+     return S_OK;
+ }
+ 
+-static HRESULT transform_drain_output(struct transform *filter, BOOL *delivered)
++static HRESULT transform_drain_output(struct transform *filter, BOOL *delivered, BOOL drain_all)
+ {
+     DWORD out_flags;
+     UINT32 out_size;
+@@ -551,6 +551,8 @@ static HRESULT transform_drain_output(struct transform *filter, BOOL *delivered)
+             return hr;
+         *delivered = TRUE;
+         filter->have_decoded_output = true;
++        if (!drain_all && IsEqualGUID(&filter->source.pin.mt.majortype, &MEDIATYPE_Video))
++            break;
+     }
+ 
+     return S_OK;
+@@ -657,7 +660,7 @@ static HRESULT WINAPI transform_sink_receive(struct strmbase_sink *pin, IMediaSa
+             goto done;
+         }
+ 
+-        if (FAILED(hr = transform_drain_output(filter, &delivered)))
++        if (FAILED(hr = transform_drain_output(filter, &delivered, FALSE)))
+             goto done;
+         if (!delivered)
+         {
+@@ -674,7 +677,7 @@ static HRESULT WINAPI transform_sink_receive(struct strmbase_sink *pin, IMediaSa
+     if (IsEqualGUID(&filter->sink.pin.mt.majortype, &MEDIATYPE_Video))
+         filter->have_video_input = true;
+ 
+-    hr = transform_drain_output(filter, &delivered);
++    hr = transform_drain_output(filter, &delivered, FALSE);
+ 
+ done:
+     LeaveCriticalSection(&filter->receive_cs);
+@@ -733,7 +736,9 @@ static HRESULT transform_sink_eos(struct strmbase_sink *pin)
+     if (status)
+         hr = E_FAIL;
+     else
+-        hr = transform_drain_output(filter, &delivered);
++        /* On EOS, drain all remaining decoded output so the renderer can
++         * receive the complete stream before EndOfStream is forwarded. */
++        hr = transform_drain_output(filter, &delivered, TRUE);
+     LeaveCriticalSection(&filter->receive_cs);
+ 
+    if (FAILED(hr))
+@@ -1525,10 +1530,17 @@ static HRESULT mpeg_video_codec_source_decide_buffer_size(struct transform *filt
+ {
+     VIDEOINFOHEADER *output_format = (VIDEOINFOHEADER *)filter->source.pin.mt.pbFormat;
+     ALLOCATOR_PROPERTIES ret_props;
++    LONG frame_size = output_format->bmiHeader.biSizeImage;
+ 
+     props->cBuffers = max(props->cBuffers, 1);
+-    props->cbBuffer = max(props->cbBuffer, output_format->bmiHeader.biSizeImage);
++    if (frame_size >= 1024 * 1024 && props->cBuffers > 4)
++    {
++        TRACE("Capping large video allocator buffers from %ld to 4, frame size %ld.\n",
++                props->cBuffers, frame_size);
++        props->cBuffers = 4;
++    }
++    props->cbBuffer = max(props->cbBuffer, frame_size);
+     props->cbAlign = max(props->cbAlign, 1);
+ 
+     return IMemAllocator_SetProperties(allocator, props, &ret_props);
+ }
+diff --git a/dlls/winedmo/unix_transform.c b/dlls/winedmo/unix_transform.c
+index 33333333333..44444444444 100644
+--- a/dlls/winedmo/unix_transform.c
++++ b/dlls/winedmo/unix_transform.c
+@@ -920,7 +920,25 @@ NTSTATUS transform_push_input( void *arg )
+ 
+     if (t->draining) return STATUS_DEVICE_BUSY;
+ 
++    if (!t->is_audio)
++    {
++        if (t->frame_pending) return STATUS_DEVICE_BUSY;
++
++        av_frame_unref( t->frame );
++        ret = avcodec_receive_frame( t->avctx, t->frame );
++        if (ret >= 0)
++        {
++            t->frame_pending = true;
++            return STATUS_DEVICE_BUSY;
++        }
++        if (ret != AVERROR(EAGAIN) && ret != AVERROR_EOF)
++        {
++            WARN( "avcodec_receive_frame before input: %d\n", ret );
++            return STATUS_UNSUCCESSFUL;
++        }
++    }
++
+     av_packet_unref( t->packet );
+ 
+     if (in && params->size)
+     {
+diff --git a/dlls/winedmo/wm_reader.c b/dlls/winedmo/wm_reader.c
+index 55555555555..66666666666 100644
+--- a/dlls/winedmo/wm_reader.c
++++ b/dlls/winedmo/wm_reader.c
+@@ -54,6 +54,7 @@ struct wm_stream
+     struct list packet_queue;
+     CRITICAL_SECTION queue_cs;
+     CONDITION_VARIABLE queue_cv;
++    UINT queued_packets;
+     bool queue_eos;
+     bool queue_flushing;
+ 
+@@ -111,6 +111,7 @@ struct wm_reader
+ 
+     struct wm_stream *streams;
+     WORD stream_count;
++    UINT preferred_audio_stream;
+ };
+ 
+ static struct wm_stream *get_stream_by_output_number(struct wm_reader *reader, DWORD output)
+@@ -990,14 +991,38 @@ static void wm_flush_stream_queue(struct wm_stream *stream)
+         free(pkt->data);
+         free(pkt);
+     }
++    stream->queued_packets = 0;
+     stream->queue_eos = false;
+     LeaveCriticalSection(&stream->queue_cs);
++    WakeAllConditionVariable(&stream->queue_cv);
+ 
+     free(stream->current_data);
+     stream->current_data = NULL;
+     stream->current_size = stream->current_offset = 0;
+ }
+ 
++static BOOL wm_stream_wait_queue_space(struct wm_reader *reader, struct wm_stream *stream)
++{
++    if (!IsEqualGUID(&stream->major_type, &MFMediaType_Video))
++        return TRUE;
++    if (reader->stream_count <= 2)
++        return TRUE;
++
++    EnterCriticalSection(&stream->queue_cs);
++    while (!reader->demux_shutdown && !stream->queue_flushing
++            && stream->selection != WMT_OFF && stream->queued_packets >= 256)
++        SleepConditionVariableCS(&stream->queue_cv, &stream->queue_cs, 10);
++
++    if (reader->demux_shutdown || stream->queue_flushing || stream->selection == WMT_OFF)
++    {
++        LeaveCriticalSection(&stream->queue_cs);
++        return FALSE;
++    }
++
++    LeaveCriticalSection(&stream->queue_cs);
++    return TRUE;
++}
++
+ static DWORD CALLBACK wm_demux_thread(void *arg)
+ {
+     struct wm_reader *reader = arg;
+@@ -1085,6 +1086,14 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+             for (UINT i = 0; i < reader->stream_count; i++)
+             {
+                 s = &reader->streams[i];
++                if (s->selection == WMT_OFF)
++                {
++                    EnterCriticalSection(&s->queue_cs);
++                    s->queue_eos = true;
++                    LeaveCriticalSection(&s->queue_cs);
++                    WakeAllConditionVariable(&s->queue_cv);
++                    continue;
++                }
+                 EnterCriticalSection(&s->decoder_cs);
+                 if (s->decode_stream && s->decoder.handle)
+                 {
+@@ -1094,7 +1119,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+                         DWORD dec_flags;
+                         BYTE *dec_buf;
+ 
+-                        if (!(dec_buf = malloc(dec_size)))
++                        if (!wm_stream_wait_queue_space(reader, s) || !(dec_buf = malloc(dec_size)))
+                             break;
+ 
+                         dec_status = winedmo_transform_get_output(s->decoder, dec_buf, &dec_size,
+@@ -1134,6 +1159,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+                             if (!s->queue_flushing)
+                             {
+                                 list_add_tail(&s->packet_queue, &pkt->entry);
++                                ++s->queued_packets;
+                                 LeaveCriticalSection(&s->queue_cs);
+                                 WakeConditionVariable(&s->queue_cv);
+                             }
+@@ -1229,7 +1255,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+                 DWORD dec_flags;
+                 BYTE *dec_buf;
+ 
+-                if (!(dec_buf = malloc(dec_size)))
++                if (!wm_stream_wait_queue_space(reader, s) || !(dec_buf = malloc(dec_size)))
+                     break;
+ 
+                 dec_status = winedmo_transform_get_output(s->decoder, dec_buf, &dec_size,
+@@ -1270,6 +1296,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+                     if (!s->queue_flushing)
+                     {
+                         list_add_tail(&s->packet_queue, &pkt->entry);
++                        ++s->queued_packets;
+                         LeaveCriticalSection(&s->queue_cs);
+                         WakeConditionVariable(&s->queue_cv);
+                     }
+@@ -1314,6 +1341,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+             if (!s->queue_flushing)
+             {
+                 list_add_tail(&s->packet_queue, &pkt->entry);
++                ++s->queued_packets;
+                 LeaveCriticalSection(&s->queue_cs);
+                 WakeConditionVariable(&s->queue_cv);
+             }
+@@ -2094,6 +2103,8 @@ static void free_stream_buffers(struct wm_reader *reader)
+ 
+ static HRESULT init_stream(struct wm_reader *reader)
+ {
++    UINT preferred_audio_stream = UINT_MAX;
++    UINT first_audio_stream = UINT_MAX;
+     NTSTATUS status;
+     UINT stream_count;
+     WORD i;
+@@ -2119,13 +2130,44 @@ static HRESULT init_stream(struct wm_reader *reader)
+ 
+     for (i = 0; i < reader->stream_count; ++i)
+     {
++        union winedmo_format *fmt = NULL;
++        GUID major;
++
++        status = winedmo_demuxer_stream_type(reader->demuxer, i, &major, &fmt);
++        if (status || !fmt)
++        {
++            WARN("Failed to get stream type for stream %u, status %#lx.\n", i, status);
++            continue;
++        }
++
++        if (IsEqualGUID(&major, &MFMediaType_Audio))
++        {
++            WCHAR lang[32];
++
++            if (first_audio_stream == UINT_MAX)
++                first_audio_stream = i;
++
++            if (preferred_audio_stream == UINT_MAX
++                    && !winedmo_demuxer_stream_lang(reader->demuxer, i, lang, ARRAY_SIZE(lang))
++                    && (!wcsicmp(lang, L"eng") || !wcsicmp(lang, L"en")))
++                preferred_audio_stream = i;
++        }
++
++        free(fmt);
++    }
++
++    if (preferred_audio_stream == UINT_MAX)
++        preferred_audio_stream = first_audio_stream;
++    reader->preferred_audio_stream = preferred_audio_stream;
++
++    for (i = 0; i < reader->stream_count; ++i)
++    {
+         struct wm_stream *stream = &reader->streams[i];
+         union winedmo_format *fmt = NULL;
+         UINT32 fmt_size;
+ 
+         stream->reader = reader;
+         stream->index = i;
+-        stream->selection = WMT_ON;
+         list_init(&stream->packet_queue);
+         InitializeCriticalSection(&stream->queue_cs);
+         InitializeConditionVariable(&stream->queue_cv);
+@@ -2137,6 +2179,8 @@ static HRESULT init_stream(struct wm_reader *reader)
+             WARN("Failed to get stream type for stream %u, status %#lx.\n", i, status);
+             continue;
+         }
++        stream->selection = IsEqualGUID(&stream->major_type, &MFMediaType_Audio)
++                && i != preferred_audio_stream ? WMT_OFF : WMT_ON;
+         if (IsEqualGUID(&stream->major_type, &MFMediaType_Audio))
+             fmt_size = sizeof(WAVEFORMATEX) + fmt->audio.cbSize;
+         else
+@@ -2319,6 +2363,9 @@ static HRESULT wm_stream_dequeue_sample(struct wm_stream *stream,
+ 
+     pkt = LIST_ENTRY(list_head(&stream->packet_queue), struct wm_packet, entry);
+     list_remove(&pkt->entry);
++    if (stream->queued_packets)
++        --stream->queued_packets;
++    WakeConditionVariable(&stream->queue_cv);
+     LeaveCriticalSection(&stream->queue_cs);
+ 
+     *data = pkt->data;
+@@ -3226,6 +3270,9 @@ static HRESULT WINAPI reader_SetStreamsSelected(IWMSyncReader2 *iface,
+ {
+     struct wm_reader *reader = impl_from_IWMSyncReader2(iface);
+     struct wm_stream *stream;
++    BOOL prefer_single_audio = FALSE;
++    UINT selected_audio_stream = UINT_MAX;
++    WORD enabled_audio_count = 0;
+     WORD i;
+ 
+     TRACE("reader %p, count %u, stream_numbers %p, selections %p.\n",
+@@ -3246,8 +3295,17 @@ static HRESULT WINAPI reader_SetStreamsSelected(IWMSyncReader2 *iface,
+             WARN("Invalid stream number %u; returning NS_E_INVALID_REQUEST.\n", stream_numbers[i]);
+             return NS_E_INVALID_REQUEST;
+         }
++        if (IsEqualGUID(&stream->major_type, &MFMediaType_Audio)
++                && selections[i] != WMT_OFF)
++        {
++            ++enabled_audio_count;
++            selected_audio_stream = stream->index;
++        }
+     }
+ 
++    prefer_single_audio = reader->preferred_audio_stream != UINT_MAX && enabled_audio_count
++            && (enabled_audio_count > 1 || selected_audio_stream != reader->preferred_audio_stream);
++
+     for (i = 0; i < count; ++i)
+     {
+         stream = wm_reader_get_stream_by_stream_number(reader, stream_numbers[i]);
+@@ -3254,7 +3310,10 @@ static HRESULT WINAPI reader_SetStreamsSelected(IWMSyncReader2 *iface,
+         if (selections[i] != WMT_ON && selections[i] != WMT_OFF)
+             FIXME("Ignoring selection %#x for stream %u; treating as enabled.\n",
+                     selections[i], stream_numbers[i]);
+-        stream->selection = selections[i];
++        if (prefer_single_audio && IsEqualGUID(&stream->major_type, &MFMediaType_Audio))
++            stream->selection = stream->index == reader->preferred_audio_stream ? WMT_ON : WMT_OFF;
++        else
++            stream->selection = selections[i];
+     }
+ 
+     LeaveCriticalSection(&reader->cs);
+diff --git a/dlls/wmvcore/async_reader.c b/dlls/wmvcore/async_reader.c
+index 55555555555..66666666666 100644
+--- a/dlls/wmvcore/async_reader.c
++++ b/dlls/wmvcore/async_reader.c
+@@ -519,11 +519,16 @@ static HRESULT async_reader_open_all_streams(struct async_reader *reader)
+ 
+     for (i = 0; i < reader->stream_count; ++i)
+     {
+         struct stream *stream = reader->streams + i;
++        WMT_STREAM_SELECTION selection;
++
++        if (FAILED(IWMSyncReader2_GetStreamSelected(reader->reader, i + 1, &selection))
++                || selection == WMT_OFF)
++            continue;
+ 
+         if (FAILED(hr = stream_open(stream, reader, i + 1)))
+             return hr;
+         stream_request_read(stream);
+     }
+     return S_OK;
+ }
+-- 
+2.50.0
