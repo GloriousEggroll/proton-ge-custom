@@ -4,8 +4,9 @@ Date: Thu, 18 Jun 2026 17:27:34 -0600
 Subject: [PATCH] fix video playback in tex murphy: overseer
 
 ---
+ dlls/quartz/Makefile.in              |   2 +-
  dlls/quartz/dsoundrender.c           | 123 ++++++++---------
- dlls/quartz/filtergraph.c            | 155 +++++++++++++++++++++
+ dlls/quartz/filtergraph.c            | 163 +++++++++++++++++++++
  dlls/quartz/main.c                   |   6 +
  dlls/winedmo/main.c                  |  32 +++++
  dlls/winedmo/quartz_transform.c      | 193 +++++++++++++++++++++++++--
@@ -17,13 +18,32 @@ Subject: [PATCH] fix video playback in tex murphy: overseer
  dlls/winedmo/winedmo_private.h       |   1 +
  dlls/winedmo/winedmo_quartz_parser.c |  25 +++-
  loader/wine.inf.in                   |   1 +
- 13 files changed, 516 insertions(+), 87 deletions(-)
+ 14 files changed, 525 insertions(+), 88 deletions(-)
 
+diff --git a/dlls/quartz/Makefile.in b/dlls/quartz/Makefile.in
+--- a/dlls/quartz/Makefile.in
++++ b/dlls/quartz/Makefile.in
+@@ -1,6 +1,6 @@
+ MODULE       = quartz.dll
+ IMPORTLIB    = quartz
+-IMPORTS      = strmiids dxguid strmbase uuid dsound msacm32 msvfw32 ole32 oleaut32 rpcrt4 user32 gdi32 advapi32 winmm msvcrt
++IMPORTS      = strmiids dxguid strmbase dmoguids uuid dsound msacm32 msvfw32 ole32 oleaut32 rpcrt4 user32 gdi32 advapi32 winmm msvcrt
+ DELAYIMPORTS = ddraw
+ 
+ SOURCES = \
 diff --git a/dlls/quartz/dsoundrender.c b/dlls/quartz/dsoundrender.c
 index 75037a85aff..96eb5db6101 100644
 --- a/dlls/quartz/dsoundrender.c
 +++ b/dlls/quartz/dsoundrender.c
-@@ -348,6 +348,55 @@ static HRESULT render_sample(struct dsound_render *filter, IMediaSample *pSample
+@@ -28,6 +28,7 @@
+ #include "strmif.h"
+ #include "dsound.h"
+ #include "amaudio.h"
++#include "mmreg.h"
+ 
+ #include "wine/debug.h"
+ 
+@@ -348,6 +349,55 @@ static HRESULT render_sample(struct dsound_render *filter, IMediaSample *pSample
      return send_sample_data(filter, start, pbSrcStream, cbSrcStream);
  }
  
@@ -79,7 +99,38 @@ index 75037a85aff..96eb5db6101 100644
  static void complete_eos(struct dsound_render *filter)
  {
      IFilterGraph *graph = filter->filter.graph;
-@@ -476,46 +525,10 @@ static HRESULT dsound_render_sink_connect(struct strmbase_sink *iface, IPin *pee
+@@ -466,56 +516,40 @@ static HRESULT dsound_render_sink_query_interface(struct strmbase_pin *iface, RE
+ 
+ static HRESULT dsound_render_sink_query_accept(struct strmbase_pin *iface, const AM_MEDIA_TYPE * pmt)
+ {
++    const WAVEFORMATEX *format = (const WAVEFORMATEX *)pmt->pbFormat;
++
+     if (!IsEqualIID(&pmt->majortype, &MEDIATYPE_Audio))
+         return S_FALSE;
+ 
++    if (!IsEqualGUID(&pmt->formattype, &FORMAT_WaveFormatEx) || pmt->cbFormat < sizeof(WAVEFORMATEX))
++        return S_FALSE;
++
++    if (format->wFormatTag == WAVE_FORMAT_PCM || format->wFormatTag == WAVE_FORMAT_IEEE_FLOAT)
++        return S_OK;
++
++    if (format->wFormatTag == WAVE_FORMAT_EXTENSIBLE
++            && pmt->cbFormat >= sizeof(WAVEFORMATEXTENSIBLE))
++    {
++        const WAVEFORMATEXTENSIBLE *ext = (const WAVEFORMATEXTENSIBLE *)format;
++
++        if (IsEqualGUID(&ext->SubFormat, &MEDIASUBTYPE_PCM)
++                || IsEqualGUID(&ext->SubFormat, &MEDIASUBTYPE_IEEE_FLOAT))
++            return S_OK;
++    }
++
++    TRACE("Rejecting compressed or unsupported audio type.\n");
++    strmbase_dump_media_type(pmt);
+-    return S_OK;
++    return S_FALSE;
+ }
+ 
+ static HRESULT dsound_render_sink_connect(struct strmbase_sink *iface, IPin *peer, const AM_MEDIA_TYPE *mt)
  {
      struct dsound_render *filter = impl_from_strmbase_pin(&iface->pin);
      const WAVEFORMATEX *format = (WAVEFORMATEX *)mt->pbFormat;
@@ -127,7 +178,7 @@ index 75037a85aff..96eb5db6101 100644
  }
  
  static void dsound_render_sink_disconnect(struct strmbase_sink *iface)
-@@ -686,9 +699,13 @@ static HRESULT dsound_render_start_stream(struct strmbase_filter *iface, REFEREN
+@@ -683,9 +720,13 @@ static HRESULT dsound_render_start_stream(struct strmbase_filter *iface, REFEREN
      struct dsound_render *filter = impl_from_strmbase_filter(iface);
      IFilterGraph *graph = filter->filter.graph;
      IMediaEventSink *event_sink;
@@ -141,7 +192,7 @@ index 75037a85aff..96eb5db6101 100644
      SetEvent(filter->state_event);
  
      if (filter->sink.pin.peer)
-@@ -1082,14 +1099,7 @@ static const IQualityControlVtbl quality_control_vtbl =
+@@ -1067,14 +1120,7 @@ static const IQualityControlVtbl quality_control_vtbl =
  
  HRESULT dsound_render_create(IUnknown *outer, IUnknown **out)
  {
@@ -156,7 +207,7 @@ index 75037a85aff..96eb5db6101 100644
      HRESULT hr;
  
      TRACE("outer %p, out %p.\n", outer, out);
-@@ -1106,31 +1116,6 @@ HRESULT dsound_render_create(IUnknown *outer, IUnknown **out)
+@@ -1091,31 +1137,6 @@ HRESULT dsound_render_create(IUnknown *outer, IUnknown **out)
          return hr;
      }
  
@@ -192,17 +243,36 @@ diff --git a/dlls/quartz/filtergraph.c b/dlls/quartz/filtergraph.c
 index bd6729ff364..d6f944c6b5f 100644
 --- a/dlls/quartz/filtergraph.c
 +++ b/dlls/quartz/filtergraph.c
-@@ -41,6 +41,9 @@
+@@ -29,6 +29,8 @@
+ #include "winreg.h"
+ #include "shlwapi.h"
+ #include "dshow.h"
++#include "dmodshow.h"
++#include "dmoreg.h"
+ #include "wine/debug.h"
+ #include "quartz_private.h"
+ #include "ole2.h"
+@@ -41,6 +44,19 @@
  
  WINE_DEFAULT_DEBUG_CHANNEL(quartz);
  
 +static const CLSID CLSID_winedmo_ac3_audio_decoder =
 +    {0x31d3ec21, 0x457d, 0x406f, {0x87, 0x84, 0x3d, 0x1a, 0x41, 0xe0, 0x7a, 0x6c}};
++static const CLSID CLSID_winedmo_wma_decoder =
++    {0x5b4d4e54, 0x0620, 0x4cf9, {0x94, 0xae, 0x78, 0x23, 0x96, 0x5c, 0x28, 0xb6}};
++static const GUID wma_audio_subtype_msaudio1 =
++    {0x00000160, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
++static const GUID wma_audio_subtype_wmaudio2 =
++    {0x00000161, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
++static const GUID wma_audio_subtype_wmaudio3 =
++    {0x00000162, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
++static const GUID wma_audio_subtype_wmaudio_lossless =
++    {0x00000163, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
 +
  DECLARE_CRITICAL_SECTION(message_cs);
  
  struct filter_create_params
-@@ -1284,6 +1287,119 @@ out:
+@@ -1284,6 +1290,204 @@ out:
      return hr;
  }
  
@@ -265,6 +335,27 @@ index bd6729ff364..d6f944c6b5f 100644
 +    return FALSE;
 +}
 +
++static BOOL autoplug_types_include_wma_audio(unsigned int type_count, const GUID *types)
++{
++    unsigned int i;
++
++    for (i = 0; i < type_count; ++i)
++    {
++        const GUID *major = &types[i * 2], *subtype = &types[i * 2 + 1];
++
++        if (!IsEqualGUID(major, &MEDIATYPE_Audio))
++            continue;
++
++        if (IsEqualGUID(subtype, &wma_audio_subtype_msaudio1)
++                || IsEqualGUID(subtype, &wma_audio_subtype_wmaudio2)
++                || IsEqualGUID(subtype, &wma_audio_subtype_wmaudio3)
++                || IsEqualGUID(subtype, &wma_audio_subtype_wmaudio_lossless))
++            return TRUE;
++    }
++
++    return FALSE;
++}
++
 +static HRESULT autoplug_filter_by_clsid(struct filter_graph *graph, IPin *source, IPin *sink,
 +        const CLSID *clsid, const WCHAR *name, IAMGraphBuilderCallback *callback,
 +        BOOL render_to_existing, unsigned int recursion_depth)
@@ -312,6 +403,70 @@ index bd6729ff364..d6f944c6b5f 100644
 +    return hr;
 +}
 +
++static HRESULT autoplug_dmo_wrapper_by_clsid(struct filter_graph *graph, IPin *source, IPin *sink,
++        const CLSID *clsid, const WCHAR *name, IAMGraphBuilderCallback *callback,
++        BOOL render_to_existing, unsigned int recursion_depth)
++{
++    IDMOWrapperFilter *wrapper;
++    IBaseFilter *filter;
++    IMoniker *moniker = NULL;
++    HRESULT hr;
++
++    TRACE("Trying %s through DMO wrapper before generic filter enumeration.\n", debugstr_w(name));
++
++    if (callback && SUCCEEDED(CreateClassMoniker(&CLSID_DMOWrapperFilter, &moniker)))
++    {
++        hr = IAMGraphBuilderCallback_SelectedFilter(callback, moniker);
++        IMoniker_Release(moniker);
++        if (FAILED(hr))
++        {
++            TRACE("%s wrapper rejected by IAMGraphBuilderCallback::SelectedFilter(), hr %#lx.\n",
++                    debugstr_w(name), hr);
++            return hr;
++        }
++    }
++
++    if (FAILED(hr = CoCreateInstance(&CLSID_DMOWrapperFilter, NULL, CLSCTX_INPROC_SERVER,
++            &IID_IBaseFilter, (void **)&filter)))
++        return hr;
++
++    if (FAILED(hr = IBaseFilter_QueryInterface(filter, &IID_IDMOWrapperFilter, (void **)&wrapper)))
++    {
++        IBaseFilter_Release(filter);
++        return hr;
++    }
++
++    hr = IDMOWrapperFilter_Init(wrapper, clsid, &DMOCATEGORY_AUDIO_DECODER);
++    IDMOWrapperFilter_Release(wrapper);
++    if (FAILED(hr))
++    {
++        IBaseFilter_Release(filter);
++        return hr;
++    }
++
++    if (callback && FAILED(hr = IAMGraphBuilderCallback_CreatedFilter(callback, filter)))
++    {
++        TRACE("%s wrapper rejected by IAMGraphBuilderCallback::CreatedFilter(), hr %#lx.\n",
++                debugstr_w(name), hr);
++        IBaseFilter_Release(filter);
++        return hr;
++    }
++
++    hr = IFilterGraph2_AddFilter(&graph->IFilterGraph2_iface, filter, name);
++    if (FAILED(hr))
++    {
++        IBaseFilter_Release(filter);
++        return hr;
++    }
++
++    hr = autoplug_through_filter(graph, source, filter, sink, render_to_existing, recursion_depth);
++    if (FAILED(hr))
++        IFilterGraph2_RemoveFilter(&graph->IFilterGraph2_iface, filter);
++
++    IBaseFilter_Release(filter);
++    return hr;
++}
++
 +static HRESULT autoplug_mpeg_stream_splitter(struct filter_graph *graph, IPin *source, IPin *sink,
 +        IAMGraphBuilderCallback *callback, BOOL render_to_existing, unsigned int recursion_depth)
 +{
@@ -322,7 +477,7 @@ index bd6729ff364..d6f944c6b5f 100644
  /* Common helper for IGraphBuilder::Connect() and IGraphBuilder::Render(), which
   * share most of the same code. Render() calls this with a NULL sink. */
  static HRESULT autoplug(struct filter_graph *graph, IPin *source, IPin *sink,
-@@ -1338,6 +1455,21 @@ static HRESULT autoplug(struct filter_graph *graph, IPin *source, IPin *sink,
+@@ -1338,6 +1529,28 @@ static HRESULT autoplug(struct filter_graph *graph, IPin *source, IPin *sink,
      if (graph->pSite)
          IUnknown_QueryInterface(graph->pSite, &IID_IAMGraphBuilderCallback, (void **)&callback);
  
@@ -340,6 +495,13 @@ index bd6729ff364..d6f944c6b5f 100644
 +            && SUCCEEDED(hr = autoplug_filter_by_clsid(graph, source, sink, &CLSID_winedmo_ac3_audio_decoder,
 +                    L"winedmo AC3 decoder", callback, render_to_existing, recursion_depth)))
 +        goto out;
++
++    if (autoplug_types_include_wma_audio(type_count, types))
++    {
++        if (SUCCEEDED(hr = autoplug_dmo_wrapper_by_clsid(graph, source, sink, &CLSID_winedmo_wma_decoder,
++                L"winedmo WMA decoder", callback, render_to_existing, recursion_depth)))
++            goto out;
++    }
 +
      if (FAILED(hr = IFilterMapper2_EnumMatchingFilters(mapper, &enummoniker,
              0, FALSE, MERIT_UNLIKELY, TRUE, type_count, types, NULL, NULL, FALSE,

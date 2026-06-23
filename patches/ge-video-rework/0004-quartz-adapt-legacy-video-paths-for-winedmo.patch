@@ -43,6 +43,7 @@ This also wires the legacy Indeo/IYUV/MPEG/video-resizer pieces into the new med
  dlls/qasf/dmowrapper.c           | 284 ++++++++++++++++++++++++++-----
  dlls/quartz/acmwrapper.c         |   1 +
  dlls/quartz/dsoundrender.c       |  23 ++-
+ dlls/quartz/filesource.c         |  33 ++++
  dlls/quartz/filtergraph.c        | 150 ++++++++++------
  dlls/quartz/main.c               |  16 ++
  dlls/quartz/memallocator.c       |   5 -
@@ -58,7 +59,7 @@ This also wires the legacy Indeo/IYUV/MPEG/video-resizer pieces into the new med
  dlls/wmvcore/wmvcore_private.h   |   2 +-
  libs/strmbase/pin.c              |  50 +++++-
  libs/strmbase/renderer.c         |   2 +-
- 31 files changed, 736 insertions(+), 217 deletions(-)
+ 32 files changed, 769 insertions(+), 217 deletions(-)
 
 diff --git a/dlls/amstream/ddrawstream.c b/dlls/amstream/ddrawstream.c
 index 55ab7ab25d4..77396d9cc93 100644
@@ -964,6 +965,57 @@ index e72b743e39e..75037a85aff 100644
  }
  
  static const struct strmbase_filter_ops filter_ops =
+diff --git a/dlls/quartz/filesource.c b/dlls/quartz/filesource.c
+index 2f85808d43e..dc997a08357 100644
+--- a/dlls/quartz/filesource.c
++++ b/dlls/quartz/filesource.c
+@@ -178,6 +178,23 @@ static BOOL process_pattern_string(const WCHAR *pattern, HANDLE file)
+     return ret;
+ }
+ 
++static BOOL is_asf_stream(HANDLE file)
++{
++    static const BYTE asf_header_guid[] =
++    {
++        0x30, 0x26, 0xb2, 0x75, 0x8e, 0x66, 0xcf, 0x11,
++        0xa6, 0xd9, 0x00, 0xaa, 0x00, 0x62, 0xce, 0x6c,
++    };
++    BYTE header[ARRAY_SIZE(asf_header_guid)];
++    DWORD ret_size;
++
++    SetFilePointer(file, 0, NULL, FILE_BEGIN);
++    if (!ReadFile(file, header, sizeof(header), &ret_size, NULL) || ret_size != sizeof(header))
++        return FALSE;
++
++    return !memcmp(header, asf_header_guid, sizeof(header));
++}
++
+ BOOL get_media_type(const WCHAR *filename, GUID *majortype, GUID *subtype, GUID *source_clsid)
+ {
+     WCHAR extensions_path[278] = L"Media Type\\Extensions\\";
+@@ -218,6 +235,22 @@ BOOL get_media_type(const WCHAR *filename, GUID *majortype, GUID *subtype, GUID
+         return FALSE;
+     }
+ 
++    if (is_asf_stream(file))
++    {
++        /* Persona 4 Arena Ultimax stores its intro ASF without an extension.
++         * Prefer the ASF reader before generic registry pattern matching so
++         * the file does not get misclassified and skipped. */
++        if (majortype)
++            *majortype = MEDIATYPE_Stream;
++        if (subtype)
++            *subtype = MEDIASUBTYPE_Asf;
++        if (source_clsid)
++            *source_clsid = CLSID_WMAsfReader;
++
++        CloseHandle(file);
++        return TRUE;
++    }
++
+     if (RegOpenKeyExW(HKEY_CLASSES_ROOT, L"Media Type", 0, KEY_READ, &parent_key))
+     {
+         CloseHandle(file);
 diff --git a/dlls/quartz/filtergraph.c b/dlls/quartz/filtergraph.c
 index 2ac397f26ab..1da175f0332 100644
 --- a/dlls/quartz/filtergraph.c
@@ -1010,7 +1062,7 @@ index 2ac397f26ab..1da175f0332 100644
      }
  
      if (SUCCEEDED(hr))
-@@ -1450,24 +1463,73 @@ static HRESULT WINAPI FilterGraph2_Render(IFilterGraph2 *iface, IPin *source)
+@@ -1450,24 +1463,122 @@ static HRESULT WINAPI FilterGraph2_Render(IFilterGraph2 *iface, IPin *source)
      return hr;
  }
  
@@ -1071,6 +1123,38 @@ index 2ac397f26ab..1da175f0332 100644
 +    return S_OK;
 +}
 +
++static BOOL filter_in_snapshot(IBaseFilter *filter, IBaseFilter **snapshot, unsigned int count)
++{
++    unsigned int i;
++
++    for (i = 0; i < count; ++i)
++    {
++        if (snapshot[i] == filter)
++            return TRUE;
++    }
++
++    return FALSE;
++}
++
++static HRESULT remove_filters_added_after_snapshot(struct filter_graph *graph,
++        IBaseFilter **snapshot, unsigned int count)
++{
++    struct filter *filter, *next;
++    HRESULT hr = S_OK, tmp_hr;
++
++    LIST_FOR_EACH_ENTRY_SAFE(filter, next, &graph->filters, struct filter, entry)
++    {
++        if (filter_in_snapshot(filter->filter, snapshot, count))
++            continue;
++
++        tmp_hr = IFilterGraph2_RemoveFilter(&graph->IFilterGraph2_iface, filter->filter);
++        if (FAILED(tmp_hr) && SUCCEEDED(hr))
++            hr = tmp_hr;
++    }
++
++    return hr;
++}
++
 +static HRESULT render_file_with_source_filter(IFilterGraph2 *iface, LPCWSTR filename, const GUID *source_clsid)
  {
      struct filter_graph *This = impl_from_IFilterGraph2(iface);
@@ -1078,9 +1162,11 @@ index 2ac397f26ab..1da175f0332 100644
 -    IPin* ppinreader = NULL;
 -    IEnumPins* penumpins = NULL;
 +    IBaseFilter *preader = NULL;
++    IBaseFilter **filter_snapshot = NULL;
 +    IPin *ppinreader = NULL;
 +    IEnumPins *penumpins = NULL;
      struct filter *filter;
++    unsigned int filter_count = 0, i = 0;
      HRESULT hr;
      BOOL partial = FALSE;
      BOOL any = FALSE;
@@ -1091,11 +1177,37 @@ index 2ac397f26ab..1da175f0332 100644
 -        return E_INVALIDARG;
 -
 -    hr = IFilterGraph2_AddSourceFilter(iface, lpcwstrFile, L"Reader", &preader);
++    if (source_clsid)
++    {
++        LIST_FOR_EACH_ENTRY(filter, &This->filters, struct filter, entry)
++            ++filter_count;
++
++        if (filter_count && !(filter_snapshot = calloc(filter_count, sizeof(*filter_snapshot))))
++            return E_OUTOFMEMORY;
++
++        LIST_FOR_EACH_ENTRY(filter, &This->filters, struct filter, entry)
++        {
++            IBaseFilter_AddRef(filter->filter);
++            filter_snapshot[i++] = filter->filter;
++        }
++    }
++
 +    hr = add_source_filter_with_clsid(iface, filename, L"Reader", source_clsid, &preader);
      if (FAILED(hr))
-         return hr;
+-        return hr;
++        goto done;
  
-@@ -1517,57 +1579,37 @@ static HRESULT WINAPI FilterGraph2_RenderFile(IFilterGraph2 *iface, LPCWSTR lpcw
+@@ -1517,60 +1628,47 @@ static HRESULT WINAPI FilterGraph2_RenderFile(IFilterGraph2 *iface, LPCWSTR lpcw
++    if (source_clsid && hr != S_OK && FAILED(remove_filters_added_after_snapshot(This, filter_snapshot, filter_count)))
++        WARN("Failed to remove all filters from partial source render.\n");
+     IBaseFilter_Release(preader);
+ 
++done:
++    for (i = 0; i < filter_count; ++i)
++        IBaseFilter_Release(filter_snapshot[i]);
++    free(filter_snapshot);
++
+     TRACE("Returning %#lx.\n", hr);
      return hr;
  }
  
@@ -1141,7 +1253,7 @@ index 2ac397f26ab..1da175f0332 100644
 -        return hr;
 -    }
 +        hr = render_file_with_source_filter(iface, lpcwstrFile, &CLSID_AsyncReader);
-+        if (SUCCEEDED(hr))
++        if (hr == S_OK)
 +            return hr;
  
 -    hr = IFileSourceFilter_Load(filesource, filename, NULL);
@@ -1834,4 +1946,3 @@ index 7305599ff78..b788d028193 100644
  static HRESULT renderer_start_stream(struct strmbase_filter *iface, REFERENCE_TIME start)
 -- 
 2.54.0
-
