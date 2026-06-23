@@ -11,11 +11,12 @@ decode before the graph exhausts 32-bit address space with queued RGB frames.
 ---
  dlls/winedmo/quartz_transform.c | 21 +++++++++++++++++----
  dlls/winedmo/unix_transform.c   | 18 ++++++++++++++++++
- dlls/winedmo/wm_reader.c        | 38 +++++++++++++++++++++++++++++++++++++-
+ dlls/winedmo/quartz_parser.c    |  3 ++-
+ dlls/winedmo/wm_reader.c        | 82 ++++++++++++++++++++++++++++++++++++++++-
  dlls/winedmo/winedmo_quartz_parser.c | 53 ++++++++++++++++++++++++++++++++++++
  dlls/qasf/asfreader.c           | 68 ++++++++++++++++++++++++++++++++++++++---
  dlls/wmvcore/async_reader.c     |  4 ++--
- 6 files changed, 195 insertions(+), 11 deletions(-)
+ 7 files changed, 197 insertions(+), 12 deletions(-)
 
 diff --git a/dlls/qasf/asfreader.c b/dlls/qasf/asfreader.c
 index 99999999999..aaaaaaaaaaa 100644
@@ -95,7 +96,6 @@ index 99999999999..aaaaaaaaaaa 100644
  
      if (SUCCEEDED(hr) && FAILED(hr = IWMReaderAdvanced2_SetStreamsSelected(reader_advanced,
              filter->stream_count, stream_numbers, selections)))
-
 @@ -833,6 +847,7 @@ static HRESULT WINAPI reader_callback_OnStatus(IWMReaderCallback *iface, WMT_STA
      AM_MEDIA_TYPE stream_media_type = {{0}};
      IWMHeaderInfo *header_info;
@@ -160,6 +160,23 @@ index 99999999999..aaaaaaaaaaa 100644
                  FreeMediaType(&stream_media_type);
  
                  strmbase_source_init(&stream->source, &filter->filter, name, &source_ops);
+
+diff --git a/dlls/winedmo/quartz_parser.c b/dlls/winedmo/quartz_parser.c
+index bbbbbbbbbbb..ccccccccccc 100644
+--- a/dlls/winedmo/quartz_parser.c
++++ b/dlls/winedmo/quartz_parser.c
+@@ -513,9 +513,10 @@ static bool amt_from_winedmo_format_video(AM_MEDIA_TYPE *mt, const struct winedm
+         video_format->AvgTimePerFrame = frame_time;
+     video_format->bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+     video_format->bmiHeader.biWidth = format->u.video.width;
+-    video_format->bmiHeader.biHeight = format->u.video.height;
+     if (winedmo_video_format_is_rgb(format->u.video.format))
+         video_format->bmiHeader.biHeight = -format->u.video.height;
++    else
++        video_format->bmiHeader.biHeight = abs(format->u.video.height);
+     video_format->bmiHeader.biPlanes = 1;
+     video_format->bmiHeader.biBitCount = winedmo_video_format_get_depth(format->u.video.format);
+     video_format->bmiHeader.biCompression = winedmo_video_format_get_compression(format->u.video.format);
 
 diff --git a/dlls/winedmo/winedmo_quartz_parser.c b/dlls/winedmo/winedmo_quartz_parser.c
 index 77777777777..88888888888 100644
@@ -359,6 +376,14 @@ index 55555555555..66666666666 100644
      bool queue_eos;
      bool queue_flushing;
  
+@@ -69,6 +70,7 @@ struct wm_stream
+     INT64 observed_decoded_duration;
+     INT64 nominal_decoded_duration;
+     bool next_decoded_cleanpoint;
++    bool video_sample_durations;
+ 
+     IWMReaderAllocatorEx *output_allocator;
+     IWMReaderAllocatorEx *stream_allocator;
 @@ -111,6 +111,7 @@ struct wm_reader
  
      struct wm_stream *streams;
@@ -367,6 +392,21 @@ index 55555555555..66666666666 100644
  };
  
  static struct wm_stream *get_stream_by_output_number(struct wm_reader *reader, DWORD output)
+@@ -567,8 +570,12 @@ static ULONG WINAPI buffer_Release(INSSBuffer *iface)
+ 
+ static HRESULT WINAPI buffer_GetLength(INSSBuffer *iface, DWORD *size)
+ {
+-    FIXME("iface %p, size %p, stub!\n", iface, size);
+-    return E_NOTIMPL;
++    struct buffer *buffer = impl_from_INSSBuffer(iface);
++
++    TRACE("buffer %p, size %p.\n", buffer, size);
++
++    *size = buffer->size;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI buffer_SetLength(INSSBuffer *iface, DWORD size)
 @@ -990,14 +991,38 @@ static void wm_flush_stream_queue(struct wm_stream *stream)
          free(pkt->data);
          free(pkt);
@@ -406,7 +446,23 @@ index 55555555555..66666666666 100644
  static DWORD CALLBACK wm_demux_thread(void *arg)
  {
      struct wm_reader *reader = arg;
-@@ -1085,6 +1086,14 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+@@ -1025,6 +1058,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+         DWORD data_len;
+         struct wm_stream *s;
+         struct wm_packet *pkt;
++        unsigned int read_generation;
+ 
+         /* Don't call the demuxer while reinit_stream is seeking it. */
+         if (reader->read_flushing)
+@@ -1040,6 +1074,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+             continue;
+         }
+ 
++        read_generation = reader->read_flush_generation;
+         memset(&output, 0, sizeof(output));
+         output.pBuffer = &sbuf->IMediaBuffer_iface;
+         stream_idx = 0;
+@@ -1066,22 +1099,31 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
              for (UINT i = 0; i < reader->stream_count; i++)
              {
                  s = &reader->streams[i];
@@ -421,9 +477,20 @@ index 55555555555..66666666666 100644
                  EnterCriticalSection(&s->decoder_cs);
                  if (s->decode_stream && s->decoder.handle)
                  {
-@@ -1094,7 +1119,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+-                    UINT32 dec_size = winedmo_format_get_max_size(&s->decoded_winedmo_format);
++                    UINT32 max_dec_size = winedmo_format_get_max_size(&s->decoded_winedmo_format);
+                     NTSTATUS dec_status;
+ 
+-                    if (!dec_size) dec_size = 0x40000;
++                    if (!max_dec_size) max_dec_size = 0x40000;
+                     winedmo_transform_drain(s->decoder);
+ 
+                     for (;;)
+                     {
+                         INT64 dec_pts, dec_dur;
                          DWORD dec_flags;
                          BYTE *dec_buf;
++                        UINT32 dec_size = max_dec_size;
  
 -                        if (!(dec_buf = malloc(dec_size)))
 +                        if (!wm_stream_wait_queue_space(reader, s) || !(dec_buf = malloc(dec_size)))
@@ -438,9 +505,50 @@ index 55555555555..66666666666 100644
                                  LeaveCriticalSection(&s->queue_cs);
                                  WakeConditionVariable(&s->queue_cv);
                              }
-@@ -1229,7 +1255,7 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+@@ -1166,6 +1192,12 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+             continue;
+         }
+ 
++        if (read_generation != reader->read_flush_generation || reader->read_flushing)
++        {
++            IMediaBuffer_Release(&sbuf->IMediaBuffer_iface);
++            continue;
++        }
++
+         IMediaBuffer_SetLength(&sbuf->IMediaBuffer_iface, needed_size);
+         data_len = needed_size;
+         IMediaBuffer_GetBufferAndLength(&sbuf->IMediaBuffer_iface, &src, NULL);
+@@ -1190,6 +1222,13 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+         }
+ 
+         EnterCriticalSection(&s->decoder_cs);
++        if (read_generation != reader->read_flush_generation || reader->read_flushing)
++        {
++            LeaveCriticalSection(&s->decoder_cs);
++            IMediaBuffer_Release(&sbuf->IMediaBuffer_iface);
++            continue;
++        }
++
+         if (s->decode_stream && s->decoder.handle)
+         {
+             INT64 in_pts = (output.dwStatus & DMO_OUTPUT_DATA_BUFFERF_TIME) ? output.rtTimestamp : INT64_MIN;
+@@ -1198,10 +1237,10 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
+             INT64 in_dur = (output.dwStatus & DMO_OUTPUT_DATA_BUFFERF_TIMELENGTH) ? output.rtTimelength : 0;
+             DWORD in_flags = (output.dwStatus & DMO_OUTPUT_DATA_BUFFERF_SYNCPOINT ? WINEDMO_SAMPLE_FLAG_SYNC_POINT : 0)
+                            | (output.dwStatus & DMO_OUTPUT_DATA_BUFFERF_DISCONTINUITY ? WINEDMO_SAMPLE_FLAG_DISCONTINUITY : 0);
+-            UINT32 dec_size = winedmo_format_get_max_size(&s->decoded_winedmo_format);
++            UINT32 max_dec_size = winedmo_format_get_max_size(&s->decoded_winedmo_format);
+             NTSTATUS dec_status;
+ 
+-            if (!dec_size) dec_size = 0x40000;
++            if (!max_dec_size) max_dec_size = 0x40000;
+ 
+             if ((dec_status = winedmo_transform_push_input(s->decoder, src, data_len,
+                     in_pts, INT64_MIN, in_dur, in_flags))
+@@ -1229,7 +1268,8 @@ static DWORD CALLBACK wm_demux_thread(void *arg)
                  DWORD dec_flags;
                  BYTE *dec_buf;
++                UINT32 dec_size = max_dec_size;
  
 -                if (!(dec_buf = malloc(dec_size)))
 +                if (!wm_stream_wait_queue_space(reader, s) || !(dec_buf = malloc(dec_size)))
@@ -537,6 +645,104 @@ index 55555555555..66666666666 100644
      LeaveCriticalSection(&stream->queue_cs);
  
      *data = pkt->data;
+@@ -2789,9 +2836,12 @@ static HRESULT WINAPI reader_GetOutputFormat(IWMSyncReader2 *iface,
+                 return NS_E_INVALID_OUTPUT_FORMAT;
+             }
+             format.u.video.format = video_formats[index];
+-            /* API consumers expect RGB video to be bottom-up. */
++            /* API consumers expect RGB video to be bottom-up. YUV/FOURCC
++             * formats do not use the DIB bottom-up convention. */
+             if (format.u.video.height > 0 && winedmo_video_format_is_rgb(format.u.video.format))
+                 format.u.video.height = -format.u.video.height;
++            else if (format.u.video.height < 0 && !winedmo_video_format_is_rgb(format.u.video.format))
++                format.u.video.height = -format.u.video.height;
+             break;
+ 
+         case WINEDMO_MAJOR_TYPE_AUDIO:
+@@ -2871,8 +2966,43 @@ static HRESULT WINAPI reader_GetOutputProps(IWMSyncReader2 *iface,
+ static HRESULT WINAPI reader_GetOutputSetting(IWMSyncReader2 *iface, DWORD output_num, const WCHAR *name,
+         WMT_ATTR_DATATYPE *type, BYTE *value, WORD *length)
+ {
+-    struct wm_reader *This = impl_from_IWMSyncReader2(iface);
+-    FIXME("(%p)->(%lu %s %p %p %p): stub!\n", This, output_num, debugstr_w(name), type, value, length);
++    struct wm_reader *reader = impl_from_IWMSyncReader2(iface);
++    struct wm_stream *stream;
++    BOOL ret;
++
++    TRACE("reader %p, output %lu, name %s, type %p, value %p, length %p.\n",
++            reader, output_num, debugstr_w(name), type, value, length);
++
++    if (!wcscmp(name, L"VideoSampleDurations"))
++    {
++        EnterCriticalSection(&reader->cs);
++
++        if (!(stream = get_stream_by_output_number(reader, output_num))
++                || !IsEqualGUID(&stream->major_type, &MFMediaType_Video))
++        {
++            LeaveCriticalSection(&reader->cs);
++            return E_INVALIDARG;
++        }
++
++        ret = stream->video_sample_durations;
++        LeaveCriticalSection(&reader->cs);
++
++        if (type)
++            *type = WMT_TYPE_BOOL;
++        if (!length)
++            return E_INVALIDARG;
++        if (!value || *length < sizeof(ret))
++        {
++            *length = sizeof(ret);
++            return NS_E_INVALID_REQUEST;
++        }
++
++        memcpy(value, &ret, sizeof(ret));
++        *length = sizeof(ret);
++        return S_OK;
++    }
++
++    FIXME("Unknown setting %s; returning E_NOTIMPL.\n", debugstr_w(name));
+     return E_NOTIMPL;
+ }
+ 
+@@ -3098,6 +3228,13 @@ static HRESULT WINAPI reader_SetOutputProps(IWMSyncReader2 *iface, DWORD output,
+         return hr;
+     }
+ 
++    if (!memcmp(&stream->decoded_winedmo_format, &format, sizeof(format)))
++    {
++        TRACE("Output format unchanged, keeping current stream state.\n");
++        LeaveCriticalSection(&reader->cs);
++        return S_OK;
++    }
++
+     stream->decoded_winedmo_format = format;
+ 
+     reinit_stream(reader);
+@@ -3116,7 +3253,22 @@ static HRESULT WINAPI reader_SetOutputSetting(IWMSyncReader2 *iface, DWORD output,
+ 
+     if (!wcscmp(name, L"VideoSampleDurations"))
+     {
+-        FIXME("Ignoring VideoSampleDurations setting.\n");
++        struct wm_stream *stream;
++
++        if (type != WMT_TYPE_BOOL || size < sizeof(BOOL))
++            return E_INVALIDARG;
++
++        EnterCriticalSection(&reader->cs);
++
++        if (!(stream = get_stream_by_output_number(reader, output))
++                || !IsEqualGUID(&stream->major_type, &MFMediaType_Video))
++        {
++            LeaveCriticalSection(&reader->cs);
++            return E_INVALIDARG;
++        }
++
++        stream->video_sample_durations = !!*(const BOOL *)value;
++        LeaveCriticalSection(&reader->cs);
+         return S_OK;
+     }
+     if (!wcscmp(name, L"EnableDiscreteOutput"))
 @@ -3226,6 +3270,9 @@ static HRESULT WINAPI reader_SetStreamsSelected(IWMSyncReader2 *iface,
  {
      struct wm_reader *reader = impl_from_IWMSyncReader2(iface);
