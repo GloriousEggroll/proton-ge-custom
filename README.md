@@ -133,14 +133,18 @@ cd /tmp/proton-ge-custom
 
 # Download the tarball for the latest release
 echo "Fetching tarball URL..."
-tarball_url=$(curl -s https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest | grep browser_download_url | cut -d\" -f4 | grep .tar.gz)
+case "$(uname -m)" in
+    aarch64|arm64) tarball_pattern='-aarch64\.tar\.gz$' ;;
+    *)             tarball_pattern='GE-Proton[^/]*[0-9]\.tar\.gz$' ;;
+esac
+tarball_url=$(curl -s https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest | grep browser_download_url | cut -d\" -f4 | grep -E "$tarball_pattern" | head -n1)
 tarball_name=$(basename $tarball_url)
 echo "Downloading tarball: $tarball_name..."
 curl -# -L $tarball_url -o $tarball_name --no-progress-meter
 
 # Download the checksum for the latest release
 echo "Fetching checksum URL..."
-checksum_url=$(curl -s https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest | grep browser_download_url | cut -d\" -f4 | grep .sha512sum)
+checksum_url=$(curl -s https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest | grep browser_download_url | cut -d\" -f4 | grep "${tarball_name}.sha512sum")
 checksum_name=$(basename $checksum_url)
 echo "Downloading checksum: $checksum_name..."
 curl -# -L $checksum_url -o $checksum_name --no-progress-meter
@@ -205,14 +209,18 @@ cd /tmp/proton-ge-custom
 
 # Download the tarball for the latest release
 echo "Fetching tarball URL..."
-tarball_url=$(curl -s https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest | grep browser_download_url | cut -d\" -f4 | grep .tar.gz)
+case "$(uname -m)" in
+    aarch64|arm64) tarball_pattern='-aarch64\.tar\.gz$' ;;
+    *)             tarball_pattern='GE-Proton[^/]*[0-9]\.tar\.gz$' ;;
+esac
+tarball_url=$(curl -s https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest | grep browser_download_url | cut -d\" -f4 | grep -E "$tarball_pattern" | head -n1)
 tarball_name=$(basename $tarball_url)
 echo "Downloading tarball: $tarball_name..."
 curl -# -L $tarball_url -o $tarball_name --no-progress-meter
 
 # Download the checksum for the latest release 
 echo "Fetching checksum URL..."
-checksum_url=$(curl -s https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest | grep browser_download_url | cut -d\" -f4 | grep .sha512sum)
+checksum_url=$(curl -s https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest | grep browser_download_url | cut -d\" -f4 | grep "${tarball_name}.sha512sum")
 checksum_name=$(basename $checksum_url)
 echo "Downloading checksum: $checksum_name..."
 curl -# -L $checksum_url -o $checksum_name --no-progress-meter
