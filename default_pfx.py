@@ -121,8 +121,13 @@ def make_default_pfx(default_pfx_dir, dist_dir, arm64):
     local_env = dict(os.environ)
     libdir = dist_dir + '/lib/'
 
-    system_libdir = ["/usr/aarch64-linux-gnu/lib"] if arm64 else []
-    ld_path = ':'.join([libdir + "x86_64-linux-gnu", libdir + "aarch64-linux-gnu", libdir + "i386-linux-gnu"] + system_libdir)
+    if arm64:
+        system_libdir = ["/usr/aarch64-linux-gnu/lib"]
+        libdirs = [libdir + "aarch64-linux-gnu", libdir + "x86_64-linux-gnu", libdir + "i386-linux-gnu"]
+    else:
+        system_libdir = []
+        libdirs = [libdir + "x86_64-linux-gnu", libdir + "i386-linux-gnu"]
+    ld_path = ':'.join(libdirs + system_libdir)
     local_env["LD_LIBRARY_PATH"] = ld_path
     local_env["WINEPREFIX"] = default_pfx_dir
     local_env["WINEDEBUG"] = "-all"
