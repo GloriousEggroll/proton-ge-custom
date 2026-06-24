@@ -121,53 +121,134 @@ This section is for those that use the native version of Steam.
    * `tar -xf GE-Proton*.tar.gz -C ~/.steam/steam/compatibilitytools.d/`.
 4. Restart Steam.
 5. [Enable proton-ge-custom in Steam](#enabling).
-  
-    
-*Get the latest release of GE-Proton through your terminal. It is assumed that you have all of the necessary software to use these commands installed:*
+
+*Get the latest GE-Proton release through your terminal. It is assumed that you have coreutils and curl installed:*
 ```bash
 # Make a temporary working directory
-echo "Creating temporary working directory..."
-rm -rf /tmp/proton-ge-custom
-mkdir /tmp/proton-ge-custom
+echo "Making sure temporary directory exists..."
+mkdir -p /tmp/proton-ge-custom
 cd /tmp/proton-ge-custom
 
-# Download the tarball for the latest release
-echo "Fetching tarball URL..."
-case "$(uname -m)" in
-    aarch64|arm64) tarball_pattern='-aarch64\.tar\.gz$' ;;
-    *)             tarball_pattern='GE-Proton[0-9-]*[0-9]\.tar\.gz$' ;;
-esac
-tarball_url=$(curl -s https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest | grep browser_download_url | cut -d\" -f4 | grep -E "$tarball_pattern" | head -n1)
-tarball_name=$(basename $tarball_url)
-echo "Downloading tarball: $tarball_name..."
-curl -# -L $tarball_url -o $tarball_name --no-progress-meter
+steam_dir=~/.steam/steam
 
-# Download the checksum for the latest release
-echo "Fetching checksum URL..."
-checksum_url=$(curl -s https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest | grep browser_download_url | cut -d\" -f4 | grep "${tarball_name%.tar.gz}.sha512sum")
-checksum_name=$(basename $checksum_url)
-echo "Downloading checksum: $checksum_name..."
-curl -# -L $checksum_url -o $checksum_name --no-progress-meter
-
-# Verify the downloaded tarball with the downloaded checksum
-echo "Verifying tarball $tarball_name with checksum $checksum_name..."
-sha512sum -c $checksum_name
-# If result the verification succeeds, continue
+# Verify Steam data directory exists
+if [[ ! -d "$steam_dir" ]]; then
+    echo "Error: Steam (native) data directory not found." >&2
+    echo "Please launch Steam at least once to populate it." >&2
+    exit 1
+fi
 
 # Make a Steam compatibility tools folder if it does not exist
-echo "Creating a Steam compatibility tools folder if it does not exist..."
-mkdir -p ~/.steam/steam/compatibilitytools.d
+mkdir -p "$steam_dir/compatibilitytools.d"
+
+# Fetch release info
+echo "Fetching release info..."
+release_json=$(curl -s --max-time 10 \
+    https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest)
+
+if [[ -z "$release_json" || "$release_json" != *'"tag_name"'* ]]; then
+    echo "Error: Failed to fetch release info from GitHub." >&2
+    exit 1
+fi
+
+# Resolve release URL for current architecture
+echo "Fetching release for your arch..."
+
+case "$(uname -m)" in
+    aarch64|arm64) tarball_pattern='-aarch64\.tar\.gz$' ;;
+    x86_64)        tarball_pattern='GE-Proton[0-9]+-[0-9]+\.tar\.gz$' ;;
+    *)
+        echo "Error: Unsupported architecture: $(uname -m)." >&2
+        echo "GE-Proton is only available for x86_64 and aarch64." >&2
+        exit 1
+        ;;
+esac
+
+tarball_url=$(echo "$release_json" |
+    grep browser_download_url |
+    cut -d\" -f4 |
+    grep -E "$tarball_pattern" |
+    head -n1 || true)
+
+tarball_name=$(basename "$tarball_url")
+release_name=${tarball_name%.tar.gz}
+
+if [[ -z "$tarball_url" ]]; then
+    echo "Error: Could not find a matching release for your arch ($(uname -m))." >&2
+    exit 1
+fi
+
+# Skip if already installed
+if [[ -d "$steam_dir/compatibilitytools.d/$release_name" ]]; then
+    echo "Latest release $release_name is already installed."
+    exit 0
+fi
+
+# Resolve checksum URL
+checksum_url=$(echo "$release_json" |
+    grep browser_download_url |
+    cut -d\" -f4 |
+    grep "$release_name.sha512sum$" || true)
+
+if [[ -z "$checksum_url" ]]; then
+    echo "Error: Could not find a checksum for $tarball_name in the release." >&2
+    exit 1
+fi
+
+# Use cached tarball from tmp if valid, resume if incomplete
+if [[ -f "$tarball_name" ]]; then
+    echo "Found cached release: $release_name"
+    echo "Verifying download..."
+
+    if curl -sL "$checksum_url" | sha512sum -c - &>/dev/null; then
+        echo "Cached release OK, skipping download."
+    else
+        echo "Cached release is incomplete, resuming download..."
+        curl -C - -L "$tarball_url" -o "$tarball_name" --progress-bar
+        echo "Verifying download..."
+
+        if ! curl -sL "$checksum_url" | sha512sum -c - &>/dev/null; then
+            echo "Resumed download corrupt, falling back to fresh download..."
+            rm -f "$tarball_name"
+            curl -L "$tarball_url" -o "$tarball_name" --progress-bar
+            echo "Verifying download..."
+
+            if ! curl -sL "$checksum_url" | sha512sum -c -; then
+                echo "Error: Verification failed! The downloaded release may be corrupt." >&2
+                exit 1
+            fi
+        fi
+    fi
+
+# Nuke the temporary working directory and download the tarball
+else
+    echo "Cleaning temporary directory..."
+    rm -rf /tmp/proton-ge-custom
+    mkdir /tmp/proton-ge-custom
+    cd /tmp/proton-ge-custom
+    echo "Downloading release: $release_name..."
+    curl -L "$tarball_url" -o "$tarball_name" --progress-bar
+    echo "Verifying download..."
+
+    if ! curl -sL "$checksum_url" | sha512sum -c -; then
+        echo "Error: Verification failed! The downloaded release may be corrupt." >&2
+        exit 1
+    fi
+fi
 
 # Extract the GE-Proton tarball to the Steam compatibility tools folder
 echo "Extracting $tarball_name to the Steam compatibility tools folder..."
-tar -xf $tarball_name -C ~/.steam/steam/compatibilitytools.d/
-echo "Done"
+tar -xf "$tarball_name" -C "$steam_dir/compatibilitytools.d/" \
+    || { echo "Error: Extraction failed!" >&2; exit 1; }
+
+echo "Done :)"
 ```
 
 The shell commands above can be run as a script by pasting the commands in a file and adding the following to the top of the file assuming you have 'bash' installed:
 ```bash
 #!/bin/bash
 set -euo pipefail
+trap 'echo "Error" >&2' ERR
 ```
 
 Save the file and make the script executable by adding the executable bit:
@@ -199,50 +280,133 @@ The Steam Flatpak and [the unofficial build of GE-Proton provided by Flathub](ht
 4. Restart Steam.
 5. [Enable proton-ge-custom in Steam](#enabling).   
 
-*Get the latest GE-Proton release through your terminal. It is assumed that you have all of the necessary software to use these commands installed:*
+*Get the latest GE-Proton release through your terminal. It is assumed that you have coreutils and curl installed:*
 ```bash
 # Make a temporary working directory
-echo "Creating a temporary working directory..."
-rm -rf /tmp/proton-ge-custom
-mkdir /tmp/proton-ge-custom
+echo "Making sure temporary directory exists..."
+mkdir -p /tmp/proton-ge-custom
 cd /tmp/proton-ge-custom
 
-# Download the tarball for the latest release
-echo "Fetching tarball URL..."
-case "$(uname -m)" in
-    aarch64|arm64) tarball_pattern='-aarch64\.tar\.gz$' ;;
-    *)             tarball_pattern='GE-Proton[0-9-]*[0-9]\.tar\.gz$' ;;
-esac
-tarball_url=$(curl -s https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest | grep browser_download_url | cut -d\" -f4 | grep -E "$tarball_pattern" | head -n1)
-tarball_name=$(basename $tarball_url)
-echo "Downloading tarball: $tarball_name..."
-curl -# -L $tarball_url -o $tarball_name --no-progress-meter
+steam_dir=~/.var/app/com.valvesoftware.Steam/data/Steam
 
-# Download the checksum for the latest release 
-echo "Fetching checksum URL..."
-checksum_url=$(curl -s https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest | grep browser_download_url | cut -d\" -f4 | grep "${tarball_name%.tar.gz}.sha512sum")
-checksum_name=$(basename $checksum_url)
-echo "Downloading checksum: $checksum_name..."
-curl -# -L $checksum_url -o $checksum_name --no-progress-meter
-
-# Verify the downloaded tarball with the downloaded checksum
-echo "Verifying tarball $tarball_name with checksum $checksum_name..."
-sha512sum -c $checksum_name
-# If result the verification succeeds, continue
+# Verify Steam data directory exists
+if [[ ! -d "$steam_dir" ]]; then
+    echo "Error: Steam (flatpak) data directory not found." >&2
+    echo "Please launch Steam at least once to populate it." >&2
+    exit 1
+fi
 
 # Make a Steam compatibility tools folder if it does not exist
-echo "Creating a Steam directory if it does not exist..."
-mkdir -p ~/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d
+mkdir -p "$steam_dir/compatibilitytools.d"
+
+# Fetch release info
+echo "Fetching release info..."
+release_json=$(curl -s --max-time 10 \
+    https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest)
+
+if [[ -z "$release_json" || "$release_json" != *'"tag_name"'* ]]; then
+    echo "Error: Failed to fetch release info from GitHub." >&2
+    exit 1
+fi
+
+# Resolve release URL for current architecture
+echo "Fetching release for your arch..."
+
+case "$(uname -m)" in
+    aarch64|arm64) tarball_pattern='-aarch64\.tar\.gz$' ;;
+    x86_64)        tarball_pattern='GE-Proton[0-9]+-[0-9]+\.tar\.gz$' ;;
+    *)
+        echo "Error: Unsupported architecture: $(uname -m)." >&2
+        echo "GE-Proton is only available for x86_64 and aarch64." >&2
+        exit 1
+        ;;
+esac
+
+tarball_url=$(echo "$release_json" |
+    grep browser_download_url |
+    cut -d\" -f4 |
+    grep -E "$tarball_pattern" |
+    head -n1 || true)
+
+tarball_name=$(basename "$tarball_url")
+release_name=${tarball_name%.tar.gz}
+
+if [[ -z "$tarball_url" ]]; then
+    echo "Error: Could not find a matching release for your arch ($(uname -m))." >&2
+    exit 1
+fi
+
+# Skip if already installed
+if [[ -d "$steam_dir/compatibilitytools.d/$release_name" ]]; then
+    echo "Latest release $release_name is already installed."
+    exit 0
+fi
+
+# Resolve checksum URL
+checksum_url=$(echo "$release_json" |
+    grep browser_download_url |
+    cut -d\" -f4 |
+    grep "$release_name.sha512sum$" || true)
+
+if [[ -z "$checksum_url" ]]; then
+    echo "Error: Could not find a checksum for $tarball_name in the release." >&2
+    exit 1
+fi
+
+# Use cached tarball from tmp if valid, resume if incomplete
+if [[ -f "$tarball_name" ]]; then
+    echo "Found cached release: $release_name"
+    echo "Verifying download..."
+
+    if curl -sL "$checksum_url" | sha512sum -c - &>/dev/null; then
+        echo "Cached release OK, skipping download."
+    else
+        echo "Cached release is incomplete, resuming download..."
+        curl -C - -L "$tarball_url" -o "$tarball_name" --progress-bar
+        echo "Verifying download..."
+
+        if ! curl -sL "$checksum_url" | sha512sum -c - &>/dev/null; then
+            echo "Resumed download corrupt, falling back to fresh download..."
+            rm -f "$tarball_name"
+            curl -L "$tarball_url" -o "$tarball_name" --progress-bar
+            echo "Verifying download..."
+
+            if ! curl -sL "$checksum_url" | sha512sum -c -; then
+                echo "Error: Verification failed! The downloaded release may be corrupt." >&2
+                exit 1
+            fi
+        fi
+    fi
+
+# Nuke the temporary working directory and download the tarball
+else
+    echo "Cleaning temporary directory..."
+    rm -rf /tmp/proton-ge-custom
+    mkdir /tmp/proton-ge-custom
+    cd /tmp/proton-ge-custom
+    echo "Downloading release: $release_name..."
+    curl -L "$tarball_url" -o "$tarball_name" --progress-bar
+    echo "Verifying download..."
+
+    if ! curl -sL "$checksum_url" | sha512sum -c -; then
+        echo "Error: Verification failed! The downloaded release may be corrupt." >&2
+        exit 1
+    fi
+fi
 
 # Extract the GE-Proton tarball to the Steam compatibility tools folder
 echo "Extracting $tarball_name to the Steam compatibility tools folder..."
-tar -xf $tarball_name -C ~/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d/
-echo "All done :)"
+tar -xf "$tarball_name" -C "$steam_dir/compatibilitytools.d/" \
+    || { echo "Error: Extraction failed!" >&2; exit 1; }
+
+echo "Done :)"
 ```
+
 The shell commands above can be run as a script by pasting the commands in a file and adding the following to the top of the file assuming you have 'bash' installed:
 ```bash
 #!/bin/bash
 set -euo pipefail
+trap 'echo "Error" >&2' ERR
 ```
 
 Save the file and make the script executable by adding the executable bit:
