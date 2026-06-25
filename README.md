@@ -155,7 +155,7 @@ fi
 echo "Fetching release for your arch..."
 
 case "$(uname -m)" in
-    aarch64|arm64) tarball_pattern='-aarch64\.tar\.gz$' ;;
+    aarch64|arm64) tarball_pattern='\-aarch64\.tar\.gz$' ;;
     x86_64)        tarball_pattern='GE-Proton[0-9]+-[0-9]+\.tar\.gz$' ;;
     *)
         echo "Error: Unsupported architecture: $(uname -m)." >&2
