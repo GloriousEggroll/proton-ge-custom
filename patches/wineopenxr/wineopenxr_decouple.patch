@@ -7,25 +7,25 @@ index 05583209..5be3dd26 100644
  UNIXLIB    = wineopenxr.so
  IMPORTS    = advapi32 user32 dxgi winevulkan
 +UNIX_LIBS  = -lopenxr_loader
- 
+
  EXTRADEFS  = -DWINE_NO_LONG_TYPES
- 
+
 diff --git a/openxr.c b/openxr.c
-index b2240792..526946d3 100644
+index b2240792..46f1c7c6 100644
 --- a/openxr.c
 +++ b/openxr.c
 @@ -4,6 +4,8 @@
- 
+
  #define _GNU_SOURCE
  #include <dlfcn.h>
 +#include <fcntl.h>
 +#include <unistd.h>
  #include <time.h>
- 
+
  #include "ntstatus.h"
 @@ -17,6 +19,50 @@
  #include "openxr_private.h"
- 
+
  WINE_DEFAULT_DEBUG_CHANNEL(openxr);
 +#define wine_dbgstr_xrhandle(h) wine_dbgstr_longlong((ULONGLONG)(h))
 +
@@ -71,7 +71,7 @@ index b2240792..526946d3 100644
 +  dup2(saved_stderr, STDERR_FILENO);
 +  close(saved_stderr);
 +}
- 
+
  static struct {
    const char *win32_ext, *linux_ext;
 @@ -39,6 +85,7 @@ XrResult WINAPI wine_xrCreateInstance(const XrInstanceCreateInfo *createInfo, Xr
@@ -79,13 +79,13 @@ index b2240792..526946d3 100644
    const char *ext_name;
    const char **new_list;
 +  int saved_stderr;
- 
+
    TRACE("%p, %p\n", createInfo, instance);
- 
+
 @@ -77,7 +124,9 @@ XrResult WINAPI wine_xrCreateInstance(const XrInstanceCreateInfo *createInfo, Xr
      TRACE("  -%s\n", createInfo->enabledExtensionNames[i]);
    }
- 
+
 +  saved_stderr = silence_openxr_loader_errors_begin();
    res = xrCreateInstance(createInfo, instance);
 +  silence_openxr_loader_errors_end(saved_stderr);
@@ -97,9 +97,9 @@ index b2240792..526946d3 100644
    uint32_t i, j, dst, count, extra_extensions_count;
    XrResult res;
 +  int saved_stderr;
- 
+
    TRACE("\n");
- 
+
 +  saved_stderr = silence_openxr_loader_errors_begin();
    res = xrEnumerateInstanceExtensionProperties(layerName, propertyCapacityInput, propertyCountOutput, properties);
 +  silence_openxr_loader_errors_end(saved_stderr);
@@ -126,75 +126,503 @@ index b2240792..526946d3 100644
 @@ -237,7 +288,7 @@ XrResult WINAPI wine_xrGetVulkanGraphicsDevice2KHR(XrInstance instance,
    XrVulkanGraphicsDeviceGetInfoKHR our_getinfo;
    XrResult res;
- 
+
 -  TRACE("instance %p, getInfo %p, vulkanPhysicalDevice %p.\n", instance, getInfo, vulkanPhysicalDevice);
 +  TRACE("instance 0x%s, getInfo %p, vulkanPhysicalDevice %p.\n", wine_dbgstr_xrhandle(instance), getInfo, vulkanPhysicalDevice);
- 
+
    if (getInfo->next) {
      WARN("Unsupported chained structure %p.\n", getInfo->next);
 @@ -264,7 +315,7 @@ XrResult WINAPI wine_xrGetVulkanInstanceExtensionsKHR(XrInstance instance,
    XrResult res;
    uint32_t lin_len;
- 
+
 -  TRACE("%p, 0x%s, %u, %p, %p\n", instance, wine_dbgstr_longlong(systemId), bufferCapacityInput, bufferCountOutput,
 +  TRACE("0x%s, 0x%s, %u, %p, %p\n", wine_dbgstr_xrhandle(instance), wine_dbgstr_longlong(systemId), bufferCapacityInput, bufferCountOutput,
          buffer);
- 
+
    /* Linux SteamVR does not return xlib_surface, but Windows SteamVR _does_
-@@ -307,7 +358,7 @@ static VkResult WINAPI vk_create_instance_callback(const VkInstanceCreateInfo *c
+@@ -301,16 +352,18 @@ static VkResult WINAPI vk_create_instance_callback(const VkInstanceCreateInfo *c
+                                                    void *(*pfnGetInstanceProcAddr)(VkInstance, const char *),
+                                                    void *context) {
+   struct vk_create_callback_context *c = context;
++  wine_XrInstance *wine_instance = wine_instance_from_handle(c->wine_instance);
+   XrVulkanInstanceCreateInfoKHR our_create_info;
+   VkInstanceCreateInfo our_vulkan_create_info;
+   const char **enabled_extensions = NULL;
    unsigned int i;
    VkResult ret;
- 
+
 -  our_create_info = *(const XrVulkanInstanceCreateInfoKHR *)c->create_info;
 +  our_create_info = *(const XrVulkanInstanceCreateInfoKHR *)(ULONG_PTR)c->create_info;
    our_create_info.pfnGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)pfnGetInstanceProcAddr;
    our_create_info.vulkanCreateInfo = create_info;
-   our_create_info.vulkanAllocator = allocator;
-@@ -347,7 +398,7 @@ static VkResult WINAPI vk_create_device_callback(VkPhysicalDevice phys_dev,
+-  our_create_info.vulkanAllocator = allocator;
++  our_create_info.vulkanAllocator = NULL;
++  wine_instance->host_vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)pfnGetInstanceProcAddr;
+
+   for (i = 0; i < create_info->enabledExtensionCount; ++i) {
+     if (!strcmp(create_info->ppEnabledExtensionNames[i], "VK_KHR_surface")) {
+@@ -331,7 +384,7 @@ static VkResult WINAPI vk_create_instance_callback(const VkInstanceCreateInfo *c
+   }
+
+   c->ret = g_xr_host_instance_dispatch_table.p_xrCreateVulkanInstanceKHR(
+-      wine_instance_from_handle(c->wine_instance)->host_instance, &our_create_info, vk_instance, &ret);
++      wine_instance->host_instance, &our_create_info, vk_instance, &ret);
+   free(enabled_extensions);
+   return ret;
+ }
+@@ -344,24 +397,30 @@ static VkResult WINAPI vk_create_device_callback(VkPhysicalDevice phys_dev,
+                                                  void *context) {
+   /* Only Unix calls here, called from the Unix side. */
+   struct vk_create_callback_context *c = context;
++  wine_XrInstance *wine_instance = wine_instance_from_handle(c->wine_instance);
    XrVulkanDeviceCreateInfoKHR our_create_info;
    VkResult ret;
- 
+
 -  our_create_info = *(const XrVulkanDeviceCreateInfoKHR *)c->create_info;
+-  our_create_info.pfnGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)pfnGetInstanceProcAddr;
++  if (!wine_instance->host_vkGetInstanceProcAddr) {
++    ERR("xrCreateVulkanDeviceKHR called before xrCreateVulkanInstanceKHR stored vkGetInstanceProcAddr\n");
++    return VK_ERROR_INITIALIZATION_FAILED;
++  }
++
 +  our_create_info = *(const XrVulkanDeviceCreateInfoKHR *)(ULONG_PTR)c->create_info;
-   our_create_info.pfnGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)pfnGetInstanceProcAddr;
++  our_create_info.pfnGetInstanceProcAddr = wine_instance->host_vkGetInstanceProcAddr;
    our_create_info.vulkanPhysicalDevice = phys_dev;
    our_create_info.vulkanCreateInfo = create_info;
-@@ -360,8 +411,8 @@ static VkResult WINAPI vk_create_device_callback(VkPhysicalDevice phys_dev,
+-  our_create_info.vulkanAllocator = allocator;
++  our_create_info.vulkanAllocator = NULL;
+   c->ret = g_xr_host_instance_dispatch_table.p_xrCreateVulkanDeviceKHR(
+-      wine_instance_from_handle(c->wine_instance)->host_instance, &our_create_info, vk_device, &ret);
++      wine_instance->host_instance, &our_create_info, vk_device, &ret);
+   return ret;
+ }
+
  NTSTATUS init_openxr(void *args) {
    struct init_openxr_params *params = args;
- 
+
 -  params->create_instance_callback = (UINT64)&vk_create_instance_callback;
 -  params->create_device_callback = (UINT64)&vk_create_device_callback;
 +  params->create_instance_callback = (UINT64)(ULONG_PTR)&vk_create_instance_callback;
 +  params->create_device_callback = (UINT64)(ULONG_PTR)&vk_create_device_callback;
- 
+
    return STATUS_SUCCESS;
  }
-@@ -460,6 +511,7 @@ NTSTATUS is_available_instance_function_openxr(void *args)
+@@ -460,6 +519,7 @@ NTSTATUS is_available_instance_function_openxr(void *args)
    wine_XrInstance *wine_instance = wine_instance_from_handle(params->instance);
    PFN_xrVoidFunction fn;
    unsigned int i;
 +  int saved_stderr = -1;
- 
+
    for (i = 0; i < ARRAY_SIZE(always_supported); ++i)
    {
-@@ -470,6 +522,8 @@ NTSTATUS is_available_instance_function_openxr(void *args)
+@@ -470,6 +530,8 @@ NTSTATUS is_available_instance_function_openxr(void *args)
      }
    }
- 
+
 -  params->ret = xrGetInstanceProcAddr(wine_instance ? wine_instance->host_instance : NULL, params->name, &fn);
 +  saved_stderr = silence_openxr_loader_errors_begin();
 +  params->ret = xrGetInstanceProcAddr(wine_instance ? wine_instance->host_instance : (XrInstance)0, params->name, &fn);
 +  silence_openxr_loader_errors_end(saved_stderr);
    return STATUS_SUCCESS;
  }
+diff --git a/openxr_loader.c b/openxr_loader.c
+index e6ee007d..ca738591 100644
+--- a/openxr_loader.c
++++ b/openxr_loader.c
+@@ -1,7 +1,14 @@
+ #include <stdlib.h>
++#include <string.h>
++#include <stdio.h>
+
+ #include "initguid.h"
+ #include "openxr_loader.h"
++
++/* openxr_loader.c calls this from get_vulkan_extensions() when the XR registry cache
++ * hasn't been initialised yet. */
++BOOL CDECL wineopenxr_init_registry(void);
++
+ #include "wine/unixlib.h"
+ #include "wine/vulkan_driver.h"
+ #include "dxvk-interop.h"
+@@ -9,10 +16,141 @@
+
+ WINE_DEFAULT_DEBUG_CHANNEL(openxr);
+
++static void call_vrclient_vrclient_init_registry(void)
++{
++    HMODULE vrclient;
++    void (CDECL *vrclient_init_registry)(void);
++
++    if (!(vrclient = LoadLibraryA("C:\\vrclient\\bin\\vrclient_x64.dll"))) return;
++    vrclient_init_registry = (void (CDECL *)(void))GetProcAddress(vrclient, "vrclient_init_registry");
++    if (vrclient_init_registry) vrclient_init_registry();
++    FreeLibrary(vrclient);
++}
++
+ static uint32_t g_physdev_vid, g_physdev_pid;
+ static char *g_instance_extensions, *g_device_extensions;
+ static XrVersion api_version = XR_CURRENT_API_VERSION;
+
++static BOOL is_vulkan_debug_callback_extension(const char *name)
++{
++    return !strcmp(name, "VK_EXT_debug_utils") || !strcmp(name, "VK_EXT_debug_report");
++}
++
++static const char **remove_vulkan_debug_callback_extensions(VkInstanceCreateInfo *create_info)
++{
++    const char **extensions;
++    uint32_t i, count = 0;
++
++    for (i = 0; i < create_info->enabledExtensionCount; ++i)
++    {
++        if (!is_vulkan_debug_callback_extension(create_info->ppEnabledExtensionNames[i]))
++            ++count;
++    }
++
++    if (count == create_info->enabledExtensionCount)
++        return NULL;
++
++    extensions = malloc(count * sizeof(*extensions));
++    if (!extensions)
++        return NULL;
++
++    for (i = 0, count = 0; i < create_info->enabledExtensionCount; ++i)
++    {
++        if (!is_vulkan_debug_callback_extension(create_info->ppEnabledExtensionNames[i]))
++            extensions[count++] = create_info->ppEnabledExtensionNames[i];
++    }
++
++    create_info->enabledExtensionCount = count;
++    create_info->ppEnabledExtensionNames = extensions;
++    return extensions;
++}
++
++static int has_surface_token(const char *s, size_t n)
++{
++    const char *p;
++    if (n < 8) return 0;
++    for (p = s; p + 8 <= s + n; ++p)
++        if (!memcmp(p, "_surface", 8)) return 1;
++    return 0;
++}
++
++static void ensure_vr_registry_from_xr(void)
++{
++    HKEY vr_key;
++    DWORD disp;
++    LSTATUS status;
++    DWORD one = 1;
++    char name[64];
++
++    /* Only create if missing. */
++    status = RegCreateKeyExA(HKEY_CURRENT_USER, "Software\\Wine\\VR", 0, NULL, REG_OPTION_VOLATILE,
++                             KEY_ALL_ACCESS, NULL, &vr_key, &disp);
++    if (status)
++        return;
++
++    /* If it already exists, don't overwrite what vrclient/steam may have set. */
++    if (disp != REG_CREATED_NEW_KEY)
++    {
++        RegCloseKey(vr_key);
++        return;
++    }
++
++    /* Mark ready. */
++    RegSetValueExA(vr_key, "state", 0, REG_DWORD, (BYTE *)&one, sizeof(one));
++    RegSetValueExA(vr_key, "is_hmd_present", 0, REG_DWORD, (BYTE *)&one, sizeof(one));
++
++    /* Propagate PROTON_VR_RUNTIME if present in the environment. */
++    {
++        char buf[4096];
++        DWORD len = GetEnvironmentVariableA("PROTON_VR_RUNTIME", buf, sizeof(buf));
++        if (len && len < sizeof(buf))
++            RegSetValueExA(vr_key, "PROTON_VR_RUNTIME", 0, REG_SZ, (BYTE *)buf, len + 1);
++    }
++
++    /* Set per-device PCIID mapping to XR device extensions. */
++    if (g_device_extensions && g_physdev_vid && g_physdev_pid)
++    {
++        snprintf(name, sizeof(name), "PCIID:%04x:%04x", (unsigned)g_physdev_vid, (unsigned)g_physdev_pid);
++        RegSetValueExA(vr_key, name, 0, REG_SZ, (BYTE *)g_device_extensions, (DWORD)strlen(g_device_extensions) + 1);
++    }
++
++    /* Derive OpenVR instance extension string from XR instance extensions.
++     * Drop any *_surface extensions, as OpenVR path doesn't need them. */
++    if (g_instance_extensions)
++    {
++        const char *src = g_instance_extensions;
++        char *out = malloc(strlen(src) + 1);
++        char *dst = out;
++        int first = 1;
++
++        if (out)
++        {
++            while (*src)
++            {
++                const char *end = strchr(src, ' ');
++                size_t len = end ? (size_t)(end - src) : strlen(src);
++
++                if (len && !has_surface_token(src, len))
++                {
++                    if (!first) *dst++ = ' ';
++                    memcpy(dst, src, len);
++                    dst += len;
++                    first = 0;
++                }
++
++                if (!end) break;
++                src = end + 1;
++            }
++            *dst = 0;
++            RegSetValueExA(vr_key, "openvr_vulkan_instance_extensions", 0, REG_SZ,
++                           (BYTE *)out, (DWORD)strlen(out) + 1);
++            free(out);
++        }
++    }
++
++    RegCloseKey(vr_key);
++}
++
+ #define SESSION_TYPE_VULKAN 1
+ #define SESSION_TYPE_OPENGL 2
+ #define SESSION_TYPE_D3D11 3
+@@ -110,11 +248,39 @@ static BOOL get_vulkan_extensions(void) {
+   HANDLE event;
+   HKEY vr_key;
+
+-  if ((status = RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Wine\\VR", 0, KEY_READ, &vr_key))) {
+-    ERR("Could not create key, status %#x.\n", status);
+-    return FALSE;
++  if ((status = RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Wine\\XR", 0, KEY_READ, &vr_key))) {
++        DWORD type, size, state = 0;
++        unsigned int i;
++
++        call_vrclient_vrclient_init_registry();
++
++        /* Wait briefly for vrclient init thread to populate XR cache. */
++        for (i = 0; i < 40; ++i) /* 40 * 50ms = 2s */
++        {
++            if (!RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Wine\\XR", 0, KEY_READ, &vr_key))
++            {
++                size = sizeof(state);
++                if (!RegQueryValueExA(vr_key, "state", NULL, &type, (BYTE *)&state, &size) &&
++                    type == REG_DWORD && (state == 1 || state == ~0u))
++                {
++                    RegCloseKey(vr_key);
++                    break;
++                }
++                RegCloseKey(vr_key);
++            }
++            Sleep(50);
++        }
++
++        if ((status = RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Wine\\XR", 0, KEY_READ, &vr_key)))
++        {
++            ERR("Could not open key, status %#x.\n", status);
++            return FALSE;
++        }
+   }
+
++  value = 1;
++  goto done;
++
+   size = sizeof(value);
+   if ((status = RegQueryValueExA(vr_key, "state", NULL, &type, (BYTE *)&value, &size))) {
+     ERR("Could not query value, status %#x.\n", status);
+@@ -161,9 +327,17 @@ static BOOL get_vulkan_extensions(void) {
+ done:
+   if (value == 1) {
+     if ((status = RegQueryValueExA(vr_key, "openxr_vulkan_instance_extensions", NULL, &type, NULL, &size))) {
+-      ERR("Error getting openxr_vulkan_instance_extensions, status %#x.\n", status);
+       RegCloseKey(vr_key);
+-      return FALSE;
++      wineopenxr_init_registry();
++      if ((status = RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Wine\\XR", 0, KEY_READ, &vr_key))) {
++        ERR("Could not open key, status %#x.\n", status);
++        return FALSE;
++      }
++      if ((status = RegQueryValueExA(vr_key, "openxr_vulkan_instance_extensions", NULL, &type, NULL, &size))) {
++        ERR("Error getting openxr_vulkan_instance_extensions, status %#x.\n", status);
++        RegCloseKey(vr_key);
++        return FALSE;
++      }
+     }
+     g_instance_extensions = malloc(size);
+     if ((status = RegQueryValueExA(vr_key, "openxr_vulkan_instance_extensions", NULL, &type,
+@@ -196,6 +370,8 @@ done:
+     }
+   }
+
++  if (value == 1) ensure_vr_registry_from_xr();
++
+   RegCloseKey(vr_key);
+   return value == 1;
+ }
+@@ -222,6 +398,8 @@ static XrResult wine_openxr_init_once(void) {
+     return XR_SUCCESS;
+   }
+
++  wineopenxr_init_registry();
++
+   if (!wine_openxr_unix_init_once()) {
+     return XR_ERROR_INITIALIZATION_FAILED;
+   }
+@@ -464,6 +642,11 @@ XrResult WINAPI xrCreateInstance(const XrInstanceCreateInfo *createInfo, XrInsta
+       .instance = &wine_instance->host_instance,
+   };
+   NTSTATUS _status;
++
++  /* Non-Steam launch paths do not run steam_helper, so populate the Wine XR
++   * registry cache when the OpenXR runtime is actually used. */
++  wineopenxr_init_registry();
++
+   _status = UNIX_CALL(xrCreateInstance, &params);
+   assert(!_status && "xrCreateInstance");
+
+@@ -1763,6 +1946,7 @@ XrResult WINAPI xrCreateVulkanInstanceKHR(XrInstance instance,
+   struct vk_create_callback_context context;
+   VkCreateInfoWineInstanceCallback callback;
+   VkInstanceCreateInfo vulkan_create_info;
++  const char **enabled_extensions;
+
+   TRACE("instance %p, createInfo %p, vulkanInstance %p, vulkanResult %p.\n", instance, createInfo, vulkanInstance,
+         vulkanResult);
+@@ -1775,6 +1959,7 @@ XrResult WINAPI xrCreateVulkanInstanceKHR(XrInstance instance,
+   context.create_info = (UINT64)createInfo;
+
+   vulkan_create_info = *createInfo->vulkanCreateInfo;
++  enabled_extensions = remove_vulkan_debug_callback_extensions(&vulkan_create_info);
+   callback.sType = VK_STRUCTURE_TYPE_CREATE_INFO_WINE_INSTANCE_CALLBACK;
+   callback.native_create_callback = g_vk_create_instance_callback;
+   callback.context = (UINT64)&context;
+@@ -1782,6 +1967,7 @@ XrResult WINAPI xrCreateVulkanInstanceKHR(XrInstance instance,
+   vulkan_create_info.pNext = &callback;
+
+   *vulkanResult = vkCreateInstance(&vulkan_create_info, createInfo->vulkanAllocator, vulkanInstance);
++  free(enabled_extensions);
+
+   if (context.ret == XR_SUCCESS && *vulkanResult != VK_SUCCESS) {
+     WARN("winevulkan instance creation failed after native xrCreateVulkanInstanceKHR() success.\n");
+@@ -1978,8 +2164,14 @@ BOOL CDECL wineopenxr_init_registry(void)
+     uint32_t vid, pid;
+     LSTATUS status;
+     HKEY vr_key;
++    DWORD state;
+
+-    if ((status = RegOpenKeyExA( HKEY_CURRENT_USER, "Software\\Wine\\VR", 0, KEY_ALL_ACCESS, &vr_key )))
++    static LONG init = 0;
++    if (InterlockedCompareExchange(&init, 1, 0) != 0)
++        return TRUE;
++
++    if ((status = RegCreateKeyExW( HKEY_CURRENT_USER, L"Software\\Wine\\XR", 0, NULL,
++                                   REG_OPTION_VOLATILE, KEY_ALL_ACCESS, NULL, &vr_key, NULL )))
+     {
+         WARN( "Could not open key, status %#x.\n", status );
+         return FALSE;
+@@ -2000,9 +2192,83 @@ BOOL CDECL wineopenxr_init_registry(void)
+         if ((status = RegSetValueExA( vr_key, "openxr_vulkan_device_pid", 0, REG_DWORD,
+                                       (BYTE *)&pid, sizeof(pid) )))
+             ERR( "Could not set openxr_vulkan_device_pid value, status %#x.\n", status );
++        state = 1;
++        RegSetValueExA( vr_key, "state", 0, REG_DWORD, (BYTE *)&state, sizeof(state) );
++    }
++    else
++    {
++        state = ~0u;
++        RegSetValueExA( vr_key, "state", 0, REG_DWORD, (BYTE *)&state, sizeof(state) );
+     }
+
+     TRACE( "Initialized OpenXR registry entries\n" );
+     RegCloseKey( vr_key );
+     return TRUE;
+ }
++
++BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, void *reserved)
++{
++    switch (reason)
++    {
++        case DLL_PROCESS_ATTACH:
++            DisableThreadLibraryCalls(hinst);
++            break;
++    }
++    return TRUE;
++}
++
++static const char openxr_json_content[] =
++    "{\n"
++    "    \"file_format_version\": \"1.0.0\",\n"
++    "    \"runtime\": {\n"
++    "        \"library_path\": \".\\\\wineopenxr.dll\"\n"
++    "    }\n"
++    "}\n";
++static const WCHAR openxr_json_pathW[] = L"\\wineopenxr.json";
++static const WCHAR openxr_runtimeW[] = L"Software\\Khronos\\OpenXR\\1";
++
++HRESULT WINAPI DllRegisterServer(void)
++{
++    WCHAR json_path[MAX_PATH];
++    DWORD written;
++    HANDLE file;
++    HKEY key;
++
++    GetSystemDirectoryW(json_path, ARRAY_SIZE(json_path));
++    lstrcatW(json_path, openxr_json_pathW);
++    file = CreateFileW(json_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
++    if (file == INVALID_HANDLE_VALUE)
++    {
++        ERR("Unable to create JSON manifest.\n");
++        return E_UNEXPECTED;
++    }
++    WriteFile(file, openxr_json_content, sizeof(openxr_json_content) - 1, &written, NULL);
++    CloseHandle(file);
++
++    if (!RegCreateKeyExW(HKEY_LOCAL_MACHINE, openxr_runtimeW, 0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL))
++    {
++        RegSetValueExW(key, L"ActiveRuntime", 0, REG_SZ, (const BYTE *)json_path, (wcslen(json_path) + 1) * sizeof(WCHAR));
++        RegCloseKey(key);
++    }
++
++    wineopenxr_init_registry();
++    return S_OK;
++}
++
++HRESULT WINAPI DllUnregisterServer(void)
++{
++    WCHAR json_path[MAX_PATH];
++    HKEY key;
++
++    GetSystemDirectoryW(json_path, ARRAY_SIZE(json_path));
++    lstrcatW(json_path, openxr_json_pathW);
++    DeleteFileW(json_path);
++
++    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, openxr_runtimeW, 0, KEY_SET_VALUE, &key) == ERROR_SUCCESS)
++    {
++        RegDeleteValueW(key, L"ActiveRuntime");
++        RegCloseKey(key);
++    }
++
++    return S_OK;
++}
+diff --git a/openxr_loader.h b/openxr_loader.h
+index 6ff476eb..41efdfd5 100644
+--- a/openxr_loader.h
++++ b/openxr_loader.h
+@@ -52,6 +52,7 @@ struct is_available_instance_function_openxr_params {
+
+ typedef struct {
+   XrInstance host_instance;
++  PFN_vkGetInstanceProcAddr host_vkGetInstanceProcAddr;
+   VkInstance vk_instance;
+   VkPhysicalDevice vk_phys_dev;
+
 diff --git a/wineopenxr.spec b/wineopenxr.spec
 index 4c522146..1380b884 100644
 --- a/wineopenxr.spec
 +++ b/wineopenxr.spec
 @@ -3,3 +3,5 @@
  @ stdcall __wineopenxr_GetVulkanDeviceExtensions(long ptr ptr)
- 
+
  @ cdecl -private wineopenxr_init_registry()
 +@ stdcall -private DllRegisterServer()
 +@ stdcall -private DllUnregisterServer()
