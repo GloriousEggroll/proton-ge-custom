@@ -1,0 +1,1021 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Proton GE Team <proton-ge@example.com>
+Date: Thu, 25 Jun 2026 21:30:00 -0600
+Subject: [PATCH] winedmo: Open remote HLS playlists by URL.
+
+VRChat's in-game YouTube player uses Media Foundation Media Engine with
+HTTP(S) HLS playlist URLs.  The winegstreamer path passed those URLs directly
+to GStreamer's uridecodebin, which let the HLS demuxer resolve relative media
+segments from the playlist URI.
+
+The winedmo path resolved HTTP(S) sources into an anonymous IStream first and
+then passed only the manifest bytes to FFmpeg through custom AVIO.  That loses
+the source URL as the HLS base URI, so FFmpeg fails to detect or resolve the
+playlist and falls into the media-converter placeholder path.
+
+Detect remote HLS URLs and let FFmpeg open the original URL directly.  Keep the
+existing custom bytestream/media-converter path for local files and non-HLS
+streams.
+
+Advertise the same HLS and common container MIME types through Media Engine
+capability queries. Some Unity video plugins validate a URL by probing
+CanPlayType() or IsTypeSupported() before passing the actual URL to Media
+Foundation; returning "unsupported" there makes VRChat reject valid YouTube HLS
+URLs before winedmo sees them.
+
+Some HLS diagnostics include the full signed playlist or segment URL, which can
+overflow Wine's debug output buffer when passed through wine_dbg_vlog().  Format
+FFmpeg log lines into a bounded local buffer before forwarding them to Wine's
+debug channel.
+---
+ dlls/mf/session.c                    | 13 ++++++++++---
+ dlls/mfmediaengine/main.c            | 178 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++----
+ dlls/mfmediaengine/mediaengine_private.h |  3 ++
+ dlls/mfmediaengine/video_frame_sink.c | 70 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++----------
+ dlls/winedmo/media_source.c          | 11 +++++++++
+ dlls/winedmo/unix_demuxer.c          | 62 +++++++++++++++++++++++++++++++++------------
+ dlls/winedmo/unixlib.c               |  7 ++++--
+ 7 files changed, 317 insertions(+), 38 deletions(-)
+
+diff --git a/dlls/mf/session.c b/dlls/mf/session.c
+--- a/dlls/mf/session.c
++++ b/dlls/mf/session.c
+@@ -3969,8 +3972,12 @@ static HRESULT session_handle_format_change(struct media_session *session, struc
+              * Satisfactory is known to use the sink frame size. */
+             if (FAILED(hr = topology_node_get_type_handler(topo_node->node, 0, FALSE, &handler)))
+                 WARN("Failed to get type handler, hr %#lx.\n", hr);
+-            else if (FAILED(hr = IMFMediaTypeHandler_SetCurrentMediaType(handler, media_type)))
+-                WARN("Failed to set type, hr %#lx.\n", hr);
++            else
++            {
++                if (FAILED(hr = IMFMediaTypeHandler_SetCurrentMediaType(handler, media_type)))
++                    WARN("Failed to set type, hr %#lx.\n", hr);
++                IMFMediaTypeHandler_Release(handler);
++            }
+ 
+             if (SUCCEEDED(hr) && topo_node->u.sink.allocator)
+             {
+
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -99,6 +99,9 @@ enum media_engine_flags
+     FLAGS_ENGINE_SEEKING = 0x40000,
+     FLAGS_ENGINE_SCRUBBING = 0x80000,
+     FLAGS_ENGINE_PAUSE_PENDING = 0x100000,
++    FLAGS_ENGINE_DEFERRED_SEEK = 0x200000,
++    FLAGS_ENGINE_SUPPRESS_INITIAL_SEEK = 0x400000,
++    FLAGS_ENGINE_SUPPRESS_SOURCE_SEEK = 0x800000,
+ };
+ 
+ struct vec3
+@@ -151,5 +151,16 @@ struct media_engine
+     double volume;
+     double duration;
++    double current_seek;
+     double next_seek;
++    double deferred_seek;
++    double last_committed_seek;
++    LONGLONG video_preroll_time;
++    MFTIME last_video_tick_clock;
++    DWORD deferred_seek_time;
++    DWORD last_committed_seek_time;
++    DWORD last_video_tick_time;
++    DWORD stalled_clock_seek_time;
++    DWORD source_start_time;
++    double suppressed_initial_seek;
+     MF_MEDIA_ENGINE_NETWORK network_state;
+     MF_MEDIA_ENGINE_ERR error_code;
+@@ -922,6 +922,24 @@ static HRESULT media_engine_set_rate(struct media_engine *engine, BOOL thin, dou
+ static HRESULT media_engine_set_current_time(struct media_engine *engine, double seektime);
++static HRESULT media_engine_flush_deferred_seek(struct media_engine *engine);
+ static void media_engine_start_playback(struct media_engine *engine);
+ 
++static BOOL media_engine_handle_ended(struct media_engine *engine)
++{
++    if (engine->flags & FLAGS_ENGINE_IS_ENDED)
++        return FALSE;
++
++    if (engine->flags & FLAGS_ENGINE_LOOP)
++    {
++         media_engine_set_current_time(engine, 0.0);
++         return FALSE;
++    }
++
++    engine->video_frame.pts = MINLONGLONG;
++    media_engine_set_flag(engine, FLAGS_ENGINE_FIRST_FRAME | FLAGS_ENGINE_WAITING | FLAGS_ENGINE_PLAY_PENDING, FALSE);
++    media_engine_set_flag(engine, FLAGS_ENGINE_IS_ENDED, TRUE);
++    return TRUE;
++}
++
+ static HRESULT WINAPI media_engine_session_events_Invoke(IMFAsyncCallback *iface, IMFAsyncResult *result)
+ {
+     struct media_engine *engine = impl_from_session_events_IMFAsyncCallback(iface);
+@@ -936,7 +943,7 @@ static HRESULT WINAPI media_engine_session_events_Invoke(IMFAsyncCallback *iface
+     struct media_engine *engine = impl_from_session_events_IMFAsyncCallback(iface);
+     BOOL playing_event, ended_event = FALSE;
+-    BOOL start_pending = FALSE;
++    BOOL start_pending = FALSE, restart_playback = FALSE;
+     IMFMediaEvent *event = NULL;
+     MediaEventType event_type;
+     PROPVARIANT rate;
+     HRESULT hr;
+@@ -998,11 +1015,20 @@ static HRESULT WINAPI media_engine_session_events_Invoke(IMFAsyncCallback *iface
+             EnterCriticalSection(&engine->cs);
+             if (engine->flags & FLAGS_ENGINE_SEEKING)
+             {
++                double next_seek = engine->next_seek;
++                double current_seek = engine->current_seek;
++
++                engine->current_seek = NAN;
++                engine->next_seek = NAN;
++                engine->deferred_seek = NAN;
+                 media_engine_set_flag(engine, FLAGS_ENGINE_SEEKING | FLAGS_ENGINE_IS_ENDED, FALSE);
++                media_engine_set_flag(engine, FLAGS_ENGINE_DEFERRED_SEEK, FALSE);
+                 IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_SEEKED, 0, 0);
+                 IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_TIMEUPDATE, 0, 0);
+-                if (isfinite(engine->next_seek))
+-                    media_engine_set_current_time(engine, engine->next_seek);
++                if (isfinite(next_seek) && (!isfinite(current_seek) || fabs(next_seek - current_seek) > 0.001))
++                    media_engine_set_current_time(engine, next_seek);
++                else if (!(engine->flags & (FLAGS_ENGINE_PAUSED | FLAGS_ENGINE_PAUSE_PENDING | FLAGS_ENGINE_SCRUBBING)))
++                    restart_playback = TRUE;
+             }
+ 
+             playing_event = !(engine->flags & (FLAGS_ENGINE_SCRUBBING | FLAGS_ENGINE_PAUSE_PENDING | FLAGS_ENGINE_PAUSED));
+@@ -1016,24 +1036,27 @@ static HRESULT WINAPI media_engine_session_events_Invoke(IMFAsyncCallback *iface
+                 if (!(engine->flags & FLAGS_ENGINE_PAUSE_PENDING))
+                     media_engine_set_flag(engine, FLAGS_ENGINE_PLAY_PENDING, FALSE);
+             }
++            if (restart_playback && !(engine->flags & FLAGS_ENGINE_SEEKING))
++                media_engine_start_playback(engine);
+             LeaveCriticalSection(&engine->cs);
+             if (playing_event)
+                 IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_PLAYING, 0, 0);
+             break;
+         case MESessionEnded:
+             EnterCriticalSection(&engine->cs);
+-            if (engine->flags & FLAGS_ENGINE_LOOP)
+-            {
+-                 media_engine_set_current_time(engine, 0.0);
+-            }
+-            else
+-            {
+-                engine->video_frame.pts = MINLONGLONG;
+-                media_engine_set_flag(engine, FLAGS_ENGINE_FIRST_FRAME, FALSE);
+-                media_engine_set_flag(engine, FLAGS_ENGINE_IS_ENDED, TRUE);
+-                ended_event = TRUE;
+-            }
++            ended_event = media_engine_handle_ended(engine);
++            LeaveCriticalSection(&engine->cs);
++            if (ended_event)
++                IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_ENDED, 0, 0);
++            break;
++
++        case MEEndOfPresentation:
++            EnterCriticalSection(&engine->cs);
++            /* Media Engine users may wait on ended state before replacing the
++             * source. Network streams can deliver source end-of-presentation
++             * before every renderer has drained enough to produce MESessionEnded. */
++            ended_event = media_engine_handle_ended(engine);
+             LeaveCriticalSection(&engine->cs);
+             if (ended_event)
+                 IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_ENDED, 0, 0);
+             break;
+@@ -1715,8 +1818,11 @@ static HRESULT WINAPI media_engine_SetSourceElements(IMFMediaEngineEx *iface, IM
+ static HRESULT media_engine_set_source(struct media_engine *engine, IMFByteStream *bytestream, BSTR url)
+ {
+     IPropertyStore *props = NULL;
++    double previous_position = NAN;
++    BOOL start_pending;
+     unsigned int flags;
+     HRESULT hr = S_OK;
++    MFTIME clocktime;
+ 
+     SysFreeString(engine->current_source);
+     engine->current_source = NULL;
+@@ -1793,6 +1818,40 @@ static HRESULT media_engine_set_source(struct media_engine *engine, IMFByteStrea
+     IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_PURGEQUEUEDEVENTS, 0, 0);
+ 
++    if (isfinite(engine->deferred_seek))
++        previous_position = engine->deferred_seek;
++    else if (isfinite(engine->current_seek))
++        previous_position = engine->current_seek;
++    else if ((engine->flags & FLAGS_ENGINE_PAUSED) && engine->presentation.start_position.vt == VT_I8)
++        previous_position = (double)engine->presentation.start_position.hVal.QuadPart / 10000000;
++    else if (SUCCEEDED(IMFPresentationClock_GetTime(engine->clock, &clocktime)))
++        previous_position = mftime_to_seconds(clocktime);
++
++    start_pending = !(engine->flags & FLAGS_ENGINE_PAUSED) || (engine->flags & FLAGS_ENGINE_IS_ENDED);
++
+     engine->network_state = MF_MEDIA_ENGINE_NETWORK_NO_SOURCE;
++    engine->video_frame.pts = MINLONGLONG;
++    engine->current_seek = NAN;
++    engine->next_seek = NAN;
++    engine->deferred_seek = NAN;
++    engine->last_committed_seek = NAN;
++    engine->video_preroll_time = MINLONGLONG;
++    engine->last_video_tick_clock = MINLONGLONG;
++    engine->deferred_seek_time = 0;
++    engine->last_committed_seek_time = 0;
++    engine->last_video_tick_time = 0;
++    engine->stalled_clock_seek_time = 0;
++    engine->source_start_time = GetTickCount();
++    engine->presentation.start_position.vt = VT_I8;
++    engine->presentation.start_position.hVal.QuadPart = 0;
++    video_frame_sink_reset(engine->presentation.frame_sink);
++    media_engine_set_flag(engine, FLAGS_ENGINE_FIRST_FRAME | FLAGS_ENGINE_IS_ENDED | FLAGS_ENGINE_WAITING
++            | FLAGS_ENGINE_SEEKING | FLAGS_ENGINE_DEFERRED_SEEK, FALSE);
++    media_engine_set_flag(engine, FLAGS_ENGINE_PAUSED, !start_pending);
++    media_engine_set_flag(engine, FLAGS_ENGINE_PLAY_PENDING, start_pending);
++    media_engine_set_flag(engine, FLAGS_ENGINE_SUPPRESS_SOURCE_SEEK, TRUE);
++    engine->suppressed_initial_seek = previous_position;
++    media_engine_set_flag(engine, FLAGS_ENGINE_SUPPRESS_INITIAL_SEEK,
++            isfinite(previous_position) && previous_position > 0.001);
+ 
+     if (url || bytestream)
+     {
+@@ -1880,20 +1906,76 @@ static HRESULT WINAPI media_engine_Load(IMFMediaEngineEx *iface)
+     return hr;
+ }
+ 
++static BOOL media_engine_is_supported_type(const WCHAR *type)
++{
++    static const WCHAR *supported_types[] =
++    {
++        L"application/mp4",
++        L"application/octet-stream",
++        L"application/vnd.apple.mpegurl",
++        L"application/x-mpegurl",
++        L"audio/aac",
++        L"audio/mp3",
++        L"audio/mp4",
++        L"audio/mpeg",
++        L"audio/x-m4a",
++        L"audio/x-mpegurl",
++        L"video/avi",
++        L"video/mp4",
++        L"video/mpeg",
++        L"video/ogg",
++        L"video/quicktime",
++        L"video/x-m4v",
++        L"video/x-matroska",
++        L"video/x-ms-asf",
++        L"video/x-ms-wmv",
++    };
++    WCHAR mime_type[128];
++    size_t i, len = 0;
++
++    if (!type)
++        return FALSE;
++
++    while (*type == ' ' || *type == '\t')
++        ++type;
++
++    while (type[len] && type[len] != ';' && type[len] != ' ' && type[len] != '\t')
++        ++len;
++
++    if (!len || len >= ARRAY_SIZE(mime_type))
++        return FALSE;
++
++    memcpy(mime_type, type, len * sizeof(WCHAR));
++    mime_type[len] = 0;
++
++    for (i = 0; i < ARRAY_SIZE(supported_types); ++i)
++    {
++        if (!lstrcmpiW(mime_type, supported_types[i]))
++            return TRUE;
++    }
++
++    return FALSE;
++}
++
+ static HRESULT WINAPI media_engine_CanPlayType(IMFMediaEngineEx *iface, BSTR mime_type, MF_MEDIA_ENGINE_CANPLAY *answer)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
+-    HRESULT hr = E_NOTIMPL;
++    HRESULT hr = S_OK;
+ 
+     TRACE("%p, %s, %p.\n", iface, debugstr_w(mime_type), answer);
+ 
++    if (!answer)
++        return E_POINTER;
++    *answer = MF_MEDIA_ENGINE_CANPLAY_NOT_SUPPORTED;
++
+     EnterCriticalSection(&engine->cs);
+ 
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+     else
+     {
+-        FIXME("Check builtin supported types.\n");
++        if (media_engine_is_supported_type(mime_type))
++            *answer = MF_MEDIA_ENGINE_CANPLAY_MAYBE;
+ 
+         if (engine->extension)
+              hr = IMFMediaEngineExtension_CanPlayType(engine->extension, !!(engine->flags & MF_MEDIA_ENGINE_AUDIOONLY),
+@@ -1918,7 +2032,13 @@ static BOOL WINAPI media_engine_IsSeeking(IMFMediaEngineEx *iface)
+ {
+-    FIXME("(%p): stub.\n", iface);
++    struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
++    BOOL value;
+ 
+-    return FALSE;
++    EnterCriticalSection(&engine->cs);
++    value = !!(engine->flags & (FLAGS_ENGINE_SEEKING | FLAGS_ENGINE_DEFERRED_SEEK));
++    TRACE("%p returning %d flags %#x.\n", iface, value, engine->flags);
++    LeaveCriticalSection(&engine->cs);
++
++    return value;
+ }
+ 
+ static double WINAPI media_engine_GetCurrentTime(IMFMediaEngineEx *iface)
+@@ -1938,6 +2058,17 @@ static double WINAPI media_engine_GetCurrentTime(IMFMediaEngineEx *iface)
+     EnterCriticalSection(&engine->cs);
+ 
+-    if (engine->flags & FLAGS_ENGINE_IS_ENDED)
++    if ((engine->flags & FLAGS_ENGINE_DEFERRED_SEEK) && GetTickCount() - engine->deferred_seek_time >= 250)
++        media_engine_flush_deferred_seek(engine);
++
++    if ((engine->flags & FLAGS_ENGINE_SEEKING) && isfinite(engine->current_seek))
++    {
++        ret = engine->current_seek;
++    }
++    else if (engine->flags & FLAGS_ENGINE_DEFERRED_SEEK)
++    {
++        ret = engine->deferred_seek;
++    }
++    else if (engine->flags & FLAGS_ENGINE_IS_ENDED)
+     {
+         ret = engine->duration;
+     }
+@@ -1946,7 +2077,27 @@ static double WINAPI media_engine_GetCurrentTime(IMFMediaEngineEx *iface)
+     {
+         ret = (double)engine->presentation.start_position.hVal.QuadPart / 10000000;
+     }
++    else if (isfinite(engine->last_committed_seek) && !(engine->flags & FLAGS_ENGINE_SOURCE_PENDING)
++            && SUCCEEDED(IMFPresentationClock_GetTime(engine->clock, &clocktime)))
++    {
++        ret = mftime_to_seconds(clocktime);
++        if (fabs(ret - engine->last_committed_seek) > 5.0)
++        {
++            ret = engine->last_committed_seek;
++            if (!(engine->flags & FLAGS_ENGINE_WAITING))
++            {
++                ret += (double)(GetTickCount() - engine->last_committed_seek_time) / 1000.0;
++                if (isfinite(engine->duration))
++                    ret = min(ret, engine->duration);
++            }
++        }
++        else
++        {
++            engine->last_committed_seek = NAN;
++            engine->last_committed_seek_time = 0;
++        }
++    }
+     else if (SUCCEEDED(IMFPresentationClock_GetTime(engine->clock, &clocktime)))
+     {
+         ret = mftime_to_seconds(clocktime);
+     }
+@@ -1981,12 +2142,35 @@ static HRESULT media_engine_set_current_time(struct media_engine *engine, double
+     DWORD caps;
+     HRESULT hr;
+ 
++    seektime = min(max(0, seektime), engine->duration);
++
+     hr = IMFMediaSession_GetSessionCapabilities(engine->session, &caps);
+     if (FAILED(hr) || !(caps & MFSESSIONCAP_SEEK))
+         return hr;
+ 
++    if (!(engine->flags & FLAGS_ENGINE_PAUSED) && isfinite(engine->duration) && seektime >= engine->duration - 0.001)
++    {
++        engine->current_seek = NAN;
++        engine->next_seek = NAN;
++        engine->deferred_seek = NAN;
++        engine->last_committed_seek = seektime;
++        engine->video_preroll_time = MINLONGLONG;
++        engine->last_committed_seek_time = GetTickCount();
++        media_engine_set_flag(engine, FLAGS_ENGINE_SEEKING | FLAGS_ENGINE_DEFERRED_SEEK, FALSE);
++        IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_SEEKING, 0, 0);
++        IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_SEEKED, 0, 0);
++        IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_TIMEUPDATE, 0, 0);
++        if (media_engine_handle_ended(engine))
++            IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_ENDED, 0, 0);
++        return S_OK;
++    }
++
+     if (engine->flags & FLAGS_ENGINE_SEEKING)
+     {
++        if ((isfinite(engine->current_seek) && fabs(engine->current_seek - seektime) <= 0.001)
++                || (isfinite(engine->next_seek) && fabs(engine->next_seek - seektime) <= 0.001))
++            return S_OK;
++
+         engine->next_seek = seektime;
+         return S_OK;
+     }
+@@ -1993,7 +2164,13 @@ static HRESULT media_engine_set_current_time(struct media_engine *engine, double
+     engine->next_seek = NAN;
+ 
+     position.vt = VT_I8;
+-    position.hVal.QuadPart = min(max(0, seektime), engine->duration) * 10000000;
++    position.hVal.QuadPart = seektime * 10000000;
++
++    engine->video_frame.pts = MINLONGLONG;
++    engine->last_video_tick_clock = MINLONGLONG;
++    engine->last_video_tick_time = 0;
++    video_frame_sink_reset(engine->presentation.frame_sink);
++    media_engine_set_flag(engine, FLAGS_ENGINE_FIRST_FRAME | FLAGS_ENGINE_NEW_FRAME, FALSE);
+ 
+    if (IMFMediaEngineEx_IsPaused(&engine->IMFMediaEngineEx_iface))
+    {
+@@ -2000,5 +2175,8 @@ static HRESULT media_engine_set_current_time(struct media_engine *engine, double
+     {
+         engine->presentation.start_position = position;
++        engine->last_committed_seek = seektime;
++        engine->video_preroll_time = seektime * 10000000;
++        engine->last_committed_seek_time = GetTickCount();
+         IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_SEEKING, 0, 0);
+         IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_SEEKED, 0, 0);
+         IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_TIMEUPDATE, 0, 0);
+@@ -2006,6 +2181,11 @@ static HRESULT media_engine_set_current_time(struct media_engine *engine, double
+ 
+     if (SUCCEEDED(hr = IMFMediaSession_Start(engine->session, &GUID_NULL, &position)))
+     {
++        engine->current_seek = seektime;
++        engine->last_committed_seek = seektime;
++        engine->video_preroll_time = seektime * 10000000;
++        engine->last_committed_seek_time = GetTickCount();
++        media_engine_set_flag(engine, FLAGS_ENGINE_IS_ENDED | FLAGS_ENGINE_WAITING, FALSE);
+         media_engine_set_flag(engine, FLAGS_ENGINE_SEEKING, TRUE);
+         IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_SEEKING, 0, 0);
+     }
+@@ -2015,7 +2192,81 @@ static HRESULT media_engine_set_current_time(struct media_engine *engine, double
+ 
+     return hr;
+ }
+ 
++static HRESULT media_engine_flush_deferred_seek(struct media_engine *engine)
++{
++    double seektime;
++
++    if (!(engine->flags & FLAGS_ENGINE_DEFERRED_SEEK))
++        return S_OK;
++
++    if ((engine->flags & FLAGS_ENGINE_SOURCE_PENDING) || !engine->presentation.pd)
++        return S_FALSE;
++
++    seektime = engine->deferred_seek;
++    engine->deferred_seek = NAN;
++    media_engine_set_flag(engine, FLAGS_ENGINE_DEFERRED_SEEK, FALSE);
++    return media_engine_set_current_time(engine, seektime);
++}
++
++static HRESULT media_engine_defer_current_time(struct media_engine *engine, double seektime)
++{
++    MFTIME clocktime;
++    double current;
++
++    if ((engine->flags & FLAGS_ENGINE_SOURCE_PENDING) || !engine->presentation.pd)
++        return S_OK;
++
++    if (isfinite(engine->duration))
++        seektime = min(max(0, seektime), engine->duration);
++    else
++        seektime = max(0, seektime);
++
++    if (engine->flags & FLAGS_ENGINE_SUPPRESS_INITIAL_SEEK)
++    {
++        if (isfinite(engine->suppressed_initial_seek) && engine->suppressed_initial_seek > 0.001
++                && seektime <= 0.001)
++            return S_OK;
++        if (isfinite(engine->suppressed_initial_seek) && fabs(engine->suppressed_initial_seek - seektime) <= 2.0)
++        {
++            media_engine_set_flag(engine, FLAGS_ENGINE_SUPPRESS_INITIAL_SEEK, FALSE);
++            engine->suppressed_initial_seek = NAN;
++            return S_OK;
++        }
++        media_engine_set_flag(engine, FLAGS_ENGINE_SUPPRESS_INITIAL_SEEK, FALSE);
++        engine->suppressed_initial_seek = NAN;
++    }
++
++    if (engine->flags & FLAGS_ENGINE_SUPPRESS_SOURCE_SEEK)
++    {
++        if (seektime <= 0.001)
++            return S_OK;
++        else
++            media_engine_set_flag(engine, FLAGS_ENGINE_SUPPRESS_SOURCE_SEEK, FALSE);
++    }
++
++    if (!(engine->flags & (FLAGS_ENGINE_PAUSED | FLAGS_ENGINE_SEEKING | FLAGS_ENGINE_DEFERRED_SEEK))
++            && SUCCEEDED(IMFPresentationClock_GetTime(engine->clock, &clocktime)))
++    {
++        current = mftime_to_seconds(clocktime);
++        if (fabs(current - seektime) <= 3.0)
++            return S_OK;
++    }
++
++    if (engine->flags & FLAGS_ENGINE_PAUSED)
++        return media_engine_set_current_time(engine, seektime);
++
++    if ((engine->flags & FLAGS_ENGINE_DEFERRED_SEEK) && fabs(engine->deferred_seek - seektime) <= 0.001)
++        return S_OK;
++
++    engine->deferred_seek = seektime;
++    engine->deferred_seek_time = GetTickCount();
++    media_engine_set_flag(engine, FLAGS_ENGINE_DEFERRED_SEEK, TRUE);
++    IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_TIMEUPDATE, 0, 0);
++
++    return S_OK;
++}
++
+ static HRESULT WINAPI media_engine_SetCurrentTime(IMFMediaEngineEx *iface, double time)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
+@@ -2270,11 +2440,15 @@ static HRESULT WINAPI media_engine_Play(IMFMediaEngineEx *iface)
+         if (!(engine->flags & FLAGS_ENGINE_WAITING))
+         {
+             media_engine_set_flag(engine, FLAGS_ENGINE_PAUSED | FLAGS_ENGINE_IS_ENDED, FALSE);
+             IMFMediaEngineNotify_EventNotify(engine->callback, MF_MEDIA_ENGINE_EVENT_PLAY, 0, 0);
+ 
+-            if (engine->flags & FLAGS_ENGINE_PAUSE_PENDING)
++            if (engine->flags & FLAGS_ENGINE_DEFERRED_SEEK)
++                hr = media_engine_flush_deferred_seek(engine);
++            if (FAILED(hr) || (engine->flags & FLAGS_ENGINE_SEEKING))
++                media_engine_set_flag(engine, FLAGS_ENGINE_PLAY_PENDING, TRUE);
++            else if (engine->flags & FLAGS_ENGINE_PAUSE_PENDING)
+                 media_engine_set_flag(engine, FLAGS_ENGINE_PLAY_PENDING, TRUE);
+             else if (!(engine->flags & (FLAGS_ENGINE_SOURCE_PENDING | FLAGS_ENGINE_SCRUBBING)))
+                 media_engine_start_playback(engine);
+             else
+                 media_engine_set_flag(engine, FLAGS_ENGINE_PLAY_PENDING, TRUE);
+@@ -3006,7 +3357,52 @@ static HRESULT WINAPI media_engine_OnVideoStreamTick(IMFMediaEngineEx *iface, LO
+         MFTIME clocktime;
+         *pts = MINLONGLONG;
+         if (SUCCEEDED(IMFPresentationClock_GetTime(engine->clock, &clocktime)))
+-            hr = video_frame_sink_get_pts(engine->presentation.frame_sink, clocktime, pts);
++        {
++            hr = video_frame_sink_get_pts_after(engine->presentation.frame_sink, clocktime,
++                    engine->video_preroll_time, pts);
++            if (hr == S_OK && engine->video_preroll_time != MINLONGLONG && *pts + 500000 >= engine->video_preroll_time)
++                engine->video_preroll_time = MINLONGLONG;
++            else if (hr == S_FALSE && *pts != MINLONGLONG && *pts > clocktime + 300000000
++                    && !(engine->flags & (FLAGS_ENGINE_SEEKING | FLAGS_ENGINE_DEFERRED_SEEK)))
++            {
++                WARN("Video sample %.6f is too far ahead of clock %.6f; resynchronizing.\n",
++                        mftime_to_seconds(*pts), mftime_to_seconds(clocktime));
++                video_frame_sink_reset(engine->presentation.frame_sink);
++                media_engine_set_current_time(engine, mftime_to_seconds(clocktime));
++                *pts = MINLONGLONG;
++            }
++
++            if (hr == S_OK && !(engine->flags & (FLAGS_ENGINE_PAUSED | FLAGS_ENGINE_PAUSE_PENDING
++                    | FLAGS_ENGINE_SEEKING | FLAGS_ENGINE_DEFERRED_SEEK | FLAGS_ENGINE_WAITING)))
++            {
++                DWORD now = GetTickCount();
++
++                if (engine->last_video_tick_clock != MINLONGLONG
++                        && clocktime <= engine->last_video_tick_clock + 10000)
++                {
++                    if (engine->last_video_tick_time && now - engine->last_video_tick_time > 1500
++                            && now - engine->stalled_clock_seek_time > 2000)
++                    {
++                        WARN("Presentation clock stalled at %.6f; restarting stream.\n",
++                                mftime_to_seconds(clocktime));
++                        engine->stalled_clock_seek_time = now;
++                        video_frame_sink_reset(engine->presentation.frame_sink);
++                        media_engine_set_current_time(engine, mftime_to_seconds(clocktime));
++                        *pts = MINLONGLONG;
++                    }
++                }
++                else
++                {
++                    engine->last_video_tick_clock = clocktime;
++                    engine->last_video_tick_time = now;
++                }
++            }
++            else
++            {
++                engine->last_video_tick_clock = MINLONGLONG;
++                engine->last_video_tick_time = 0;
++            }
++        }
+         else
+             hr = S_FALSE;
+     }
+@@ -3470,7 +3644,7 @@ static HRESULT WINAPI media_engine_SetCurrentTimeEx(IMFMediaEngineEx *iface, dou
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+     else
+-        hr = media_engine_set_current_time(engine, seektime);
++        hr = media_engine_defer_current_time(engine, seektime);
+ 
+     LeaveCriticalSection(&engine->cs);
+ 
+@@ -3658,6 +3863,15 @@ static HRESULT init_media_engine(DWORD flags, IMFAttributes *attributes, struct
+     engine->volume = 1.0;
+     engine->duration = NAN;
++    engine->current_seek = NAN;
++    engine->deferred_seek = NAN;
++    engine->last_committed_seek = NAN;
++    engine->video_preroll_time = MINLONGLONG;
++    engine->last_video_tick_clock = MINLONGLONG;
++    engine->last_video_tick_time = 0;
++    engine->stalled_clock_seek_time = 0;
++    engine->source_start_time = 0;
++    engine->suppressed_initial_seek = NAN;
+     engine->next_seek = NAN;
+     engine->video_frame.pts = MINLONGLONG;
+     InitializeCriticalSection(&engine->cs);
+ 
+@@ -3767,7 +3823,10 @@ static HRESULT WINAPI media_engine_factory_CreateMediaKeys(IMFMediaEngineClassFa
+ 
+ static HRESULT WINAPI media_engine_factory_IsTypeSupported(IMFMediaEngineClassFactoryEx *iface, BSTR type, BSTR key_system, BOOL *is_supported)
+ {
+-    FIXME("iface %p, type %s, key_system %s, is_supported %p stub.\n",
++    TRACE("iface %p, type %s, key_system %s, is_supported %p.\n",
+             iface, debugstr_w(type), debugstr_w(key_system), is_supported);
+-    *is_supported = FALSE;
++    if (!is_supported)
++        return E_POINTER;
++
++    *is_supported = !key_system && media_engine_is_supported_type(type);
+     return S_OK;
+ }
+diff --git a/dlls/mfmediaengine/mediaengine_private.h b/dlls/mfmediaengine/mediaengine_private.h
+--- a/dlls/mfmediaengine/mediaengine_private.h
++++ b/dlls/mfmediaengine/mediaengine_private.h
+@@ -26,4 +26,7 @@ HRESULT video_frame_sink_query_iface(struct video_frame_sink *object, REFIID rii
+ ULONG video_frame_sink_release(struct video_frame_sink *sink);
+ int video_frame_sink_get_sample(struct video_frame_sink *sink, IMFSample **sample);
+ HRESULT video_frame_sink_get_pts(struct video_frame_sink *sink, MFTIME clocktime, LONGLONG *pts);
++HRESULT video_frame_sink_get_pts_after(struct video_frame_sink *sink, MFTIME clocktime, LONGLONG min_pts,
++        LONGLONG *pts);
++void video_frame_sink_reset(struct video_frame_sink *sink);
+ void video_frame_sink_notify_end_of_presentation_segment(struct video_frame_sink *sink);
+
+diff --git a/dlls/mfmediaengine/video_frame_sink.c b/dlls/mfmediaengine/video_frame_sink.c
+--- a/dlls/mfmediaengine/video_frame_sink.c
++++ b/dlls/mfmediaengine/video_frame_sink.c
+@@ -167,16 +167,26 @@ static void video_frame_sink_sample_queue_flush(struct video_frame_sink *sink)
+     queue->back = ARRAY_SIZE(queue->samples) - 1;
+ }
+ 
++static void video_frame_sink_sample_queue_clear_presentation(struct video_frame_sink *sink)
++{
++    struct sample_queue *queue = &sink->queue;
++
++    if (queue->presentation_sample)
++    {
++        IMFSample_Release(queue->presentation_sample);
++        queue->presentation_sample = NULL;
++    }
++    queue->sample_presented = FALSE;
++}
++
+ static void video_frame_sink_sample_queue_free(struct video_frame_sink *sink)
+ {
+-    struct sample_queue *queue = &sink->queue;
+     IMFSample *sample;
+ 
+     while (video_frame_sink_sample_queue_pop(sink, &sample))
+         IMFSample_Release(sample);
+ 
+-    if (queue->presentation_sample)
+-        IMFSample_Release(queue->presentation_sample);
++    video_frame_sink_sample_queue_clear_presentation(sink);
+ }
+ 
+ static void video_frame_sink_set_flag(struct video_frame_sink *sink, unsigned int mask, bool value)
+@@ -578,9 +578,12 @@ static HRESULT WINAPI video_frame_sink_stream_type_handler_SetCurrentMediaType(I
+     if (FAILED(hr = video_frame_sink_stream_is_media_type_supported(sink, media_type)))
+         return hr;
+ 
+-    IMFMediaType_Release(sink->current_media_type);
+-    sink->current_media_type = media_type;
+-    IMFMediaType_AddRef(sink->current_media_type);
++    if (sink->current_media_type != media_type)
++    {
++        IMFMediaType_Release(sink->current_media_type);
++        sink->current_media_type = media_type;
++        IMFMediaType_AddRef(sink->current_media_type);
++    }
+ 
+     return S_OK;
+ }
+@@ -1238,22 +1256,43 @@ int video_frame_sink_get_sample(struct video_frame_sink *sink, IMFSample **ret)
+     return !!*ret;
+ }
+ 
+-static HRESULT sample_get_pts(IMFSample *sample, MFTIME clocktime, LONGLONG *pts)
++static HRESULT sample_get_time(IMFSample *sample, LONGLONG *pts)
+ {
+-    HRESULT hr = S_FALSE;
++    HRESULT hr;
++
++    if (SUCCEEDED(hr = IMFSample_GetSampleTime(sample, pts)))
++        return S_OK;
++
++    WARN("Failed to get sample time, hr %#lx.\n", hr);
++    return hr;
++}
++
++static HRESULT sample_get_pts(IMFSample *sample, MFTIME clocktime, LONGLONG min_pts, LONGLONG *pts,
++        BOOL *preroll_sample)
++{
++    HRESULT hr;
+     LONGLONG sample_pts;
+ 
++    *preroll_sample = FALSE;
++
+-    if (sample)
++    if (!sample)
++        return S_FALSE;
++
++    if (SUCCEEDED(hr = sample_get_time(sample, &sample_pts)))
+     {
+-        if (SUCCEEDED(hr = IMFSample_GetSampleTime(sample, &sample_pts)))
+-        {
+-            hr = (clocktime >= sample_pts) ? S_OK : S_FALSE;
+-            if (hr == S_OK)
+-                *pts = sample_pts;
+-        }
+-        else
+-            WARN("Failed to get sample time, hr %#lx.\n", hr);
++        if (sample_pts + 500000 < min_pts)
++        {
++            *preroll_sample = TRUE;
++            return S_FALSE;
++        }
++
++        hr = (clocktime >= sample_pts) ? S_OK : S_FALSE;
++        if (hr == S_FALSE)
++            *pts = sample_pts;
++        if (hr == S_OK)
++            *pts = sample_pts;
+     }
++
+     return hr;
+ }
+ 
+@@ -1264,7 +1295,8 @@ static HRESULT sample_get_pts(IMFSample *sample, MFTIME clocktime, LONGLONG *pts
+  * by subsequent calls to video_frame_sink_get_sample.
+  * Queued samples with a PTS lower than the PTS of the selected sample will be silently dropped.
+  */
+-HRESULT video_frame_sink_get_pts(struct video_frame_sink *sink, MFTIME clocktime, LONGLONG *pts)
++HRESULT video_frame_sink_get_pts_after(struct video_frame_sink *sink, MFTIME clocktime, LONGLONG min_pts,
++        LONGLONG *pts)
+ {
+     HRESULT hr = S_FALSE;
+     LONGLONG sample_pts;
+@@ -1272,6 +1304,7 @@ HRESULT video_frame_sink_get_pts(struct video_frame_sink *sink, MFTIME clocktime
+     {
+         IMFSample *sample;
+         bool transfer_sample = FALSE;
++        BOOL preroll_sample;
+         EnterCriticalSection(&sink->cs);
+         while (video_frame_sink_sample_queue_pop(sink, &sample))
+         {
+@@ -1277,11 +1309,17 @@ HRESULT video_frame_sink_get_pts(struct video_frame_sink *sink, MFTIME clocktime
+         EnterCriticalSection(&sink->cs);
+         while (video_frame_sink_sample_queue_pop(sink, &sample))
+         {
+-            if (sample_get_pts(sample, clocktime, pts) == S_OK)
++            hr = sample_get_pts(sample, clocktime, min_pts, pts, &preroll_sample);
++            if (hr == S_OK)
+             {
+                 video_frame_sink_sample_queue_set_presentation(sink, sample);
+                 transfer_sample = TRUE;
+-                hr = S_OK;
++            }
++            else if (preroll_sample)
++            {
++                IMFSample_Release(sample);
++                transfer_sample = TRUE;
++                hr = S_FALSE;
+             }
+             else
+             {
+@@ -1305,6 +1343,30 @@ HRESULT video_frame_sink_get_pts(struct video_frame_sink *sink, MFTIME clocktime
+     return hr;
+ }
+ 
++HRESULT video_frame_sink_get_pts(struct video_frame_sink *sink, MFTIME clocktime, LONGLONG *pts)
++{
++    return video_frame_sink_get_pts_after(sink, clocktime, MINLONGLONG, pts);
++}
++
++void video_frame_sink_reset(struct video_frame_sink *sink)
++{
++    if (!sink)
++        return;
++
++    EnterCriticalSection(&sink->cs);
++
++    if (!sink->is_shut_down)
++    {
++        video_frame_sink_sample_queue_flush(sink);
++        video_frame_sink_sample_queue_clear_presentation(sink);
++        video_frame_sink_set_flag(sink, FLAGS_FIRST_FRAME, FALSE);
++        sink->sample_request_pending = FALSE;
++        sink->eos = FALSE;
++    }
++
++    LeaveCriticalSection(&sink->cs);
++}
++
+ void video_frame_sink_notify_end_of_presentation_segment(struct video_frame_sink *sink)
+ {
+     sink->eos = TRUE;
+
+diff --git a/dlls/winedmo/media_source.c b/dlls/winedmo/media_source.c
+--- a/dlls/winedmo/media_source.c
++++ b/dlls/winedmo/media_source.c
+@@ -329,6 +329,7 @@ struct media_source
+     IMFAsyncResult *shutdown_result;
+ 
+     CRITICAL_SECTION cs;
++    CRITICAL_SECTION demuxer_cs;
+ 
+     UINT64 file_size;
+     UINT64 duration;
+@@ -912,7 +913,9 @@ static HRESULT media_source_start(struct media_source *source, IMFPresentationDe
+         }
+ 
+         WARN("MF media source seek to %s.\n", debugstr_time(position->hVal.QuadPart));
++        EnterCriticalSection(&source->demuxer_cs);
+         winedmo_demuxer_seek(source->demuxer, position->hVal.QuadPart);
++        LeaveCriticalSection(&source->demuxer_cs);
+ 
+         source->flushing = FALSE;
+         source->read_flushing = FALSE;
+@@ -1179,7 +1182,9 @@ static DWORD CALLBACK source_demux_thread(void *arg)
+         stream_idx = 0;
+         needed_size = buffer_size;
+ 
++        EnterCriticalSection(&source->demuxer_cs);
+         status = winedmo_demuxer_read(source->demuxer, &stream_idx, &output, &needed_size);
++        LeaveCriticalSection(&source->demuxer_cs);
+ 
+         if (status == STATUS_BUFFER_TOO_SMALL)
+         {
+@@ -1890,6 +1895,8 @@ static ULONG WINAPI media_source_Release(IMFMediaSource *iface)
+         IMFMediaSource_Shutdown(iface);
+         IMFMediaEventQueue_Release(source->event_queue);
+         IMFByteStream_Release(source->byte_stream);
++        source->demuxer_cs.DebugInfo->Spare[0] = 0;
++        DeleteCriticalSection(&source->demuxer_cs);
+         source->cs.DebugInfo->Spare[0] = 0;
+         DeleteCriticalSection(&source->cs);
+         free(source);
+@@ -2199,6 +2206,8 @@ static HRESULT media_source_create(struct object_context *context, IMFMediaSourc
+     object->rate = 1.0f;
+     InitializeCriticalSectionEx(&object->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+     object->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": cs");
++    InitializeCriticalSectionEx(&object->demuxer_cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
++    object->demuxer_cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": demuxer_cs");
+ 
+     if (FAILED(hr = MFCreateEventQueue(&object->event_queue)))
+         goto fail;
+@@ -2322,6 +2331,8 @@ fail:
+     if (object->event_queue)
+         IMFMediaEventQueue_Release(object->event_queue);
+     IMFByteStream_Release(object->byte_stream);
++    object->demuxer_cs.DebugInfo->Spare[0] = 0;
++    DeleteCriticalSection(&object->demuxer_cs);
+     object->cs.DebugInfo->Spare[0] = 0;
+     DeleteCriticalSection(&object->cs);
+     free(object);
+
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -54,6 +54,7 @@ struct demuxer
+     struct stream_context *stream_context;
+     struct stream *streams;
+     INT64 duration;
++    BOOL direct_url;
+ 
+     AVPacket *last_packet; /* last read packet */
+     struct stream *last_stream; /* last read packet stream */
+@@ -763,6 +764,26 @@ static void parse_mp4_streams_metadata( struct demuxer *demuxer )
+     unix_seek_callback( context, pos, SEEK_SET );
+ }
+ 
++static BOOL is_http_hls_url( const char *url )
++{
++    if (!url || (strncmp( url, "http://", 7 ) && strncmp( url, "https://", 8 ))) return FALSE;
++
++    return !!strstr( url, ".m3u8" ) || !!strstr( url, "/hls_playlist/" );
++}
++
++static void demuxer_free_context( struct demuxer *demuxer )
++{
++    if (!demuxer->ctx) return;
++
++    if (demuxer->direct_url) avformat_close_input( &demuxer->ctx );
++    else
++    {
++        avio_context_free( &demuxer->ctx->pb );
++        avformat_free_context( demuxer->ctx );
++        demuxer->ctx = NULL;
++    }
++}
++
+ NTSTATUS demuxer_create( void *arg )
+ {
+     struct demuxer_create_params *params = arg;
+@@ -784,15 +805,33 @@ NTSTATUS demuxer_create( void *arg )
+     demuxer->stream_context = params->context;
+ 
+     if (!(demuxer->ctx = avformat_alloc_context())) goto failed;
+-    if (!(demuxer->ctx->pb = avio_alloc_context( NULL, 0, 0, params->context, unix_read_callback, NULL,
+-                                                 params->context->length == (UINT64)-1 ? NULL : unix_seek_callback ))) goto failed;
++    if (is_http_hls_url( params->url ))
++    {
++        const AVInputFormat *hls = av_find_input_format( "hls" );
+ 
+-    if ((ret = avformat_open_input( &demuxer->ctx, NULL, NULL, NULL )) < 0)
+-        WARN( "Failed to open input, error %s.\n", debugstr_averr(ret) );
+-    if ((ret = mediaconv_demuxer_open( &demuxer->ctx, params->context )) < 0)
++        /* HLS playlists need the source URL as their base URI so relative
++         * segment URLs can be resolved.  The custom bytestream path only
++         * exposes the downloaded manifest bytes, which breaks YouTube HLS
++         * streams used by VRChat's in-game video player. */
++        demuxer->direct_url = TRUE;
++        if ((ret = avformat_open_input( &demuxer->ctx, params->url, hls, NULL )) < 0)
++        {
++            ERR( "Failed to open HLS URL, error %s.\n", debugstr_averr(ret) );
++            goto failed;
++        }
++    }
++    else
+     {
+-        ERR( "Failed to open input, error %s.\n", debugstr_averr(ret) );
+-        goto failed;
++        if (!(demuxer->ctx->pb = avio_alloc_context( NULL, 0, 0, params->context, unix_read_callback, NULL,
++                                                     params->context->length == (UINT64)-1 ? NULL : unix_seek_callback ))) goto failed;
++
++        if ((ret = avformat_open_input( &demuxer->ctx, NULL, NULL, NULL )) < 0)
++            WARN( "Failed to open input, error %s.\n", debugstr_averr(ret) );
++        if ((ret = mediaconv_demuxer_open( &demuxer->ctx, params->context )) < 0)
++        {
++            ERR( "Failed to open input, error %s.\n", debugstr_averr(ret) );
++            goto failed;
++        }
+     }
+     format = demuxer->ctx->iformat;
+     if ((params->duration = get_context_duration( demuxer->ctx )) == AV_NOPTS_VALUE ||
+@@ -815,6 +854,7 @@ NTSTATUS demuxer_create( void *arg )
+     if (strstr( format->name, "mp4" )) strcpy( params->mime_type, "video/mp4" );
+     else if (strstr( format->name, "avi" )) strcpy( params->mime_type, "video/avi" );
+     else if (strstr( format->name, "mpeg" )) strcpy( params->mime_type, "video/mpeg" );
++    else if (strstr( format->name, "hls" )) strcpy( params->mime_type, "application/vnd.apple.mpegurl" );
+     else if (strstr( format->name, "mp3" )) strcpy( params->mime_type, "audio/mp3" );
+     else if (strstr( format->name, "wav" )) strcpy( params->mime_type, "audio/wav" );
+     else if (strstr( format->name, "asf" ))
+@@ -839,11 +879,7 @@ NTSTATUS demuxer_create( void *arg )
+ 
+ failed:
+     i = demuxer->ctx ? demuxer->ctx->nb_streams : 0;
+-    if (demuxer->ctx)
+-    {
+-        avio_context_free( &demuxer->ctx->pb );
+-        avformat_free_context( demuxer->ctx );
+-    }
++    demuxer_free_context( demuxer );
+     if (demuxer->streams)
+     {
+         for (UINT j = 0; j < i; j++)
+@@ -871,8 +907,7 @@ NTSTATUS demuxer_destroy( void *arg )
+     {
+         av_bsf_free( &demuxer->streams[i].filter );
+     }
+-    avio_context_free( &demuxer->ctx->pb );
+-    avformat_free_context( demuxer->ctx );
++    demuxer_free_context( demuxer );
+     free( demuxer->streams );
+     free( demuxer );
+
+diff --git a/dlls/winedmo/unixlib.c b/dlls/winedmo/unixlib.c
+--- a/dlls/winedmo/unixlib.c
++++ b/dlls/winedmo/unixlib.c
+@@ -109,8 +109,18 @@ static void vlog( void *ctx, int level, const char *fmt, va_list va_args )
+ {
+     enum __wine_debug_class dbcl = __WINE_DBCL_TRACE;
++    char buffer[512];
++    char *p;
++    int prefix = 1;
++
+     if (level <= AV_LOG_ERROR) dbcl = __WINE_DBCL_ERR;
+     if (level <= AV_LOG_WARNING) dbcl = __WINE_DBCL_WARN;
+-    wine_dbg_vlog( dbcl, __wine_dbch___default, __func__, fmt, va_args );
++
++    av_log_format_line( ctx, level, fmt, va_args, buffer, sizeof(buffer), &prefix );
++    for (p = buffer; *p; ++p)
++    {
++        if (*p == '\r' || *p == '\n') *p = ' ';
++    }
++    wine_dbg_log( dbcl, __wine_dbch___default, __func__, "%.160s\n", buffer );
+ }
+ 
+ static const char *debugstr_version( UINT version )
