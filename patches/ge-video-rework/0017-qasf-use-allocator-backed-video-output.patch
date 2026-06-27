@@ -1,0 +1,338 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Proton GE Team <proton-ge@example.com>
+Date: Sat, 27 Jun 2026 00:00:00 +0000
+Subject: [PATCH] winedmo: Fix large VC-1 WMV video delivery.
+
+Deadly Premonition's opening WMV is delivered through the WM ASF Reader into a
+Sample Grabber. Some VC-1 streams expose sparse or reordered frame timestamps
+through FFmpeg; the async WM reader can then deliver only a still frame every
+time audio catches the next far-future video timestamp.
+
+Use the stream's preferred framerate for WMV decoded-frame duration when the
+container reports enough information to calculate it. This avoids rounded
+AVFrame durations, such as 160000 for a 60000/1001 stream that should use about
+166833 100ns units per frame, or 330000 for a 30000/1001 stream that should use
+about 333667 100ns units per frame.
+
+Keep backward/repeated VC-1 timestamp correction, but also clamp large forward
+VC-1 decoded-frame timestamp jumps to the expected frame cadence. Do not reset
+the VC-1 output cadence on forward discontinuities; some ASF/VC-1 streams mark
+packet boundaries that way even though the presentation timeline should remain
+continuous.
+
+Also apply the existing decoded-video queue cap to normal two-stream ASF files.
+Deadly Premonition's 720p VC-1 video can otherwise decode hundreds of seconds
+ahead of the async reader consumer, exhausting 32-bit address space before qasf
+can deliver more than the first few seconds.
+
+Start the async reader clock after the first selected streams have produced
+initial samples. Starting the clock before the reader threads have decoded
+anything makes slow startup or heavy logging look like late playback, so video
+frames are then delivered in bursts to catch up.
+
+Keep selected streams roughly synchronized while another stream is still
+pending. The previous EOF fix allowed one ready stream to continue when another
+stream had no sample queued, but for long ASF files that also let audio advance
+far ahead while video decode was still pending. Only wait in that case when the
+ready stream would move more than a second past a pending stream's last delivered
+timestamp, so EOF draining still works.
+
+Keep qasf delivery on the WMReader callback thread. Dedicated delivery threads
+can let audio and video callbacks drift independently after WMReader has already
+paced samples, which shows up as smooth video that no longer matches the audio.
+
+When the ASF reader gets near EOF, audio can be waiting for more data while
+video has queued samples ready to deliver. Do not let one stream's pending read
+stop the async reader from delivering another stream's ready sample; otherwise
+the video queue can fill, blocking decoder drain and freezing playback while
+audio continues.
+---
+ dlls/qasf/asfreader.c         |  5 +++--
+ dlls/wmvcore/async_reader.c   | 65 ++++++++++++++++++++++++++++++++++++++++---
+ dlls/winedmo/unix_transform.c | 18 +++++++++++++++---
+ dlls/winedmo/wm_reader.c      |  7 +++++--
+ 4 files changed, 86 insertions(+), 8 deletions(-)
+diff --git a/dlls/qasf/asfreader.c b/dlls/qasf/asfreader.c
+index 22222222222..33333333333 100644
+--- a/dlls/qasf/asfreader.c
++++ b/dlls/qasf/asfreader.c
+@@ -530,7 +530,10 @@ static HRESULT asf_reader_init_stream(struct strmbase_filter *iface)
+         if (!stream->source.pin.peer)
+             continue;
+ 
+-        value = IMemInputPin_ReceiveCanBlock(stream->source.pMemInputPin) == S_OK;
++        /* WMReader already paces async samples. Deliver qasf outputs from the
++         * callback thread so audio and video callbacks stay in timestamp order
++         * instead of drifting on separate delivery threads. */
++        value = FALSE;
+         if (FAILED(hr = IWMReaderAdvanced2_SetOutputSetting(reader_advanced, i, L"DedicatedDeliveryThread",
+                 WMT_TYPE_BOOL, (BYTE *)&value, sizeof(value))))
+         {
+diff --git a/dlls/wmvcore/async_reader.c b/dlls/wmvcore/async_reader.c
+index 33333333333..44444444444 100644
+--- a/dlls/wmvcore/async_reader.c
++++ b/dlls/wmvcore/async_reader.c
+@@ -83,6 +83,9 @@ struct stream
+     struct list deliver_samples;
+     CONDITION_VARIABLE deliver_cv;
+ 
++    bool delivered_sample;
++    QWORD last_delivered_pts;
++
+     bool running;
+ };
+ 
+@@ -295,6 +298,7 @@ static void async_reader_deliver_sample(struct async_reader *reader, struct samp
+ {
+     IWMReaderCallbackAdvanced *callback_advanced = reader->callback_advanced;
+     IWMReaderCallback *callback = reader->callback;
++    struct stream *stream = reader->streams + sample->output;
+     BOOL read_compressed;
+     HRESULT hr;
+ 
+@@ -315,6 +319,9 @@ static void async_reader_deliver_sample(struct async_reader *reader, struct samp
+                 sample->flags, sample->buffer, reader->context);
+     EnterCriticalSection(&reader->callback_cs);
+ 
++    stream->delivered_sample = true;
++    stream->last_delivered_pts = sample->pts;
++
+     TRACE("Callback returned %#lx.\n", hr);
+ 
+     list_remove(&sample->entry);
+@@ -538,6 +538,44 @@ static HRESULT async_reader_open_all_streams(struct async_reader *reader)
+     return S_OK;
+ }
+ 
++static void async_reader_wait_initial_samples(struct async_reader *reader)
++{
++    DWORD start = GetTickCount();
++
++    while (reader->running && list_empty(&reader->async_ops))
++    {
++        BOOL waiting = FALSE;
++        DWORD i;
++
++        for (i = 0; i < reader->stream_count; ++i)
++        {
++            struct stream *stream = reader->streams + i;
++            WMT_STREAM_SELECTION selection;
++
++            if (FAILED(IWMSyncReader2_GetStreamSelected(reader->reader, i + 1, &selection))
++                    || selection == WMT_OFF)
++                continue;
++
++            if (list_empty(&stream->read_samples) && stream->read_result == E_PENDING)
++            {
++                waiting = TRUE;
++                break;
++            }
++        }
++
++        if (!waiting)
++            return;
++
++        if (GetTickCount() - start >= 5000)
++        {
++            WARN("Timed out waiting for initial samples, starting reader clock anyway.\n");
++            return;
++        }
++
++        SleepConditionVariableCS(&reader->callback_cv, &reader->callback_cs, 50);
++    }
++}
++
+ static HRESULT async_reader_get_next_sample(struct async_reader *reader,
+         struct stream **out_stream, struct sample **out_sample)
+ {
+@@ -558,7 +558,7 @@ static HRESULT async_reader_get_next_sample(struct async_reader *reader,
+         if (!(entry = list_head(&stream->read_samples)))
+         {
+             if (stream->read_result == E_PENDING)
+-                return E_PENDING;
++                pending = TRUE;
+             continue;
+         }
+ 
+@@ -566,6 +566,27 @@ static HRESULT async_reader_get_next_sample(struct async_reader *reader,
+     if (!first_sample)
+         return pending ? E_PENDING : NS_E_NO_MORE_SAMPLES;
+ 
++    for (i = 0; i < reader->stream_count; ++i)
++    {
++        stream = reader->streams + i;
++
++        if (stream == first_stream)
++            continue;
++        if (FAILED(IWMSyncReader2_GetStreamSelected(reader->reader, i + 1, &selection))
++                || selection == WMT_OFF)
++            continue;
++        if (!list_empty(&stream->read_samples) || stream->read_result != E_PENDING)
++            continue;
++
++        if (stream->delivered_sample && first_sample->pts > stream->last_delivered_pts + 10000000)
++        {
++            TRACE("Waiting for stream %u before delivering stream %u sample %s past %s.\n",
++                    stream->number, first_stream->number, debugstr_time(first_sample->pts),
++                    debugstr_time(stream->last_delivered_pts));
++            return E_PENDING;
++        }
++    }
++
+     TRACE("Found first stream %u with pts %I64d.\n", first_stream->number, first_sample->pts);
+     *out_sample = first_sample;
+     *out_stream = first_stream;
+@@ -696,7 +734,6 @@ static DWORD WINAPI async_reader_callback_thread(void *arg)
+                     {
+                         reader->active_start = op->u.start.start;
+                         reader->active_duration = op->u.start.duration;
+-                        reader->clock_start = get_current_time(reader);
+ 
+                         if (FAILED(hr = async_reader_open_all_streams(reader)))
+                         {
+@@ -708,6 +745,11 @@ static DWORD WINAPI async_reader_callback_thread(void *arg)
+                             EnterCriticalSection(&reader->callback_cs);
+                             reader->running = false;
+                         }
++                        else
++                        {
++                            async_reader_wait_initial_samples(reader);
++                            reader->clock_start = get_current_time(reader);
++                        }
+                     }
+ 
+                     LeaveCriticalSection(&reader->callback_cs);
+diff --git a/dlls/winedmo/unix_transform.c b/dlls/winedmo/unix_transform.c
+index 55555555555..66666666666 100644
+--- a/dlls/winedmo/unix_transform.c
++++ b/dlls/winedmo/unix_transform.c
+@@ -99,5 +99,8 @@ struct unix_transform
+     INT64               video_buf_pts;
+     INT64               video_buf_duration;
++    INT64               last_video_input_duration;
++    INT64               last_video_input_pts;
++    INT64               max_video_input_delta;
+     INT64               last_video_pts;   /* last emitted video pts, kept monotonic across decoder reordering */
+     INT64               last_video_duration;
+     INT64               video_input_anchor_pts; /* first input pts for the current video clip/segment */
+@@ -508,9 +508,20 @@ static INT64 get_video_frame_duration( struct unix_transform *t )
+ {
+-    INT64 duration;
++    INT64 container_duration, duration;
+ 
+-    duration = video_duration_from_rate( t->input_fps_num, t->input_fps_den );
++    container_duration = video_duration_from_rate( t->input_fps_num, t->input_fps_den );
++    duration = container_duration;
++
+     if (t->frame->duration > 0)
+         duration = t->frame->duration;
+ 
++    if (is_wmv_video_codec( t->avctx->codec_id ) && t->last_video_input_duration > 0
++            && (duration <= 0 || t->last_video_input_duration > duration))
++        duration = t->last_video_input_duration;
++    if (is_wmv_video_codec( t->avctx->codec_id ) && t->max_video_input_delta > 0
++            && (duration <= 0 || t->max_video_input_delta > duration))
++        duration = t->max_video_input_delta;
++    else if (is_wmv_video_codec( t->avctx->codec_id ) && duration <= 0)
++        duration = container_duration;
++
+     return duration;
+ }
+@@ -667,5 +676,8 @@ NTSTATUS transform_create( void *arg )
+     t->audio_output_pts_adjust = INT64_MIN;
+     t->last_video_pts = INT64_MIN;
+     t->last_video_duration = INT64_MIN;
++    t->last_video_input_duration = INT64_MIN;
++    t->last_video_input_pts = INT64_MIN;
++    t->max_video_input_delta = INT64_MIN;
+     t->video_input_anchor_pts = INT64_MIN;
+     t->video_pts_offset = INT64_MIN;
+@@ -963,13 +973,20 @@ NTSTATUS transform_push_input( void *arg )
+             t->video_pts_offset = INT64_MIN;
+             t->last_video_pts = INT64_MIN;
+             t->last_video_duration = INT64_MIN;
++            t->last_video_input_duration = INT64_MIN;
++            t->last_video_input_pts = INT64_MIN;
++            t->max_video_input_delta = INT64_MIN;
+             t->video_trace_count = 0;
+         }
+-        else if ((params->flags & WINEDMO_SAMPLE_FLAG_DISCONTINUITY) && params->pts != INT64_MIN)
++        else if ((params->flags & WINEDMO_SAMPLE_FLAG_DISCONTINUITY) && params->pts != INT64_MIN
++                && (t->avctx->codec_id != AV_CODEC_ID_VC1 || t->last_video_pts == INT64_MIN))
+         {
+             t->video_input_anchor_pts = params->pts;
+             t->video_pts_offset = INT64_MIN;
+             t->last_video_pts = INT64_MIN;
+             t->last_video_duration = INT64_MIN;
++            t->last_video_input_duration = INT64_MIN;
++            t->last_video_input_pts = INT64_MIN;
++            t->max_video_input_delta = INT64_MIN;
+             t->video_trace_count = 0;
+         }
+@@ -982,5 +995,19 @@ NTSTATUS transform_push_input( void *arg )
+ 
+     t->packet->dts = (params->dts != INT64_MIN) ? params->dts : t->packet->pts;
+     t->packet->duration = params->duration != INT64_MIN ? params->duration : 0;
++    if (!t->is_audio)
++    {
++        if (params->pts != INT64_MIN && t->last_video_input_pts != INT64_MIN
++                && params->pts > t->last_video_input_pts)
++        {
++            INT64 delta = params->pts - t->last_video_input_pts;
++
++            if (delta < 20000000 && delta > t->max_video_input_delta)
++                t->max_video_input_delta = delta;
++        }
++        if (params->pts != INT64_MIN)
++            t->last_video_input_pts = params->pts;
++        t->last_video_input_duration = t->packet->duration;
++    }
+     if (params->flags & WINEDMO_SAMPLE_FLAG_SYNC_POINT)
+         t->packet->flags |= AV_PKT_FLAG_KEY;
+@@ -1254,9 +1259,14 @@ NTSTATUS transform_get_output( void *arg )
+ 
+         if (video_pts != AV_NOPTS_VALUE)
+         {
+-            if (t->avctx->codec_id == AV_CODEC_ID_VC1 && t->last_video_pts != INT64_MIN
+-                    && params->duration > 0 && video_pts <= t->last_video_pts)
+-                video_pts = t->last_video_pts + params->duration;
++            if (t->avctx->codec_id == AV_CODEC_ID_VC1 && t->last_video_pts != INT64_MIN
++                    && params->duration > 0)
++            {
++                INT64 expected = t->last_video_pts + params->duration;
++
++                if (video_pts <= t->last_video_pts || video_pts > expected + params->duration * 2)
++                    video_pts = expected;
++            }
+             params->pts = video_pts;
+             if (t->avctx->codec_id == AV_CODEC_ID_VC1)
+             {
+@@ -1502,5 +1512,8 @@ NTSTATUS transform_flush( void *arg )
+     t->audio_started      = false;
+     t->last_video_pts     = INT64_MIN;
+     t->last_video_duration = INT64_MIN;
++    t->last_video_input_duration = INT64_MIN;
++    t->last_video_input_pts = INT64_MIN;
++    t->max_video_input_delta = INT64_MIN;
+     t->video_input_anchor_pts = INT64_MIN;
+     t->video_pts_offset   = INT64_MIN;
+diff --git a/dlls/winedmo/wm_reader.c b/dlls/winedmo/wm_reader.c
+index 77777777777..88888888888 100644
+--- a/dlls/winedmo/wm_reader.c
++++ b/dlls/winedmo/wm_reader.c
+@@ -1017,9 +1017,11 @@ static BOOL wm_stream_wait_queue_space(struct wm_reader *reader, struct wm_strea
+ {
+     if (!IsEqualGUID(&stream->major_type, &MFMediaType_Video))
+         return TRUE;
+-    if (reader->stream_count <= 2)
+-        return TRUE;
+ 
++    /* Large decoded video frames can exhaust 32-bit address space if the demux
++     * thread decodes far ahead of async reader consumers. Keep enough video
++     * queued for smooth playback without letting full-frame buffers grow
++     * unbounded. */
+     EnterCriticalSection(&stream->queue_cs);
+     while (!reader->demux_shutdown && !stream->queue_flushing
+             && stream->selection != WMT_OFF && stream->queued_packets >= 256)
+-- 
+2.50.0
