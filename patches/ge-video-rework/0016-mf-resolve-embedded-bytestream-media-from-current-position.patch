@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <ge-proton@example.com>
+Date: Fri, 26 Jun 2026 00:00:00 +0000
+Subject: [PATCH] winedmo: Resolve embedded byte-stream media from the current
+ position.
+
+Witch on the Holy Night stores its title-screen movies inside .hfa archive
+files and hands Media Foundation a byte stream positioned at the embedded
+ASF/WMV payload.  Probing and demuxing from absolute offset zero sees the
+archive header instead of the media stream, so the movie after the title screen
+does not play.
+
+The MFPlat resolver now probes byte streams from the current position.  When
+the winedmo byte-stream handler creates a media source, preserve that position
+as the logical start of the demuxer stream and translate demuxer reads back to
+absolute byte-stream offsets.
+---
+ dlls/winedmo/media_source.c  | 16 ++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/dlls/winedmo/media_source.c b/dlls/winedmo/media_source.c
+index 33333333333..44444444444 100644
+--- a/dlls/winedmo/media_source.c
++++ b/dlls/winedmo/media_source.c
+@@ -44,6 +44,7 @@ struct object_context
+     IMFAsyncResult *result;
+     IMFByteStream *stream;
+     UINT64 file_size;
++    UINT64 stream_offset;
+     WCHAR *url;
+ };
+ 
+@@ -104,7 +105,7 @@ static const IUnknownVtbl object_context_vtbl =
+ };
+ 
+ static HRESULT object_context_create(DWORD flags, IMFByteStream *stream, const WCHAR *url,
+-        QWORD file_size, IMFAsyncResult *result, IUnknown **out)
++        QWORD file_size, QWORD stream_offset, IMFAsyncResult *result, IUnknown **out)
+ {
+     WCHAR *tmp_url = url ? wcsdup(url) : NULL;
+     struct object_context *context;
+@@ -120,6 +121,7 @@ static HRESULT object_context_create(DWORD flags, IMFByteStream *stream, const W
+     context->stream = stream;
+     IMFByteStream_AddRef(context->stream);
+     context->file_size = file_size;
++    context->stream_offset = stream_offset;
+     context->url = tmp_url;
+     context->result = result;
+     IMFAsyncResult_AddRef(context->result);
+@@ -335,6 +337,7 @@ struct media_source
+     CRITICAL_SECTION demuxer_cs;
+ 
+     UINT64 file_size;
++    UINT64 stream_offset;
+     UINT64 duration;
+     bool has_duration;
+ 
+@@ -748,7 +751,8 @@ static NTSTATUS CDECL source_stream_read_cb(struct winedmo_stream *stream, BYTE
+     if (!*size)
+         return STATUS_SUCCESS;
+ 
+-    if (!known_size || SUCCEEDED(hr = IMFByteStream_SetCurrentPosition(source->byte_stream, (QWORD)pos)))
++    if (!known_size || SUCCEEDED(hr = IMFByteStream_SetCurrentPosition(source->byte_stream,
++            source->stream_offset + (QWORD)pos)))
+         hr = winedmo_bytestream_read(source->byte_stream, buffer, *size, &ret_size);
+ 
+     if (FAILED(hr))
+@@ -2204,7 +2208,9 @@ static HRESULT media_source_create(struct object_context *context, IMFMediaSourc
+     object->ref = 1;
+     object->byte_stream = context->stream;
+     IMFByteStream_AddRef(context->stream);
+-    object->file_size = context->file_size;
++    object->stream_offset = context->stream_offset;
++    object->file_size = context->file_size > context->stream_offset
++            ? context->file_size - context->stream_offset : (UINT64)-1;
+     object->rate = 1.0f;
+     InitializeCriticalSectionEx(&object->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+     object->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": cs");
+@@ -2479,7 +2485,7 @@ static HRESULT WINAPI stream_handler_BeginCreateObject(IMFByteStreamHandler *ifa
+     struct stream_handler *handler = impl_from_IMFByteStreamHandler(iface);
+     IMFAsyncResult *result;
+     IUnknown *context;
+-    QWORD file_size;
++    QWORD file_size, stream_offset;
+     HRESULT hr;
+     DWORD caps;
+ 
+@@ -2504,11 +2510,16 @@ static HRESULT WINAPI stream_handler_BeginCreateObject(IMFByteStreamHandler *ifa
+         FIXME("Failed to get byte stream length, hr %#lx.\n", hr);
+         return hr;
+     }
++    if (FAILED(hr = IMFByteStream_GetCurrentPosition(stream, &stream_offset)))
++    {
++        FIXME("Failed to get byte stream position, hr %#lx.\n", hr);
++        return hr;
++    }
+ 
+     if (FAILED(hr = MFCreateAsyncResult(NULL, callback, state, &result)))
+         return hr;
+-    if (FAILED(hr = object_context_create(flags, stream, url, file_size, result, &context)))
++    if (FAILED(hr = object_context_create(flags, stream, url, file_size, stream_offset, result, &context)))
+     {
+         IMFAsyncResult_Release(result);
+         return hr;
+     }
+@@ -2811,7 +2822,7 @@ static HRESULT WINAPI scheme_handler_BeginCreateObject(IMFSchemeHandler *iface,
+ 
+     if (FAILED(hr = MFCreateAsyncResult(NULL, callback, state, &result)))
+         return hr;
+-    if (FAILED(hr = object_context_create(flags, bytestream, url, -1, result, &context)))
++    if (FAILED(hr = object_context_create(flags, bytestream, url, -1, 0, result, &context)))
+     {
+         IMFAsyncResult_Release(result);
+         return hr;
+     }
+-- 
+2.51.0
