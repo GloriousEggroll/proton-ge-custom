@@ -226,6 +226,9 @@ apply_all_in_dir() {
     echo "WINE: -HOTFIX- Fix Smart Tee negotiation and V4L WoW64 media type marshaling"
     apply_all_in_dir "../patches/wine-hotfixes/qcap-dshow-fixes/"
 
+    echo "WINE: -HOTFIX- Add GetFileVersionInfoByHandle version export stub"
+    apply_patch "../patches/wine-hotfixes/pending/version-GetFileVersionInfoByHandle-stub.patch"
+
 ### END WINE HOTFIX/BACKPORT SECTION ###
 
 ### (2-6) WINE PENDING UPSTREAM SECTION ###
