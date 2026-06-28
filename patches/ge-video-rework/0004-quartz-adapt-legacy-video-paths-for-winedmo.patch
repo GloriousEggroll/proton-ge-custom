@@ -1374,7 +1374,7 @@ index cb38a1883d1..dc3b7d9a9f8 100644
      DWORD surface_count;
      DWORD surface_index;
      DWORD_PTR cookie;
-@@ -163,6 +161,47 @@ static void copy_plane(BYTE **dstp, unsigned int dst_pitch, unsigned int dst_hei
+@@ -163,6 +161,81 @@ static void copy_plane(BYTE **dstp, unsigned int dst_pitch, unsigned int dst_hei
      *dstp += dst_pitch * dst_height;
  }
  
@@ -1419,10 +1419,44 @@ index cb38a1883d1..dc3b7d9a9f8 100644
 +    }
 +}
 +
++static void convert_yv12_to_rgb32(BYTE *dst, unsigned int dst_pitch,
++        const BYTE *src, unsigned int src_pitch, unsigned int width, unsigned int height)
++{
++    const BYTE *y_plane = src;
++    const BYTE *v_plane = src + src_pitch * height;
++    const BYTE *u_plane = v_plane + (src_pitch / 2) * (height / 2);
++    unsigned int x, y;
++
++    for (y = 0; y < height; ++y)
++    {
++        DWORD *dst_row = (DWORD *)(dst + dst_pitch * y);
++        const BYTE *y_row = y_plane + src_pitch * y;
++        const BYTE *u_row = u_plane + (src_pitch / 2) * (y / 2);
++        const BYTE *v_row = v_plane + (src_pitch / 2) * (y / 2);
++
++        for (x = 0; x < width; ++x)
++        {
++            int c = y_row[x] - 16;
++            int d = u_row[x / 2] - 128;
++            int e = v_row[x / 2] - 128;
++            BYTE r, g, b;
++
++            if (c < 0)
++                c = 0;
++
++            r = clamp_rgb_value((298 * c + 409 * e + 128) >> 8);
++            g = clamp_rgb_value((298 * c - 100 * d - 208 * e + 128) >> 8);
++            b = clamp_rgb_value((298 * c + 516 * d + 128) >> 8);
++
++            dst_row[x] = (r << 16) | (g << 8) | b;
++        }
++    }
++}
++
  static HRESULT vmr_render(struct strmbase_renderer *iface, IMediaSample *sample)
  {
      struct vmr7 *filter = impl_from_IBaseFilter(&iface->filter.IBaseFilter_iface);
-@@ -240,7 +279,13 @@ static HRESULT vmr_render(struct strmbase_renderer *iface, IMediaSample *sample)
+@@ -240,7 +313,13 @@ static HRESULT vmr_render(struct strmbase_renderer *iface, IMediaSample *sample)
                  surface_desc.dwWidth, surface_desc.dwHeight);
      }
  
@@ -1437,7 +1471,25 @@ index cb38a1883d1..dc3b7d9a9f8 100644
      {
          BYTE *dst = surface_desc.lpSurface;
          const BYTE *src = data;
-@@ -285,43 +330,21 @@ static HRESULT vmr_render(struct strmbase_renderer *iface, IMediaSample *sample)
+@@ -256,6 +335,14 @@ static HRESULT vmr_render(struct strmbase_renderer *iface, IMediaSample *sample)
+-        copy_plane(&dst, surface_desc.lPitch, surface_desc.dwHeight, &src, src_pitch, height);
+-        copy_plane(&dst, surface_desc.lPitch / 2, surface_desc.dwHeight / 2, &src, src_pitch / 2, height / 2);
+-        copy_plane(&dst, surface_desc.lPitch / 2, surface_desc.dwHeight / 2, &src, src_pitch / 2, height / 2);
++        if ((surface_desc.ddpfPixelFormat.dwFlags & DDPF_RGB)
++                && surface_desc.ddpfPixelFormat.dwRGBBitCount == 32)
++        {
++            convert_yv12_to_rgb32(surface_desc.lpSurface, surface_desc.lPitch, data, src_pitch, width, abs(height));
++        }
++        else
++        {
++            copy_plane(&dst, surface_desc.lPitch, surface_desc.dwHeight, &src, src_pitch, height);
++            copy_plane(&dst, surface_desc.lPitch / 2, surface_desc.dwHeight / 2, &src, src_pitch / 2, height / 2);
++            copy_plane(&dst, surface_desc.lPitch / 2, surface_desc.dwHeight / 2, &src, src_pitch / 2, height / 2);
++        }
+     }
+     else if (height > 0 && (bitmap_header->biCompression == BI_RGB || bitmap_header->biCompression == BI_BITFIELDS))
+     {
+@@ -285,43 +372,21 @@ static HRESULT vmr_render(struct strmbase_renderer *iface, IMediaSample *sample)
      return IVMRImagePresenter_PresentImage(filter->presenter, filter->cookie, &info);
  }
  
@@ -1559,7 +1611,7 @@ index 2931dc4c36d..12a53373032 100644
      IDirectDrawSurface7 *frontbuffer;
      IDirectDrawSurface7 *primary;
      HWND window;
-+    BOOL nv12_to_rgb;
++    BOOL yuv_to_rgb;
  
      SIZE native_size, aspect_ratio;
  };
@@ -1567,7 +1619,7 @@ index 2931dc4c36d..12a53373032 100644
      if (info->dwFlags & VMRSample_SrcDstRectsValid)
          FIXME("Ignoring src/dst rects.\n");
  
-+    if (presenter->nv12_to_rgb)
++    if (presenter->yuv_to_rgb)
 +    {
 +        DDSURFACEDESC2 surface_desc = {.dwSize = sizeof(surface_desc)};
 +        BITMAPINFO bitmap_info = {0};
@@ -1597,14 +1649,15 @@ index 2931dc4c36d..12a53373032 100644
      GetClientRect(presenter->window, &rect);
      point.x = point.y = 0;
      ClientToScreen(presenter->window, &point);
-@@ -195,7 +223,17 @@ static HRESULT WINAPI surface_allocator_AllocateSurface(IVMRSurfaceAllocator *if
+@@ -195,7 +223,18 @@ static HRESULT WINAPI surface_allocator_AllocateSurface(IVMRSurfaceAllocator *if
      surface_desc.ddsCaps.dwCaps = DDSCAPS_FLIP | DDSCAPS_COMPLEX | DDSCAPS_OFFSCREENPLAIN;
      surface_desc.dwBackBufferCount = *count;
  
 -    if (info->lpHdr->biCompression == BI_RGB || info->lpHdr->biCompression == BI_BITFIELDS)
-+    presenter->nv12_to_rgb = info->lpHdr->biCompression == mmioFOURCC('N','V','1','2');
++    presenter->yuv_to_rgb = info->lpHdr->biCompression == mmioFOURCC('N','V','1','2')
++            || info->lpHdr->biCompression == mmioFOURCC('Y','V','1','2');
 +
-+    if (presenter->nv12_to_rgb)
++    if (presenter->yuv_to_rgb)
 +    {
 +        surface_desc.ddpfPixelFormat.dwFlags = DDPF_RGB;
 +        surface_desc.ddpfPixelFormat.dwRGBBitCount = 32;
