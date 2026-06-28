@@ -162,8 +162,7 @@ index 1965d8a257e..a6cc3f20921 100644
      attr.minreq = attr.fragsize = period_bytes;
      attr.tlength = period_bytes * 3;
      attr.maxlength = stream->bufsize_frames * pa_frame_size(&stream->ss);
--    attr.prebuf = 0;
-+    attr.prebuf = pa_frame_size(&stream->ss);
+     attr.prebuf = 0;
 +    stream->attr = attr;
      dump_attr(&attr);
  
@@ -211,7 +210,39 @@ index 1965d8a257e..a6cc3f20921 100644
          SIZE_T size;
  
          stream->attr = *attr;
-@@ -1542,7 +1609,12 @@ static void pulse_write(struct pulse_stream *stream)
+@@ -1498,23 +1565,28 @@ write:
+ 
+ static void pulse_write_index_catchup(struct pulse_stream *stream)
+ {
+-    const pa_timing_info *ti = pa_stream_get_timing_info(stream->stream);
++    const pa_timing_info *ti;
+     UINT32 frame_size, to_write;
+     int64_t write_index;
+ 
++    if (!pulse_stream_ready(stream))
++        return;
++
+     ti = pa_stream_get_timing_info(stream->stream);
+     if (!ti || ti->read_index <= ti->write_index) return;
+ 
+     if (!silence_buf) silence_buf = calloc(1, silence_buf_size);
+     frame_size = pa_frame_size(&stream->ss);
++    if (!frame_size) return;
+ 
+     while (ti && ti->read_index > ti->write_index)
+     {
+         write_index = ti->write_index;
+-        TRACE("stream %p, runnind %d, read is ahead of write %lld bytes.\n", stream, stream->started,
++        TRACE("stream %p, running %d, read is ahead of write %lld bytes.\n", stream, stream->started,
+               (long long)(ti->read_index - write_index));
+ 
+-        to_write = min(ti->read_index - write_index, silence_buf_size) / frame_size * frame_size;
++        to_write = min(ti->read_index - write_index, min(stream->period_bytes, silence_buf_size)) / frame_size * frame_size;
++        if (!to_write) break;
+         pa_stream_write(stream->stream, silence_buf, to_write, NULL, 0, PA_SEEK_RELATIVE);
+         ti = pa_stream_get_timing_info(stream->stream);
+         if (ti && ti->write_index <= write_index)
+@@ -1530,7 +1602,12 @@ static void pulse_write(struct pulse_stream *stream)
      /* write as much data to PA as we can */
      UINT32 to_write;
      BYTE *buf = stream->local_buffer + stream->pa_offs_bytes;
@@ -225,7 +256,87 @@ index 1965d8a257e..a6cc3f20921 100644
  
      pulse_write_index_catchup(stream);
  
-@@ -1937,12 +2009,13 @@ static NTSTATUS pulse_release_stream(void *args)
+@@ -1696,17 +1773,20 @@ static void pa_streams_timer_cb(pa_mainloop_api *api, pa_time_event *e, const st
+     UINT32 adv_bytes;
+     int err;
+ 
+-    if (period->timer_stream && !period->timer_stream->started)
++    if (period->timer_stream && (!period->timer_stream->started || !pulse_stream_ready(period->timer_stream)))
+         period->timer_stream = NULL;
+ 
+     if (!period->timer_stream)
+     {
+         LIST_FOR_EACH_ENTRY(stream, &period->streams, struct pulse_stream, period_entry)
+         {
+-            if (stream->started)
++            if (stream->started && pulse_stream_ready(stream))
+             {
+                 if ((err = pa_stream_get_time(stream->stream, &stream->stream_time)))
++                {
+                     ERR("pa_stream_get_time error %d.\n", err);
++                    continue;
++                }
+                 stream->last_time = stream->stream_time;
+                 TRACE("period %p, stream %p is now timer stream, stream_time %llu.\n", period, stream, (long long)stream->stream_time);
+                 stream->stream_time -= period->period;
+@@ -1720,24 +1800,32 @@ static void pa_streams_timer_cb(pa_mainloop_api *api, pa_time_event *e, const st
+     if (period->timer_stream)
+     {
+         if ((err = pa_stream_get_time(period->timer_stream->stream, &stream_time)))
+-            ERR("pa_stream_get_time error %d.\n", err);
+-        if (stream_time > period->timer_stream->last_time)
+         {
+-            period->timer_stream->stream_time += period->period;
+-            adjust = period->timer_stream->stream_time - stream_time;
+-            TRACE("period %p, stream_time %lld, adjust %lld.\n", period, (long long)stream_time, (long long)adjust);
+-            if (adjust > (int64_t)(period->period / 3))
+-                adjust = period->period / 3;
+-            else if (adjust < -(int64_t)(period->period / 3))
+-                adjust = -(int64_t)period->period / 3;
+-            next_timer += adjust;
++            ERR("pa_stream_get_time error %d.\n", err);
++            period->timer_stream = NULL;
+         }
+         else
+         {
+-            WARN("stream time did not advance, last_time %lld, stream_time %lld.\n",
+-                    (long long)period->timer_stream->last_time, (long long)stream_time);
++            if (stream_time > period->timer_stream->last_time)
++            {
++                period->timer_stream->stream_time += period->period;
++                adjust = period->timer_stream->stream_time - stream_time;
++                TRACE("period %p, stream_time %lld, adjust %lld.\n", period, (long long)stream_time, (long long)adjust);
++                if (period->timer_stream->dataflow == eRender && adjust > 0)
++                    adjust = 0;
++                else if (adjust > (int64_t)(period->period / 3))
++                    adjust = period->period / 3;
++                else if (adjust < -(int64_t)(period->period / 3))
++                    adjust = -(int64_t)period->period / 3;
++                next_timer += adjust;
++            }
++            else
++            {
++                WARN("stream time did not advance, last_time %lld, stream_time %lld.\n",
++                        (long long)period->timer_stream->last_time, (long long)stream_time);
++            }
++            period->timer_stream->last_time = stream_time;
+         }
+-        period->timer_stream->last_time = stream_time;
+     }
+ 
+     LIST_FOR_EACH_ENTRY(stream, &period->streams, struct pulse_stream, period_entry)
+@@ -1754,10 +1840,6 @@ static void pa_streams_timer_cb(pa_mainloop_api *api, pa_time_event *e, const st
+                 stream->lcl_offs_bytes %= stream->real_bufsize_bytes;
+                 stream->held_bytes -= adv_bytes;
+             }
+-            else if (stream->dataflow == eRender)
+-            {
+-                pulse_write_index_catchup(stream);
+-            }
+             else if (stream->dataflow == eCapture)
+             {
+                 pulse_read(stream);
+@@ -1859,12 +1941,13 @@ static NTSTATUS pulse_release_stream(void *args)
  
      pulse_lock();
      remove_stream_from_period(stream);
