@@ -1,0 +1,298 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@proton.me>
+Date: Sun, 28 Jun 2026 00:00:00 -0600
+Subject: [PATCH] winedmo: handle dynamic video decoder output format changes
+
+Yakuza 5 Remastered changes H.264 output dimensions during the startup
+USM videos. The old winegstreamer path propagated the decoder native
+1280x720 stream type after reinit, and the game continued playback.
+
+Prefer the decoder current frame dimensions when reporting a dynamic output
+format, compute stride and sample size from that new frame size, update the
+selected output type when the decoder reports a real stream change, and use
+the same dimensions when sizing and copying the pending frame. This keeps
+ProcessOutput on the new layout even if the caller does not immediately
+call SetOutputType again.
+---
+--- a/dlls/winedmo/video_decoder.c
++++ b/dlls/winedmo/video_decoder.c
+@@ -1350,23 +1350,71 @@
+     return S_OK;
+ }
+ 
+-static HRESULT handle_stream_type_change(struct video_decoder *decoder)
++static BOOL video_decoder_media_type_guid_changed(IMFMediaType *old_type, IMFMediaType *new_type, REFGUID key)
++{
++    GUID old_value, new_value;
++    HRESULT old_hr, new_hr;
++
++    old_hr = IMFMediaType_GetGUID(old_type, key, &old_value);
++    new_hr = IMFMediaType_GetGUID(new_type, key, &new_value);
++    return old_hr != new_hr || (SUCCEEDED(old_hr) && !IsEqualGUID(&old_value, &new_value));
++}
++
++static BOOL video_decoder_media_type_uint32_changed(IMFMediaType *old_type, IMFMediaType *new_type, REFGUID key)
++{
++    UINT32 old_value, new_value;
++    HRESULT old_hr, new_hr;
++
++    old_hr = IMFMediaType_GetUINT32(old_type, key, &old_value);
++    new_hr = IMFMediaType_GetUINT32(new_type, key, &new_value);
++    return old_hr != new_hr || (SUCCEEDED(old_hr) && old_value != new_value);
++}
++
++static BOOL video_decoder_media_type_uint64_changed(IMFMediaType *old_type, IMFMediaType *new_type, REFGUID key)
++{
++    UINT64 old_value, new_value;
++    HRESULT old_hr, new_hr;
++
++    old_hr = IMFMediaType_GetUINT64(old_type, key, &old_value);
++    new_hr = IMFMediaType_GetUINT64(new_type, key, &new_value);
++    return old_hr != new_hr || (SUCCEEDED(old_hr) && old_value != new_value);
++}
++
++static BOOL video_decoder_needs_stream_change(struct video_decoder *decoder, IMFMediaType *new_type)
++{
++    IMFMediaType *old_type = decoder->output_type;
++
++    if (!old_type)
++        return TRUE;
++
++    return video_decoder_media_type_guid_changed(old_type, new_type, &MF_MT_SUBTYPE)
++            || video_decoder_media_type_uint64_changed(old_type, new_type, &MF_MT_FRAME_SIZE)
++            || video_decoder_media_type_uint64_changed(old_type, new_type, &MF_MT_FRAME_RATE)
++            || video_decoder_media_type_uint32_changed(old_type, new_type, &MF_MT_DEFAULT_STRIDE)
++            || video_decoder_media_type_uint32_changed(old_type, new_type, &MF_MT_SAMPLE_SIZE);
++}
++
++static HRESULT handle_stream_type_change(struct video_decoder *decoder, BOOL *changed)
+ {
+     union winedmo_format *format;
++    IMFMediaType *new_type = NULL;
+     UINT64 frame_size, frame_rate;
++    UINT32 sample_size;
++    LONG stride;
+     GUID major;
++    GUID subtype;
+     HRESULT hr;
+ 
++    *changed = FALSE;
++
+     if (FAILED(hr = winedmo_transform_get_output_format(decoder->winedmo_transform, &major, &format)))
+     {
+         WARN("Failed to get transform output format, hr %#lx\n", hr);
+         return hr;
+     }
+ 
+-    if (decoder->stream_type)
+-        IMFMediaType_Release(decoder->stream_type);
+-
+-    hr = MFCreateVideoMediaTypeFromSubtype(&format->video.guidFormat, (IMFVideoMediaType **)&decoder->stream_type);
++    subtype = format->video.guidFormat;
++    hr = MFCreateVideoMediaTypeFromSubtype(&subtype, (IMFVideoMediaType **)&new_type);
+     if (SUCCEEDED(hr) && format->video.videoInfo.dwWidth && format->video.videoInfo.dwHeight)
+     {
+         UINT32 width = format->video.videoInfo.dwWidth;
+@@ -1376,12 +1424,12 @@
+         /* Life Makeover's Beginner_pc_win10.mp4 needs codec-aligned NV12 output
+          * dimensions; the smaller visible area is carried in the aperture blobs. */
+         sz = ((UINT64)width << 32) | height;
+-        IMFMediaType_SetUINT64(decoder->stream_type, &MF_MT_FRAME_SIZE, sz);
+-        IMFMediaType_SetBlob(decoder->stream_type, &MF_MT_GEOMETRIC_APERTURE,
++        IMFMediaType_SetUINT64(new_type, &MF_MT_FRAME_SIZE, sz);
++        IMFMediaType_SetBlob(new_type, &MF_MT_GEOMETRIC_APERTURE,
+                 (BYTE *)&format->video.videoInfo.GeometricAperture, sizeof(format->video.videoInfo.GeometricAperture));
+-        IMFMediaType_SetBlob(decoder->stream_type, &MF_MT_MINIMUM_DISPLAY_APERTURE,
++        IMFMediaType_SetBlob(new_type, &MF_MT_MINIMUM_DISPLAY_APERTURE,
+                 (BYTE *)&format->video.videoInfo.MinimumDisplayAperture, sizeof(format->video.videoInfo.MinimumDisplayAperture));
+-        IMFMediaType_SetBlob(decoder->stream_type, &MF_MT_PAN_SCAN_APERTURE,
++        IMFMediaType_SetBlob(new_type, &MF_MT_PAN_SCAN_APERTURE,
+                 (BYTE *)&format->video.videoInfo.PanScanAperture, sizeof(format->video.videoInfo.PanScanAperture));
+     }
+     free(format);
+@@ -1390,7 +1438,31 @@
+         return hr;
+ 
+     if (SUCCEEDED(IMFMediaType_GetUINT64(decoder->output_type, &MF_MT_FRAME_RATE, &frame_rate)))
+-        IMFMediaType_SetUINT64(decoder->stream_type, &MF_MT_FRAME_RATE, frame_rate);
++        IMFMediaType_SetUINT64(new_type, &MF_MT_FRAME_RATE, frame_rate);
++    if (SUCCEEDED(IMFMediaType_GetUINT64(new_type, &MF_MT_FRAME_SIZE, &frame_size)))
++    {
++        if (SUCCEEDED(MFGetStrideForBitmapInfoHeader(subtype.Data1, frame_size >> 32, &stride)))
++            IMFMediaType_SetUINT32(new_type, &MF_MT_DEFAULT_STRIDE, abs(stride));
++        if (SUCCEEDED(MFCalculateImageSize(&subtype, frame_size >> 32, frame_size, &sample_size)))
++            IMFMediaType_SetUINT32(new_type, &MF_MT_SAMPLE_SIZE, sample_size);
++    }
++
++    *changed = video_decoder_needs_stream_change(decoder, new_type);
++
++    if (!*changed)
++    {
++        IMFMediaType_Release(new_type);
++        return S_OK;
++    }
++
++    if (decoder->stream_type)
++        IMFMediaType_Release(decoder->stream_type);
++    decoder->stream_type = new_type;
++    IMFMediaType_AddRef(new_type);
++
++    if (decoder->output_type)
++        IMFMediaType_Release(decoder->output_type);
++    decoder->output_type = new_type;
+ 
+     if (FAILED(hr = IMFMediaType_GetUINT64(decoder->stream_type, &MF_MT_FRAME_SIZE, &frame_size)))
+         return hr;
+@@ -1398,7 +1470,7 @@
+         return hr;
+     uninit_allocator(decoder);
+ 
+-    return MF_E_TRANSFORM_STREAM_CHANGE;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI transform_ProcessOutput(IMFTransform *iface, DWORD flags, DWORD count,
+@@ -1417,6 +1489,7 @@
+     INT64 output_pts, output_dur;
+     DWORD out_flags;
+     NTSTATUS ntstatus;
++    BOOL retried_format_change = FALSE;
+     HRESULT hr;
+ 
+     TRACE("iface %p, flags %#lx, count %lu, samples %p, status %p.\n", iface, flags, count, samples, status);
+@@ -1432,6 +1505,7 @@
+         return E_INVALIDARG;
+     provided_sample = sample;
+ 
++retry:
+     if (FAILED(hr = IMFMediaType_GetGUID(decoder->output_type, &MF_MT_SUBTYPE, &subtype)))
+         return hr;
+     if (FAILED(hr = IMFMediaType_GetUINT64(decoder->output_type, &MF_MT_FRAME_SIZE, &frame_size)))
+@@ -1463,7 +1537,55 @@
+             &pts, &dur, &out_flags);
+     IMFMediaBuffer_Unlock(buffer);
+ 
+-    if (!ntstatus && !(out_flags & WINEDMO_SAMPLE_FLAG_FORMAT_CHANGED))
++    if (!ntstatus && (out_flags & WINEDMO_SAMPLE_FLAG_FORMAT_CHANGED))
++    {
++        BOOL type_changed;
++
++        if (FAILED(hr = handle_stream_type_change(decoder, &type_changed)))
++            goto done;
++        if (type_changed)
++        {
++            UINT32 new_sample_size;
++            UINT64 new_frame_size;
++            GUID new_subtype;
++
++            if (!retried_format_change
++                    && SUCCEEDED(IMFMediaType_GetGUID(decoder->output_type, &MF_MT_SUBTYPE, &new_subtype))
++                    && SUCCEEDED(IMFMediaType_GetUINT64(decoder->output_type, &MF_MT_FRAME_SIZE, &new_frame_size))
++                    && SUCCEEDED(MFCalculateImageSize(&new_subtype, new_frame_size >> 32,
++                            (UINT32)new_frame_size, &new_sample_size))
++                    && new_sample_size <= sample_size)
++            {
++                retried_format_change = TRUE;
++                if (buffer)
++                {
++                    IMFMediaBuffer_Release(buffer);
++                    buffer = NULL;
++                }
++                if (decode_sample)
++                {
++                    IMFSample_Release(decode_sample);
++                    decode_sample = NULL;
++                }
++                sample = provided_sample;
++                goto retry;
++            }
++            else
++            {
++                samples[0].dwStatus |= MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE;
++                *status |= MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE;
++                hr = MF_E_TRANSFORM_STREAM_CHANGE;
++            }
++            goto done;
++        }
++
++        TRACE("Ignoring no-op decoder output format change.\n");
++        samples->dwStatus = MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE;
++        hr = MF_E_TRANSFORM_NEED_MORE_INPUT;
++        goto done;
++    }
++
++    if (!ntstatus)
+     {
+         IMFMediaBuffer_SetCurrentLength(buffer, out_size);
+ 
+@@ -1500,12 +1622,6 @@
+             goto done;
+         hr = S_OK;
+     }
+-    else if (!ntstatus && (out_flags & WINEDMO_SAMPLE_FLAG_FORMAT_CHANGED))
+-    {
+-        samples[0].dwStatus |= MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE;
+-        *status |= MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE;
+-        hr = handle_stream_type_change(decoder);
+-    }
+     else if (ntstatus == STATUS_MORE_PROCESSING_REQUIRED)
+     {
+         samples->dwStatus = MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE;
+--- a/dlls/winedmo/unix_transform.c
++++ b/dlls/winedmo/unix_transform.c
+@@ -578,12 +578,10 @@
+ }
+ 
+ static NTSTATUS copy_video_frame( struct unix_transform *t, const AVFrame *frame,
+-                                  BYTE *dst, UINT32 dst_size )
++                                  BYTE *dst, UINT32 dst_size, int out_width, int out_height )
+ {
+     enum AVPixelFormat out_fmt = (t->out_pix_fmt != AV_PIX_FMT_NONE)
+                                  ? t->out_pix_fmt : (enum AVPixelFormat)frame->format;
+-    int out_width = t->out_width > 0 ? t->out_width : frame->width;
+-    int out_height = t->out_height > 0 ? t->out_height : frame->height;
+     int src_width = frame->width, src_height = frame->height;
+ 
+     if (out_width <= frame->width && out_height <= frame->height
+@@ -1172,7 +1170,7 @@
+         frame.height = input_height;
+         frame.format = t->in_pix_fmt;
+ 
+-        st = copy_video_frame( t, &frame, dst, capacity );
++        st = copy_video_frame( t, &frame, dst, capacity, out_width, out_height );
+         if (FAILED(st)) return st;
+ 
+         params->pts = t->video_buf_pts;
+@@ -1448,8 +1446,8 @@
+         enum AVPixelFormat out_fmt = (t->out_pix_fmt != AV_PIX_FMT_NONE)
+                                      ? t->out_pix_fmt
+                                      : (enum AVPixelFormat)t->frame->format;
+-        int out_width = t->out_width > 0 ? t->out_width : t->frame->width;
+-        int out_height = t->out_height > 0 ? t->out_height : t->frame->height;
++        int out_width = t->last_width > 0 ? t->last_width : (t->out_width > 0 ? t->out_width : t->frame->width);
++        int out_height = t->last_height > 0 ? t->last_height : (t->out_height > 0 ? t->out_height : t->frame->height);
+         UINT32 required = video_frame_size( out_fmt, out_width, out_height );
+         NTSTATUS st;
+ 
+@@ -1459,7 +1457,7 @@
+             return STATUS_BUFFER_TOO_SMALL;
+         }
+ 
+-        st = copy_video_frame( t, t->frame, dst, capacity );
++        st = copy_video_frame( t, t->frame, dst, capacity, out_width, out_height );
+         if (FAILED(st)) return st;
+ 
+         t->frame_pending = false;
+@@ -1590,10 +1588,8 @@
+     else
+     {
+         MFVIDEOFORMAT mfvf = {0};
+-        int visible_w = t->out_width > 0 ? t->out_width
+-                : (t->last_width  > 0 ? t->last_width  : (t->avctx ? t->avctx->width : 0));
+-        int visible_h = t->out_height > 0 ? t->out_height
+-                : (t->last_height > 0 ? t->last_height : (t->avctx ? t->avctx->height : 0));
++        int visible_w = t->last_width  > 0 ? t->last_width  : (t->avctx ? t->avctx->width  : t->out_width);
++        int visible_h = t->last_height > 0 ? t->last_height : (t->avctx ? t->avctx->height : t->out_height);
+         int w = visible_w, h = visible_h;
+         enum AVPixelFormat pf = (t->out_pix_fmt != AV_PIX_FMT_NONE)
+                                 ? t->out_pix_fmt
