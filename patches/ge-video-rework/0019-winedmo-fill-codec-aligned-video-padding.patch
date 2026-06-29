@@ -9,24 +9,146 @@ the visible 1080p byte count causes the MF sample copier to update only
 the visible rows while leaving the D3D surface padding stale, which shows
 up as a green bar at the bottom of the video.
 
-When the codec-aligned dimensions are only small padding over the decoded
-frame, return and copy the padded output size. The NV12 copy path already
-initializes the padded area to neutral black/chroma, and real dynamic size
-changes such as Yakuza 5's 1080p-to-720p startup videos are unaffected
-because they are not a small padding delta.
+Dragon's Dogma exposes a related case where FFmpeg can surface the
+codec-aligned 1920x1088 H.264 frame directly. In that case the padded rows
+must not be exposed as visible output. Keep coded-size output only when
+FFmpeg reports distinct visible and coded dimensions and the caller already
+selected a coded-size output type. Otherwise keep the consumer-visible size
+while copying only visible rows into initialized NV12 output.
+
+Real dynamic size changes such as Yakuza 5's 1080p-to-720p startup videos
+are unaffected because they are not a small padding delta.
 ---
- dlls/winedmo/unix_transform.c | 8 ++++++++
- 1 file changed, 8 insertions(+)
+ dlls/winedmo/unix_transform.c | 86 +++++++++++++++++++++++++++++++++--
+ 1 file changed, 82 insertions(+), 4 deletions(-)
 
 diff --git a/dlls/winedmo/unix_transform.c b/dlls/winedmo/unix_transform.c
 --- a/dlls/winedmo/unix_transform.c
 +++ b/dlls/winedmo/unix_transform.c
-@@ -1449,6 +1449,14 @@ NTSTATUS transform_get_output( void *arg )
+@@ -278,6 +278,46 @@ static DWORD mf_fourcc_from_pix_fmt( enum AVPixelFormat fmt )
+     }
+ }
+ 
++static void get_video_frame_visible_size( const struct unix_transform *t, const AVFrame *frame, int *width, int *height )
++{
++    *width = frame->width;
++    *height = frame->height;
++
++    if (t->avctx && t->avctx->width > 0 && t->avctx->height > 0
++            && t->avctx->coded_width >= t->avctx->width && t->avctx->coded_height >= t->avctx->height
++            && frame->width >= t->avctx->width && frame->height >= t->avctx->height
++            && frame->width - t->avctx->width < 16 && frame->height - t->avctx->height < 16)
++    {
++        *width = t->avctx->width;
++        *height = t->avctx->height;
++    }
++    else if (t->avctx && t->avctx->codec_id == AV_CODEC_ID_H264
++            && frame->width == 1920 && frame->height == 1088)
++    {
++        *height = 1080;
++    }
++}
++
++static bool should_use_coded_video_output_size( const struct unix_transform *t, int width, int height )
++{
++    if (!t->avctx || t->avctx->coded_width < width || t->avctx->coded_height < height)
++        return false;
++    if (t->avctx->coded_width - width >= 16 || t->avctx->coded_height - height >= 16)
++        return false;
++
++    /* If FFmpeg reports the padded dimensions as the visible size, don't expose
++     * those padding rows to consumers. */
++    if (t->avctx->width == t->avctx->coded_width && t->avctx->height == t->avctx->coded_height
++            && t->avctx->coded_height > height)
++        return false;
++
++    if (t->out_width > 0 && t->out_height > 0
++            && (t->out_width < t->avctx->coded_width || t->out_height < t->avctx->coded_height))
++        return false;
++
++    return true;
++}
++
+ static int fill_output_image_arrays( struct unix_transform *t, uint8_t *data[4], int linesize[4],
+                                      BYTE *dst, enum AVPixelFormat fmt, int width, int height );
+ 
+@@ -314,11 +354,16 @@ static NTSTATUS copy_yuv420_frame_to_nv12( struct unix_transform *t, const AVFra
+ {
+     uint8_t *dst_data[4];
+     int dst_linesize[4];
+-    int copy_width = width < frame->width ? width : frame->width;
+-    int copy_height = height < frame->height ? height : frame->height;
++    int visible_width, visible_height;
++    int copy_width, copy_height;
+     int x, y;
+ 
+-    if (frame->format != AV_PIX_FMT_YUV420P && frame->format != AV_PIX_FMT_YUVJ420P)
++    get_video_frame_visible_size( t, frame, &visible_width, &visible_height );
++    copy_width = width < visible_width ? width : visible_width;
++    copy_height = height < visible_height ? height : visible_height;
++
++    if (frame->format != AV_PIX_FMT_YUV420P && frame->format != AV_PIX_FMT_YUVJ420P
++            && frame->format != AV_PIX_FMT_NV12)
+         return STATUS_NOT_SUPPORTED;
+     if (t->out_pix_fmt != AV_PIX_FMT_NV12)
+         return STATUS_NOT_SUPPORTED;
+@@ -332,6 +377,17 @@ static NTSTATUS copy_yuv420_frame_to_nv12( struct unix_transform *t, const AVFra
+     memset(dst, 0, dst_size);
+     memset(dst_data[1], 0x80, dst_linesize[1] * height / 2);
+ 
++    if (frame->format == AV_PIX_FMT_NV12)
++    {
++        for (y = 0; y < copy_height; ++y)
++            memcpy(dst_data[0] + y * dst_linesize[0], frame->data[0] + y * frame->linesize[0], copy_width);
++
++        for (y = 0; y < copy_height / 2; ++y)
++            memcpy(dst_data[1] + y * dst_linesize[1], frame->data[1] + y * frame->linesize[1], copy_width);
++
++        return STATUS_SUCCESS;
++    }
++
+     for (y = 0; y < copy_height; ++y)
+         memcpy(dst_data[0] + y * dst_linesize[0], frame->data[0] + y * frame->linesize[0], copy_width);
+ 
+@@ -582,9 +638,12 @@ static NTSTATUS copy_video_frame( struct unix_transform *t, const AVFrame *frame
+ {
+     enum AVPixelFormat out_fmt = (t->out_pix_fmt != AV_PIX_FMT_NONE)
+                                  ? t->out_pix_fmt : (enum AVPixelFormat)frame->format;
+-    int src_width = frame->width, src_height = frame->height;
++    int src_width, src_height;
++
++    get_video_frame_visible_size( t, frame, &src_width, &src_height );
+ 
+-    if (out_width <= frame->width && out_height <= frame->height
++    if (src_width == frame->width && src_height == frame->height
++            && out_width <= frame->width && out_height <= frame->height
+             && frame->width - out_width < 16 && frame->height - out_height < 16)
+     {
+         src_width = out_width;
+@@ -1262,12 +1321,14 @@ NTSTATUS transform_get_output( void *arg )
+     }
+     else
+     {
+-        if (t->frame->width  != t->last_width  ||
+-            t->frame->height != t->last_height ||
++        int width, height;
++
++        get_video_frame_visible_size( t, t->frame, &width, &height );
++        if (width != t->last_width || height != t->last_height ||
+             (enum AVPixelFormat)t->frame->format != t->last_pix_fmt)
+         {
+-            t->last_width   = t->frame->width;
+-            t->last_height  = t->frame->height;
++            t->last_width = width;
++            t->last_height = height;
+             t->last_pix_fmt = (enum AVPixelFormat)t->frame->format;
+             if (t->sws) { sws_freeContext( t->sws ); t->sws = NULL; }
+             if (!t->is_raw_video)
+@@ -1451,6 +1512,13 @@ NTSTATUS transform_get_output( void *arg )
          UINT32 required = video_frame_size( out_fmt, out_width, out_height );
          NTSTATUS st;
  
-+        if (t->avctx && t->avctx->coded_width >= out_width && t->avctx->coded_height >= out_height
-+                && t->avctx->coded_width - out_width < 16 && t->avctx->coded_height - out_height < 16)
++        if (should_use_coded_video_output_size( t, out_width, out_height ))
 +        {
 +            out_width = t->avctx->coded_width;
 +            out_height = t->avctx->coded_height;
@@ -36,5 +158,15 @@ diff --git a/dlls/winedmo/unix_transform.c b/dlls/winedmo/unix_transform.c
          if (capacity < required)
          {
              params->size = required;
+@@ -1597,8 +1665,7 @@ NTSTATUS transform_get_output_format( void *arg )
+                                    ? t->last_pix_fmt : AV_PIX_FMT_NV12);
+         DWORD fourcc = t->out_video_fourcc ? t->out_video_fourcc : mf_fourcc_from_pix_fmt( pf );
+ 
+-        if (t->avctx && t->avctx->coded_width >= visible_w && t->avctx->coded_height >= visible_h
+-                && t->avctx->coded_width - visible_w < 16 && t->avctx->coded_height - visible_h < 16)
++        if (should_use_coded_video_output_size( t, visible_w, visible_h ))
+         {
+             w = t->avctx->coded_width;
+             h = t->avctx->coded_height;
 -- 
 2.50.0
