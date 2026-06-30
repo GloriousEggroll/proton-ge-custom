@@ -293,21 +293,12 @@ apply_all_in_dir() {
 
     # https://github.com/xzn/proton-ds5-haptic
     echo "WINE: -HOTFIX- Add proton DS5 patches"
-    for patch in ../patches/proton-ds5-haptic/00{01..12}-*.patch; do
+    for patch in ../patches/proton-ds5-haptic/*.patch; do
         apply_patch "$patch"
     done
 
-
     echo "WINE: -HOTFIX- Implement GE-Proton ffmpeg + winedmo only video playback rework patches"
     apply_all_in_dir "../patches/ge-video-rework/"
-
-    echo "WINE: -HOTFIX- Add proton DS5 direct USB haptics patch"
-    apply_patch "../patches/proton-ds5-haptic/0013-winepulse-route-dualsense-usb-haptics-to-raw-node.patch"
-    apply_patch "../patches/proton-ds5-haptic/0014-winebus-prefer-hidraw-for-dualsense-hotplug.patch"
-    apply_patch "../patches/proton-ds5-haptic/0015-winepulse-refresh-audio-endpoint-deltas-for-ds5-hotplug.patch"
-    apply_patch "../patches/proton-ds5-haptic/0016-winepulse-refresh-ds5-hotplug-only-on-audio-events.patch"
-    apply_patch "../patches/proton-ds5-haptic/0017-mmdevapi-notify-device-added-when-hotplugged-endpoint.patch"
-    apply_patch "../patches/proton-ds5-haptic/0018-winebus-remove-hidraw-device-on-fatal-read-error.patch"
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
