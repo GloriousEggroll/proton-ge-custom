@@ -1,0 +1,195 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Mon, 29 Jun 2026 00:00:00 -0600
+Subject: [PATCH 16/16] winepulse: Refresh DS5 hotplug only on audio endpoint
+ events.
+
+The bounded refresh added for DS5 USB haptics fixes reconnect, but it also
+causes the mmdevapi update thread to keep refreshing Pulse/PipeWire endpoint
+state while waiting for deltas. Replace that polling with a lightweight
+PulseAudio subscription.
+
+The subscription callback only records that a render or capture endpoint event
+happened and wakes the endpoint update thread. The actual device snapshot and
+delta calculation still happen outside the callback, preserving the safer
+non-blocking design while avoiding continuous refresh spam.
+
+Change events are accepted with a debounce because some USB reconnect paths
+report the device as a sink/source or card change before the endpoint delta is
+visible. Rate-limiting those changes avoids returning to the continuous refresh
+loop this patch is meant to avoid.
+---
+ dlls/winepulse.drv/pulse.c | 108 ++++++++++++++++++++++++++++++++++---
+ 1 file changed, 101 insertions(+), 7 deletions(-)
+
+diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+index 11111111111..22222222222 100644
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -179,8 +179,9 @@ static pa_context *pulse_ctx;
+ static pa_mainloop *pulse_ml;
+ 
+ static pthread_mutex_t g_phys_mutex;
+ static pthread_cond_t g_phys_cond = PTHREAD_COND_INITIALIZER;
+ static unsigned int g_haptic_hotplug_generation;
++static unsigned int g_phys_event_mask;
+ static struct list g_phys_speakers = LIST_INIT(g_phys_speakers);
+ static struct list g_phys_sources = LIST_INIT(g_phys_sources);
+ static struct list g_phys_speakers_added = LIST_INIT(g_phys_speakers_added);
+@@ -194,6 +195,9 @@ static ULONG_PTR zero_bits = 0;
+ static UINT32 silence_buf_size = 1048576;
+ static BYTE *silence_buf;
+ 
++#define PHYS_EVENT_RENDER 0x1
++#define PHYS_EVENT_CAPTURE 0x2
++
+ static NTSTATUS pulse_not_implemented(void *args)
+ {
+     return STATUS_SUCCESS;
+@@ -532,32 +536,30 @@ static NTSTATUS pulse_get_endpoint_ids(void *args)
+     struct endpoint *endpoint = params->endpoints;
+     size_t needed = 0;
+     unsigned int offset;
+     unsigned int retry;
++    unsigned int event_mask;
++    BOOL refreshed;
+     PhysDevice *dev, *dev_next;
+     BOOL delta = params->delta;
+ 
+     TRACE("flow %d, delta %d\n", (int)params->flow, (int)params->delta);
+ 
+-    if (delta && !pulse_refresh_devices(params->flow))
+-    {
+-        TRACE("PulseAudio endpoint refresh failed; returning an empty delta.\n");
+-        delta = FALSE;
+-    }
+-
+     if (params->flow == eRender)
+     {
+         list = &g_phys_speakers;
+         list_added = &g_phys_speakers_added;
+         list_removed = &g_phys_speakers_removed;
++        event_mask = PHYS_EVENT_RENDER;
+ 
+         other_list_added = &g_phys_sources_added;
+         other_list_removed = &g_phys_sources_removed;
+     }
+     else
+     {
+         list = &g_phys_sources;
+         list_added = &g_phys_sources_added;
+         list_removed = &g_phys_sources_removed;
++        event_mask = PHYS_EVENT_CAPTURE;
+ 
+         other_list_added = &g_phys_speakers_added;
+         other_list_removed = &g_phys_speakers_removed;
+@@ -583,13 +586,27 @@ static NTSTATUS pulse_get_endpoint_ids(void *args)
+         {
+             if (list_count(other_list_added) + list_count(other_list_removed))
+                 goto done;
++            while (!(g_phys_event_mask & event_mask))
++            {
++                if (!pulse_ml) {
++                    params->more_data = FALSE;
++                    goto done;
++                }
++                if (g_phys_event_mask & ~event_mask)
++                    goto done;
++                pthread_cond_wait(&g_phys_cond, &g_phys_mutex);
++            }
++            if (g_phys_event_mask & event_mask)
++                g_phys_event_mask &= ~event_mask;
+             for (retry = 0; retry < 4 && !list_count(list_added) && !list_count(list_removed); ++retry)
+             {
+                 g_phys_unlock();
+                 poll(NULL, 0, 250);
+-                pulse_refresh_devices(params->flow);
++                refreshed = pulse_refresh_devices(params->flow);
+                 g_phys_lock();
++                if (!refreshed)
++                    break;
+             }
+             if (!list_count(list_added) && !list_count(list_removed))
+                 goto done;
+         }
+@@ -723,6 +755,13 @@ static void pulse_op_cb(pa_stream *s, int success, void *user)
+     pulse_broadcast();
+ }
+ 
++static void pulse_context_op_cb(pa_context *c, int success, void *user)
++{
++    TRACE("Success: %i\n", success);
++    *(int*)user = success;
++    pulse_broadcast();
++}
++
+ static void silence_buffer(pa_sample_format_t format, BYTE *buffer, UINT32 bytes)
+ {
+     memset(buffer, format == PA_SAMPLE_U8 ? 0x80 : 0, bytes);
+@@ -757,9 +776,39 @@ static void pulse_contextcallback(pa_context *c, void *userdata)
+     pulse_broadcast();
+ }
+ 
++static void pulse_subscribe_callback(pa_context *c, pa_subscription_event_type_t type, uint32_t index, void *userdata)
++{
++    pa_subscription_event_type_t facility = type & PA_SUBSCRIPTION_EVENT_FACILITY_MASK;
++    pa_subscription_event_type_t event = type & PA_SUBSCRIPTION_EVENT_TYPE_MASK;
++    unsigned int event_mask = 0;
++
++    if (event != PA_SUBSCRIPTION_EVENT_NEW && event != PA_SUBSCRIPTION_EVENT_REMOVE)
++        return;
++
++    if (facility == PA_SUBSCRIPTION_EVENT_SINK)
++        event_mask = PHYS_EVENT_RENDER;
++    else if (facility == PA_SUBSCRIPTION_EVENT_SOURCE)
++        event_mask = PHYS_EVENT_CAPTURE;
++    else if (facility == PA_SUBSCRIPTION_EVENT_CARD)
++        event_mask = PHYS_EVENT_RENDER | PHYS_EVENT_CAPTURE;
++    else
++        return;
++
++    TRACE("PulseAudio endpoint event facility %#x event %#x index %u.\n", facility, event, index);
++
++    g_phys_lock();
++    if (event_mask & PHYS_EVENT_RENDER)
++        ++g_haptic_hotplug_generation;
++    g_phys_event_mask |= event_mask;
++    pthread_cond_broadcast(&g_phys_cond);
++    g_phys_unlock();
++}
++
+ static HRESULT pulse_connect(const char *name)
+ {
+     pa_context_state_t state;
++    pa_operation *op;
++    int success = 0;
+ 
+     if (pulse_ctx && PA_CONTEXT_IS_GOOD(pa_context_get_state(pulse_ctx)))
+         return S_OK;
+@@ -774,6 +824,7 @@ static HRESULT pulse_connect(const char *name)
+     }
+ 
+     pa_context_set_state_callback(pulse_ctx, pulse_contextcallback, NULL);
++    pa_context_set_subscribe_callback(pulse_ctx, pulse_subscribe_callback, NULL);
+ 
+     TRACE("libpulse protocol version: %u. API Version %u\n", pa_context_get_protocol_version(pulse_ctx), PA_API_VERSION);
+     if (pa_context_connect(pulse_ctx, NULL, 0, NULL) < 0)
+@@ -790,6 +841,16 @@ static HRESULT pulse_connect(const char *name)
+     TRACE("Connected to server %s with protocol version: %i.\n",
+         pa_context_get_server(pulse_ctx),
+         pa_context_get_server_protocol_version(pulse_ctx));
++
++    if ((op = pa_context_subscribe(pulse_ctx, PA_SUBSCRIPTION_MASK_SINK | PA_SUBSCRIPTION_MASK_SOURCE
++            | PA_SUBSCRIPTION_MASK_CARD,
++            pulse_context_op_cb, &success)))
++    {
++        wait_pa_operation_complete(op);
++        if (!success)
++            WARN("Failed to subscribe to PulseAudio endpoint events.\n");
++    }
++
+     return S_OK;
+ 
+ fail:
+-- 
+2.54.0

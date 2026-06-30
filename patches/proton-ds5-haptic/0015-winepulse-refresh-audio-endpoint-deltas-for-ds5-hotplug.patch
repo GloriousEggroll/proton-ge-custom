@@ -1,0 +1,289 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Mon, 29 Jun 2026 00:00:00 -0600
+Subject: [PATCH 15/15] winepulse: Refresh audio endpoint deltas for DS5
+ hotplug.
+
+The DS5 haptic path routes the controller's four-channel haptic audio stream
+to the raw ALSA endpoint. That works for an initially connected USB controller,
+but after unplug the game can release the haptic IAudioClient. When the
+controller is plugged back in, winebus recreates the HID device correctly, but
+mmdevapi never sees a useful render endpoint add event because the previous
+hotplug workaround disabled the PulseAudio delta path and only returned the
+stale startup snapshot.
+
+Keep the non-subscribed design, but make each delta query refresh a bounded
+Pulse/PipeWire snapshot with a private mainloop. Compare it with the cached
+endpoint list and report actual added/removed endpoints to mmdevapi. This lets
+games recreate the DS5 haptic audio stream after USB reconnect without
+restoring the original blocking subscription callback.
+---
+ dlls/winepulse.drv/pulse.c | 127 ++++++++++++++++++++++++++++++++++--
+ 1 file changed, 123 insertions(+), 4 deletions(-)
+
+diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+index 11111111111..22222222222 100644
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -519,6 +519,8 @@ again:
+     }
+ }
+ 
++static BOOL pulse_refresh_devices(EDataFlow flow);
++
+ /* for winepulse, this function can be called in a separate thread from other functions. */
+ /* this function cannot be called from multiple threads at the same time however. */
+ /* for the list variable, all devices in it must be ready by the end of the lock. */
+@@ -532,14 +534,17 @@ static NTSTATUS pulse_get_endpoint_ids(void *args)
+     struct endpoint *endpoint = params->endpoints;
+     size_t needed = 0;
+     unsigned int offset;
++    unsigned int retry;
+     PhysDevice *dev, *dev_next;
+     BOOL delta = params->delta;
+ 
+     TRACE("flow %d, delta %d\n", (int)params->flow, (int)params->delta);
+ 
+-    if (delta)
+-        TRACE("blocking PulseAudio delta updates are disabled; returning a full snapshot instead.\n");
+-    delta = FALSE;
++    if (delta && !pulse_refresh_devices(params->flow))
++    {
++        TRACE("PulseAudio endpoint refresh failed; returning an empty delta.\n");
++        delta = FALSE;
++    }
+ 
+     if (params->flow == eRender)
+     {
+@@ -570,17 +575,24 @@ static NTSTATUS pulse_get_endpoint_ids(void *args)
+     if (delta)
+     {
+         params->more_data = TRUE;
+-        for(;;) {
+-            /* also check if we are still running */
+-            if (!pulse_ml) {
+-                params->more_data = FALSE;
+-                goto done;
+-            }
+-            if (list_count(list_added) + list_count(list_removed))
+-                break;
+-            if (list_count(other_list_added) + list_count(other_list_removed))
++        /* also check if we are still running */
++        if (!pulse_ml) {
++            params->more_data = FALSE;
++            goto done;
++        }
++        if (!list_count(list_added) && !list_count(list_removed))
++        {
++            if (list_count(other_list_added) + list_count(other_list_removed))
+                 goto done;
+-            pthread_cond_wait(&g_phys_cond, &g_phys_mutex);
++            for (retry = 0; retry < 4 && !list_count(list_added) && !list_count(list_removed); ++retry)
++            {
++                g_phys_unlock();
++                poll(NULL, 0, 250);
++                pulse_refresh_devices(params->flow);
++                g_phys_lock();
++            }
++            if (!list_count(list_added) && !list_count(list_removed))
++                goto done;
+         }
+ 
+         params->default_idx = -1;
+@@ -638,7 +642,7 @@ done:
+         params->size = needed;
+         params->result = HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+     } else {
+-        params->delta = FALSE;
++        params->delta = TRUE;
+         params->result = S_OK;
+     }
+     return STATUS_SUCCESS;
+@@ -731,6 +735,9 @@ static BOOL pulse_stream_haptic(struct pulse_stream *stream)
+     return stream->dataflow == eRender && stream->haptic_alsa_path;
+ }
+ 
++static void pulse_probe_settings(pa_mainloop *ml, pa_context *ctx, int render, const char *pulse_name,
++                                 WAVEFORMATEXTENSIBLE *fmt, REFERENCE_TIME *def_period, REFERENCE_TIME *min_period);
++
+ static void pulse_contextcallback(pa_context *c, void *userdata)
+ {
+     switch (pa_context_get_state(c))
+@@ -1025,7 +1032,7 @@ static BOOL string_contains_dualsense_name(const char *name)
+             || strstr(name, "Wireless Controller") || strstr(name, "Sony_Interactive_Entertainment"));
+ }
+ 
+-static void pulse_add_device(struct list *list, pa_proplist *proplist, int index, EndpointFormFactor form,
++static void pulse_add_device(struct list *list, EDataFlow flow, pa_proplist *proplist, int index, EndpointFormFactor form,
+                              UINT channel_mask, const char *pulse_name, const char *desc)
+ {
+     size_t len = strlen(pulse_name);
+@@ -1041,7 +1048,7 @@ static void pulse_add_device(struct list *list, pa_proplist *proplist, int index
+         free(dev);
+         return;
+     }
+-    dev->flow = list == &g_phys_speakers || list == &g_phys_speakers_added ? eRender : eCapture;
++    dev->flow = flow;
+     dev->form = form;
+     dev->index = index;
+     dev->channel_mask = channel_mask;
+@@ -1074,21 +1081,143 @@ static void pulse_phys_speakers_cb(pa_context *c, const pa_sink_info *i, int eol
+ 
+     /* For default PulseAudio render device, OR together all of the
+      * PKEY_AudioEndpoint_PhysicalSpeakers values of the sinks. */
+-    speaker = list_head(&g_phys_speakers);
++    speaker = list_head(userdata ? userdata : &g_phys_speakers);
+     if (speaker)
+         LIST_ENTRY(speaker, PhysDevice, entry)->channel_mask |= channel_mask;
+ 
+-    pulse_add_device(&g_phys_speakers, i->proplist, i->index, Speakers, channel_mask, i->name, i->description);
++    pulse_add_device(userdata ? userdata : &g_phys_speakers, eRender, i->proplist, i->index, Speakers, channel_mask,
++            i->name, i->description);
+ }
+ 
+ static void pulse_phys_sources_cb(pa_context *c, const pa_source_info *i, int eol, void *userdata)
+ {
+     if (!i || !i->name || !i->name[0])
+         return;
+-    pulse_add_device(&g_phys_sources, i->proplist, i->index,
++    pulse_add_device(userdata ? userdata : &g_phys_sources, eCapture, i->proplist, i->index,
+         (i->monitor_of_sink == PA_INVALID_INDEX) ? Microphone : LineLevel, 0, i->name, i->description);
+ }
+ 
++static PhysDevice *pulse_find_device(struct list *list, const char *pulse_name)
++{
++    PhysDevice *dev;
++
++    LIST_FOR_EACH_ENTRY(dev, list, PhysDevice, entry)
++        if (!strcmp(dev->pulse_name, pulse_name))
++            return dev;
++
++    return NULL;
++}
++
++static void pulse_probe_device_list(pa_mainloop *ml, pa_context *ctx, struct list *list, BOOL render)
++{
++    PhysDevice *dev;
++
++    LIST_FOR_EACH_ENTRY(dev, list, PhysDevice, entry)
++        pulse_probe_settings(ml, ctx, render, dev->pulse_name, &dev->fmt, &dev->def_period, &dev->min_period);
++}
++
++static BOOL pulse_refresh_devices(EDataFlow flow)
++{
++    struct list current = LIST_INIT(current);
++    struct list *active = flow == eRender ? &g_phys_speakers : &g_phys_sources;
++    struct list *added = flow == eRender ? &g_phys_speakers_added : &g_phys_sources_added;
++    struct list *removed = flow == eRender ? &g_phys_speakers_removed : &g_phys_sources_removed;
++    PhysDevice *dev, *next;
++    pa_mainloop *ml;
++    pa_context *ctx;
++    pa_operation *o;
++    int ret;
++
++    if (!(ml = pa_mainloop_new()))
++        return FALSE;
++
++    if (!(ctx = pa_context_new(pa_mainloop_get_api(ml), "winepulse device refresh")))
++    {
++        pa_mainloop_free(ml);
++        return FALSE;
++    }
++
++    pa_context_set_state_callback(ctx, pulse_contextcallback, NULL);
++    if (pa_context_connect(ctx, NULL, 0, NULL) < 0)
++        goto fail;
++
++    while (pa_mainloop_iterate(ml, 1, &ret) >= 0)
++    {
++        pa_context_state_t state = pa_context_get_state(ctx);
++
++        if (state == PA_CONTEXT_FAILED || state == PA_CONTEXT_TERMINATED)
++            goto fail;
++        if (state == PA_CONTEXT_READY)
++            break;
++    }
++
++    if (flow == eRender)
++        pulse_add_device(&current, eRender, NULL, 0, Speakers, 0, "", "PulseAudio Output");
++    else
++        pulse_add_device(&current, eCapture, NULL, 0, Microphone, 0, "", "PulseAudio Input");
++
++    if (flow == eRender)
++        o = pa_context_get_sink_info_list(ctx, pulse_phys_speakers_cb, &current);
++    else
++        o = pa_context_get_source_info_list(ctx, pulse_phys_sources_cb, &current);
++
++    if (o)
++    {
++        while (pa_mainloop_iterate(ml, 1, &ret) >= 0 && pa_operation_get_state(o) == PA_OPERATION_RUNNING)
++        {}
++        pa_operation_unref(o);
++    }
++
++    pulse_probe_device_list(ml, ctx, &current, flow == eRender);
++
++    g_phys_lock();
++
++    LIST_FOR_EACH_ENTRY_SAFE(dev, next, active, PhysDevice, entry)
++    {
++        if (pulse_find_device(&current, dev->pulse_name))
++            continue;
++        TRACE("PulseAudio endpoint %s was removed.\n", debugstr_a(dev->pulse_name));
++        if (flow == eRender && is_dualsense_audio_device(dev))
++            ++g_haptic_hotplug_generation;
++        list_remove(&dev->entry);
++        list_add_tail(removed, &dev->entry);
++    }
++
++    LIST_FOR_EACH_ENTRY_SAFE(dev, next, &current, PhysDevice, entry)
++    {
++        if (pulse_find_device(active, dev->pulse_name) || pulse_find_device(added, dev->pulse_name))
++        {
++            list_remove(&dev->entry);
++            pulse_dev_free(dev);
++            continue;
++        }
++
++        TRACE("PulseAudio endpoint %s was added.\n", debugstr_a(dev->pulse_name));
++        if (flow == eRender && is_dualsense_audio_device(dev))
++            ++g_haptic_hotplug_generation;
++        list_remove(&dev->entry);
++        list_add_tail(added, &dev->entry);
++    }
++
++    g_phys_unlock();
++
++    pa_context_unref(ctx);
++    pa_mainloop_free(ml);
++
++    LIST_FOR_EACH_ENTRY_SAFE(dev, next, &current, PhysDevice, entry)
++        pulse_dev_free(dev);
++
++    pthread_cond_broadcast(&g_phys_cond);
++    return TRUE;
++
++fail:
++    pa_context_unref(ctx);
++    pa_mainloop_free(ml);
++    LIST_FOR_EACH_ENTRY_SAFE(dev, next, &current, PhysDevice, entry)
++        pulse_dev_free(dev);
++    return FALSE;
++}
++
+ /* For most hardware on Windows, users must choose a configuration with an even
+  * number of channels (stereo, quad, 5.1, 7.1). Users can then disable
+  * channels, but those channels are still reported to applications from
+@@ -1427,8 +1534,8 @@ static NTSTATUS pulse_test_connect(void *args)
+     list_init(&g_phys_sources);
+ 
+     /* Burnout Paradise Remastered expects device name to have a space. */
+-    pulse_add_device(&g_phys_speakers, NULL, 0, Speakers, 0, "", "PulseAudio Output");
+-    pulse_add_device(&g_phys_sources, NULL, 0, Microphone, 0, "", "PulseAudio Input");
++    pulse_add_device(&g_phys_speakers, eRender, NULL, 0, Speakers, 0, "", "PulseAudio Output");
++    pulse_add_device(&g_phys_sources, eCapture, NULL, 0, Microphone, 0, "", "PulseAudio Input");
+ 
+     o = pa_context_get_sink_info_list(ctx, &pulse_phys_speakers_cb, NULL);
+     if (o) {
+-- 
+2.54.0

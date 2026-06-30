@@ -1,0 +1,216 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Mon, 29 Jun 2026 00:00:00 -0600
+Subject: [PATCH 14/14] winebus: Prefer hidraw immediately for DualSense
+ hotplug.
+
+DualSense and DualSense Edge require the hidraw path for their native HID
+reports and haptic behavior. During USB hotplug, the non-hidraw backend can
+arrive before the matching hidraw node. If Wine exposes that temporary device,
+some games may bind the wrong controller personality and keep using it after
+the hidraw device appears, causing bad mappings such as the left stick being
+treated like camera input until a second unplug/replug cycle.
+
+Ignore non-hidraw DualSense devices without waiting for the hidraw device to
+already exist in Wine's device list. Also ignore SDL DualSense devices at the
+SDL bus source so games never see the temporary SDL mapping before Wine rejects
+it. Other devices keep the existing fallback behavior.
+
+---
+ dlls/winebus.sys/bus_sdl.c |  7 +++++
+ dlls/winebus.sys/main.c    | 78 ++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 84 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/winebus.sys/bus_sdl.c b/dlls/winebus.sys/bus_sdl.c
+index fbea0cb00b9..a532205a1f9 100644
+--- a/dlls/winebus.sys/bus_sdl.c
++++ b/dlls/winebus.sys/bus_sdl.c
+@@ -999,6 +999,13 @@ static void sdl_add_device(unsigned int index)
+         pSDL_JoystickClose(joystick);
+         return;
+     }
++    if (is_dualsense_gamepad(desc.vid, desc.pid))
++    {
++        TRACE("ignoring SDL DualSense device %s; hidraw handles native reports.\n", debugstr_device_desc(&desc));
++        if (controller) pSDL_GameControllerClose(controller);
++        pSDL_JoystickClose(joystick);
++        return;
++    }
+ 
+     if (is_emulating_steaminput())
+     {
+diff --git a/dlls/winebus.sys/main.c b/dlls/winebus.sys/main.c
+index 4bc967176ab..b297aaf40e5 100644
+--- a/dlls/winebus.sys/main.c
++++ b/dlls/winebus.sys/main.c
+@@ -75,6 +75,23 @@ enum device_state
+ #define HIDRAW_FIXUP_DUALSHOCK_BT 0x1
+ #define HIDRAW_FIXUP_DUALSENSE_BT 0x2
+ 
++#define DUALSENSE_OUTPUT_REPORT_USB 0x02
++#define DUALSENSE_OUTPUT_REPORT_USB_SIZE 63
++#define DUALSENSE_OUTPUT_REPORT_BT 0x31
++#define DUALSENSE_OUTPUT_REPORT_BT_SIZE 78
++#define DUALSENSE_OUTPUT_REPORT_COMMON_SIZE 47
++#define DUALSENSE_OUTPUT_REPORT_BT_COMMON_OFFSET 3
++#define DUALSENSE_OUTPUT_REPORT_USB_COMMON_OFFSET 1
++#define DUALSENSE_OUTPUT_VALID_FLAG0_COMPATIBLE_VIBRATION 0x01
++#define DUALSENSE_OUTPUT_VALID_FLAG0_HAPTICS_SELECT 0x02
++#define DUALSENSE_OUTPUT_VALID_FLAG2_COMPATIBLE_VIBRATION2 0x04
++#define DUALSENSE_OUTPUT_VALID_FLAG0_OFFSET 1
++#define DUALSENSE_OUTPUT_VALID_FLAG2_OFFSET 39
++#define DUALSENSE_OUTPUT_MOTOR_RIGHT_OFFSET 3
++#define DUALSENSE_OUTPUT_MOTOR_LEFT_OFFSET 4
++#define DUALSENSE_HID_HAPTICS_RUMBLE_OFFSET 13
++#define DUALSENSE_HID_HAPTICS_BUZZ_OFFSET 24
++
+ struct device_extension
+ {
+     struct list entry;
+@@ -471,6 +488,46 @@ static void bus_unlink_hid_device(DEVICE_OBJECT *device)
+     RtlLeaveCriticalSection(&device_list_cs);
+ }
+ 
++static void bus_unlink_devices_from_vid_pid(struct device_desc *desc, USAGE_AND_PAGE *usages)
++{
++    DEVICE_OBJECT *device;
++
++    while ((device = bus_find_device_from_vid_pid(FALSE, desc, usages)))
++        bus_unlink_hid_device(device);
++
++    /* Fast USB reconnect can create a new hidraw node before the old removal event
++     * is processed. Remove stale matching hidraw devices before exposing the new one. */
++    while ((device = bus_find_device_from_vid_pid(TRUE, desc, usages)))
++        bus_unlink_hid_device(device);
++}
++
++static void hidraw_enable_dualsense_usb_haptics(DEVICE_OBJECT *device)
++{
++    struct device_extension *ext = (struct device_extension *)device->DeviceExtension;
++    HID_XFER_PACKET packet;
++    IO_STATUS_BLOCK io = {0};
++    BYTE report[DUALSENSE_OUTPUT_REPORT_USB_SIZE] = {0};
++
++    if (!ext->desc.is_hidraw || ext->desc.bus_type == BUS_TYPE_BLUETOOTH)
++        return;
++    if (!is_dualsense_gamepad(ext->desc.vid, ext->desc.pid))
++        return;
++
++    report[0] = DUALSENSE_OUTPUT_REPORT_USB;
++    report[DUALSENSE_OUTPUT_VALID_FLAG0_OFFSET] =
++            DUALSENSE_OUTPUT_VALID_FLAG0_COMPATIBLE_VIBRATION | DUALSENSE_OUTPUT_VALID_FLAG0_HAPTICS_SELECT;
++    report[DUALSENSE_OUTPUT_VALID_FLAG2_OFFSET] = DUALSENSE_OUTPUT_VALID_FLAG2_COMPATIBLE_VIBRATION2;
++
++    packet.reportId = DUALSENSE_OUTPUT_REPORT_USB;
++    packet.reportBuffer = report;
++    packet.reportBufferLen = sizeof(report);
++
++    TRACE("Enabling DualSense USB haptics mode on device %p.\n", device);
++    unix_device_set_output_report(device, &packet, &io);
++    if (io.Status)
++        WARN("Failed to enable DualSense USB haptics mode on device %p: %#lx\n", device, io.Status);
++}
++
+ #ifdef __ASM_USE_FASTCALL_WRAPPER
+ extern void * WINAPI wrap_fastcall_func1(void *func, const void *a);
+ __ASM_STDCALL_FUNC(wrap_fastcall_func1, 8,
+@@ -1049,8 +1108,12 @@ static DWORD CALLBACK bus_main_thread(void *args)
+             else if (desc.is_hidraw && hidraw_enabled)
+             {
+                 RtlEnterCriticalSection(&device_list_cs);
+-                if ((device = bus_find_device_from_vid_pid(FALSE, &event->device_created.desc, &usages)))
++                if (is_dualsense_gamepad(desc.vid, desc.pid))
++                    bus_unlink_devices_from_vid_pid(&event->device_created.desc, &usages);
++                else if ((device = bus_find_device_from_vid_pid(FALSE, &event->device_created.desc, &usages)))
+                     bus_unlink_hid_device(device);
+                 device = bus_create_hid_device(&event->device_created.desc, event->device);
+                 RtlLeaveCriticalSection(&device_list_cs);
++                if (device && is_dualsense_gamepad(desc.vid, desc.pid))
++                    hidraw_enable_dualsense_usb_haptics(device);
+             }
+@@ -1057,7 +1089,8 @@ static DWORD CALLBACK bus_main_thread(void *args)
+             else /* desc.is_hidraw == FALSE */
+             {
+                 RtlEnterCriticalSection(&device_list_cs);
+-                if (hidraw_enabled && bus_find_device_from_vid_pid(TRUE, &event->device_created.desc, &usages)) device = NULL;
++                if (is_dualsense_gamepad(desc.vid, desc.pid)) device = NULL;
++                else if (hidraw_enabled && bus_find_device_from_vid_pid(TRUE, &event->device_created.desc, &usages)) device = NULL;
+                 else device = bus_create_hid_device(&event->device_created.desc, event->device);
+                 RtlLeaveCriticalSection(&device_list_cs);
+             }
+@@ -1572,6 +1608,55 @@ static void hidraw_disable_report_fixups(DEVICE_OBJECT *device)
+     }
+ }
+ 
++static BYTE dualsense_hid_haptics_intensity_to_motor(BYTE lo, BYTE hi)
++{
++    USHORT value = lo | (hi << 8);
++
++    return value <= 0xff ? value : value / 257;
++}
++
++static BOOL hidraw_fixup_dualsense_usb_output_report(struct device_extension *ext,
++        HID_XFER_PACKET *packet, HID_XFER_PACKET *fixed_packet, BYTE *fixed_report)
++{
++    BYTE motor_left, motor_right;
++
++    if (!ext->desc.is_hidraw || ext->desc.bus_type == BUS_TYPE_BLUETOOTH)
++        return FALSE;
++    if (!is_dualsense_gamepad(ext->desc.vid, ext->desc.pid))
++        return FALSE;
++    if (packet->reportId != DUALSENSE_OUTPUT_REPORT_BT
++            || packet->reportBufferLen != DUALSENSE_OUTPUT_REPORT_BT_SIZE
++            || packet->reportBuffer[0] != DUALSENSE_OUTPUT_REPORT_BT)
++        return FALSE;
++
++    memset(fixed_report, 0, DUALSENSE_OUTPUT_REPORT_USB_SIZE);
++    fixed_report[0] = DUALSENSE_OUTPUT_REPORT_USB;
++    memcpy(fixed_report + DUALSENSE_OUTPUT_REPORT_USB_COMMON_OFFSET,
++            packet->reportBuffer + DUALSENSE_OUTPUT_REPORT_BT_COMMON_OFFSET,
++            DUALSENSE_OUTPUT_REPORT_COMMON_SIZE);
++
++    motor_left = dualsense_hid_haptics_intensity_to_motor(
++            packet->reportBuffer[DUALSENSE_HID_HAPTICS_RUMBLE_OFFSET],
++            packet->reportBuffer[DUALSENSE_HID_HAPTICS_RUMBLE_OFFSET + 1]);
++    motor_right = dualsense_hid_haptics_intensity_to_motor(
++            packet->reportBuffer[DUALSENSE_HID_HAPTICS_BUZZ_OFFSET],
++            packet->reportBuffer[DUALSENSE_HID_HAPTICS_BUZZ_OFFSET + 1]);
++    fixed_report[DUALSENSE_OUTPUT_VALID_FLAG0_OFFSET] |=
++            DUALSENSE_OUTPUT_VALID_FLAG0_COMPATIBLE_VIBRATION | DUALSENSE_OUTPUT_VALID_FLAG0_HAPTICS_SELECT;
++    fixed_report[DUALSENSE_OUTPUT_VALID_FLAG2_OFFSET] |= DUALSENSE_OUTPUT_VALID_FLAG2_COMPATIBLE_VIBRATION2;
++    fixed_report[DUALSENSE_OUTPUT_MOTOR_LEFT_OFFSET] = motor_left;
++    fixed_report[DUALSENSE_OUTPUT_MOTOR_RIGHT_OFFSET] = motor_right;
++    *fixed_packet = *packet;
++    fixed_packet->reportId = DUALSENSE_OUTPUT_REPORT_USB;
++    fixed_packet->reportBuffer = fixed_report;
++    fixed_packet->reportBufferLen = DUALSENSE_OUTPUT_REPORT_USB_SIZE;
++
++    TRACE("translated DualSense USB output report %#x/%lu to %#x/%lu, motors %u/%u.\n",
++            packet->reportId, packet->reportBufferLen,
++            fixed_packet->reportId, fixed_packet->reportBufferLen, motor_left, motor_right);
++    return TRUE;
++}
++
+ static NTSTATUS WINAPI hid_internal_dispatch(DEVICE_OBJECT *device, IRP *irp)
+ {
+     IO_STACK_LOCATION *irpsp = IoGetCurrentIrpStackLocation(irp);
+@@ -1695,6 +1778,8 @@ static NTSTATUS WINAPI hid_internal_dispatch(DEVICE_OBJECT *device, IRP *irp)
+         case IOCTL_HID_WRITE_REPORT:
+         {
+             HID_XFER_PACKET *packet = (HID_XFER_PACKET *)irp->UserBuffer;
++            HID_XFER_PACKET fixed_packet;
++            BYTE fixed_report[DUALSENSE_OUTPUT_REPORT_USB_SIZE];
+             if (TRACE_ON(hid))
+             {
+                 TRACE("write output report id %u length %lu:\n", packet->reportId, packet->reportBufferLen);
+@@ -1707,6 +1792,8 @@ static NTSTATUS WINAPI hid_internal_dispatch(DEVICE_OBJECT *device, IRP *irp)
+                     TRACE("%s\n", buffer);
+                 }
+             }
++            if (hidraw_fixup_dualsense_usb_output_report(ext, packet, &fixed_packet, fixed_report))
++                packet = &fixed_packet;
+             unix_device_set_output_report(device, packet, &irp->IoStatus);
+             if (!irp->IoStatus.Status) hidraw_disable_report_fixups(device);
+             break;
+-- 
+2.50.0

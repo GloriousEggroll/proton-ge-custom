@@ -241,11 +241,6 @@ apply_all_in_dir() {
     echo "WINE: -PENDING- RegGetValueW dwFlags hotfix (R.E.A.L VR mod)"
     apply_patch "../patches/wine-hotfixes/pending/registry_RRF_RT_REG_SZ-RRF_RT_REG_EXPAND_SZ.patch"
 
-    # https://github.com/ValveSoftware/wine/pull/205
-    # https://github.com/ValveSoftware/Proton/issues/4625
-    echo "WINE: -PENDING- Add WINE_DISABLE_SFN option. (Yakuza 5 cutscenes fix)"
-    apply_patch "../patches/wine-hotfixes/pending/ntdll_add_wine_disable_sfn.patch"
-
     echo "WINE: -PENDING- ncrypt: NCryptDecrypt implementation (PSN Login for Ghost of Tsushima)"
     apply_patch "../patches/wine-hotfixes/pending/NCryptDecrypt_implementation.patch"
 
@@ -296,8 +291,23 @@ apply_all_in_dir() {
     echo "WINE: add optiscaler patch"
     apply_patch "../patches/proton/0001-HACK-kernelbase-allow-overriding-dlls-for-DLSS-XeSS-.patch"
 
+    # https://github.com/xzn/proton-ds5-haptic
+    echo "WINE: -HOTFIX- Add proton DS5 patches"
+    for patch in ../patches/proton-ds5-haptic/00{01..12}-*.patch; do
+        apply_patch "$patch"
+    done
+
+
     echo "WINE: -HOTFIX- Implement GE-Proton ffmpeg + winedmo only video playback rework patches"
     apply_all_in_dir "../patches/ge-video-rework/"
+
+    echo "WINE: -HOTFIX- Add proton DS5 direct USB haptics patch"
+    apply_patch "../patches/proton-ds5-haptic/0013-winepulse-route-dualsense-usb-haptics-to-raw-node.patch"
+    apply_patch "../patches/proton-ds5-haptic/0014-winebus-prefer-hidraw-for-dualsense-hotplug.patch"
+    apply_patch "../patches/proton-ds5-haptic/0015-winepulse-refresh-audio-endpoint-deltas-for-ds5-hotplug.patch"
+    apply_patch "../patches/proton-ds5-haptic/0016-winepulse-refresh-ds5-hotplug-only-on-audio-events.patch"
+    apply_patch "../patches/proton-ds5-haptic/0017-mmdevapi-notify-device-added-when-hotplugged-endpoint.patch"
+    apply_patch "../patches/proton-ds5-haptic/0018-winebus-remove-hidraw-device-on-fatal-read-error.patch"
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f

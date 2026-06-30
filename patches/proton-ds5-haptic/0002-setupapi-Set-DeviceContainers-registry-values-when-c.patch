@@ -1,0 +1,147 @@
+From cf0a53c412e06e7d7ad947fe86ab959a43910d1f Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Wed, 24 Jun 2026 12:38:02 -0300
+Subject: [PATCH 02/11] setupapi: Set DeviceContainers registry values when
+ container ids are set.
+
+---
+ dlls/setupapi/devinst.c | 106 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 106 insertions(+)
+
+diff --git a/dlls/setupapi/devinst.c b/dlls/setupapi/devinst.c
+index 2226396f298..9d090d0274a 100644
+--- a/dlls/setupapi/devinst.c
++++ b/dlls/setupapi/devinst.c
+@@ -614,9 +614,111 @@ static const struct PropertyMapEntry PropertyMap[] = {
+ };
+ #undef PROPERTY_MAP_ENTRY
+ 
++#define DeviceContainers L"System\\CurrentControlSet\\Control\\DeviceContainers"
++#define BaseContainers  L"BaseContainers"
++#define GUID_STR_LEN 39
++#define GUID_NULL_STR L"{00000000-0000-0000-0000-000000000000}"
++#define CONTAINER_PATH_LEN 143
++
++static void get_device_containers_path(LPWSTR path, DWORD path_len, LPCWSTR container_str)
++{
++    swprintf(path, path_len,
++        DeviceContainers L"\\%ls\\" BaseContainers L"\\%ls",
++        container_str, container_str);
++}
++
++static void SETUPDI_UpdateDeviceContainersW(struct device *device, const BYTE *buffer, DWORD buffer_size)
++{
++    WCHAR path[CONTAINER_PATH_LEN];
++    WCHAR container_str[GUID_STR_LEN];
++    DWORD container_str_size;
++    HKEY key;
++    DWORD data_size = GUID_STR_LEN * sizeof(WCHAR);
++    LPVOID data = NULL;
++
++    for(;;) {
++        LONG ret;
++
++        free(data);
++        data = malloc(data_size);
++        if (!data)
++            break;
++
++        if (!(ret = RegGetValueW(device->key, NULL, PropertyMap[SPDRP_BASE_CONTAINERID].nameW, RRF_RT_REG_SZ, NULL, data, &data_size))) {
++            HKEY key0, key1, key2, key3;
++            BOOL remove = FALSE;
++            LPWSTR container = data;
++
++            if (!RegOpenKeyW(HKEY_LOCAL_MACHINE, DeviceContainers, &key0))
++            {
++                if (!RegOpenKeyW(key0, container, &key1))
++                {
++                    if (!RegOpenKeyW(key1, BaseContainers, &key2))
++                    {
++                        if (!RegOpenKeyW(key2, container, &key3))
++                        {
++                            DWORD cValues = 0;
++                            TRACE("Deleting instance id from device container: %s, %ls\n", debugstr_w(device->instanceId), container);
++                            RegDeleteValueW(key3, device->instanceId);
++                            remove = !RegQueryInfoKeyW(key3, NULL, NULL, NULL, NULL, NULL, NULL, &cValues, NULL, NULL, NULL, NULL) && !cValues;
++                            RegCloseKey(key3);
++                            if (remove)
++                                remove = !RegDeleteKeyW(key2, container);
++                        }
++                        RegCloseKey(key2);
++                        if (remove)
++                            remove = !RegDeleteKeyW(key1, BaseContainers);
++                    }
++                    RegCloseKey(key1);
++                    if (remove)
++                        remove = !RegDeleteKeyW(key0, container);
++                }
++                RegCloseKey(key0);
++            }
++
++            free(data);
++            break;
++        }
++        else if (ret != ERROR_MORE_DATA)
++        {
++            free(data);
++            break;
++        }
++    }
++
++    if (!buffer_size || !lstrcmpW((LPCWSTR)buffer, GUID_NULL_STR))
++        return;
++    container_str_size = buffer_size < sizeof(container_str) ? buffer_size : sizeof(container_str);
++    memcpy(container_str, buffer, container_str_size);
++    container_str[container_str_size / sizeof(WCHAR) - 1] = 0;
++    _wcslwr(container_str);
++
++    get_device_containers_path(path, ARRAY_SIZE(path), container_str);
++    if (!RegCreateKeyW(HKEY_LOCAL_MACHINE, path, &key))
++    {
++        TRACE("Setting instance id from device container: %s, %ls\n", debugstr_w(device->instanceId), container_str);
++        RegSetValueExW(key, device->instanceId, 0, REG_NONE, NULL, 0);
++        RegCloseKey(key);
++    }
++}
++
++static void SETUPDI_UpdateDeviceContainersA(struct device *device, const BYTE *buffer, DWORD buffer_size)
++{
++    DWORD wbuffer_size;
++    WCHAR *wbuffer = strdupAtoW((const char *)buffer);
++    if (!wbuffer)
++        return;
++    wbuffer_size = (wcslen(wbuffer) + 1) * sizeof(WCHAR);
++    SETUPDI_UpdateDeviceContainersW(device, (const BYTE *)wbuffer, wbuffer_size);
++    free(wbuffer);
++}
++
+ static BOOL SETUPDI_SetDeviceRegistryPropertyW(struct device *device,
+     DWORD prop, const BYTE *buffer, DWORD size)
+ {
++    if (prop == SPDRP_BASE_CONTAINERID)
++        SETUPDI_UpdateDeviceContainersW(device, buffer, size);
++
+     if (prop < ARRAY_SIZE(PropertyMap) && PropertyMap[prop].nameW)
+     {
+         LONG ret = RegSetValueExW(device->key, PropertyMap[prop].nameW, 0,
+@@ -733,6 +835,7 @@ static void remove_device(struct device *device)
+     struct device_iface *iface;
+     HKEY enum_key;
+ 
++    SETUPDI_UpdateDeviceContainersW(device, (const BYTE *)GUID_NULL_STR, GUID_STR_LEN * sizeof(WCHAR));
+     delete_driver_key(device);
+ 
+     LIST_FOR_EACH_ENTRY(iface, &device->interfaces, struct device_iface, entry)
+@@ -3340,6 +3443,9 @@ BOOL WINAPI SetupDiSetDeviceRegistryPropertyA(HDEVINFO devinfo, SP_DEVINFO_DATA
+     if (!(device = get_device(devinfo, device_data)))
+         return FALSE;
+ 
++    if (Property == SPDRP_BASE_CONTAINERID)
++        SETUPDI_UpdateDeviceContainersA(device, PropertyBuffer, PropertyBufferSize);
++
+     if (Property < ARRAY_SIZE(PropertyMap) && PropertyMap[Property].nameA)
+     {
+         LONG l = RegSetValueExA(device->key, PropertyMap[Property].nameA, 0,
+-- 
+2.54.0
+

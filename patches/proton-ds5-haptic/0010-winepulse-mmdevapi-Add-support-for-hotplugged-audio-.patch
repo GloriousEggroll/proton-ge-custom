@@ -1,0 +1,1154 @@
+From 4797f8239f21f8d009bf726e648f924a5ed212b3 Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Wed, 24 Jun 2026 14:02:57 -0300
+Subject: [PATCH 10/11] winepulse/mmdevapi: Add support for hotplugged audio
+ devices to be updated in the device list.
+
+---
+ dlls/mmdevapi/devenum.c          | 219 ++++++-
+ dlls/mmdevapi/main.c             |   1 +
+ dlls/mmdevapi/mmdevapi_private.h |   1 +
+ dlls/mmdevapi/unixlib.h          |   9 +
+ dlls/winepulse.drv/pulse.c       | 951 +++++++++++++++++++++++--------
+ 5 files changed, 909 insertions(+), 272 deletions(-)
+
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+index eff6c3bcb7a..f895681e94f 100644
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -79,6 +79,17 @@ static const IMMEndpointVtbl MMEndpointVtbl;
+ 
+ static MMDevEnumImpl enumerator;
+ static struct list device_list = LIST_INIT(device_list);
++static CRITICAL_SECTION device_list_cs;
++static CRITICAL_SECTION_DEBUG device_list_cs_debug =
++{
++    0, 0, &device_list_cs,
++    { &device_list_cs_debug.ProcessLocksList, &device_list_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": device_list_cs") }
++};
++static CRITICAL_SECTION device_list_cs = { &device_list_cs_debug, -1, 0, 0, 0, 0 };
++
++/* forward declare */
++static CRITICAL_SECTION g_notif_lock;
+ 
+ typedef struct MMDevColImpl
+ {
+@@ -139,7 +150,7 @@ static inline IDeviceTopologyImpl *impl_from_IDeviceTopology(IDeviceTopology *if
+     return CONTAINING_RECORD(iface, IDeviceTopologyImpl, IDeviceTopology_iface);
+ }
+ 
+-static const WCHAR propkey_formatW[] = L"{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X},%d";
++static const WCHAR propkey_formatW[] = L"{%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x},%d";
+ 
+ struct device
+ {
+@@ -149,6 +160,14 @@ struct device
+     char        name[];
+ };
+ 
++static CRITICAL_SECTION devices_cache_cs;
++static CRITICAL_SECTION_DEBUG devices_cache_cs_debug =
++{
++    0, 0, &devices_cache_cs,
++    { &devices_cache_cs_debug.ProcessLocksList, &devices_cache_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": devices_cache_cs") }
++};
++static CRITICAL_SECTION devices_cache_cs = { &devices_cache_cs_debug, -1, 0, 0, 0, 0 };
+ static struct list devices_cache = LIST_INIT( devices_cache );
+ 
+ static void add_device_to_cache( const GUID *guid, const char *name, EDataFlow flow )
+@@ -178,15 +197,21 @@ BOOL get_device_name_from_guid( const GUID *guid, char **name, EDataFlow *flow )
+     DWORD index = 0;
+     HKEY key;
+ 
++    EnterCriticalSection( &devices_cache_cs );
+     if ((dev = find_device_in_cache( guid )))
+     {
+         *name = strdup(dev->name);
+         *flow = dev->flow;
++
++        LeaveCriticalSection( &devices_cache_cs );
+         return TRUE;
+     }
+ 
+     swprintf( key_name, ARRAY_SIZE(key_name), L"Software\\Wine\\Drivers\\%s\\devices", drvs.module_name );
+-    if (RegOpenKeyExW( HKEY_CURRENT_USER, key_name, 0, KEY_READ | KEY_WOW64_64KEY, &key )) return FALSE;
++    if (RegOpenKeyExW( HKEY_CURRENT_USER, key_name, 0, KEY_READ | KEY_WOW64_64KEY, &key )) {
++        LeaveCriticalSection( &devices_cache_cs );
++        return FALSE;
++    }
+ 
+     for (;;)
+     {
+@@ -210,13 +235,20 @@ BOOL get_device_name_from_guid( const GUID *guid, char **name, EDataFlow *flow )
+         RegCloseKey( key );
+         TRACE( "Found matching device key %s for %s\n", wine_dbgstr_w(key_name), debugstr_guid(guid) );
+         size = WideCharToMultiByte( CP_UNIXCP, 0, key_name + 2, -1, NULL, 0, NULL, NULL );
+-        if (!(*name = malloc( size ))) return FALSE;
++        if (!(*name = malloc( size ))) {
++            LeaveCriticalSection( &devices_cache_cs );
++            return FALSE;
++        }
+         WideCharToMultiByte( CP_UNIXCP, 0, key_name + 2, -1, *name, size, NULL, NULL );
+         add_device_to_cache( guid, *name, *flow );
++
++        LeaveCriticalSection( &devices_cache_cs );
+         return TRUE;
+     }
+     RegCloseKey( key );
+     WARN( "No matching device in registry for %s\n", debugstr_guid(guid) );
++
++    LeaveCriticalSection( &devices_cache_cs );
+     return FALSE;
+ }
+ 
+@@ -245,7 +277,10 @@ static void get_device_guid( EDataFlow flow, const char *dev_name, GUID *guid )
+         RegSetValueExW( key, L"guid", 0, REG_BINARY, (BYTE *)guid, sizeof(*guid) );
+     }
+     RegCloseKey( key );
++
++    EnterCriticalSection( &devices_cache_cs );
+     if (!find_device_in_cache( guid )) add_device_to_cache( guid, dev_name, flow );
++    LeaveCriticalSection( &devices_cache_cs );
+ }
+ 
+ static HRESULT MMDevPropStore_OpenPropKey(const GUID *guid, DWORD flow, HKEY *propkey)
+@@ -828,6 +863,7 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
+     PropVariantInit(&device_path);
+     PropVariantInit(&container_id);
+ 
++    EnterCriticalSection(&device_list_cs);
+     LIST_FOR_EACH_ENTRY(device, &device_list, MMDevice, entry)
+     {
+         if (device->flow == flow && IsEqualGUID(&device->devguid, id)){
+@@ -835,6 +871,7 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
+             break;
+         }
+     }
++    LeaveCriticalSection(&device_list_cs);
+ 
+     if(!cur){
+         /* No device found, allocate new one */
+@@ -845,7 +882,9 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
+         cur->IMMDevice_iface.lpVtbl = &MMDeviceVtbl;
+         cur->IMMEndpoint_iface.lpVtbl = &MMEndpointVtbl;
+ 
++        EnterCriticalSection(&device_list_cs);
+         list_add_tail(&device_list, &cur->entry);
++        LeaveCriticalSection(&device_list_cs);
+     }else if(cur->ref > 0)
+         WARN("Modifying an MMDevice with positive reference count!\n");
+ 
+@@ -940,10 +979,12 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
+ 
+     if (setdefault)
+     {
++        EnterCriticalSection(&g_notif_lock);
+         if (flow == eRender)
+             MMDevice_def_play = cur;
+         else
+             MMDevice_def_rec = cur;
++        LeaveCriticalSection(&g_notif_lock);
+     }
+     return cur;
+ }
+@@ -967,7 +1008,10 @@ HRESULT load_devices_from_reg(void)
+     curflow = eCapture;
+     if (ret != ERROR_SUCCESS)
+     {
+-        RegCloseKey(key_capture);
++        if (key_render)
++            RegCloseKey(key_render);
++        if (key_capture)
++            RegCloseKey(key_capture);
+         key_render = key_capture = NULL;
+         WARN("Couldn't create key: %lu\n", ret);
+         return E_FAIL;
+@@ -1057,34 +1101,153 @@ static HRESULT set_format(MMDevice *dev)
+     return S_OK;
+ }
+ 
+-HRESULT load_driver_devices(EDataFlow flow)
++static void add_endpoints_from_params(struct get_endpoint_ids_params *params)
++{
++    UINT i;
++
++    for (i = 0; i < params->num; i++) {
++        GUID guid;
++        MMDevice *dev;
++        const WCHAR *name = (WCHAR *)((char *)params->endpoints + params->endpoints[i].name);
++        const char *dev_name = (char *)params->endpoints + params->endpoints[i].device;
++        get_device_guid(params->flow, dev_name, &guid);
++        dev = MMDevice_Create(name, &guid, params->flow, DEVICE_STATE_ACTIVE, params->default_idx == i);
++        set_format(dev);
++    }
++}
++
++static HANDLE g_update_thread;
++static BOOL g_update_thread_running;
++static DWORD WINAPI update_thread_proc(void *user)
+ {
+     struct get_endpoint_ids_params params;
+     UINT i;
+ 
++    params.flow = eRender;
++    params.size = 1024;
++    params.endpoints = malloc(params.size);
++    params.delta = TRUE;
++    params.more_data = TRUE;
++
++    for (;;) {
++        for (;;) {
++            if (!g_update_thread_running || !params.more_data)
++                goto end;
++            params.more_data = TRUE;
++            __wine_unix_call(drvs.module_unixlib, get_endpoint_ids, &params);
++
++            if (params.result == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)) {
++                free(params.endpoints);
++                params.endpoints = malloc(params.size);
++            }
++            else
++                break;
++        }
++
++        if (FAILED(params.result))
++            goto end;
++
++        /* FIXME: update default device when removed, though currently only core audio backend could potentially */
++        /* change the default device, and it doesn't have hotplug implemented. */
++        for (i = 0; i < params.num_removed; i++) {
++            GUID guid;
++            MMDevice *dev;
++            UINT i_removed = params.num + i;
++            const char *dev_name = (char *)params.endpoints + params.endpoints[i_removed].device;
++            get_device_guid( params.flow, dev_name, &guid );
++
++            EnterCriticalSection(&device_list_cs);
++            LIST_FOR_EACH_ENTRY(dev, &device_list, MMDevice, entry) {
++                WCHAR guidstr[39];
++                HKEY key, root;
++                if (dev->flow != params.flow)
++                    continue;
++                if (IsEqualGUID(&dev->devguid, &guid)) {
++                    dev->state = DEVICE_STATE_NOTPRESENT;
++                    StringFromGUID2(&dev->devguid, guidstr, ARRAY_SIZE(guidstr));
++                    if (dev->flow == eRender)
++                        root = key_render;
++                    else
++                        root = key_capture;
++                    if (RegCreateKeyExW(root, guidstr, 0, NULL, 0, KEY_WRITE|KEY_READ|KEY_WOW64_64KEY, NULL, &key, NULL) == ERROR_SUCCESS)
++                    {
++                        RegSetValueExW(key, L"DeviceState", 0, REG_DWORD, (const BYTE*)&dev->state, sizeof(DWORD));
++                        RegCloseKey(key);
++                    }
++                    break;
++                }
++            }
++            LeaveCriticalSection(&device_list_cs);
++        }
++
++        /* add devices only after removing devices */
++        add_endpoints_from_params(&params);
++
++        params.flow = params.flow == eRender ? eCapture : eRender;
++    }
++
++end:
++    free(params.endpoints);
++    return 0;
++}
++
++static BOOL need_update_thread;
++void create_update_thread(void)
++{
++    if (!need_update_thread)
++        return;
++
++    if (g_update_thread)
++        return;
++
++    EnterCriticalSection(&device_list_cs);
++
++    if (g_update_thread) {
++        LeaveCriticalSection(&device_list_cs);
++        return;
++    }
++
++    g_update_thread_running = TRUE;
++    g_update_thread = CreateThread(NULL, 0, update_thread_proc, NULL, 0, NULL);
++    if (!g_update_thread) {
++        ERR("CreateThread failed: %lu\n", GetLastError());
++        g_update_thread_running = FALSE;
++    } else
++        SetThreadPriority(update_thread_proc, THREAD_PRIORITY_BELOW_NORMAL);
++
++    LeaveCriticalSection(&device_list_cs);
++}
++
++void stop_update_thread(void)
++{
++    if (g_update_thread) {
++        g_update_thread_running = FALSE;
++        WaitForSingleObject(g_update_thread, INFINITE);
++        CloseHandle(g_update_thread);
++        g_update_thread = NULL;
++    }
++}
++
++HRESULT load_driver_devices(EDataFlow flow)
++{
++    struct get_endpoint_ids_params params;
++
+     params.flow = flow;
+     params.size = 1024;
+     params.endpoints = NULL;
+     do {
+         free(params.endpoints);
+         params.endpoints = malloc(params.size);
++        params.delta = FALSE;
+         __wine_unix_call(drvs.module_unixlib, get_endpoint_ids, &params);
+     } while (params.result == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER));
+ 
+     if (FAILED(params.result))
+         goto end;
+ 
+-    for (i = 0; i < params.num; i++) {
+-        GUID guid;
+-        MMDevice *dev;
+-        const WCHAR *name = (WCHAR *)((char *)params.endpoints + params.endpoints[i].name);
+-        const char *dev_name = (char *)params.endpoints + params.endpoints[i].device;
+-
+-        get_device_guid( flow, dev_name, &guid );
+-
+-        dev = MMDevice_Create(name, &guid, flow, DEVICE_STATE_ACTIVE, params.default_idx == i);
+-        set_format(dev);
+-    }
++    if (params.delta)
++        need_update_thread = TRUE;
++    add_endpoints_from_params(&params);
+ 
+ end:
+     free(params.endpoints);
+@@ -1260,7 +1423,7 @@ static HRESULT WINAPI MMDevice_GetId(IMMDevice *iface, WCHAR **itemid)
+     *itemid = str = CoTaskMemAlloc(56 * sizeof(WCHAR));
+     if (!str)
+         return E_OUTOFMEMORY;
+-    wsprintfW(str, L"{0.0.%u.00000000}.{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
++    wsprintfW(str, L"{0.0.%u.00000000}.{%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}",
+               This->flow, id->Data1, id->Data2, id->Data3,
+               id->Data4[0], id->Data4[1], id->Data4[2], id->Data4[3],
+               id->Data4[4], id->Data4[5], id->Data4[6], id->Data4[7]);
+@@ -1350,6 +1513,7 @@ static HRESULT MMDevCol_Create(IMMDeviceCollection **ppv, EDataFlow flow, DWORD
+     This->devices_count = 0;
+     *ppv = &This->IMMDeviceCollection_iface;
+ 
++    EnterCriticalSection(&device_list_cs);
+     LIST_FOR_EACH_ENTRY(cur, &device_list, MMDevice, entry)
+     {
+         if ((cur->flow == flow || flow == eAll) && (cur->state & state))
+@@ -1359,8 +1523,10 @@ static HRESULT MMDevCol_Create(IMMDeviceCollection **ppv, EDataFlow flow, DWORD
+     if (This->devices_count)
+     {
+         This->devices = malloc(This->devices_count * sizeof(IMMDevice *));
+-        if (!This->devices_count)
++        if (!This->devices_count) {
++            LeaveCriticalSection(&device_list_cs);
+             return E_OUTOFMEMORY;
++        }
+ 
+         LIST_FOR_EACH_ENTRY(cur, &device_list, MMDevice, entry)
+         {
+@@ -1372,6 +1538,9 @@ static HRESULT MMDevCol_Create(IMMDeviceCollection **ppv, EDataFlow flow, DWORD
+             }
+         }
+     }
++    LeaveCriticalSection(&device_list_cs);
++
++    create_update_thread();
+ 
+     return S_OK;
+ }
+@@ -1473,8 +1642,11 @@ void MMDevEnum_Free(void)
+     MMDevice *device, *next;
+     struct device *dev, *dev_next;
+ 
++    EnterCriticalSection(&device_list_cs);
+     LIST_FOR_EACH_ENTRY_SAFE(device, next, &device_list, MMDevice, entry)
+         MMDevice_Destroy(device);
++    list_init(&device_list);
++    LeaveCriticalSection(&device_list_cs);
+     RegCloseKey(key_render);
+     RegCloseKey(key_capture);
+     LIST_FOR_EACH_ENTRY_SAFE(dev, dev_next, &devices_cache, struct device, entry)
+@@ -1496,6 +1668,7 @@ static HRESULT WINAPI MMDevEnum_QueryInterface(IMMDeviceEnumerator *iface, REFII
+     if (!*ppv)
+         return E_NOINTERFACE;
+     IUnknown_AddRef((IUnknown*)*ppv);
++
+     return S_OK;
+ }
+ 
+@@ -1601,10 +1774,12 @@ static HRESULT WINAPI MMDevEnum_GetDefaultAudioEndpoint(IMMDeviceEnumerator *ifa
+         RegCloseKey(key);
+     }
+ 
++    EnterCriticalSection(&g_notif_lock);
+     if (flow == eRender)
+         *device = &MMDevice_def_play->IMMDevice_iface;
+     else
+         *device = &MMDevice_def_rec->IMMDevice_iface;
++    LeaveCriticalSection(&g_notif_lock);
+ 
+     if (!*device)
+         return E_NOTFOUND;
+@@ -1623,6 +1798,7 @@ static HRESULT WINAPI MMDevEnum_GetDevice(IMMDeviceEnumerator *iface, const WCHA
+     if(!name || !device)
+         return E_POINTER;
+ 
++    EnterCriticalSection(&device_list_cs);
+     LIST_FOR_EACH_ENTRY(impl, &device_list, MMDevice, entry)
+     {
+         HRESULT hr;
+@@ -1637,6 +1813,7 @@ static HRESULT WINAPI MMDevEnum_GetDevice(IMMDeviceEnumerator *iface, const WCHA
+ 
+         if (str && !lstrcmpiW(str, name))
+         {
++            LeaveCriticalSection(&device_list_cs);
+             CoTaskMemFree(str);
+             IMMDevice_AddRef(dev);
+             *device = dev;
+@@ -1644,6 +1821,7 @@ static HRESULT WINAPI MMDevEnum_GetDevice(IMMDeviceEnumerator *iface, const WCHA
+         }
+         CoTaskMemFree(str);
+     }
++    LeaveCriticalSection(&device_list_cs);
+     TRACE("Could not find device %s\n", debugstr_w(name));
+     return E_INVALIDARG;
+ }
+@@ -1656,7 +1834,6 @@ struct NotificationClientWrapper {
+ static struct list g_notif_clients = LIST_INIT(g_notif_clients);
+ static HANDLE g_notif_thread;
+ 
+-static CRITICAL_SECTION g_notif_lock;
+ static CRITICAL_SECTION_DEBUG g_notif_lock_debug =
+ {
+     0, 0, &g_notif_lock,
+@@ -1832,6 +2009,9 @@ static HRESULT WINAPI MMDevEnum_RegisterEndpointNotificationCallback(IMMDeviceEn
+ 
+     LeaveCriticalSection(&g_notif_lock);
+ 
++    /* Delay create thread as much as possible. */
++    create_update_thread();
++
+     return S_OK;
+ }
+ 
+@@ -2017,6 +2197,7 @@ static HRESULT WINAPI MMDevPropStore_GetValue(IPropertyStore *iface, REFPROPERTY
+         if (!pv->pwszVal)
+             return E_OUTOFMEMORY;
+         StringFromGUID2(&This->parent->devguid, pv->pwszVal, 39);
++        _wcslwr(pv->pwszVal);
+         return S_OK;
+     }
+ 
+diff --git a/dlls/mmdevapi/main.c b/dlls/mmdevapi/main.c
+index 6d1616e5b55..46b2bfae3b7 100644
+--- a/dlls/mmdevapi/main.c
++++ b/dlls/mmdevapi/main.c
+@@ -220,6 +220,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
+                 }
+             }
+             main_loop_stop();
++            stop_update_thread();
+ 
+             if (!lpvReserved)
+                 MMDevEnum_Free();
+diff --git a/dlls/mmdevapi/mmdevapi_private.h b/dlls/mmdevapi/mmdevapi_private.h
+index 672d901bf6d..4e80fe1e2f2 100644
+--- a/dlls/mmdevapi/mmdevapi_private.h
++++ b/dlls/mmdevapi/mmdevapi_private.h
+@@ -130,6 +130,7 @@ extern HRESULT load_devices_from_reg(void);
+ extern HRESULT load_driver_devices(EDataFlow flow);
+ 
+ extern void main_loop_stop(void);
++extern void stop_update_thread(void);
+ 
+ extern const WCHAR drv_keyW[];
+ 
+diff --git a/dlls/mmdevapi/unixlib.h b/dlls/mmdevapi/unixlib.h
+index 3df13e93b39..f8038f58e23 100644
+--- a/dlls/mmdevapi/unixlib.h
++++ b/dlls/mmdevapi/unixlib.h
+@@ -49,6 +49,15 @@ struct get_endpoint_ids_params
+     HRESULT result;
+     unsigned int num;
+     unsigned int default_idx;
++
++    /* delta update support. */
++    /* should be set to FALSE on initial calls, */
++    /* then check return value for driver support. */
++    BOOL delta;
++    unsigned int num_removed;
++    /* will return TRUE for endpoints of the other flow
++       in addition to the one specified. */
++    BOOL more_data;
+ };
+ 
+ struct create_stream_params
+diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+index 5c120a26e66..bb253986d26 100644
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -129,6 +129,19 @@ typedef struct _PhysDevice {
+     WCHAR *name;
+     enum phys_device_bus_type bus_type;
+     USHORT vendor_id, product_id;
++
++    /* ready vars */
++    BOOL ready;
++    pthread_mutex_t ready_mutex;
++    pthread_cond_t ready_cond;
++
++    /* probe vars */
++    pa_channel_map map;
++    pa_sample_spec ss;
++    unsigned int length;
++    int probe_status;
++
++    EDataFlow flow;
+     EndpointFormFactor form;
+     UINT channel_mask;
+     UINT index;
+@@ -141,9 +154,24 @@ typedef struct _PhysDevice {
+ static pa_context *pulse_ctx;
+ static pa_mainloop *pulse_ml;
+ 
++static pthread_mutex_t g_phys_mutex;
++static pthread_cond_t g_phys_cond = PTHREAD_COND_INITIALIZER;
+ static struct list g_phys_speakers = LIST_INIT(g_phys_speakers);
+ static struct list g_phys_sources = LIST_INIT(g_phys_sources);
+-
++static struct list g_phys_speakers_added = LIST_INIT(g_phys_speakers_added);
++static struct list g_phys_sources_added = LIST_INIT(g_phys_sources_added);
++static struct list g_phys_speakers_removed = LIST_INIT(g_phys_speakers_removed);
++static struct list g_phys_sources_removed = LIST_INIT(g_phys_sources_removed);
++/* separate list for holding removed devices that were just added */
++/* to avoid race-condition/deadlock. */
++static struct list g_phys_added_removed = LIST_INIT(g_phys_added_removed);
++
++static BOOL pulse_ready;
++static int pulse_ready_count;
++static pthread_mutex_t pulse_ready_mutex;
++static pthread_cond_t pulse_ready_cond = PTHREAD_COND_INITIALIZER;
++
++static BOOL pulse_test_succeeded;
+ static pthread_mutex_t pulse_mutex;
+ static pthread_cond_t pulse_cond = PTHREAD_COND_INITIALIZER;
+ 
+@@ -157,6 +185,16 @@ static NTSTATUS pulse_not_implemented(void *args)
+     return STATUS_SUCCESS;
+ }
+ 
++static void g_phys_lock(void)
++{
++    pthread_mutex_lock(&g_phys_mutex);
++}
++
++static void g_phys_unlock(void)
++{
++    pthread_mutex_unlock(&g_phys_mutex);
++}
++
+ static void pulse_lock(void)
+ {
+     pthread_mutex_lock(&pulse_mutex);
+@@ -177,6 +215,45 @@ static void pulse_broadcast(void)
+     pthread_cond_broadcast(&pulse_cond);
+ }
+ 
++static void pulse_dev_free(PhysDevice *dev)
++{
++    pthread_mutex_destroy(&dev->ready_mutex);
++    pthread_cond_destroy(&dev->ready_cond);
++    free(dev->name);
++    free(dev);
++}
++
++static void pulse_dev_wait_ready(PhysDevice *dev)
++{
++    if (dev->ready)
++        return;
++    pthread_mutex_lock(&dev->ready_mutex);
++    while (!dev->ready)
++        pthread_cond_wait(&dev->ready_cond, &dev->ready_mutex);
++    pthread_mutex_unlock(&dev->ready_mutex);
++}
++
++static void pulse_dev_set_ready(PhysDevice *dev)
++{
++    if (dev->ready)
++        return;
++    pthread_mutex_lock(&dev->ready_mutex);
++    if (dev->ready) {
++        pthread_mutex_unlock(&dev->ready_mutex);
++        return;
++    }
++    dev->ready = TRUE;
++    pthread_cond_broadcast(&dev->ready_cond);
++    pthread_mutex_unlock(&dev->ready_mutex);
++
++    pthread_mutex_lock(&pulse_ready_mutex);
++    if (!--pulse_ready_count) {
++        pulse_ready = TRUE;
++        pthread_cond_broadcast(&pulse_ready_cond);
++    }
++    pthread_mutex_unlock(&pulse_ready_mutex);
++}
++
+ static struct pulse_stream *handle_get_stream(stream_handle h)
+ {
+     return (struct pulse_stream *)(UINT_PTR)h;
+@@ -193,16 +270,26 @@ static void dump_attr(const pa_buffer_attr *attr)
+ 
+ static void free_phys_device_lists(void)
+ {
+-    static struct list *const lists[] = { &g_phys_speakers, &g_phys_sources, NULL };
++    static struct list *const lists[] = {
++        &g_phys_speakers,
++        &g_phys_sources,
++        &g_phys_speakers_added,
++        &g_phys_sources_added,
++        &g_phys_speakers_removed,
++        &g_phys_sources_removed,
++        &g_phys_added_removed,
++        NULL
++    };
+     struct list *const *list = lists;
+     PhysDevice *dev, *dev_next;
+ 
++    g_phys_lock();
+     do {
+-        LIST_FOR_EACH_ENTRY_SAFE(dev, dev_next, *list, PhysDevice, entry) {
+-            free(dev->name);
+-            free(dev);
+-        }
++        LIST_FOR_EACH_ENTRY_SAFE(dev, dev_next, *list, PhysDevice, entry)
++            pulse_dev_free(dev);
++        list_init(*list);
+     } while (*(++list));
++    g_phys_unlock();
+ }
+ 
+ /* copied from kernelbase */
+@@ -282,6 +369,12 @@ static NTSTATUS pulse_process_attach(void *args)
+     if (pthread_mutex_init(&pulse_mutex, &attr) != 0)
+         pthread_mutex_init(&pulse_mutex, NULL);
+ 
++    if (pthread_mutex_init(&pulse_ready_mutex, &attr) != 0)
++        pthread_mutex_init(&pulse_ready_mutex, NULL);
++
++    if (pthread_mutex_init(&g_phys_mutex, &attr) != 0)
++        pthread_mutex_init(&g_phys_mutex, NULL);
++
+ #ifdef _WIN64
+     if (NtCurrentTeb()->WowTebOffset)
+     {
+@@ -308,15 +401,37 @@ static NTSTATUS pulse_process_detach(void *args)
+ 
+     free( silence_buf );
+     silence_buf = NULL;
++
++    pthread_mutex_destroy(&pulse_mutex);
++    pthread_mutex_destroy(&pulse_ready_mutex);
++    pthread_mutex_destroy(&g_phys_mutex);
++
+     return STATUS_SUCCESS;
+ }
+ 
+ static void pulse_main_loop_thread_cleanup(void *context)
+ {
+     TRACE("Main loop thread is being aborted.\n");
++    pulse_broadcast();
++}
+ 
++static pa_mainloop *pulse_main_loop_new(void)
++{
++    if (pulse_ml)
++        return pulse_ml;
++    pulse_ml = pa_mainloop_new();
++    if (!pulse_ml)
++        return NULL;
++    pa_mainloop_set_poll_func(pulse_ml, pulse_poll_func, NULL);
++    return pulse_ml;
++}
++
++static void pulse_main_loop_free(void)
++{
++    if (!pulse_ml)
++        return;
++    pa_mainloop_free(pulse_ml);
+     pulse_ml = NULL;
+-    pulse_broadcast();
+ }
+ 
+ static NTSTATUS pulse_main_loop(void *args)
+@@ -324,78 +439,197 @@ static NTSTATUS pulse_main_loop(void *args)
+     struct main_loop_params *params = args;
+     int ret;
+     pulse_lock();
+-    pulse_ml = pa_mainloop_new();
+-    pa_mainloop_set_poll_func(pulse_ml, pulse_poll_func, NULL);
++    if (!pulse_main_loop_new()) {
++        NtSetEvent(params->event, NULL);
++        pulse_unlock();
++        ERR("Failed to create main loop\n");
++        return STATUS_SUCCESS;
++    }
+     NtSetEvent(params->event, NULL);
+     pthread_cleanup_push(pulse_main_loop_thread_cleanup, NULL);
+     pa_mainloop_run(pulse_ml, &ret);
+     pthread_cleanup_pop(0);
+-    pa_mainloop_free(pulse_ml);
++    pulse_main_loop_free();
+     pulse_unlock();
++
++    pthread_cond_broadcast(&g_phys_cond);
++
+     return STATUS_SUCCESS;
+ }
+ 
+-static NTSTATUS pulse_get_endpoint_ids(void *args)
++static BOOL pulse_get_endpoints_size_needed(struct list *list, size_t *needed, unsigned int size)
+ {
+-    struct get_endpoint_ids_params *params = args;
+-    struct list *list = (params->flow == eRender) ? &g_phys_speakers : &g_phys_sources;
+-    struct endpoint *endpoint = params->endpoints;
+-    size_t len, name_len, needed;
+-    unsigned int offset;
+     PhysDevice *dev;
++    size_t len, name_len;
+ 
+-    params->num = list_count(list);
+-    offset = needed = params->num * sizeof(*params->endpoints);
++    LIST_FOR_EACH_ENTRY(dev, list, PhysDevice, entry) {
++        name_len = lstrlenW(dev->name) + 1;
++        len = strlen(dev->pulse_name) + 1;
++        *needed += name_len * sizeof(WCHAR) + ((len + 1) & ~1);
++
++        if (*needed > size)
++            return FALSE;
++    }
++    return TRUE;
++}
++
++static void pulse_get_endpoints(struct list *list, struct endpoint **endpoint, unsigned int *offset, void *names)
++{
++    PhysDevice *dev;
++    size_t len, name_len;
+ 
+     LIST_FOR_EACH_ENTRY(dev, list, PhysDevice, entry) {
+         name_len = lstrlenW(dev->name) + 1;
+         len = strlen(dev->pulse_name) + 1;
+-        needed += name_len * sizeof(WCHAR) + ((len + 1) & ~1);
+-
+-        if (needed <= params->size) {
+-            endpoint->name = offset;
+-            memcpy((char *)params->endpoints + offset, dev->name, name_len * sizeof(WCHAR));
+-            offset += name_len * sizeof(WCHAR);
+-            endpoint->device = offset;
+-            memcpy((char *)params->endpoints + offset, dev->pulse_name, len);
+-            offset += (len + 1) & ~1;
+-            endpoint++;
+-        }
++
++        (*endpoint)->name = *offset;
++        memcpy((char *)names + *offset, dev->name, name_len * sizeof(WCHAR));
++        *offset += name_len * sizeof(WCHAR);
++        (*endpoint)->device = *offset;
++        memcpy((char *)names + *offset, dev->pulse_name, len);
++        *offset += (len + 1) & ~1;
++        (*endpoint)++;
+     }
+-    params->default_idx = 0;
++}
+ 
+-    if (needed > params->size) {
+-        params->size = needed;
+-        params->result = HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+-    } else
+-        params->result = S_OK;
+-    return STATUS_SUCCESS;
++static void pulse_wait_devices(struct list *list)
++{
++    PhysDevice *dev;
++again:
++    LIST_FOR_EACH_ENTRY(dev, list, PhysDevice, entry) {
++        if (dev->ready)
++            continue;
++
++        g_phys_unlock();
++        pulse_dev_wait_ready(dev);
++        g_phys_lock();
++        goto again;
++    }
+ }
+ 
+-static void pulse_contextcallback(pa_context *c, void *userdata)
++/* for winepulse, this function can be called in a separate thread from other functions. */
++/* this function cannot be called from multiple threads at the same time however. */
++/* for the list variable, all devices in it must be ready by the end of the lock. */
++static NTSTATUS pulse_get_endpoint_ids(void *args)
+ {
+-    switch (pa_context_get_state(c)) {
+-        default:
+-            FIXME("Unhandled state: %i\n", pa_context_get_state(c));
+-            return;
++    struct get_endpoint_ids_params *params = args;
++    struct list *list;
++    struct list *list_added;
++    struct list *list_removed;
++    struct list *other_list_added;
++    struct list *other_list_removed;
++    struct endpoint *endpoint = params->endpoints;
++    size_t needed = 0;
++    unsigned int offset;
++    PhysDevice *dev, *dev_next;
++    BOOL delta = params->delta;
+ 
+-        case PA_CONTEXT_CONNECTING:
+-        case PA_CONTEXT_UNCONNECTED:
+-        case PA_CONTEXT_AUTHORIZING:
+-        case PA_CONTEXT_SETTING_NAME:
+-        case PA_CONTEXT_TERMINATED:
+-            TRACE("State change to %i\n", pa_context_get_state(c));
+-            return;
++    TRACE("flow %d, delta %d\n", (int)params->flow, (int)params->delta);
+ 
+-        case PA_CONTEXT_READY:
+-            TRACE("Ready\n");
+-            break;
++    if (params->flow == eRender)
++    {
++        list = &g_phys_speakers;
++        list_added = &g_phys_speakers_added;
++        list_removed = &g_phys_speakers_removed;
+ 
+-        case PA_CONTEXT_FAILED:
+-            WARN("Context failed: %s\n", pa_strerror(pa_context_errno(c)));
+-            break;
++        other_list_added = &g_phys_sources_added;
++        other_list_removed = &g_phys_sources_removed;
+     }
+-    pulse_broadcast();
++    else
++    {
++        list = &g_phys_sources;
++        list_added = &g_phys_sources_added;
++        list_removed = &g_phys_sources_removed;
++
++        other_list_added = &g_phys_speakers_added;
++        other_list_removed = &g_phys_speakers_removed;
++    }
++
++    params->num = params->num_removed = 0;
++
++    g_phys_lock();
++
++    pulse_wait_devices(&g_phys_added_removed);
++    LIST_FOR_EACH_ENTRY_SAFE(dev, dev_next, &g_phys_added_removed, PhysDevice, entry)
++        pulse_dev_free(dev);
++    list_init(&g_phys_added_removed);
++
++    if (delta)
++    {
++        params->more_data = TRUE;
++        for(;;) {
++            /* also check if we are still running */
++            if (!pulse_ml) {
++                params->more_data = FALSE;
++                goto done;
++            }
++            if (list_count(list_added) + list_count(list_removed))
++                break;
++            if (list_count(other_list_added) + list_count(other_list_removed))
++                goto done;
++            pthread_cond_wait(&g_phys_cond, &g_phys_mutex);
++        }
++
++        params->default_idx = -1;
++        pulse_wait_devices(list_added);
++        pulse_wait_devices(list_removed);
++
++        params->num = list_count(list_added);
++        params->num_removed = list_count(list_removed);
++        offset = needed = (params->num + params->num_removed) * sizeof(*params->endpoints);
++
++        if (!pulse_get_endpoints_size_needed(list_added, &needed, params->size))
++            goto done;
++        if (!pulse_get_endpoints_size_needed(list_removed, &needed, params->size))
++            goto done;
++
++        pulse_get_endpoints(list_added, &endpoint, &offset, params->endpoints);
++        pulse_get_endpoints(list_removed, &endpoint, &offset, params->endpoints);
++
++        LIST_FOR_EACH_ENTRY_SAFE(dev, dev_next, list_added, PhysDevice, entry) {
++            list_remove(&dev->entry);
++            list_add_tail(list, &dev->entry);
++        }
++        LIST_FOR_EACH_ENTRY_SAFE(dev, dev_next, list_removed, PhysDevice, entry) {
++            list_remove(&dev->entry);
++            pulse_dev_free(dev);
++        }
++    }
++    else
++    {
++        pulse_wait_devices(list);
++        pulse_wait_devices(list_added);
++
++        params->default_idx = 0;
++        params->num = list_count(list) + list_count(list_added);
++        params->num_removed = 0;
++        offset = needed = params->num * sizeof(*params->endpoints);
++
++        if (!pulse_get_endpoints_size_needed(list, &needed, params->size))
++            goto done;
++        if (!pulse_get_endpoints_size_needed(list_added, &needed, params->size))
++            goto done;
++
++        pulse_get_endpoints(list, &endpoint, &offset, params->endpoints);
++        pulse_get_endpoints(list_added, &endpoint, &offset, params->endpoints);
++
++        LIST_FOR_EACH_ENTRY_SAFE(dev, dev_next, list_added, PhysDevice, entry) {
++            list_remove(&dev->entry);
++            list_add_tail(list, &dev->entry);
++        }
++    }
++
++done:
++    g_phys_unlock();
++
++    if (needed > params->size) {
++        params->size = needed;
++        params->result = HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
++    } else {
++        params->delta = TRUE;
++        params->result = S_OK;
++    }
++    return STATUS_SUCCESS;
+ }
+ 
+ static void pulse_stream_state(pa_stream *s, void *user)
+@@ -443,47 +677,6 @@ static BOOL pulse_stream_valid(struct pulse_stream *stream)
+     return pa_stream_get_state(stream->stream) == PA_STREAM_READY;
+ }
+ 
+-static HRESULT pulse_connect(const char *name)
+-{
+-    pa_context_state_t state;
+-
+-    if (pulse_ctx && PA_CONTEXT_IS_GOOD(pa_context_get_state(pulse_ctx)))
+-        return S_OK;
+-    if (pulse_ctx)
+-        pa_context_unref(pulse_ctx);
+-
+-    pulse_ctx = pa_context_new(pa_mainloop_get_api(pulse_ml), name);
+-    setenv("PULSE_PROP_application.name", name, 1);
+-    if (!pulse_ctx) {
+-        ERR("Failed to create context\n");
+-        return E_FAIL;
+-    }
+-
+-    pa_context_set_state_callback(pulse_ctx, pulse_contextcallback, NULL);
+-
+-    TRACE("libpulse protocol version: %u. API Version %u\n", pa_context_get_protocol_version(pulse_ctx), PA_API_VERSION);
+-    if (pa_context_connect(pulse_ctx, NULL, 0, NULL) < 0)
+-        goto fail;
+-
+-    /* Wait for connection */
+-    while ((state = pa_context_get_state(pulse_ctx)) != PA_CONTEXT_READY &&
+-           state != PA_CONTEXT_FAILED && state != PA_CONTEXT_TERMINATED)
+-        pulse_cond_wait();
+-
+-    if (state != PA_CONTEXT_READY)
+-        goto fail;
+-
+-    TRACE("Connected to server %s with protocol version: %i.\n",
+-        pa_context_get_server(pulse_ctx),
+-        pa_context_get_server_protocol_version(pulse_ctx));
+-    return S_OK;
+-
+-fail:
+-    pa_context_unref(pulse_ctx);
+-    pulse_ctx = NULL;
+-    return E_FAIL;
+-}
+-
+ static UINT pulse_channel_map_to_channel_mask(const pa_channel_map *map)
+ {
+     int i;
+@@ -646,10 +839,10 @@ static GUID get_container_id(const char *sysfs_path)
+     create_usb_dev_container_id(init_time, vid, pid, bus_num, dev_num, &tmp_guid);
+ 
+ exit:
+-    if (udev)
+-        udev_unref(udev);
+     if (audio_dev)
+         udev_device_unref(audio_dev);
++    if (udev)
++        udev_unref(udev);
+ 
+     TRACE("Returning %s.\n", debugstr_guid(&tmp_guid));
+     return tmp_guid;
+@@ -692,58 +885,6 @@ static void fill_device_info(PhysDevice *dev, pa_proplist *p)
+         dev->container_id = get_container_id(buffer);
+ }
+ 
+-static void pulse_add_device(struct list *list, pa_proplist *proplist, int index, EndpointFormFactor form,
+-                             UINT channel_mask, const char *pulse_name, const char *desc)
+-{
+-    size_t len = strlen(pulse_name);
+-    PhysDevice *dev = malloc(FIELD_OFFSET(PhysDevice, pulse_name[len + 1]));
+-
+-    if (!dev)
+-        return;
+-
+-    if (!(dev->name = get_device_name(desc, proplist))) {
+-        free(dev);
+-        return;
+-    }
+-    dev->form = form;
+-    dev->index = index;
+-    dev->channel_mask = channel_mask;
+-    dev->def_period = 0;
+-    dev->min_period = 0;
+-    fill_device_info(dev, proplist);
+-    memcpy(dev->pulse_name, pulse_name, len + 1);
+-
+-    list_add_tail(list, &dev->entry);
+-
+-    TRACE("%s\n", debugstr_w(dev->name));
+-}
+-
+-static void pulse_phys_speakers_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
+-{
+-    struct list *speaker;
+-    UINT channel_mask;
+-
+-    if (!i || !i->name || !i->name[0])
+-        return;
+-    channel_mask = pulse_channel_map_to_channel_mask(&i->channel_map);
+-
+-    /* For default PulseAudio render device, OR together all of the
+-     * PKEY_AudioEndpoint_PhysicalSpeakers values of the sinks. */
+-    speaker = list_head(&g_phys_speakers);
+-    if (speaker)
+-        LIST_ENTRY(speaker, PhysDevice, entry)->channel_mask |= channel_mask;
+-
+-    pulse_add_device(&g_phys_speakers, i->proplist, i->index, Speakers, channel_mask, i->name, i->description);
+-}
+-
+-static void pulse_phys_sources_cb(pa_context *c, const pa_source_info *i, int eol, void *userdata)
+-{
+-    if (!i || !i->name || !i->name[0])
+-        return;
+-    pulse_add_device(&g_phys_sources, i->proplist, i->index,
+-        (i->monitor_of_sink == PA_INVALID_INDEX) ? Microphone : LineLevel, 0, i->name, i->description);
+-}
+-
+ /* For most hardware on Windows, users must choose a configuration with an even
+  * number of channels (stereo, quad, 5.1, 7.1). Users can then disable
+  * channels, but those channels are still reported to applications from
+@@ -1229,6 +1658,7 @@ static HRESULT get_device_period_helper(EDataFlow flow, const char *pulse_name,
+         return E_POINTER;
+     }
+ 
++    g_phys_lock();
+     LIST_FOR_EACH_ENTRY(dev, list, PhysDevice, entry) {
+         if (strcmp(pulse_name, dev->pulse_name))
+             continue;
+@@ -1237,8 +1667,11 @@ static HRESULT get_device_period_helper(EDataFlow flow, const char *pulse_name,
+             *def = dev->def_period;
+         if (min)
+             *min = dev->min_period;
++
++        g_phys_unlock();
+         return S_OK;
+     }
++    g_phys_unlock();
+ 
+     return E_FAIL;
+ }
+@@ -2460,15 +2893,17 @@ static NTSTATUS pulse_get_mix_format(void *args)
+     struct list *list = (params->flow == eRender) ? &g_phys_speakers : &g_phys_sources;
+     PhysDevice *dev;
+ 
++    g_phys_lock();
+     LIST_FOR_EACH_ENTRY(dev, list, PhysDevice, entry) {
+         if (strcmp(params->device, dev->pulse_name))
+             continue;
+ 
+         *params->fmt = dev->fmt;
++        g_phys_unlock();
+         params->result = S_OK;
+-
+         return STATUS_SUCCESS;
+     }
++    g_phys_unlock();
+ 
+     params->result = E_FAIL;
+     return STATUS_SUCCESS;
+@@ -2770,17 +3205,22 @@ static NTSTATUS pulse_get_prop_value(void *args)
+     struct list *list = (params->flow == eRender) ? &g_phys_speakers : &g_phys_sources;
+     PhysDevice *dev;
+ 
++    g_phys_lock();
+     LIST_FOR_EACH_ENTRY(dev, list, PhysDevice, entry) {
+         if (strcmp(params->device, dev->pulse_name))
+             continue;
+         if (IsEqualPropertyKey(*params->prop, devicepath_key)) {
+             get_device_path(dev, params);
++
++            g_phys_unlock();
+             return STATUS_SUCCESS;
+         } else if (IsEqualGUID(&params->prop->fmtid, &PKEY_AudioEndpoint_GUID)) {
+             switch (params->prop->pid) {
+             case 0:   /* FormFactor */
+                 params->value->vt = VT_UI4;
+                 params->value->ulVal = dev->form;
++
++                g_phys_unlock();
+                 params->result = S_OK;
+                 return STATUS_SUCCESS;
+             case 3:   /* PhysicalSpeakers */
+@@ -2788,6 +3228,8 @@ static NTSTATUS pulse_get_prop_value(void *args)
+                     goto fail;
+                 params->value->vt = VT_UI4;
+                 params->value->ulVal = dev->channel_mask;
++
++                g_phys_unlock();
+                 params->result = S_OK;
+                 return STATUS_SUCCESS;
+             }
+@@ -2802,14 +3244,17 @@ static NTSTATUS pulse_get_prop_value(void *args)
+                 params->result = S_OK;
+             }
+ 
++            g_phys_unlock();
+             return STATUS_SUCCESS;
+         }
+ 
++        g_phys_unlock();
+         params->result = E_NOTIMPL;
+         return STATUS_SUCCESS;
+     }
+ 
+ fail:
++    g_phys_unlock();
+     params->result = E_FAIL;
+     return STATUS_SUCCESS;
+ }
+-- 
+2.54.0
+

@@ -1,0 +1,371 @@
+From 8532b2a12147b53d1c2440e948a933eb6226b903 Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Wed, 24 Jun 2026 12:36:55 -0300
+Subject: [PATCH 01/11] mmdevapi/setupapi: HACK: Set MMDevices properties in
+ setupapi.
+
+---
+ dlls/mmdevapi/Makefile.in |   2 +-
+ dlls/mmdevapi/devenum.c   | 177 ++++++++++++++++++++++++++++++++------
+ dlls/setupapi/devinst.c   |  32 ++++++-
+ 3 files changed, 182 insertions(+), 29 deletions(-)
+
+diff --git a/dlls/mmdevapi/Makefile.in b/dlls/mmdevapi/Makefile.in
+index 26f0e8ee0aa..2157763f571 100644
+--- a/dlls/mmdevapi/Makefile.in
++++ b/dlls/mmdevapi/Makefile.in
+@@ -1,5 +1,5 @@
+ MODULE    = mmdevapi.dll
+-IMPORTS   = ole32 oleaut32 user32 advapi32 version
++IMPORTS   = ole32 oleaut32 user32 advapi32 version setupapi
+ DELAYIMPORTS = winmm
+ 
+ SOURCES = \
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+index 7fd518de0f6..adf2624a674 100644
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -36,6 +36,7 @@
+ #include "endpointvolume.h"
+ #include "audiopolicy.h"
+ #include "spatialaudioclient.h"
++#include "setupapi.h"
+ 
+ #include "mmdevapi_private.h"
+ #include "devpkey.h"
+@@ -536,10 +537,11 @@ static HRESULT MMDevice_SetPropValue(const GUID *devguid, DWORD flow, REFPROPERT
+     return hr;
+ }
+ 
+-static HRESULT set_driver_prop_value(GUID *id, const EDataFlow flow, const PROPERTYKEY *prop)
++/* pv will be overwritten, make sure it doesn't have allocated memory before. */
++/* On return it will be valid (or empty). */
++static HRESULT set_get_driver_prop_value(GUID *id, const EDataFlow flow, const PROPERTYKEY *prop, PROPVARIANT *pv)
+ {
+     struct get_prop_value_params params;
+-    PROPVARIANT pv;
+     char *dev_name;
+     unsigned int size = 0;
+ 
+@@ -551,7 +553,7 @@ static HRESULT set_driver_prop_value(GUID *id, const EDataFlow flow, const PROPE
+     params.device      = dev_name;
+     params.guid        = id;
+     params.prop        = prop;
+-    params.value       = &pv;
++    params.value       = pv;
+     params.buffer      = NULL;
+     params.buffer_size = &size;
+ 
+@@ -569,17 +571,27 @@ static HRESULT set_driver_prop_value(GUID *id, const EDataFlow flow, const PROPE
+         }
+     }
+ 
+-    if (FAILED(params.result))
++    if (FAILED(params.result)) {
+         CoTaskMemFree(params.buffer);
++        PropVariantInit(&pv);
++    } else {
++        MMDevice_SetPropValue(id, flow, prop, pv);
++    }
+ 
+     free(dev_name);
++    return params.result;
++}
+ 
+-    if (SUCCEEDED(params.result)) {
+-        MMDevice_SetPropValue(id, flow, prop, &pv);
+-        PropVariantClear(&pv);
+-    }
++static HRESULT set_driver_prop_value(GUID *id, const EDataFlow flow, const PROPERTYKEY *prop)
++{
++    PROPVARIANT pv;
++    HRESULT hr;
+ 
+-    return params.result;
++    PropVariantInit(&pv);
++    hr = set_get_driver_prop_value(id, flow, prop, &pv);
++
++    PropVariantClear(&pv);
++    return hr;
+ }
+ 
+ struct product_name_overrides
+@@ -607,6 +619,108 @@ static const WCHAR *find_product_name_override(const WCHAR *device_id)
+     return NULL;
+ }
+ 
++/* len of SWD\MMDEVAPI\{0.0.x.00000000}.{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx} + nul */
++#define DEVICE_ID_LEN 69
++#define FRIENDLY_NAME_MAX 200
++
++/* Create fake entries for an AudioEndpoint driver even though we are not actually one. */
++/* Fix DualSense Wireless Controller haptic detection for some. */
++/* This is way less code than even a skeleton pnp driver, not to mention the difficulty of setting friendly name */
++/* from within ntoskrnl. */
++static void MMDevice_Register(const WCHAR *instguid, const WCHAR *friendly_name, const GUID *container_id, EDataFlow flow)
++{
++    static const WCHAR ControlClass[] = L"System\\CurrentControlSet\\Control\\Class";
++    static const WCHAR AudioEndpoint_Class[] = L"AudioEndpoint";
++    static const GUID AudioEndpoint_ClassGUID = { 0xc166523c, 0xfe0c, 0x4a94, { 0xa5, 0x86, 0xf1, 0xa8, 0x0c, 0xfb, 0xbf, 0x3e } };
++
++    HDEVINFO device_set;
++    WCHAR device_name[DEVICE_ID_LEN];
++    SP_DEVINFO_DATA device_info_data;
++    SP_DEVICE_INTERFACE_DATA device_interface_data;
++
++    {
++        /* len of ControlClass + '\\' + guidstr */
++        WCHAR buf[78];
++        WCHAR guidstr[39];
++        HKEY key;
++
++        StringFromGUID2(&AudioEndpoint_ClassGUID, guidstr, 39);
++        _wcslwr(guidstr);
++        lstrcpyW(buf, ControlClass);
++        lstrcatW(buf, L"\\");
++        lstrcatW(buf, guidstr);
++        if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, buf, 0, NULL, REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, NULL, &key, NULL) == ERROR_SUCCESS)
++        {
++            /* setupapi uses this to set other things later. */
++            RegSetValueExW(key, L"Class", 0, REG_SZ, (LPBYTE)AudioEndpoint_Class, ARRAY_SIZE(AudioEndpoint_Class) * sizeof(WCHAR));
++            RegCloseKey(key);
++        }
++    }
++
++    /* pretend to be pnp */
++    if ((device_set = SetupDiCreateDeviceInfoList(NULL, NULL)))
++    {
++        if (swprintf(device_name, ARRAY_SIZE(device_name), L"SWD\\MMDEVAPI\\{0.0.%u.00000000}.%s", flow, instguid) != -1)
++        {
++            memset(&device_info_data, 0, sizeof(device_info_data));
++            device_info_data.cbSize = sizeof(device_info_data);
++
++            if (
++                SetupDiCreateDeviceInfoW(device_set, device_name, &AudioEndpoint_ClassGUID, device_name, NULL, 0, &device_info_data) ||
++                (
++                    GetLastError() == ERROR_DEVINST_ALREADY_EXISTS &&
++                    SetupDiOpenDeviceInfoW(device_set, device_name, NULL, 0, &device_info_data)
++                )
++            )
++            {
++                SetupDiRegisterDeviceInfo(device_set, &device_info_data, 0, NULL, NULL, NULL);
++
++                {
++                    HKEY key;
++                    key = SetupDiOpenDevRegKey(device_set, &device_info_data, DICS_FLAG_GLOBAL, 0, DIREG_DRV, 0);
++                    if (key == INVALID_HANDLE_VALUE)
++                        key = SetupDiCreateDevRegKeyW(device_set, &device_info_data, DICS_FLAG_GLOBAL, 0, DIREG_DRV, NULL, NULL);
++
++                    if (key != INVALID_HANDLE_VALUE)
++                        RegCloseKey(key);
++                    else
++                        WARN("SetupDiOpenDevRegKey and SetupDiCreateDevRegKeyW failed.");
++                }
++
++                {
++                    WCHAR buf[39];
++                    if (StringFromGUID2(container_id, buf, 39))
++                    {
++                        _wcslwr(buf);
++                        TRACE("Container id: %S\n", buf);
++                        if (!SetupDiSetDeviceRegistryPropertyW(device_set, &device_info_data, SPDRP_BASE_CONTAINERID, (BYTE *)buf, 39 * sizeof(WCHAR)))
++                            WARN("Set container id failed: 0x%lu\n", GetLastError());
++                    }
++                    else
++                        WARN("StringFromGUID2 failed.\n");
++                }
++
++                if (!SetupDiSetDeviceRegistryPropertyW(device_set, &device_info_data, SPDRP_FRIENDLYNAME, (BYTE *)friendly_name, (wcslen(friendly_name) + 1) * sizeof(WCHAR)))
++                    WARN("Set friendly name failed: 0x%lu\n", GetLastError());
++
++                memset(&device_interface_data, 0, sizeof(device_interface_data));
++                device_interface_data.cbSize = sizeof(device_interface_data);
++
++                if (!SetupDiCreateDeviceInterfaceW(device_set, &device_info_data, flow == eRender ? &DEVINTERFACE_AUDIO_RENDER : &DEVINTERFACE_AUDIO_CAPTURE, NULL, 0, &device_interface_data))
++                    WARN("SetupDiCreateDeviceInterfaceW failed.");
++            }
++            else
++                WARN("SetupDiCreateDeviceInfoW failed.");
++        }
++        else
++            WARN("swprintf failed.");
++
++        SetupDiDestroyDeviceInfoList(device_set);
++    }
++    else
++        WARN("SetupDiCreateDeviceInfoList failed.");
++}
++
+ /* Creates or updates the state of a device
+  * If GUID is null, a random guid will be assigned
+  * and the device will be created
+@@ -616,6 +730,11 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
+     HKEY key, root;
+     MMDevice *device, *cur = NULL;
+     WCHAR guidstr[39];
++    PROPVARIANT container_id;
++    WCHAR friendly_name[FRIENDLY_NAME_MAX];
++    const WCHAR *device_iname;
++    const WCHAR *device_desc = flow == eRender ? L"Speakers" : L"Microphone";
++    const WCHAR *friendly_name_fmt = L"%ls (%ls)";
+ 
+     static const PROPERTYKEY deviceinterface_key = {
+         {0x233164c8, 0x1b2c, 0x4c7d, {0xbc, 0x68, 0xb6, 0x71, 0x68, 0x7a, 0x25, 0x67}}, 1
+@@ -625,6 +744,8 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
+         {0xb3f8fa53, 0x0004, 0x438e, {0x90, 0x03, 0x51, 0xa4, 0x6e, 0x13, 0x9b, 0xfc}}, 2
+     };
+ 
++    PropVariantInit(&container_id);
++
+     LIST_FOR_EACH_ENTRY(device, &device_list, MMDevice, entry)
+     {
+         if (device->flow == flow && IsEqualGUID(&device->devguid, id)){
+@@ -644,10 +765,12 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
+ 
+         list_add_tail(&device_list, &cur->entry);
+     }else if(cur->ref > 0)
+-        WARN("Modifying an MMDevice with postitive reference count!\n");
++        WARN("Modifying an MMDevice with positive reference count!\n");
+ 
+     free(cur->drv_id);
+     cur->drv_id = wcsdup(name);
++    device_iname = cur->drv_id;
++    swprintf(friendly_name, FRIENDLY_NAME_MAX, friendly_name_fmt, device_desc, device_iname);
+ 
+     cur->flow = flow;
+     cur->state = state;
+@@ -667,11 +790,6 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
+         if (!RegCreateKeyExW(key, L"Properties", 0, NULL, 0, KEY_WRITE|KEY_READ|KEY_WOW64_64KEY, NULL, &keyprop, NULL))
+         {
+             PROPVARIANT pv;
+-            WCHAR *type;
+-            DWORD len;
+-
+-            pv.vt = VT_LPWSTR;
+-            pv.pwszVal = cur->drv_id;
+ 
+             if (SUCCEEDED(set_driver_prop_value(id, flow, &devicepath_key))) {
+                 PROPVARIANT pv2;
+@@ -680,29 +798,31 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
+ 
+                 if (SUCCEEDED(MMDevice_GetPropValue(id, flow, &devicepath_key, &pv2)) && pv2.vt == VT_LPWSTR) {
+                     const WCHAR *override;
+-                    if ((override = find_product_name_override(pv2.pwszVal)) != NULL)
+-                        pv.pwszVal = (WCHAR*) override;
++                    if ((override = find_product_name_override(pv2.pwszVal)) != NULL) {
++                        device_iname = override;
++                        swprintf(friendly_name, FRIENDLY_NAME_MAX, friendly_name_fmt, device_desc, device_iname);
++                    }
+                 }
+ 
+                 PropVariantClear(&pv2);
+             }
+ 
++            pv.vt = VT_LPWSTR;
++
++            pv.pwszVal = friendly_name;
++            MMDevice_SetPropValue(id, flow, (const PROPERTYKEY*)&DEVPKEY_Device_FriendlyName, &pv);
++
++            pv.pwszVal = (LPWSTR)device_iname;
+             MMDevice_SetPropValue(id, flow, (const PROPERTYKEY*)&DEVPKEY_DeviceInterface_FriendlyName, &pv);
+ 
+-            pv.pwszVal = type = (WCHAR *)(flow == eCapture ? L"Microphone" : L"Speakers");
++            pv.pwszVal = (LPWSTR)device_desc;
+             MMDevice_SetPropValue(id, flow, (const PROPERTYKEY*)&DEVPKEY_Device_DeviceDesc, &pv);
+ 
+-            len = (wcslen(type) + wcslen(cur->drv_id) + wcslen(L" ()") + 1);
+-            pv.vt = VT_LPWSTR;
+-            pv.pwszVal = CoTaskMemAlloc(len * sizeof(WCHAR));
+-            swprintf(pv.pwszVal, len, L"%ls (%ls)", type, cur->drv_id);
+-            MMDevice_SetPropValue(id, flow, (const PROPERTYKEY*)&DEVPKEY_Device_FriendlyName, &pv);
+-            CoTaskMemFree(pv.pwszVal);
+-
+             pv.pwszVal = guidstr;
+             MMDevice_SetPropValue(id, flow, &deviceinterface_key, &pv);
+ 
+-            set_driver_prop_value(id, flow, (const PROPERTYKEY*)&DEVPKEY_Device_ContainerId);
++            if (FAILED(set_get_driver_prop_value(id, flow, (const PROPERTYKEY*)&DEVPKEY_Device_ContainerId, &container_id)) && state == DEVICE_STATE_ACTIVE)
++                WARN("Failed to get and set container id\n");
+ 
+             if (FAILED(set_driver_prop_value(id, flow, &PKEY_AudioEndpoint_FormFactor)))
+             {
+@@ -735,6 +855,9 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
+         RegCloseKey(key);
+     }
+ 
++    MMDevice_Register(guidstr, friendly_name, container_id.vt == VT_CLSID ? container_id.puuid : &GUID_NULL, flow);
++    PropVariantClear(&container_id);
++
+     if (setdefault)
+     {
+         if (flow == eRender)
+@@ -792,7 +915,7 @@ HRESULT load_devices_from_reg(void)
+         if (ret != ERROR_SUCCESS)
+             continue;
+         if (SUCCEEDED(CLSIDFromString(guidvalue, &guid))
+-            && SUCCEEDED(MMDevice_GetPropValue(&guid, curflow, (const PROPERTYKEY*)&DEVPKEY_Device_FriendlyName, &pv))
++            && SUCCEEDED(MMDevice_GetPropValue(&guid, curflow, (const PROPERTYKEY*)&DEVPKEY_DeviceInterface_FriendlyName, &pv))
+             && pv.vt == VT_LPWSTR)
+         {
+             MMDevice_Create(pv.pwszVal, &guid, curflow,
+diff --git a/dlls/setupapi/devinst.c b/dlls/setupapi/devinst.c
+index b860d72b16f..2226396f298 100644
+--- a/dlls/setupapi/devinst.c
++++ b/dlls/setupapi/devinst.c
+@@ -1935,6 +1935,9 @@ end:
+     return ret;
+ }
+ 
++DEFINE_GUID(DEVINTERFACE_AUDIO_RENDER, 0xe6327cad,0xdcec,0x4949,0xae,0x8a,0x99,0x1e,0x97,0x6a,0x79,0xd2);
++DEFINE_GUID(DEVINTERFACE_AUDIO_CAPTURE, 0x2eef81be,0x33fa,0x4800,0x96,0x70,0x1c,0xd4,0x74,0x97,0x2c,0x3f);
++
+ static void SETUPDI_AddDeviceInterfaces(struct device *device, HKEY key,
+     const GUID *guid, DWORD flags)
+ {
+@@ -1942,6 +1945,17 @@ static void SETUPDI_AddDeviceInterfaces(struct device *device, HKEY key,
+     WCHAR subKeyName[MAX_PATH];
+     LONG l = ERROR_SUCCESS;
+ 
++    /* Fake entries instead of a real driver. See mmdevapi/devenum.c */
++    const GUID *SKIP_PRESENT_CHECK[] = {&DEVINTERFACE_AUDIO_RENDER, &DEVINTERFACE_AUDIO_CAPTURE, NULL};
++    bool skip_present_check = false;
++
++    for (i = 0; SKIP_PRESENT_CHECK[i] ; i++)
++        if (IsEqualGUID(SKIP_PRESENT_CHECK[i], guid))
++        {
++            skip_present_check = true;
++            break;
++        }
++
+     for (i = 0; !l; i++)
+     {
+         len = ARRAY_SIZE(subKeyName);
+@@ -1960,8 +1974,24 @@ static void SETUPDI_AddDeviceInterfaces(struct device *device, HKEY key,
+                     WCHAR symbolicLink[MAX_PATH];
+                     DWORD dataType;
+ 
+-                    if (!(flags & DIGCF_PRESENT) || is_linked(subKey))
++                    if (!(flags & DIGCF_PRESENT) || is_linked(subKey) || skip_present_check)
+                     {
++                        if (skip_present_check)
++                        {
++                            DWORD linked = 1;
++                            HKEY control_key;
++
++                            if (!RegCreateKeyW(subKey, L"Control", &control_key))
++                            {
++                                if (RegSetValueExW(control_key, L"Linked", 0, REG_DWORD, (BYTE *)&linked, sizeof(DWORD)))
++                                    WARN("Set \"Linked\" registry entry failed");
++
++                                RegCloseKey(control_key);
++                            }
++                            else
++                                WARN("Create \"Control\" registry key failed");
++                        }
++
+                         iface = SETUPDI_CreateDeviceInterface(device, guid, subKeyName + 1);
+ 
+                         len = sizeof(symbolicLink);
+-- 
+2.54.0
+
