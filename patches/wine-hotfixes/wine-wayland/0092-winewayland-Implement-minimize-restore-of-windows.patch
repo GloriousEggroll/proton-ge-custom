@@ -1,0 +1,135 @@
+From ea98642cf2940e38d2eafc529780abf9a508fefc Mon Sep 17 00:00:00 2001
+From: Etaash Mathamsetty
+ <45927311+Etaash-mathamsetty@users.noreply.github.com>
+Date: Sun, 29 Mar 2026 03:07:24 -0500
+Subject: [PATCH 092/185] winewayland: Implement minimize & restore of windows.
+
+---
+ dlls/winewayland.drv/wayland_keyboard.c | 28 ++++++++++++++++++++++---
+ dlls/winewayland.drv/waylanddrv.h       |  1 +
+ dlls/winewayland.drv/window.c           | 27 ++++++++++++++++++++++--
+ 3 files changed, 51 insertions(+), 5 deletions(-)
+
+diff --git a/dlls/winewayland.drv/wayland_keyboard.c b/dlls/winewayland.drv/wayland_keyboard.c
+index 648b7f9cc2f..0aebf7550f2 100644
+--- a/dlls/winewayland.drv/wayland_keyboard.c
++++ b/dlls/winewayland.drv/wayland_keyboard.c
+@@ -770,16 +770,20 @@ static void keyboard_handle_enter(void *private, struct wl_keyboard *wl_keyboard
+          * directly once it's updated to not explicitly deactivate the old
+          * foreground window when both the old and new foreground windows
+          * are in the same non-current thread. */
+-        if (surface->window.managed)
++        if (surface->window.minimized)
++            NtUserPostMessage(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0);
++        else if (surface->window.managed)
+             NtUserPostMessage(hwnd, WM_WAYLAND_SET_FOREGROUND, 0, 0);
+     }
+ 
+     wayland_win_data_release(data);
+ }
+ 
+-static void keyboard_handle_leave(void *data, struct wl_keyboard *wl_keyboard,
++static void keyboard_handle_leave(void *private, struct wl_keyboard *wl_keyboard,
+                                   uint32_t serial, struct wl_surface *wl_surface)
+ {
++    struct wayland_win_data *data;
++    struct wayland_surface *surface;
+     struct wayland_keyboard *keyboard = &process_wayland.keyboard;
+     HWND hwnd;
+ 
+@@ -801,7 +805,25 @@ static void keyboard_handle_leave(void *data, struct wl_keyboard *wl_keyboard,
+      * and for any key repetition to stop. */
+     release_all_keys(hwnd);
+ 
+-    /* FIXME: update foreground window as well */
++    if (hwnd == NtUserGetForegroundWindow())
++    {
++        if (!(NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_MINIMIZE))
++            send_message(hwnd, WM_CANCELMODE, 0, 0);
++
++        if (!(data = wayland_win_data_get(hwnd))) return;
++
++        if ((surface = data->wayland_surface))
++        {
++            /* TODO: Drop the internal message and call NtUserSetForegroundWindow
++             * directly once it's updated to not explicitly deactivate the old
++             * foreground window when both the old and new foreground windows
++             * are in the same non-current thread. */
++            if (surface->window.managed)
++                NtUserPostMessage(hwnd, WM_WAYLAND_SET_FOREGROUND, 1, 0);
++        }
++
++        wayland_win_data_release(data);
++    }
+ }
+ 
+ static void send_right_control(HWND hwnd, uint32_t state)
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index 5cf1fbfb6b4..40a61b8a7c0 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -268,6 +268,7 @@ struct wayland_window_config
+     BOOL visible;
+     BOOL managed;
+     BOOL resizeable;
++    BOOL minimized;
+ };
+ 
+ struct wayland_client_surface
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index 09ff21acaa4..62f8fbe4dc3 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -149,8 +149,14 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
+ 
+     TRACE("window=%s style=%#x\n", wine_dbgstr_rect(&conf->rect), style);
+ 
++    conf->minimized = FALSE;
++
++    if (style & WS_MINIMIZE)
++    {
++        conf->minimized = TRUE;
++    }
+     /* The fullscreen state is implied by the window position and style. */
+-    if (data->is_fullscreen)
++    else if (data->is_fullscreen)
+     {
+         if ((style & WS_MAXIMIZE) && (style & WS_CAPTION) == WS_CAPTION)
+             window_state |= WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED;
+@@ -310,6 +316,10 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
+             skip_fullscreen:
+             pthread_mutex_unlock(&process_wayland.output_mutex);
+         }
++        if (surface->window.minimized)
++        {
++            xdg_toplevel_set_minimized(surface->xdg_toplevel);
++        }
+     }
+     else
+     {
+@@ -638,8 +648,21 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+         wayland_configure_window(hwnd);
+         return 0;
+     case WM_WAYLAND_SET_FOREGROUND:
+-        NtUserSetForegroundWindowInternal(hwnd);
++    {
++        HWND focused;
++        pthread_mutex_lock(&process_wayland.keyboard.mutex);
++        focused = process_wayland.keyboard.focused_hwnd;
++        pthread_mutex_unlock(&process_wayland.keyboard.mutex);
++        /* if the focused hwnd is already == hwnd, this was a spurious leave event. */
++        if (wp && NtUserGetForegroundWindow() == hwnd && focused != hwnd)
++            NtUserSetForegroundWindowInternal(NtUserGetDesktopWindow());
++        /* the same applies here */
++        else if (!wp && focused == hwnd)
++            NtUserSetForegroundWindowInternal(hwnd);
++        else
++            WARN("Ignoring stale %s message\n", wp ? "focus loss" : "focus gain");
+         return 0;
++    }
+     default:
+         FIXME("got window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (long)wp, lp);
+         return 0;
+-- 
+2.54.0
+

@@ -1,0 +1,106 @@
+From c82831d85bb2bc25a6701b00d651eb9c6c699af4 Mon Sep 17 00:00:00 2001
+From: Etaash Mathamsetty
+ <45927311+Etaash-mathamsetty@users.noreply.github.com>
+Date: Sat, 18 Apr 2026 19:05:16 -0500
+Subject: [PATCH 091/185] winewayland: Implement client surface caching.
+
+Requires: https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/34918
+---
+ dlls/winewayland.drv/vulkan.c     | 40 ++++++++++++++++++++++++++++++-
+ dlls/winewayland.drv/waylanddrv.h |  2 ++
+ dlls/winewayland.drv/window.c     |  1 +
+ 3 files changed, 42 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/winewayland.drv/vulkan.c b/dlls/winewayland.drv/vulkan.c
+index 14d9a1871cc..cdc6ddf1440 100644
+--- a/dlls/winewayland.drv/vulkan.c
++++ b/dlls/winewayland.drv/vulkan.c
+@@ -39,6 +39,42 @@ WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
+ 
+ static const struct vulkan_driver_funcs wayland_vulkan_driver_funcs;
+ 
++static struct wayland_client_surface *stash_client_surface(HWND hwnd,
++                                                           struct wayland_client_surface *surface)
++{
++    struct wayland_client_surface *ret = NULL;
++    struct wayland_win_data *data;
++
++    if (!(data = wayland_win_data_get(hwnd))) return NULL;
++
++    if (surface)
++    {
++        if ((ret = data->stashed_client) == surface)
++        {
++            wayland_win_data_release(data);
++            return ret;
++        }
++        client_surface_add_ref(&surface->client);
++        data->stashed_client = surface;
++    }
++    else if ((ret = data->stashed_client) && !ReadAcquire(&ret->client.busy_ref))
++    {
++        /* cannot decrease the ref count here as there is a
++         * new VkSurface referencing this client surface */
++        data->stashed_client = NULL;
++        /* detach the client surface to ensure it is reparented */
++        wayland_client_surface_attach(ret, NULL);
++        if (data->client_surface == ret) data->client_surface = NULL;
++    }
++    else ret = NULL;
++
++    wayland_win_data_release(data);
++
++    if (ret && surface) client_surface_release(&ret->client);
++
++    return ret;
++}
++
+ static VkResult wayland_vulkan_surface_create(HWND hwnd, BOOL raw, const struct vulkan_instance *instance,
+                                               VkSurfaceKHR *handle, struct client_surface **client)
+ {
+@@ -48,7 +84,8 @@ static VkResult wayland_vulkan_surface_create(HWND hwnd, BOOL raw, const struct
+ 
+     TRACE("%p %p %p %p\n", hwnd, instance, handle, client);
+ 
+-    if (!(surface = wayland_client_surface_create(hwnd)))
++    if (!(surface = stash_client_surface(hwnd, NULL)) &&
++        !(surface = wayland_client_surface_create(hwnd)))
+     {
+         ERR("Failed to create vulkan client surface\n");
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+@@ -69,6 +106,7 @@ static VkResult wayland_vulkan_surface_create(HWND hwnd, BOOL raw, const struct
+     }
+ 
+     set_client_surface(hwnd, surface);
++    stash_client_surface(hwnd, surface);
+     *client = &surface->client;
+ 
+     TRACE("Created surface=0x%s, client=%p\n", wine_dbgstr_longlong(*handle), *client);
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index 9b97639f42d..5cf1fbfb6b4 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -413,6 +413,8 @@ struct wayland_win_data
+     struct wayland_surface *wayland_surface;
+     /* wayland client surface (if any) for this window */
+     struct wayland_client_surface *client_surface;
++    /* track a stale client surface to ensure DMABUF modifiers stay valid */
++    struct wayland_client_surface *stashed_client;
+     /* window rects, relative to parent client area */
+     struct window_rects rects;
+     BOOL is_fullscreen;
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index 11e359fd3f6..09ff21acaa4 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -102,6 +102,7 @@ static void wayland_win_data_destroy(struct wayland_win_data *data)
+ 
+     pthread_mutex_unlock(&win_data_mutex);
+ 
++    if (data->stashed_client) client_surface_release(&data->stashed_client->client);
+     if (data->wayland_surface) wayland_surface_destroy(data->wayland_surface);
+     if (data->window_contents) wayland_shm_buffer_unref(data->window_contents);
+     free(data);
+-- 
+2.54.0
+
