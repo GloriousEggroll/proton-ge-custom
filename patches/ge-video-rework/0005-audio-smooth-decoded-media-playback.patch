@@ -26,8 +26,7 @@ The Pulse changes keep timer and buffer accounting stable when video playback is
 ---
  dlls/msauddecmft/msauddecmft.c |   6 +-
  dlls/winepulse.drv/pulse.c     | 131 ++++++++++++++++++++++++++-------
- dlls/xaudio2_7/xaudio_dll.c    |  14 +++-
- 3 files changed, 121 insertions(+), 30 deletions(-)
+ 2 files changed, 109 insertions(+), 28 deletions(-)
 diff --git a/dlls/msauddecmft/msauddecmft.c b/dlls/msauddecmft/msauddecmft.c
 index 672389564a2..9928ddf92da 100644
 --- a/dlls/msauddecmft/msauddecmft.c
@@ -108,7 +107,7 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
  {
 +    struct pulse_stream *stream = user;
      pa_stream_state_t state = pa_stream_get_state(s);
-     TRACE("Stream state changed to %i\n", state);
+     TRACE("%p: Stream state changed to %i\n", user, state);
 +    if (stream && stream->dataflow == eRender && state == PA_STREAM_READY)
 +    {
 +        const pa_buffer_attr *attr = pa_stream_get_buffer_attr(s);
@@ -129,7 +128,7 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
  static void pulse_attr_update(pa_stream *s, void *user) {
 +    struct pulse_stream *stream = user;
      const pa_buffer_attr *attr = pa_stream_get_buffer_attr(s);
-     TRACE("New attributes or device moved:\n");
+     TRACE("%p: New attributes or device moved:\n", user);
 +    if (stream && attr)
 +        stream->attr = *attr;
      dump_attr(attr);
@@ -188,9 +187,7 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
          SIZE_T size;
  
          stream->attr = *attr;
-@@ -2587,23 +2637,28 @@
- 
- static void pulse_write_index_catchup(struct pulse_stream *stream)
+@@ -2642,6 +2642,10 @@ static void pulse_write_index_catchup(struct pulse_stream *stream)
  {
 -    const pa_timing_info *ti = pa_stream_get_timing_info(stream->stream);
 +    const pa_timing_info *ti;
@@ -200,15 +197,16 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
 +    if (!pulse_stream_ready(stream))
 +        return;
 +
-     ti = pa_stream_get_timing_info(stream->stream);
++    ti = pa_stream_get_timing_info(stream->stream);
      if (!ti || ti->read_index <= ti->write_index) return;
- 
+@@ -2655,5 +2658,6 @@ static void pulse_write_index_catchup(struct pulse_stream *stream)
      if (!silence_buf) silence_buf = calloc(1, silence_buf_size);
      frame_size = pa_frame_size(&stream->ss);
 +    if (!frame_size) return;
  
      while (ti && ti->read_index > ti->write_index)
      {
+@@ -2660,7 +2664,8 @@ static void pulse_write_index_catchup(struct pulse_stream *stream)
          write_index = ti->write_index;
 -        TRACE("stream %p, runnind %d, read is ahead of write %lld bytes.\n", stream, stream->started,
 +        TRACE("stream %p, running %d, read is ahead of write %lld bytes.\n", stream, stream->started,
@@ -219,8 +217,7 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
 +        if (!to_write) break;
          pa_stream_write(stream->stream, silence_buf, to_write, NULL, 0, PA_SEEK_RELATIVE);
          ti = pa_stream_get_timing_info(stream->stream);
-         if (ti && ti->write_index <= write_index)
-@@ -2627,6 +2682,9 @@
+@@ -2683,6 +2688,9 @@ static void pulse_write(struct pulse_stream *stream)
          return;
      }
  
@@ -230,86 +227,25 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
      bytes = pa_stream_writable_size(stream->stream);
  
      pulse_write_index_catchup(stream);
-@@ -2793,17 +2851,20 @@
-     UINT32 adv_bytes;
-     int err;
- 
--    if (period->timer_stream && !period->timer_stream->started)
-+    if (period->timer_stream && (!period->timer_stream->started || !pulse_stream_ready(period->timer_stream)))
-         period->timer_stream = NULL;
- 
-     if (!period->timer_stream)
-     {
-         LIST_FOR_EACH_ENTRY(stream, &period->streams, struct pulse_stream, period_entry)
-         {
--            if (stream->started)
-+            if (stream->started && pulse_stream_ready(stream))
+@@ -2952,13 +2952,15 @@ static void pa_streams_timer_cb(pa_mainloop_api *api, pa_time_event *e, const struct timeval *tv, void *userdata)
+-            if (!stream->update_timing_info_pending && (o = pa_stream_update_timing_info(stream->stream, pulse_update_timing_cb, stream)))
++            if (!pulse_stream_haptic(stream) && !pulse_stream_ready(stream))
++                continue;
++            if (!pulse_stream_haptic(stream) && !stream->update_timing_info_pending && (o = pa_stream_update_timing_info(stream->stream, pulse_update_timing_cb, stream)))
              {
-                 if ((err = pa_stream_get_time(stream->stream, &stream->stream_time)))
-+                {
-                     ERR("pa_stream_get_time error %d.\n", err);
-+                    continue;
-+                }
-                 stream->last_time = stream->stream_time;
-                 TRACE("period %p, stream %p is now timer stream, stream_time %llu.\n", period, stream, (long long)stream->stream_time);
-                 stream->stream_time -= period->period;
-@@ -2817,24 +2878,32 @@
-     if (period->timer_stream)
-     {
-         if ((err = pa_stream_get_time(period->timer_stream->stream, &stream_time)))
--            ERR("pa_stream_get_time error %d.\n", err);
--        if (stream_time > period->timer_stream->last_time)
-         {
--            period->timer_stream->stream_time += period->period;
--            adjust = period->timer_stream->stream_time - stream_time;
--            TRACE("period %p, stream_time %lld, adjust %lld.\n", period, (long long)stream_time, (long long)adjust);
--            if (adjust > (int64_t)(period->period / 3))
--                adjust = period->period / 3;
--            else if (adjust < -(int64_t)(period->period / 3))
--                adjust = -(int64_t)period->period / 3;
--            next_timer += adjust;
-+            ERR("pa_stream_get_time error %d.\n", err);
-+            period->timer_stream = NULL;
-         }
-         else
-         {
--            WARN("stream time did not advance, last_time %lld, stream_time %lld.\n",
--                    (long long)period->timer_stream->last_time, (long long)stream_time);
-+            if (stream_time > period->timer_stream->last_time)
-+            {
-+                period->timer_stream->stream_time += period->period;
-+                adjust = period->timer_stream->stream_time - stream_time;
-+                TRACE("period %p, stream_time %lld, adjust %lld.\n", period, (long long)stream_time, (long long)adjust);
-+                if (period->timer_stream->dataflow == eRender && adjust > 0)
-+                    adjust = 0;
-+                else if (adjust > (int64_t)(period->period / 3))
-+                    adjust = period->period / 3;
-+                else if (adjust < -(int64_t)(period->period / 3))
-+                    adjust = -(int64_t)period->period / 3;
-+                next_timer += adjust;
-+            }
-+            else
-+            {
-+                WARN("stream time did not advance, last_time %lld, stream_time %lld.\n",
-+                        (long long)period->timer_stream->last_time, (long long)stream_time);
-+            }
-+            period->timer_stream->last_time = stream_time;
-         }
--        period->timer_stream->last_time = stream_time;
-     }
- 
-     LIST_FOR_EACH_ENTRY(stream, &period->streams, struct pulse_stream, period_entry)
-@@ -2854,10 +2923,6 @@
-                     stream->held_bytes -= adv_bytes;
-                 }
+                 pa_operation_unref(o);
+                 stream->update_timing_info_pending = TRUE;
              }
--            else if (stream->dataflow == eRender)
--            {
--                pulse_write_index_catchup(stream);
--            }
-             else if (stream->dataflow == eCapture)
+-            else if (stream->update_timing_info_pending)
++            else if (!pulse_stream_haptic(stream) && stream->update_timing_info_pending)
              {
-                 pulse_read(stream);
+                 TRACE("pa_stream_update_timing_info is still pending.\n");
+             }
+-            else
++            else if (!pulse_stream_haptic(stream))
+             {
+                 ERR("pa_stream_update_timing_info err %d.\n", pa_context_errno(pulse_ctx));
+             }
 @@ -3584,7 +3649,7 @@
          params->result = AUDCLNT_E_DEVICE_INVALIDATED;
          return STATUS_SUCCESS;
@@ -344,45 +280,5 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
          wait_pa_operation_complete(pa_stream_flush(stream->stream, pulse_op_cb, &success));
  
      stream->clock_lastpos = stream->clock_written = 0;
-diff --git a/dlls/xaudio2_7/xaudio_dll.c b/dlls/xaudio2_7/xaudio_dll.c
-index fe9351e8b4a..0f2e900fcfb 100644
---- a/dlls/xaudio2_7/xaudio_dll.c
-+++ b/dlls/xaudio2_7/xaudio_dll.c
-@@ -1748,6 +1748,7 @@ static HRESULT WINAPI IXAudio2Impl_CreateMasteringVoice(IXAudio2 *iface,
- {
-     IXAudio2Impl *This = impl_from_IXAudio2(iface);
-     FAudioEffectChain *chain;
-+    HRESULT hr;
- 
-     TRACE("(%p)->(%p, %u, %u, 0x%x, %p)\n", This,
-             ppMasteringVoice, inputChannels, inputSampleRate, flags, pEffectChain);
-@@ -1777,16 +1778,25 @@ static HRESULT WINAPI IXAudio2Impl_CreateMasteringVoice(IXAudio2 *iface,
- #if XAUDIO2_VER >= 8
-     TRACE("device id %s, category %#x\n", debugstr_w(deviceId), streamCategory);
- 
--    FAudio_CreateMasteringVoice8(This->faudio, &This->mst.faudio_voice, inputChannels,
-+    hr = FAudio_CreateMasteringVoice8(This->faudio, &This->mst.faudio_voice, inputChannels,
-             inputSampleRate, flags, NULL /* TODO: (uint16_t*)deviceId */,
-             This->mst.effect_chain, (FAudioStreamCategory)streamCategory);
- #else
-     TRACE("device index %u\n", index);
- 
--    FAudio_CreateMasteringVoice(This->faudio, &This->mst.faudio_voice, inputChannels,
-+    hr = FAudio_CreateMasteringVoice(This->faudio, &This->mst.faudio_voice, inputChannels,
-             inputSampleRate, flags, index, This->mst.effect_chain);
- #endif
- 
-+    if (FAILED(hr))
-+    {
-+        This->mst.effect_chain = NULL;
-+        *ppMasteringVoice = NULL;
-+        LeaveCriticalSection(&This->mst.lock);
-+        free_effect_chain(chain);
-+        return hr;
-+    }
-+
-     This->mst.in_use = TRUE;
- 
-     LeaveCriticalSection(&This->mst.lock);
 -- 
 2.54.0
