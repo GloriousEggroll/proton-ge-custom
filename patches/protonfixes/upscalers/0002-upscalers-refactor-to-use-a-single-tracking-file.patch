@@ -1,0 +1,425 @@
+From 8ab8b8eea9f69685cad9f9430d62dfef4b5f1e7a Mon Sep 17 00:00:00 2001
+From: Stelios Tsampas <loathingkernel@gmail.com>
+Date: Tue, 23 Jun 2026 12:40:43 +0300
+Subject: [PATCH 2/8] upscalers: refactor to use a single tracking file
+
+---
+ upscalers.py | 232 +++++++++++++++++++++++++++++----------------------
+ 1 file changed, 133 insertions(+), 99 deletions(-)
+
+diff --git a/upscalers.py b/upscalers.py
+index b557a29..189706a 100644
+--- a/upscalers.py
++++ b/upscalers.py
+@@ -36,7 +36,7 @@ def __get_manifest() -> dict:
+             __manifest_json = json.loads(url_fd.read())
+     except Exception as e:
+         log.crit(f'Failed to download "{__manifest_url}"')
+-        log.crit(repr(e))
++        log.crit(e)
+     else:
+         with cached_manifest.open('w', encoding='utf-8') as manifest_fd:
+             manifest_fd.write(json.dumps(__manifest_json))
+@@ -47,7 +47,7 @@ def __get_manifest() -> dict:
+                 __manifest_json = json.loads(manifest_fd.read())
+     except Exception as e:
+         log.crit(f'Failed to read cached manifest "{str(cached_manifest)}"')
+-        log.crit(repr(e))
++        log.crit(e)
+ 
+     return __manifest_json  # pyright: ignore [reportReturnType]
+ 
+@@ -78,10 +78,11 @@ def __dll_download_exists(url: str) -> bool:
+     return False
+ 
+ 
+-__dlss_version_file = 'dlss_version'
+-__xess_version_file = 'xess_version'
+-__fsr3_version_file = 'fsr3_version'
+-__fsr4_version_file = 'fsr4_version'
++__dlss_section = 'dlss_files'
++__xess_section = 'xess_files'
++__fsr3_section = 'fsr3_files'
++__fsr4_section = 'fsr4_files'
++__version_file = 'upscaler_files'
+ 
+ 
+ def __get_dlss_dlls(version: str = 'default') -> dict:
+@@ -156,15 +157,15 @@ def __get_fsr4_dlls(version: str = 'default') -> dict:
+ 
+     cache_dir = config.path.cache_dir.joinpath('upscalers')
+ 
+-    def _cached_file_exists(file: dict) -> bool:
+-        url_path = Path(unquote(urlparse(file['download_url']).path))
++    def _cached_file_exists(it: dict) -> bool:
++        url_path = Path(unquote(urlparse(it['download_url']).path))
+         cached_file = cache_dir.joinpath(
+-            url_path.stem + f'_v{file["version"]}' + url_path.suffix
++            url_path.stem + f'_v{it["version"]}' + url_path.suffix
+         )
+         return cached_file.exists()
+ 
+     if version == 'default' or version not in __fsr4_dlls.keys():
+-        version = '4.0.3'
++        version = '4.1.0'
+ 
+     item = __fsr4_dlls[version]
+     if not (__dll_download_exists(item['download_url']) or _cached_file_exists(item)):
+@@ -183,8 +184,56 @@ def __get_fsr4_dlls(version: str = 'default') -> dict:
+     }
+ 
+ 
++def __get_upscaler_items(name: str, version: str) -> tuple[dict, Callable, str]:
++    upscalers = {
++        'dlss': (__get_dlss_dlls, __download_extract_zip, __dlss_section),
++        'xess': (__get_xess_dlls, __download_extract_zip, __xess_section),
++        'fsr3': (__get_fsr3_dlls, __download_extract_zip, __fsr3_section),
++        'fsr4': (__get_fsr4_dlls, __download_fsr4, __fsr4_section),
++    }
++    get_items, dlfunc, section = upscalers[name]
++    try:
++        items = get_items(version)
++    except Exception as e:
++        log.crit(f'Failed to get "{name}" versions from manifest')
++        log.crit(e)
++        raise e
++
++    return items, dlfunc, section
++
++
++def __get_tracked_items(compat_dir: str, section: str) -> dict:
++    tracking_file = os.path.join(compat_dir, __version_file)
++    try:
++        with open(tracking_file, encoding='utf-8') as file_fd:
++            data = file_fd.read()
++        tracked_versions = json.loads(data)
++        tracked_versions = tracked_versions[section]
++    except Exception as e:
++        log.warn(f'Error while reading version file "{tracking_file}"')
++        raise e
++
++    return tracked_versions
++
++
++def __set_tracked_items(compat_dir: str, section: str, checksums: dict) -> None:
++    tracking_file = os.path.join(compat_dir, __version_file)
++    try:
++        with open(tracking_file, encoding='utf-8') as file_fd:
++            data = file_fd.read()
++        local_versions = json.loads(data)
++    except Exception as e:
++        log.warn(f'Error while reading version file "{tracking_file}"')
++        local_versions = {}
++
++    local_versions[section] = checksums
++
++    with open(tracking_file, 'w', encoding='utf-8') as file_fd:
++        file_fd.write(json.dumps(local_versions))
++
++
+ def __check_upscaler_file(
+-    prefix_dir: str, dst: str, item: dict, tracked: dict, ignore_version: bool
++    prefix_dir: str, dst: str, remote_item: dict, tracked_item: dict, ignore_version: bool
+ ) -> bool:
+     target = os.path.join(prefix_dir, dst)
+ 
+@@ -206,7 +255,7 @@ def __check_upscaler_file(
+         dst_md5 = hashlib.md5(dst_fd.read()).hexdigest().lower()
+ 
+     # Then check if the file matches the one recorded in the tracking file
+-    tracked_md5 = tracked['md5_hash']
++    tracked_md5 = tracked_item['md5_hash']
+     if tracked_md5 and dst_md5 != tracked_md5.lower():
+         log.warn(f'MD5 checksum mismatch between tracking file and prefix "{dst}"')
+         return False
+@@ -214,10 +263,10 @@ def __check_upscaler_file(
+     # If we don't want to ignore the update
+     # We ignore updates in the validation check after the downloads
+     if not ignore_version:
+-        if tracked['version'] != item['version']:
++        if tracked_item['version'] != remote_item['version']:
+             log.warn(f'Version mismatch between tracking file and prefix "{dst}"')
+             return False
+-        item_md5 = item.get('md5_hash', '')
++        item_md5 = remote_item.get('md5_hash', '')
+         if item_md5 and dst_md5 != item_md5.lower():
+             log.warn(f'MD5 checksum mismatch between manifest and prefix "{dst}"')
+             return False
+@@ -227,27 +276,20 @@ def __check_upscaler_file(
+ 
+ 
+ def __check_upscaler_files(
+-    prefix_dir: str, files: dict, version_file: str, ignore_version: bool
++    compat_dir: str, prefix_dir: str, remote_items: dict, section: str, ignore_version: bool
+ ) -> bool:
+-    if not os.path.isfile(version_file):
+-        log.warn(f'Missing version file "{version_file}"')
+-        return False
+-
+     try:
+-        with open(version_file, encoding='utf-8') as version_fd:
+-            version = version_fd.read()
+-        version = json.loads(version)
++        tracked_items = __get_tracked_items(compat_dir, section)
+         # test if new files and their attributes exist in the tracking file
+-        for dst in files.keys():
+-            _ = version[dst].get('md5_hash')
++        for dst in remote_items.keys():
++            _ = tracked_items[dst].get('md5_hash')
+     except Exception as e:
+-        log.warn(f'Error while reading version file "{version_file}"')
+-        log.warn(repr(e))
++        log.warn(e)
+         return False
+ 
+     valid_files = tuple(
+-        __check_upscaler_file(prefix_dir, dst, files[dst], version[dst], ignore_version)
+-        for dst in files.keys()
++        __check_upscaler_file(prefix_dir, dst, remote_items[dst], tracked_items[dst], ignore_version)
++        for dst in remote_items.keys()
+     )
+ 
+     return all(valid_files)
+@@ -267,32 +309,26 @@ def check_upscaler(
+     version: the version of the upscaler dll to download
+     ignore_version: ignore version mismatch but still check if the dlls are present
+     """
+-    upscalers = {
+-        'dlss': (__get_dlss_dlls, __dlss_version_file),
+-        'xess': (__get_xess_dlls, __xess_version_file),
+-        'fsr3': (__get_fsr3_dlls, __fsr3_version_file),
+-        'fsr4': (__get_fsr4_dlls, __fsr4_version_file),
+-    }
+-    get_files, version_file = upscalers[name]
+     try:
+-        files = get_files(version)
+-    except Exception as e:
+-        log.crit('Failed to get file versions from manifest')
+-        log.crit(repr(e))
++        items, _, section = __get_upscaler_items(name, version)
++    except Exception:
+         return False
++
+     return __check_upscaler_files(
++        compat_dir,
+         prefix_dir,
+-        files,
+-        os.path.join(compat_dir, version_file),
++        items,
++        section,
+         ignore_version,
+     )
+ 
+ 
+ def __download_upscaler_files(
++    compat_dir: str,
+     prefix_dir: str,
+-    files: dict,
++    items: dict,
+     dlfunc: Callable[[dict, Path, Path], None],
+-    version_file: str,
++    section: str,
+ ) -> bool:
+     """Download and install the required dlls.
+ 
+@@ -305,28 +341,27 @@ def __download_upscaler_files(
+     """
+     cache_dir = config.path.cache_dir.joinpath('upscalers')
+     version = {}
+-    for dst in files.keys():
++    for dst in items.keys():
+         log.info(f'Downloading upscaler file "{os.path.basename(dst)}"')
+         file = Path(prefix_dir, dst)
+         temp = Path(prefix_dir, dst + '.old')
+         try:
+             if file.exists() or file.is_symlink():
+                 file.rename(temp)
+-            dlfunc(files[dst], cache_dir, file)
++            dlfunc(items[dst], cache_dir, file)
+             temp.unlink(missing_ok=True)
+         except Exception as e:
+             log.crit(f'Error while downloading file "{file.name}"')
+-            log.crit(repr(e))
++            log.crit(e)
+             file.unlink(missing_ok=True)
+             if temp.exists() or temp.is_symlink():
+                 temp.rename(file)
+             return False
+         version[dst] = {
+-            'version': files[dst]['version'],
+-            'md5_hash': files[dst]['md5_hash'],
++            'version': items[dst]['version'],
++            'md5_hash': items[dst]['md5_hash'],
+         }
+-    with open(version_file, 'w', encoding='utf-8') as version_fd:
+-        version_fd.write(json.dumps(version))
++    __set_tracked_items(compat_dir, section, version)
+     return True
+ 
+ 
+@@ -351,27 +386,31 @@ def __download_file(url: str, dst: Path, *, checksum: Union[str, None] = None) -
+             dst_md5 = hashlib.md5(dst_fd.read()).hexdigest().lower()
+         dst_size = dst.stat().st_size if dst.exists() else 0
+         # Size check is arbitrary, but nothing should be below 1K
+-        if (checksum is not None and dst_md5 != checksum.lower()) or dst_size < 1024:
++        if (checksum and dst_md5 != checksum.lower()) or dst_size < 1024:
+             raise RuntimeError(f'Malformed download {str(dst)}')
+     except Exception as e:
+         dst.unlink(missing_ok=True)
+         raise e
+ 
+ 
+-def __download_extract_zip(file: dict, cache: Path, dst: Path) -> None:
+-    url_path = Path(unquote(urlparse(file['download_url']).path))
+-    cached_file = cache.joinpath(url_path.name)
+-    file_md5 = file.get('zip_md5_hash', None)
++def __cached_download(item: dict, cached_file: Path) -> None:
++    item_md5 = item.get('zip_md5_hash', '')
++
+     if cached_file.exists():
+         with cached_file.open('rb') as cached_fd:
+             cached_md5 = hashlib.md5(cached_fd.read()).hexdigest().lower()
+-        if file_md5 is not None and cached_md5 != file_md5.lower():
+-            log.crit(
+-                f'MD5 checksum mismatch between manifest and cached "{cached_file.name}"'
+-            )
++        if item_md5 and cached_md5 != item_md5.lower():
++            log.crit(f'MD5 mismatch between manifest and cached "{cached_file.name}"')
+             cached_file.unlink(missing_ok=True)
++
+     if not cached_file.exists():
+-        __download_file(file['download_url'], cached_file, checksum=file_md5)
++        __download_file(item['download_url'], cached_file, checksum=item_md5)
++
++
++def __download_extract_zip(item: dict, cache: Path, dst: Path) -> None:
++    url_path = Path(unquote(urlparse(item['download_url']).path))
++    cached_file = cache.joinpath(url_path.name)
++    __cached_download(item, cached_file)
+     dst.parent.mkdir(parents=True, exist_ok=True)
+     if cached_file.suffix == '.zip':
+         with zipfile.ZipFile(cached_file) as zip_fd:
+@@ -383,17 +422,17 @@ def __download_extract_zip(file: dict, cache: Path, dst: Path) -> None:
+                 dst_fd.write(lzma.decompress(cached_fd.read()))
+ 
+ 
+-def __download_fsr4(file: dict, cache: Path, dst: Path) -> None:
+-    url_path = Path(unquote(urlparse(file['download_url']).path))
++def __download_fsr4(item: dict, cache: Path, dst: Path) -> None:
++    url_path = Path(unquote(urlparse(item['download_url']).path))
+     cached_file = cache.joinpath(
+-        url_path.stem + f'_v{file["version"]}' + url_path.suffix
++        url_path.stem + f'_v{item["version"]}' + url_path.suffix
+     )
+-    file_md5 = file.get('zip_md5_hash', None)
++    item_md5 = item.get('zip_md5_hash', '')
+     if cached_file.exists():
+         if cached_file.stat().st_size < 1024:
+             cached_file.unlink()
+     if not cached_file.exists():
+-        __download_file(file['download_url'], cached_file, checksum=file_md5)
++        __download_file(item['download_url'], cached_file, checksum=item_md5)
+     dst.parent.mkdir(parents=True, exist_ok=True)
+     shutil.copy(cached_file, dst)
+ 
+@@ -410,43 +449,37 @@ def download_upscaler(
+         return
+     log.info(f'Failed to validate "{name.upper()}" files.')
+ 
+-    upscalers = {
+-        'dlss': (__get_dlss_dlls, __download_extract_zip, __dlss_version_file),
+-        'xess': (__get_xess_dlls, __download_extract_zip, __xess_version_file),
+-        'fsr3': (__get_fsr3_dlls, __download_extract_zip, __fsr3_version_file),
+-        'fsr4': (__get_fsr4_dlls, __download_fsr4, __fsr4_version_file),
+-    }
+-    get_files, download_func, version_file = upscalers[name]
+     try:
+-        files = get_files(version)
++        items, download_func, section = __get_upscaler_items(name, version)
+         if not __download_upscaler_files(
++            compat_dir,
+             prefix_dir,
+-            files,
++            items,
+             download_func,
+-            os.path.join(compat_dir, version_file),
++            section,
+         ):
+             raise RuntimeError
+     except Exception as e:
+         log.crit(f'Failed to download {name.upper()} dlls.')
+-        log.crit(repr(e))
++        log.crit(e)
+ 
+ 
+ def setup_upscaler(
+-    env: dict,
+-    key: str,
+     name: str,
+     compat_dir: str,
+     prefix_dir: str,
+-    version: str = 'default',
++    version: str,
+ ) -> bool:
+-    version = env[key] if env.get(key, '0') not in {'0', '1'} else version
++    log.info(f'Setting up {name.upper()} version {version}.')
+     download_upscaler(name, compat_dir, prefix_dir, version)
+     enabled = check_upscaler(name, compat_dir, prefix_dir, version, ignore_version=True)
+-    if enabled:
+-        log.info(f'Automatic {name.upper()} upgrade enabled.')
+     return enabled
+ 
+ 
++def get_version(env: dict, key: str, fallback: str) -> str:
++    return env[key] if env.get(key, '0') not in {'0', '1'} else fallback
++
++
+ def setup_upscalers(
+     compat_config: set, env: dict, compat_dir: str, prefix_dir: str
+ ) -> None:
+@@ -454,24 +487,25 @@ def setup_upscalers(
+ 
+     usage: setup_upscalers(g_session.compat_config, g_session.env, g_compatdata.base_dir, g_compatdata.prefix_dir)
+     """
++    dlss_version = get_version(env, 'PROTON_DLSS_UPGRADE', 'default')
++    xess_version = get_version(env, 'PROTON_XESS_UPGRADE', 'default')
++    fsr3_version = get_version(env, 'PROTON_FSR3_UPGRADE', '1.0.1.41314')
++    fsr4rdna3_version = get_version(env, 'PROTON_FSR4_RDNA3_UPGRADE', '4.0.0')
++    fsr4_version = get_version(env, 'PROTON_FSR4_UPGRADE', 'default')
++    fsr4_version = fsr4rdna3_version if 'fsr4rdna3' in compat_config else fsr4_version
++
+     upscaler_replace = set()
+-    if 'dlss' in compat_config:
+-        if setup_upscaler(env, 'PROTON_DLSS_UPGRADE', 'dlss', compat_dir, prefix_dir):
+-            upscaler_replace.add('dlss')
+-    if 'xess' in compat_config:
+-        if setup_upscaler(env, 'PROTON_XESS_UPGRADE', 'xess', compat_dir, prefix_dir):
+-            upscaler_replace.add('xess')
+-    if 'fsr3' in compat_config:
+-        if setup_upscaler(env, 'PROTON_FSR3_UPGRADE', 'fsr3', compat_dir, prefix_dir):
+-            upscaler_replace.add('fsr3')
+-    if 'fsr4rdna3' in compat_config:
+-        if setup_upscaler(
+-            env, 'PROTON_FSR4_RDNA3_UPGRADE', 'fsr4', compat_dir, prefix_dir, '4.0.0'
+-        ):
+-            upscaler_replace.add('fsr4')
+-    elif 'fsr4' in compat_config:
+-        if setup_upscaler(env, 'PROTON_FSR4_UPGRADE', 'fsr4', compat_dir, prefix_dir):
+-            upscaler_replace.add('fsr4')
++    upscalers = (
++        ('dlss', dlss_version, 'dlss' in compat_config),
++        ('xess', xess_version, 'xess' in compat_config),
++        ('fsr3', fsr3_version, 'fsr3' in compat_config),
++        ('fsr4', fsr4_version, 'fsr4' in compat_config or 'fsr4rdna3' in compat_config),
++    )
++    for upscaler in upscalers:
++        name, version, enabled = upscaler
++        if enabled and setup_upscaler(name, compat_dir, prefix_dir, version):
++            log.info(f'Automatic {name.upper()} upgrade enabled.')
++            upscaler_replace.add(name)
+ 
+     if 'fsr4' in upscaler_replace:
+         env['FSR4_UPGRADE'] = '1'
+-- 
+2.55.0
+

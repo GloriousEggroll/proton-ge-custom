@@ -34,6 +34,7 @@ apply_all_in_dir() {
     pushd protonfixes
     git reset --hard HEAD
     git clean -xdf
+    apply_all_in_dir "../patches/protonfixes/upscalers"
     popd
 
     pushd wineopenxr
@@ -74,9 +75,6 @@ apply_all_in_dir() {
 
     echo "WINE: -CUSTOM- ETAASH WINE-WAYLAND+ PATCHES"
    apply_all_in_dir "../patches/wine-hotfixes/wine-wayland/"
-
-    echo "WINE: -CUSTOM- DWPROTON PATCHES"
-   apply_all_in_dir "../patches/wine-hotfixes/dw-proton/"
 
 ### END EM-10/WINE-WAYLAND PATCH SECTION ###
 
@@ -216,6 +214,9 @@ apply_all_in_dir() {
 
     echo "WINE: -GAME FIXES- add TBH: Task Bar Hero fixes"
     apply_patch "../patches/game-patches/layered-overlay-wine.patch"
+
+    echo "WINE: -GAME FIXES- force Battle.net Launcher in-process GPU on winewayland"
+    apply_patch "../patches/game-patches/battlenet-launcher-in-process-gpu.patch"
 
     echo "WINE: -GAME FIXES- add fixes Guilty Gear Accent Core Plus R intro video (win32u related)"
     apply_patch "../patches/game-patches/0001-win32u-Avoid-zero-WM_ACTIVATEAPP-lparam-on-first-for.patch"
