@@ -1,0 +1,219 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Fri, 10 Jul 2026 06:55:00 -0600
+Subject: [PATCH] mmdevapi: Re-signal matching DualSense mono endpoint.
+
+Spider-Man Remastered does not consistently follow a newly-added controller
+speaker endpoint after swapping between DualSense and DualSense Edge. It uses a
+logical mono endpoint it has already activated, while winepulse retargets that
+logical stream to the currently connected physical controller speaker sink.
+
+Re-signal the most recently activated hidden logical endpoint only for
+same-model reconnects. When swapping between DualSense and DualSense Edge,
+prefer the newly added visible endpoint so Spider-Man does not keep selecting a
+hidden endpoint from the previous controller model.
+
+Keep hidden logical endpoints resolvable through GetDevice() while the physical
+controller is temporarily disconnected, but keep filtering inactive visible
+replacement endpoints so stale physical ids cannot win during hotplug.
+---
+ dlls/mmdevapi/devenum.c          | 82 +++++++++++++++++++++++++++++++-
+ dlls/mmdevapi/mmdevapi_private.h |  1 +
+ 2 files changed, 77 insertions(+), 6 deletions(-)
+
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -732,11 +732,35 @@
+     return name && wcsstr(name, L"DualSense") && wcsstr(name, L"Internal Mono Speaker");
+ }
+ 
++enum dualsense_mono_model
++{
++    DUALSENSE_MONO_MODEL_UNKNOWN,
++    DUALSENSE_MONO_MODEL_STANDARD,
++    DUALSENSE_MONO_MODEL_EDGE,
++};
++
++static enum dualsense_mono_model dualsense_mono_endpoint_model_name(const WCHAR *name)
++{
++    if (!is_dualsense_mono_endpoint_name(name))
++        return DUALSENSE_MONO_MODEL_UNKNOWN;
++
++    if (wcsstr(name, L"Edge"))
++        return DUALSENSE_MONO_MODEL_EDGE;
++
++    return DUALSENSE_MONO_MODEL_STANDARD;
++}
++
+ static BOOL is_dualsense_mono_endpoint(const MMDevice *device)
+ {
+     return device->flow == eRender && is_dualsense_mono_endpoint_name(device->drv_id);
+ }
+ 
++static enum dualsense_mono_model dualsense_mono_endpoint_model(const MMDevice *device)
++{
++    return device->flow == eRender ? dualsense_mono_endpoint_model_name(device->drv_id) :
++            DUALSENSE_MONO_MODEL_UNKNOWN;
++}
++
+ static BOOL should_hide_from_endpoint_collection(const MMDevice *device)
+ {
+     return is_dualsense_mono_endpoint(device) &&
+@@ -822,35 +846,44 @@
+     return TRUE;
+ }
+ 
+-static void resignal_visible_dualsense_mono_endpoints(void)
++static void resignal_visible_dualsense_mono_endpoints(enum dualsense_mono_model model, BOOL allow_hidden)
+ {
+     struct endpoint_notification *notifications = NULL;
+     unsigned int count = 0, capacity = 0, i;
+-    MMDevice *device;
++    MMDevice *device, *hidden = NULL;
+ 
+     EnterCriticalSection(&device_list_cs);
+-    LIST_FOR_EACH_ENTRY(device, &device_list, MMDevice, entry)
++    if (allow_hidden && model != DUALSENSE_MONO_MODEL_UNKNOWN)
+     {
+-        if (!is_dualsense_mono_endpoint(device) || !device->hide_from_collection)
+-            continue;
++        LIST_FOR_EACH_ENTRY(device, &device_list, MMDevice, entry)
++        {
++            if (!is_dualsense_mono_endpoint(device) || !device->hide_from_collection)
++                continue;
++
++            if (!hidden || device->dualsense_mono_activation_serial > hidden->dualsense_mono_activation_serial)
++                hidden = device;
++        }
++    }
+ 
+-        if (!(device->state & DEVICE_STATE_ACTIVE))
++    if (hidden)
++    {
++        if (!(hidden->state & DEVICE_STATE_ACTIVE))
+         {
+             TRACE("Reactivating hidden DualSense mono endpoint %s after replacement speaker hotplug.\n",
+-                    debugstr_guid(&device->devguid));
+-            set_device_state(device, DEVICE_STATE_ACTIVE);
++                    debugstr_guid(&hidden->devguid));
++            set_device_state(hidden, DEVICE_STATE_ACTIVE);
+         }
+ 
+-        if (!add_endpoint_notification(&notifications, &count, &capacity, device))
+-            break;
++        add_endpoint_notification(&notifications, &count, &capacity, hidden);
+     }
+-
+-    if (!count)
++    else
+     {
+         LIST_FOR_EACH_ENTRY(device, &device_list, MMDevice, entry)
+         {
+             if (!is_dualsense_mono_endpoint(device) || should_hide_from_endpoint_collection(device))
+                 continue;
++            if (model != DUALSENSE_MONO_MODEL_UNKNOWN && dualsense_mono_endpoint_model(device) != model)
++                continue;
+ 
+             if (!add_endpoint_notification(&notifications, &count, &capacity, device))
+                 break;
+@@ -1521,6 +1556,9 @@
+ }
+ 
+ static LONG dualsense_mono_render_add_pending;
++static LONG dualsense_mono_activation_serial;
++static enum dualsense_mono_model dualsense_mono_render_add_model;
++static enum dualsense_mono_model dualsense_mono_render_removed_model;
+ 
+ static void add_endpoints_from_params(struct get_endpoint_ids_params *params)
+ {
+@@ -1534,7 +1572,10 @@
+         get_device_guid(params->flow, dev_name, &guid);
+         device = MMDevice_Create(name, &guid, params->flow, DEVICE_STATE_ACTIVE, params->default_idx == i);
+         if (device && params->flow == eRender && is_dualsense_mono_endpoint(device))
++        {
++            dualsense_mono_render_add_model = dualsense_mono_endpoint_model(device);
+             InterlockedExchange(&dualsense_mono_render_add_pending, 1);
++        }
+     }
+ }
+ 
+@@ -1639,8 +1678,11 @@
+                     LeaveCriticalSection(&g_notif_lock);
+ 
+                     if (dualsense_mono_endpoint)
++                    {
++                        dualsense_mono_render_removed_model = dualsense_mono_endpoint_model(dev);
+                         TRACE("Keeping disconnected DualSense mono endpoint %s for stable app-facing hotplug.\n",
+                                 debugstr_guid(&dev->devguid));
++                    }
+ 
+                     break;
+                 }
+@@ -1654,7 +1696,16 @@
+         if (params.flow == eRender)
+         {
+             if (InterlockedExchange(&dualsense_mono_render_add_pending, 0))
+-                resignal_visible_dualsense_mono_endpoints();
++            {
++                enum dualsense_mono_model model = dualsense_mono_render_add_model;
++                enum dualsense_mono_model removed_model = dualsense_mono_render_removed_model;
++                BOOL allow_hidden = model != DUALSENSE_MONO_MODEL_UNKNOWN &&
++                        removed_model != DUALSENSE_MONO_MODEL_UNKNOWN && model == removed_model;
++
++                dualsense_mono_render_add_model = DUALSENSE_MONO_MODEL_UNKNOWN;
++                dualsense_mono_render_removed_model = DUALSENSE_MONO_MODEL_UNKNOWN;
++                resignal_visible_dualsense_mono_endpoints(model, allow_hidden);
++            }
+             InterlockedExchange(&render_update_in_progress, 0);
+         }
+ 
+@@ -1665,6 +1717,8 @@
+ end:
+     InterlockedExchange(&render_update_in_progress, 0);
+     InterlockedExchange(&dualsense_mono_render_add_pending, 0);
++    dualsense_mono_render_add_model = DUALSENSE_MONO_MODEL_UNKNOWN;
++    dualsense_mono_render_removed_model = DUALSENSE_MONO_MODEL_UNKNOWN;
+     free(params.endpoints);
+     return 0;
+ }
+@@ -1819,6 +1873,7 @@
+             TRACE("Hiding activated DualSense mono endpoint %s from endpoint collections.\n",
+                     debugstr_guid(&This->devguid));
+             This->hide_from_collection = TRUE;
++            This->dualsense_mono_activation_serial = InterlockedIncrement(&dualsense_mono_activation_serial);
+             remove_mmdevice_audioendpoint_device(&This->devguid, This->flow);
+             delete_mmdevice_registry_key(&This->devguid, This->flow);
+         }
+@@ -2328,12 +2383,20 @@
+     EnterCriticalSection(&device_list_cs);
+     LIST_FOR_EACH_ENTRY(impl, &device_list, MMDevice, entry)
+     {
+         HRESULT hr;
+         WCHAR *str;
++
++        if (is_dualsense_mono_endpoint(impl) && !impl->hide_from_collection
++                && !(impl->state & DEVICE_STATE_ACTIVE))
++        {
++            TRACE("Skipping disconnected visible DualSense mono endpoint %s.\n", debugstr_guid(&impl->devguid));
++            continue;
++        }
++
+         dev = &impl->IMMDevice_iface;
+         hr = IMMDevice_GetId(dev, &str);
+         if (FAILED(hr))
+         {
+             WARN("GetId failed: %08lx\n", hr);
+             continue;
+         }
+--- a/dlls/mmdevapi/mmdevapi_private.h
++++ b/dlls/mmdevapi/mmdevapi_private.h
+@@ -112,6 +112,7 @@
+     WCHAR *drv_id;
+     BOOL removed;
+     BOOL hide_from_collection;
++    LONG dualsense_mono_activation_serial;
+ 
+     struct list entry;
+ } MMDevice;
+-- 
+2.54.0

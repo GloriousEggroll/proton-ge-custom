@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Tue, 7 Jul 2026 00:00:04 -0600
+Subject: [PATCH] mmdevapi: Hide stale DualSense mono speakers from endpoint
+ collections.
+
+Spider-Man Remastered discovers and opens the controller speaker through the
+normal render endpoint collection before playing effect audio. Hiding the
+active DualSense mono endpoint from that collection leaves the game with no
+controller speaker output.
+
+Keep active DualSense mono speakers visible, but hide stale/not-present
+DualSense speaker endpoints from broad EnumAudioEndpoints() collections after
+USB reconnect or controller swap. Preserve the normal endpoint order; moving
+the active controller speaker to the front of the collection can trip apps with
+fragile endpoint type assumptions.
+---
+ dlls/mmdevapi/devenum.c | 50 ++++++++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 44 insertions(+), 6 deletions(-)
+
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+index 7d439404319..2fb7a2e0b57 100644
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -718,6 +718,27 @@ static BOOL is_dualsense_mono_endpoint_name(const WCHAR *name)
+     return name && wcsstr(name, L"DualSense") && wcsstr(name, L"Internal Mono Speaker");
+ }
+ 
++static BOOL is_dualsense_mono_endpoint(const MMDevice *device)
++{
++    return device->flow == eRender && is_dualsense_mono_endpoint_name(device->drv_id);
++}
++
++static BOOL should_hide_from_endpoint_collection(const MMDevice *device)
++{
++    return is_dualsense_mono_endpoint(device) && !(device->state & DEVICE_STATE_ACTIVE);
++}
++
++static BOOL should_prioritize_dualsense_mono_endpoint(const MMDevice *device)
++{
++    return FALSE;
++}
++
++static BOOL collection_device_visible(const MMDevice *device, EDataFlow flow, DWORD state)
++{
++    return (device->flow == flow || flow == eAll) && (device->state & state) &&
++            !should_hide_from_endpoint_collection(device);
++}
++
+ static void remove_dualsense_media_devices(void)
+ {
+     static const GUID MEDIA_ClassGUID = { 0x4d36e96c, 0xe325, 0x11ce, { 0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18 } };
+@@ -1680,9 +1701,10 @@ static const IMMEndpointVtbl MMEndpointVtbl =
+ 
+ static HRESULT MMDevCol_Create(IMMDeviceCollection **ppv, EDataFlow flow, DWORD state)
+ {
++    MMDevice *default_device = flow == eRender ? MMDevice_def_play : NULL;
+     MMDevColImpl *This;
+     MMDevice *cur;
+     UINT i = 0;
+ 
+     This = malloc(sizeof(*This));
+     *ppv = NULL;
+@@ -1697,26 +1719,43 @@ static HRESULT MMDevCol_Create(IMMDeviceCollection **ppv, EDataFlow flow, DWORD
+     EnterCriticalSection(&device_list_cs);
+     LIST_FOR_EACH_ENTRY(cur, &device_list, MMDevice, entry)
+     {
+-        if ((cur->flow == flow || flow == eAll) && (cur->state & state))
++        if (collection_device_visible(cur, flow, state))
+             This->devices_count++;
+     }
+ 
+     if (This->devices_count)
+     {
+         This->devices = malloc(This->devices_count * sizeof(IMMDevice *));
+         if (!This->devices_count) {
+             LeaveCriticalSection(&device_list_cs);
+             return E_OUTOFMEMORY;
+         }
+ 
++        if (default_device && collection_device_visible(default_device, flow, state))
++        {
++            This->devices[i] = &default_device->IMMDevice_iface;
++            IMMDevice_AddRef(This->devices[i]);
++            i++;
++        }
++
+         LIST_FOR_EACH_ENTRY(cur, &device_list, MMDevice, entry)
+         {
+-            if ((cur->flow == flow || flow == eAll) && (cur->state & state))
+-            {
+-                This->devices[i] = &cur->IMMDevice_iface;
+-                IMMDevice_AddRef(This->devices[i]);
+-                i++;
+-            }
++            if (cur == default_device || !collection_device_visible(cur, flow, state) ||
++                    !should_prioritize_dualsense_mono_endpoint(cur))
++                continue;
++            This->devices[i] = &cur->IMMDevice_iface;
++            IMMDevice_AddRef(This->devices[i]);
++            i++;
++        }
++
++        LIST_FOR_EACH_ENTRY(cur, &device_list, MMDevice, entry)
++        {
++            if (cur == default_device || !collection_device_visible(cur, flow, state) ||
++                    should_prioritize_dualsense_mono_endpoint(cur))
++                continue;
++            This->devices[i] = &cur->IMMDevice_iface;
++            IMMDevice_AddRef(This->devices[i]);
++            i++;
+         }
+     }
+     LeaveCriticalSection(&device_list_cs);
+-- 
+2.54.0

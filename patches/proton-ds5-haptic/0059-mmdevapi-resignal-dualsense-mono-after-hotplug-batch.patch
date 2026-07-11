@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Thu, 9 Jul 2026 13:20:00 -0600
+Subject: [PATCH] mmdevapi: Re-signal DualSense mono endpoints after hotplug
+ batch.
+
+Spider-Man Remastered registers endpoint notifications and re-enumerates
+render endpoints to bind DualSense controller speaker effects. During a
+controller swap the Pulse backend reports the render speaker endpoint first,
+then finishes the matching capture-side update. The new mono speaker endpoint
+can be created correctly, but the game may miss the first add notification
+while the hotplug batch is still in flight; the endpoint is then left visible
+but never activated, so controller speaker effects stop working until another
+connect event happens to retrigger enumeration.
+
+Track DualSense mono render additions and, once the current hotplug batch has
+settled, re-send add/state notifications for active visible mono speaker
+endpoints. If the game already saw and activated the endpoint, activation hides
+it from collections and this follow-up notification is skipped. Disconnects
+still remove and destroy the old endpoint, so a new DS or DS Edge plug is
+treated as a fresh device instead of a reconnect to stale state.
+---
+ dlls/mmdevapi/devenum.c | 78 ++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 77 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+index 11111111111..22222222222 100644
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -754,6 +754,78 @@ static BOOL collection_device_visible(const MMDevice *device, EDataFlow flow, DW
+             !should_hide_from_endpoint_collection(device);
+ }
+ 
++struct endpoint_notification
++{
++    EDataFlow flow;
++    GUID guid;
++    DWORD state;
++};
++
++static void notify_endpoint_added_state(EDataFlow flow, const GUID *id, DWORD state)
++{
++    struct NotificationClientWrapper *wrapper;
++    WCHAR devid[56];
++
++    swprintf(devid, 56, devid_formatW,
++            flow, id->Data1, id->Data2, id->Data3,
++            id->Data4[0], id->Data4[1], id->Data4[2], id->Data4[3],
++            id->Data4[4], id->Data4[5], id->Data4[6], id->Data4[7]);
++
++    EnterCriticalSection(&g_notif_lock);
++    LIST_FOR_EACH_ENTRY(wrapper, &g_notif_clients, struct NotificationClientWrapper, entry)
++    {
++        IMMNotificationClient_OnDeviceAdded(wrapper->client, devid);
++        IMMNotificationClient_OnDeviceStateChanged(wrapper->client, devid, state);
++    }
++    LeaveCriticalSection(&g_notif_lock);
++}
++
++static void resignal_visible_dualsense_mono_endpoints(void)
++{
++    struct endpoint_notification *notifications = NULL;
++    unsigned int count = 0, capacity = 0, i;
++    MMDevice *device;
++
++    EnterCriticalSection(&device_list_cs);
++    LIST_FOR_EACH_ENTRY(device, &device_list, MMDevice, entry)
++    {
++        if (!is_dualsense_mono_endpoint(device) || should_hide_from_endpoint_collection(device))
++            continue;
++
++        if (count == capacity)
++        {
++            struct endpoint_notification *new_notifications;
++            unsigned int new_capacity = capacity ? capacity * 2 : 2;
++
++            new_notifications = realloc(notifications, new_capacity * sizeof(*notifications));
++            if (!new_notifications)
++            {
++                WARN("Failed to allocate DualSense mono endpoint hotplug notifications.\n");
++                break;
++            }
++
++            notifications = new_notifications;
++            capacity = new_capacity;
++        }
++
++        notifications[count].flow = device->flow;
++        notifications[count].guid = device->devguid;
++        notifications[count].state = device->state;
++        count++;
++    }
++    LeaveCriticalSection(&device_list_cs);
++
++    for (i = 0; i < count; i++)
++    {
++        TRACE("Re-signaling DualSense mono endpoint add %s after hotplug batch.\n",
++                debugstr_guid(&notifications[i].guid));
++        notify_endpoint_added_state(notifications[i].flow, &notifications[i].guid,
++                notifications[i].state);
++    }
++
++    free(notifications);
++}
++
+ static void delete_mmdevice_registry_key(const GUID *guid, EDataFlow flow)
+ {
+     HKEY root = flow == eRender ? key_render : key_capture;
+@@ -1405,16 +1477,21 @@ static HRESULT set_format(MMDevice *dev)
+     return S_OK;
+ }
+ 
++static LONG dualsense_mono_render_add_pending;
++
+ static void add_endpoints_from_params(struct get_endpoint_ids_params *params)
+ {
+     UINT i;
+ 
+     for (i = 0; i < params->num; i++) {
++        MMDevice *device;
+         GUID guid;
+         const WCHAR *name = (WCHAR *)((char *)params->endpoints + params->endpoints[i].name);
+         const char *dev_name = (char *)params->endpoints + params->endpoints[i].device;
+         get_device_guid(params->flow, dev_name, &guid);
+-        MMDevice_Create(name, &guid, params->flow, DEVICE_STATE_ACTIVE, params->default_idx == i);
++        device = MMDevice_Create(name, &guid, params->flow, DEVICE_STATE_ACTIVE, params->default_idx == i);
++        if (device && params->flow == eRender && is_dualsense_mono_endpoint(device))
++            InterlockedExchange(&dualsense_mono_render_add_pending, 1);
+     }
+ }
+ 
+@@ -1550,12 +1627,16 @@ static DWORD WINAPI update_thread_proc(void *user)
+         if (params.flow == eRender)
+             InterlockedExchange(&render_update_in_progress, 0);
+ 
++        if (!params.more_data && InterlockedExchange(&dualsense_mono_render_add_pending, 0))
++            resignal_visible_dualsense_mono_endpoints();
++
+         if (params.more_data)
+             params.flow = params.flow == eRender ? eCapture : eRender;
+     }
+ 
+ end:
+     InterlockedExchange(&render_update_in_progress, 0);
++    InterlockedExchange(&dualsense_mono_render_add_pending, 0);
+     free(params.endpoints);
+     return 0;
+ }
+-- 
+2.54.0
+

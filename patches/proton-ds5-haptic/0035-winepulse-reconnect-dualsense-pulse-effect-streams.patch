@@ -1,0 +1,251 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Tue, 7 Jul 2026 00:00:05 -0600
+Subject: [PATCH] winepulse: Reconnect DualSense Pulse effect streams after
+ hotplug.
+
+Spider-Man Remastered opens more than one 4-channel DualSense render stream.
+The primary stream is routed to the raw ALSA haptic PCM, while a later stream
+can fall back to PulseAudio because the raw PCM is already busy. That fallback
+stream is the one used for controller speaker/effect playback.
+
+The existing reconnect path only covered raw haptic streams and the 1-channel
+mono endpoint. If the controller was unplugged/replugged more than once, the
+Pulse-routed 4-channel effect stream could remain attached to a removed Pulse
+sink and continue to look valid from the game's point of view, leaving the
+controller speaker silent until the game recreated the audio client.
+
+Track Pulse-routed DualSense 4-channel fallback streams separately and reuse
+the speaker/effect reconnect path on render-device hotplug generation changes.
+This keeps the raw ALSA haptic path unchanged while allowing controller effect
+audio to recover across repeated disconnect/reconnect or controller swaps.
+---
+ dlls/winepulse.drv/pulse.c | 78 ++++++++++++++++++++++++++++++++-----
+ 1 file changed, 69 insertions(+), 9 deletions(-)
+
+diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -82,6 +82,7 @@ struct pulse_period
+ 
+ static struct list active_periods = LIST_INIT(active_periods);
+ static struct list dualsense_mono_streams = LIST_INIT(dualsense_mono_streams);
++static struct list dualsense_pulse_haptic_streams = LIST_INIT(dualsense_pulse_haptic_streams);
+ 
+ struct pulse_stream
+ {
+@@ -124,0 +125,1 @@ struct pulse_stream
++    struct list dualsense_pulse_haptic_entry;
+@@ -129,0 +131,1 @@ struct pulse_stream
++    BOOL dualsense_pulse_haptic_registered;
+@@ -303,8 +306,11 @@ static struct pulse_stream *handle_get_stream(stream_handle h)
+ }
+ 
+ static BOOL pulse_stream_dualsense_mono(const struct pulse_stream *stream);
++static BOOL pulse_stream_dualsense_pulse_haptic(const struct pulse_stream *stream);
+ static HRESULT pulse_dualsense_mono_reconnect(struct pulse_stream *stream);
++static HRESULT pulse_dualsense_pulse_haptic_reconnect(struct pulse_stream *stream);
+ static void pulse_reconnect_dualsense_mono_streams(struct pulse_period *current_period);
++static void pulse_reconnect_dualsense_pulse_haptic_streams(struct pulse_period *current_period);
+ 
+ static void dump_attr(const pa_buffer_attr *attr)
+ {
+@@ -804,12 +810,14 @@ static BOOL pulse_stream_valid(struct pulse_stream *stream)
+     pa_stream_state_t state;
+ 
+     if (!stream->stream)
+-        return stream->dataflow == eRender && (stream->haptic_alsa_path || pulse_stream_dualsense_mono(stream));
++        return stream->dataflow == eRender && (stream->haptic_alsa_path
++                || pulse_stream_dualsense_mono(stream) || pulse_stream_dualsense_pulse_haptic(stream));
+ 
+     state = pa_stream_get_state(stream->stream);
+ 
+     return state == PA_STREAM_READY || (stream->dataflow == eRender
+-            && (state == PA_STREAM_CREATING || pulse_stream_dualsense_mono(stream)));
++            && (state == PA_STREAM_CREATING || pulse_stream_dualsense_mono(stream)
++                    || pulse_stream_dualsense_pulse_haptic(stream)));
+ }
+ 
+ static BOOL pulse_stream_ready(struct pulse_stream *stream)
+@@ -1177,6 +1185,23 @@ static BOOL pulse_stream_dualsense_mono(const struct pulse_stream *stream)
+     return pulse_stream_dualsense_mono_format(stream) && string_contains_dualsense_name(stream->device);
+ }
+ 
++static BOOL pulse_stream_dualsense_pulse_haptic(const struct pulse_stream *stream)
++{
++    return is_dualsense_haptic_format(stream) && !stream->haptic_alsa_path
++            && string_contains_dualsense_name(stream->device);
++}
++
++static BOOL dualsense_render_event_pending(void)
++{
++    BOOL pending;
++
++    g_phys_lock();
++    pending = !!(g_phys_event_mask & PHYS_EVENT_RENDER);
++    g_phys_unlock();
++
++    return pending;
++}
++
+ static void pulse_add_device(struct list *list, EDataFlow flow, pa_proplist *proplist, int index, EndpointFormFactor form,
+                              UINT channel_mask, const char *pulse_name, const char *desc)
+ {
+@@ -2521,7 +2535,7 @@ static NTSTATUS pulse_create_stream(void *args)
+     HRESULT hr;
+     char *name, *haptic_target = NULL, *haptic_alsa_path = NULL, *dualsense_speaker = NULL;
+     const char *connect_device;
+-    BOOL haptic_candidate, dualsense_mono_candidate;
++    BOOL haptic_candidate, dualsense_mono_candidate, dualsense_pulse_haptic_candidate = FALSE;
+ 
+     if (params->share == AUDCLNT_SHAREMODE_EXCLUSIVE) {
+         params->result = AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED;
+@@ -2548,6 +2562,7 @@ static NTSTATUS pulse_create_stream(void *args)
+     }
+ 
+     stream->dataflow = params->flow;
++    list_init(&stream->dualsense_pulse_haptic_entry);
+     list_init(&stream->dualsense_mono_entry);
+     for (i = 0; i < ARRAY_SIZE(stream->vol); ++i)
+         stream->vol[i] = 1.f;
+@@ -2614,6 +2629,8 @@ static NTSTATUS pulse_create_stream(void *args)
+         }
+         else
+             hr = E_OUTOFMEMORY;
++        if (SUCCEEDED(hr) && !stream->haptic_alsa_path)
++            dualsense_pulse_haptic_candidate = TRUE;
+     }
+     else
+     {
+@@ -2665,6 +2682,14 @@ static NTSTATUS pulse_create_stream(void *args)
+             }
+         }
+         stream->device = strdup(connect_device);
++        if (dualsense_pulse_haptic_candidate)
++        {
++            g_phys_lock();
++            stream->haptic_hotplug_generation = g_haptic_hotplug_generation;
++            g_phys_unlock();
++            list_add_tail(&dualsense_pulse_haptic_streams, &stream->dualsense_pulse_haptic_entry);
++            stream->dualsense_pulse_haptic_registered = TRUE;
++        }
+         if (dualsense_mono_candidate)
+         {
+             g_phys_lock();
+@@ -3298,7 +3339,7 @@ static HRESULT pulse_dualsense_mono_reconnect_internal(struct pulse_stream *stre
+     char *device = NULL;
+     HRESULT hr;
+ 
+-    if (!pulse_stream_dualsense_mono(stream))
++    if (!pulse_stream_dualsense_mono(stream) && !pulse_stream_dualsense_pulse_haptic(stream))
+         return AUDCLNT_E_DEVICE_INVALIDATED;
+ 
+     g_phys_lock();
+@@ -3307,7 +3348,14 @@ static HRESULT pulse_dualsense_mono_reconnect_internal(struct pulse_stream *stre
+     g_phys_unlock();
+ 
+     now = pa_rtclock_now();
+     if (stream->stream && !PA_STREAM_IS_GOOD(pa_stream_get_state(stream->stream)))
+-        pulse_stream_disconnect(stream);
++    {
++        pulse_stream_disconnect(stream);
++        if (pulse_stream_dualsense_pulse_haptic(stream))
++        {
++            stream->haptic_reconnect_time = now + DUALSENSE_HAPTIC_REFRESH_USEC;
++            return AUDCLNT_E_DEVICE_INVALIDATED;
++        }
++    }
+ 
+     if (stream->haptic_reconnect_time && now < stream->haptic_reconnect_time)
+@@ -3311,6 +3352,12 @@ static HRESULT pulse_dualsense_mono_reconnect_internal(struct pulse_stream *stre
+     {
+         free(device);
+         return AUDCLNT_E_DEVICE_INVALIDATED;
+     }
++    if (dualsense_render_event_pending())
++    {
++        TRACE("Deferring DualSense speaker/effects reconnect while render endpoint event is pending.\n");
++        stream->haptic_reconnect_time = now + DUALSENSE_HAPTIC_REFRESH_USEC;
++        return AUDCLNT_E_DEVICE_INVALIDATED;
++    }
+ 
+     device = get_dualsense_speaker_sink(stream->device);
+@@ -3318,7 +3359,7 @@ static HRESULT pulse_dualsense_mono_reconnect_internal(struct pulse_stream *stre
+     device = get_dualsense_speaker_sink(stream->device);
+     if (!device)
+     {
+-        TRACE("DualSense mono speaker sink is not currently available, generation %u -> %u.\n",
++        TRACE("DualSense speaker/effects sink is not currently available, generation %u -> %u.\n",
+                 stream->haptic_hotplug_generation, generation);
+         stream->haptic_hotplug_generation = generation;
+         stream->haptic_reconnect_time = now + DUALSENSE_HAPTIC_REFRESH_USEC;
+@@ -3340,1 +3381,1 @@ static HRESULT pulse_dualsense_mono_reconnect_internal(struct pulse_stream *stre
+-        TRACE("Deferring DualSense mono speaker reconnect for reused sink %s, generation %u -> %u.\n",
++        TRACE("Deferring DualSense speaker/effects reconnect for reused sink %s, generation %u -> %u.\n",
+@@ -3347,1 +3388,1 @@ static HRESULT pulse_dualsense_mono_reconnect_internal(struct pulse_stream *stre
+-    TRACE("Reconnecting DualSense mono speaker stream from %s/%s to %s, generation %u -> %u.\n",
++    TRACE("Reconnecting DualSense speaker/effects stream from %s/%s to %s, generation %u -> %u.\n",
+@@ -3398,6 +3439,11 @@ static HRESULT pulse_dualsense_mono_reconnect(struct pulse_stream *stream)
+     return pulse_dualsense_mono_reconnect_internal(stream, FALSE);
+ }
+ 
++static HRESULT pulse_dualsense_pulse_haptic_reconnect(struct pulse_stream *stream)
++{
++    return pulse_dualsense_mono_reconnect_internal(stream, FALSE);
++}
++
+ static void pulse_reconnect_dualsense_mono_streams(struct pulse_period *current_period)
+ {
+     struct pulse_stream *stream, *next;
+@@ -3420,6 +3466,32 @@ static void pulse_reconnect_dualsense_mono_streams(struct pulse_period *current_
+     }
+ }
+ 
++static void pulse_reconnect_dualsense_pulse_haptic_streams(struct pulse_period *current_period)
++{
++    struct pulse_stream *stream, *next;
++    unsigned int generation;
++
++    if (list_empty(&dualsense_pulse_haptic_streams))
++        return;
++
++    g_phys_lock();
++    generation = g_haptic_hotplug_generation;
++    g_phys_unlock();
++
++    LIST_FOR_EACH_ENTRY_SAFE(stream, next, &dualsense_pulse_haptic_streams, struct pulse_stream,
++            dualsense_pulse_haptic_entry)
++    {
++        if (!stream->started)
++            continue;
++        if (stream->period == current_period && stream->haptic_hotplug_generation == generation
++                && pulse_stream_ready(stream))
++            continue;
++
++        if (stream->haptic_hotplug_generation != generation || !pulse_stream_ready(stream))
++            pulse_dualsense_pulse_haptic_reconnect(stream);
++    }
++}
++
+ static NTSTATUS pulse_release_stream(void *args)
+ {
+     struct release_stream_params *params = args;
+@@ -3438,6 +3507,11 @@ static NTSTATUS pulse_release_stream(void *args)
+         list_remove(&stream->dualsense_mono_entry);
+         stream->dualsense_mono_registered = FALSE;
+     }
++    if (stream->dualsense_pulse_haptic_registered)
++    {
++        list_remove(&stream->dualsense_pulse_haptic_entry);
++        stream->dualsense_pulse_haptic_registered = FALSE;
++    }
+     if (stream->stream)
+     {
+         if (PA_STREAM_IS_GOOD(pa_stream_get_state(stream->stream))) {
+@@ -3514,2 +3588,4 @@ static NTSTATUS pulse_start(void *args)
+         if (pulse_stream_dualsense_mono(stream))
+             pulse_dualsense_mono_reconnect(stream);
++        else if (pulse_stream_dualsense_pulse_haptic(stream))
++            pulse_dualsense_pulse_haptic_reconnect(stream);
+-- 
+2.54.0

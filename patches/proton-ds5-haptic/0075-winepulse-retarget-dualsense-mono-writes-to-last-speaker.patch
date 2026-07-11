@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Fri, 10 Jul 2026 08:10:00 -0600
+Subject: [PATCH] winepulse: Retarget DualSense mono writes to the last speaker.
+
+Spider-Man Remastered keeps a logical DualSense mono stream alive across
+controller hotplug. When the controller model changes, mmdevapi must avoid
+re-signaling hidden endpoints because exposing both the visible replacement
+endpoint and a stale hidden endpoint can crash the game.
+
+Keep the endpoint side conservative and remember the exact Pulse sink from the
+latest newly-added DualSense speaker. If an existing mono stream later writes
+after a hotplug generation change, retarget it to that preferred physical
+speaker sink instead of letting the generic fallback choose whichever
+DualSense-like sink happens to be visible first.
+---
+ dlls/winepulse.drv/pulse.c | 41 ++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 38 insertions(+), 3 deletions(-)
+
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -182,6 +182,7 @@
+ static unsigned int g_haptic_hotplug_generation;
+ static unsigned int g_dualsense_endpoint_generation;
+ static unsigned int g_dualsense_mono_speaker_add_generation;
++static char *g_dualsense_mono_preferred_sink;
+ static unsigned int g_phys_event_mask;
+ static unsigned int g_phys_event_stale_render;
+ static unsigned int g_phys_event_stale_capture;
+@@ -2493,15 +2494,41 @@
+     return hr;
+ }
+ 
++static void pulse_set_dualsense_mono_preferred_sink(const char *preferred)
++{
++    char *copy;
++
++    if (!preferred)
++    {
++        free(g_dualsense_mono_preferred_sink);
++        g_dualsense_mono_preferred_sink = NULL;
++        return;
++    }
++
++    if (!(copy = strdup(preferred)))
++    {
++        WARN("Failed to remember preferred DualSense mono sink %s.\n", debugstr_a(preferred));
++        return;
++    }
++
++    free(g_dualsense_mono_preferred_sink);
++    g_dualsense_mono_preferred_sink = copy;
++}
++
+ static void pulse_retarget_dualsense_mono_streams(const char *preferred)
+ {
+     struct pulse_stream *stream, *next;
++    BOOL found = FALSE;
+ 
+     if (preferred)
++    {
+         TRACE("Forcing DualSense mono streams to newly-added speaker %s.\n", debugstr_a(preferred));
++        pulse_set_dualsense_mono_preferred_sink(preferred);
++    }
+ 
+     LIST_FOR_EACH_ENTRY_SAFE(stream, next, &dualsense_mono_streams, struct pulse_stream, dualsense_mono_entry)
+     {
++        found = TRUE;
+         if (!preferred && stream->dualsense_mono_hotplug_generation == g_dualsense_mono_speaker_add_generation
+                 && stream->haptic_hotplug_generation == g_haptic_hotplug_generation
+                 && pulse_stream_ready(stream))
+@@ -2509,6 +2536,10 @@
+ 
+         pulse_retarget_dualsense_mono_stream(stream, preferred);
+     }
++
++    if (preferred && !found)
++        TRACE("No live DualSense mono streams were registered for preferred speaker %s.\n",
++                debugstr_a(preferred));
+ }
+ 
+ static char *find_dualsense_haptic_alsa_path(void)
+@@ -2949,7 +2980,8 @@
+     stream->share = params->share;
+     stream->flags = params->flags;
+     connect_device = params->device;
+-    if (dualsense_mono_candidate && (dualsense_speaker = get_dualsense_speaker_sink(params->device, TRUE)))
++    if (dualsense_mono_candidate && (dualsense_speaker = get_dualsense_speaker_sink(
++            g_dualsense_mono_preferred_sink ? g_dualsense_mono_preferred_sink : params->device, TRUE)))
+         connect_device = dualsense_speaker;
+     else if ((resolved_device = pulse_resolve_device_name(connect_device)))
+         connect_device = resolved_device;
+@@ -3076,7 +3108,9 @@
+         if (dualsense_mono_candidate)
+         {
+             stream->dualsense_mono_stream = TRUE;
+-            stream->dualsense_mono_hotplug_generation = g_dualsense_mono_speaker_add_generation;
++            stream->dualsense_mono_hotplug_generation = g_dualsense_mono_preferred_sink &&
++                    g_dualsense_mono_speaker_add_generation ?
++                    g_dualsense_mono_speaker_add_generation - 1 : g_dualsense_mono_speaker_add_generation;
+             list_add_tail(&dualsense_mono_streams, &stream->dualsense_mono_entry);
+             stream->dualsense_mono_registered = TRUE;
+         }
+@@ -3279,7 +3313,7 @@
+             && (stream->dualsense_mono_hotplug_generation != g_dualsense_mono_speaker_add_generation
+                 || stream->haptic_hotplug_generation != g_haptic_hotplug_generation
+                 || !pulse_stream_ready(stream))
+-            && FAILED(pulse_retarget_dualsense_mono_stream(stream, NULL)))
++            && FAILED(pulse_retarget_dualsense_mono_stream(stream, g_dualsense_mono_preferred_sink)))
+         return;
+ 
+     if (!pulse_stream_ready(stream))
+-- 
+2.54.0

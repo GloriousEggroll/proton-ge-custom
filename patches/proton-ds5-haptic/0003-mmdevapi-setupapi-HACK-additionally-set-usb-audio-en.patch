@@ -9,12 +9,109 @@ diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
 index adf2624a674..df2f07bbf48 100644
 --- a/dlls/mmdevapi/devenum.c
 +++ b/dlls/mmdevapi/devenum.c
-@@ -627,17 +627,20 @@ static const WCHAR *find_product_name_override(const WCHAR *device_id)
+@@ -627,17 +627,117 @@ static const WCHAR *find_product_name_override(const WCHAR *device_id)
  /* Fix DualSense Wireless Controller haptic detection for some. */
  /* This is way less code than even a skeleton pnp driver, not to mention the difficulty of setting friendly name */
  /* from within ntoskrnl. */
++static BOOL is_dualsense_device_path(const WCHAR *device_path)
++{
++    return device_path && (wcsstr(device_path, L"VID_054C&PID_0CE6") ||
++            wcsstr(device_path, L"VID_054C&PID_0DF2"));
++}
++
++static BOOL is_dualsense_standard_device_path(const WCHAR *device_path)
++{
++    return device_path && wcsstr(device_path, L"VID_054C&PID_0CE6");
++}
++
++static BOOL is_dualsense_mono_endpoint_name(const WCHAR *name)
++{
++    return name && wcsstr(name, L"DualSense") && wcsstr(name, L"Internal Mono Speaker");
++}
++
++static BOOL is_dualsense_audioendpoint_name(const WCHAR *name)
++{
++    return name && (wcsstr(name, L"DualSense Wireless Controller Speaker") ||
++            wcsstr(name, L"DualSense Edge Wireless Controller Speaker"));
++}
++
++static void remove_dualsense_media_devices(void)
++{
++    static const GUID MEDIA_ClassGUID = { 0x4d36e96c, 0xe325, 0x11ce, { 0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18 } };
++    HDEVINFO device_set;
++    SP_DEVINFO_DATA device_info_data;
++    DWORD index = 0;
++
++    device_set = SetupDiGetClassDevsW(&MEDIA_ClassGUID, NULL, NULL, 0);
++    if (device_set == INVALID_HANDLE_VALUE)
++        return;
++
++    for (;;)
++    {
++        WCHAR instance_id[256];
++
++        memset(&device_info_data, 0, sizeof(device_info_data));
++        device_info_data.cbSize = sizeof(device_info_data);
++
++        if (!SetupDiEnumDeviceInfo(device_set, index, &device_info_data))
++            break;
++
++        if (SetupDiGetDeviceInstanceIdW(device_set, &device_info_data, instance_id, ARRAY_SIZE(instance_id), NULL) &&
++                is_dualsense_device_path(instance_id))
++        {
++            TRACE("Removing stale DualSense MEDIA device %s.\n", debugstr_w(instance_id));
++            if (SetupDiRemoveDevice(device_set, &device_info_data))
++                continue;
++            WARN("Failed to remove stale DualSense MEDIA device %s: 0x%lu.\n", debugstr_w(instance_id), GetLastError());
++        }
++
++        index++;
++    }
++
++    SetupDiDestroyDeviceInfoList(device_set);
++}
++
++static void remove_dualsense_audioendpoint_devices(void)
++{
++    static const GUID AudioEndpoint_ClassGUID = { 0xc166523c, 0xfe0c, 0x4a94, { 0xa5, 0x86, 0xf1, 0xa8, 0x0c, 0xfb, 0xbf, 0x3e } };
++    HDEVINFO device_set;
++    SP_DEVINFO_DATA device_info_data;
++    DWORD index = 0;
++
++    device_set = SetupDiGetClassDevsW(&AudioEndpoint_ClassGUID, NULL, NULL, 0);
++    if (device_set == INVALID_HANDLE_VALUE)
++        return;
++
++    for (;;)
++    {
++        WCHAR friendly_name[256];
++
++        memset(&device_info_data, 0, sizeof(device_info_data));
++        device_info_data.cbSize = sizeof(device_info_data);
++
++        if (!SetupDiEnumDeviceInfo(device_set, index, &device_info_data))
++            break;
++
++        if (SetupDiGetDeviceRegistryPropertyW(device_set, &device_info_data, SPDRP_FRIENDLYNAME, NULL,
++                (BYTE *)friendly_name, sizeof(friendly_name), NULL) &&
++                is_dualsense_audioendpoint_name(friendly_name))
++        {
++            TRACE("Removing stale DualSense AudioEndpoint device %s.\n", debugstr_w(friendly_name));
++            if (SetupDiRemoveDevice(device_set, &device_info_data))
++                continue;
++            WARN("Failed to remove stale DualSense AudioEndpoint device %s: 0x%lu.\n",
++                    debugstr_w(friendly_name), GetLastError());
++        }
++
++        index++;
++    }
++
++    SetupDiDestroyDeviceInfoList(device_set);
++}
++
 -static void MMDevice_Register(const WCHAR *instguid, const WCHAR *friendly_name, const GUID *container_id, EDataFlow flow)
-+static void MMDevice_Register(const WCHAR *instguid, const WCHAR *friendly_name, const WCHAR *device_iname, const WCHAR *device_path, const GUID *container_id, EDataFlow flow)
++static void MMDevice_Register(const WCHAR *instguid, const WCHAR *friendly_name, const WCHAR *device_iname, const WCHAR *device_path,
++        const GUID *container_id, BOOL skip_audioendpoint, EDataFlow flow)
  {
      static const WCHAR ControlClass[] = L"System\\CurrentControlSet\\Control\\Class";
      static const WCHAR AudioEndpoint_Class[] = L"AudioEndpoint";
@@ -32,7 +129,7 @@ index adf2624a674..df2f07bbf48 100644
      {
          /* len of ControlClass + '\\' + guidstr */
          WCHAR buf[78];
-@@ -655,11 +658,25 @@ static void MMDevice_Register(const WCHAR *instguid, const WCHAR *friendly_name,
+@@ -655,11 +691,30 @@ static void MMDevice_Register(const WCHAR *instguid, const WCHAR *friendly_name,
              RegSetValueExW(key, L"Class", 0, REG_SZ, (LPBYTE)AudioEndpoint_Class, ARRAY_SIZE(AudioEndpoint_Class) * sizeof(WCHAR));
              RegCloseKey(key);
          }
@@ -55,15 +152,24 @@ index adf2624a674..df2f07bbf48 100644
      {
 +        WCHAR device_name[DEVICE_ID_LEN];
 +
-         if (swprintf(device_name, ARRAY_SIZE(device_name), L"SWD\\MMDEVAPI\\{0.0.%u.00000000}.%s", flow, instguid) != -1)
+-        if (swprintf(device_name, ARRAY_SIZE(device_name), L"SWD\\MMDEVAPI\\{0.0.%u.00000000}.%s", flow, instguid) != -1)
++        if (skip_audioendpoint)
++        {
++            TRACE("Refreshing DualSense PnP AudioEndpoint registration for %s.\n", debugstr_w(friendly_name));
++            remove_dualsense_audioendpoint_devices();
++        }
++        if (swprintf(device_name, ARRAY_SIZE(device_name), L"SWD\\MMDEVAPI\\{0.0.%u.00000000}.%s", flow, instguid) != -1)
          {
              memset(&device_info_data, 0, sizeof(device_info_data));
-@@ -715,6 +732,91 @@ static void MMDevice_Register(const WCHAR *instguid, const WCHAR *friendly_name,
+@@ -715,6 +773,94 @@ static void MMDevice_Register(const WCHAR *instguid, const WCHAR *friendly_name,
          else
              WARN("swprintf failed.");
  
++        if (is_dualsense_device_path(device_path))
++            remove_dualsense_media_devices();
++
 +        // HACK on top of hack, create entries that MHWilds expects.
-+        if (device_path) {
++        if (device_path && !is_dualsense_device_path(device_path)) {
 +            device_path = wcsstr(device_path, L"USB\\VID_");
 +            if (device_path) {
 +                memset(&device_info_data, 0, sizeof(device_info_data));
@@ -150,7 +256,7 @@ index adf2624a674..df2f07bbf48 100644
          SetupDiDestroyDeviceInfoList(device_set);
      }
      else
-@@ -730,7 +832,7 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
+@@ -730,20 +868,23 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
      HKEY key, root;
      MMDevice *device, *cur = NULL;
      WCHAR guidstr[39];
@@ -159,15 +265,23 @@ index adf2624a674..df2f07bbf48 100644
      WCHAR friendly_name[FRIENDLY_NAME_MAX];
      const WCHAR *device_iname;
      const WCHAR *device_desc = flow == eRender ? L"Speakers" : L"Microphone";
-@@ -744,6 +846,7 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
+     const WCHAR *friendly_name_fmt = L"%ls (%ls)";
++    BOOL dualsense_mono_endpoint;
+ 
+     static const PROPERTYKEY deviceinterface_key = {
+         {0x233164c8, 0x1b2c, 0x4c7d, {0xbc, 0x68, 0xb6, 0x71, 0x68, 0x7a, 0x25, 0x67}}, 1
+     };
+ 
+     static const PROPERTYKEY devicepath_key = {
          {0xb3f8fa53, 0x0004, 0x438e, {0x90, 0x03, 0x51, 0xa4, 0x6e, 0x13, 0x9b, 0xfc}}, 2
      };
  
 +    PropVariantInit(&device_path);
      PropVariantInit(&container_id);
++    dualsense_mono_endpoint = flow == eRender && is_dualsense_mono_endpoint_name(name);
  
      LIST_FOR_EACH_ENTRY(device, &device_list, MMDevice, entry)
-@@ -792,19 +895,13 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
+@@ -792,19 +931,16 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
              PROPVARIANT pv;
  
              if (SUCCEEDED(set_driver_prop_value(id, flow, &devicepath_key))) {
@@ -183,13 +297,16 @@ index adf2624a674..df2f07bbf48 100644
                          device_iname = override;
                          swprintf(friendly_name, FRIENDLY_NAME_MAX, friendly_name_fmt, device_desc, device_iname);
                      }
++                    if (dualsense_mono_endpoint && is_dualsense_standard_device_path(device_path.pwszVal))
++                        swprintf(friendly_name, FRIENDLY_NAME_MAX, friendly_name_fmt,
++                                device_desc, L"DualSense Wireless Controller");
                  }
 -
 -                PropVariantClear(&pv2);
              }
  
              pv.vt = VT_LPWSTR;
-@@ -855,7 +952,11 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
+@@ -855,7 +997,11 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
          RegCloseKey(key);
      }
  
@@ -197,7 +314,7 @@ index adf2624a674..df2f07bbf48 100644
 +    MMDevice_Register(guidstr, friendly_name, device_iname,
 +        device_path.vt == VT_LPWSTR ? device_path.pwszVal : NULL,
 +        container_id.vt == VT_CLSID ? container_id.puuid : &GUID_NULL,
-+        flow);
++        dualsense_mono_endpoint, flow);
 +    PropVariantClear(&device_path);
      PropVariantClear(&container_id);
  

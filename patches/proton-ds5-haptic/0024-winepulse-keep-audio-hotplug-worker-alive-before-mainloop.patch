@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Mon, 6 Jul 2026 00:00:00 -0600
+Subject: [PATCH 24/24] winepulse: Keep audio hotplug worker alive before
+ mainloop.
+
+The mmdevapi audio endpoint update thread can start before winepulse has a
+live PulseAudio mainloop. Returning AUDCLNT_E_DEVICE_INVALIDATED from that
+early delta call makes mmdevapi treat the update worker as permanently failed.
+
+That is exactly what broke Spider-Man controller speaker hotplug: the initial
+DualSense mono endpoint worked, but after the controller was unplugged the
+worker had already exited, so later Pulse add/remove events were logged but
+never converted into mmdevapi endpoint remove/add notifications.
+
+For this pre-mainloop state, wait briefly and return an empty successful delta
+instead. The worker remains alive and will process the real controller speaker
+remove/add once Pulse/PipeWire endpoint events arrive.
+---
+ dlls/winepulse.drv/pulse.c | 13 ++++++-------
+ 1 file changed, 6 insertions(+), 7 deletions(-)
+
+diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -568,7 +568,6 @@ static NTSTATUS pulse_get_endpoint_ids(void *args)
+     unsigned int other_event_mask;
+     unsigned int *event_stale;
+     BOOL refreshed;
+-    BOOL unavailable = FALSE;
+     PhysDevice *dev, *dev_next;
+     BOOL delta = params->delta;
+ 
+@@ -604,6 +603,7 @@ static NTSTATUS pulse_get_endpoint_ids(void *args)
+         other_list_removed = &g_phys_speakers_removed;
+     }
+ 
+-    params->num = params->num_removed = 0;
++    params->num = params->num_removed = 0;
++    params->more_data = FALSE;
+ 
+     g_phys_lock();
+ 
+@@ -615,9 +615,9 @@ static NTSTATUS pulse_get_endpoint_ids(void *args)
+ 
+     if (delta)
+     {
+-        params->more_data = FALSE;
+         /* also check if we are still running */
+-        if (!pulse_ml) {
+-            unavailable = TRUE;
++        if (!pulse_ml)
++        {
++            g_phys_cond_timedwait_ms(1000);
+             goto done;
+         }
+         if (!list_count(list_added) && !list_count(list_removed))
+@@ -631,8 +631,9 @@ static NTSTATUS pulse_get_endpoint_ids(void *args)
+             }
+             while (!(g_phys_event_mask & event_mask))
+             {
+-                if (!pulse_ml) {
+-                    unavailable = TRUE;
++                if (!pulse_ml)
++                {
++                    g_phys_cond_timedwait_ms(1000);
+                     goto done;
+                 }
+                 if (g_phys_event_mask & ~event_mask)
+@@ -724,8 +725,6 @@ done:
+     if (needed > params->size) {
+         params->size = needed;
+         params->result = HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+-    } else if (unavailable) {
+-        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+     } else {
+         params->delta = TRUE;
+         params->result = S_OK;
+-- 
+2.54.0

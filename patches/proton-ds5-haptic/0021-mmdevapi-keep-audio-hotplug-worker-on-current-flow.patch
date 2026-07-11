@@ -1,0 +1,142 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Mon, 6 Jul 2026 00:00:00 -0600
+Subject: [PATCH 21/21] mmdevapi: Keep audio hotplug worker on current flow.
+
+The mmdevapi update worker used to alternate render/capture after every
+completed delta update. That breaks render-only hotplug sequences such as
+DualSense controller speaker reconnects:
+
+1. The render-side mono speaker disappears and the game releases its audio
+   client.
+2. The worker consumes the render removal delta.
+3. The worker switches to capture and blocks there.
+4. The render-side mono speaker add event arrives, but the worker is no longer
+   waiting on render, so Spider-Man never sees the new controller speaker
+   endpoint and never recreates the mono effect stream.
+
+Make the Pulse driver report whether the opposite flow has queued work, and only
+switch flows in mmdevapi when that is true. A worker waiting on one flow can
+still be interrupted by an event for the other flow, but single-flow sequences
+continue watching the same flow for follow-up remove/add events.
+
+---
+ dlls/mmdevapi/devenum.c   |  7 +++----
+ dlls/winepulse.drv/pulse.c | 24 +++++++++++++++++++-----
+ 2 files changed, 22 insertions(+), 9 deletions(-)
+
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -1211,13 +1211,12 @@ static DWORD WINAPI update_thread_proc(void *user)
+     params.size = 1024;
+     params.endpoints = malloc(params.size);
+     params.delta = TRUE;
+-    params.more_data = TRUE;
+ 
+     for (;;) {
+         for (;;) {
+-            if (!g_update_thread_running || !params.more_data)
++            if (!g_update_thread_running)
+                 goto end;
+-            params.more_data = TRUE;
++            params.more_data = FALSE;
+             __wine_unix_call(drvs.module_unixlib, get_endpoint_ids, &params);
+ 
+             if (params.result == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)) {
+@@ -1268,7 +1266,8 @@ static DWORD WINAPI update_thread_proc(void *user)
+         /* add devices only after removing devices */
+         add_endpoints_from_params(&params);
+ 
+-        params.flow = params.flow == eRender ? eCapture : eRender;
++        if (params.more_data)
++            params.flow = params.flow == eRender ? eCapture : eRender;
+     }
+ 
+ end:
+diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -550,6 +550,8 @@ static NTSTATUS pulse_get_endpoint_ids(void *args)
+     unsigned int retry;
+     unsigned int event_mask;
++    unsigned int other_event_mask;
+     BOOL refreshed;
++    BOOL unavailable = FALSE;
+     PhysDevice *dev, *dev_next;
+     BOOL delta = params->delta;
+ 
+@@ -564,6 +566,7 @@ static NTSTATUS pulse_get_endpoint_ids(void *args)
+         list_added = &g_phys_speakers_added;
+         list_removed = &g_phys_speakers_removed;
+         event_mask = PHYS_EVENT_RENDER;
++        other_event_mask = PHYS_EVENT_CAPTURE;
+ 
+         other_list_added = &g_phys_sources_added;
+         other_list_removed = &g_phys_sources_removed;
+@@ -575,6 +578,7 @@ static NTSTATUS pulse_get_endpoint_ids(void *args)
+         list_added = &g_phys_sources_added;
+         list_removed = &g_phys_sources_removed;
+         event_mask = PHYS_EVENT_CAPTURE;
++        other_event_mask = PHYS_EVENT_RENDER;
+ 
+         other_list_added = &g_phys_speakers_added;
+         other_list_removed = &g_phys_speakers_removed;
+@@ -590,22 +594,29 @@ static NTSTATUS pulse_get_endpoint_ids(void *args)
+     if (delta)
+     {
+-        params->more_data = TRUE;
++        params->more_data = FALSE;
+         /* also check if we are still running */
+         if (!pulse_ml) {
+-            params->more_data = FALSE;
++            unavailable = TRUE;
+             goto done;
+         }
+         if (!list_count(list_added) && !list_count(list_removed))
+         {
+-            if (list_count(other_list_added) + list_count(other_list_removed))
++            if (list_count(other_list_added) + list_count(other_list_removed)
++                    || (g_phys_event_mask & other_event_mask))
++            {
++                params->more_data = TRUE;
+                 goto done;
++            }
+             while (!(g_phys_event_mask & event_mask))
+             {
+                 if (!pulse_ml) {
+-                    params->more_data = FALSE;
++                    unavailable = TRUE;
+                     goto done;
+                 }
+                 if (g_phys_event_mask & ~event_mask)
++                {
++                    params->more_data = TRUE;
+                     goto done;
++                }
+                 pthread_cond_wait(&g_phys_cond, &g_phys_mutex);
+             }
+@@ -638,7 +649,9 @@ static NTSTATUS pulse_get_endpoint_ids(void *args)
+         LIST_FOR_EACH_ENTRY_SAFE(dev, dev_next, list_removed, PhysDevice, entry) {
+             list_remove(&dev->entry);
+             pulse_dev_free(dev);
+         }
++        params->more_data = list_count(other_list_added) + list_count(other_list_removed)
++                || (g_phys_event_mask & other_event_mask);
+     }
+     else
+     {
+@@ -669,8 +682,10 @@ done:
+ 
+     if (needed > params->size) {
+         params->size = needed;
+         params->result = HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+-    } else {
++    } else if (unavailable) {
++        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
++    } else {
+         params->delta = TRUE;
+         params->result = S_OK;
+     }
+-- 
+2.54.0

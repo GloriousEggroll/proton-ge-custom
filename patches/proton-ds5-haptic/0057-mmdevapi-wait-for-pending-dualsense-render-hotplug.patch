@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Thu, 9 Jul 2026 08:10:00 -0600
+Subject: [PATCH] mmdevapi: Wait for pending DualSense render hotplug before
+ enumeration.
+
+Spider-Man Remastered can enumerate render endpoints while the mmdevapi update
+thread is still processing the render side of a DualSense controller swap. The
+DualSense speaker sink then appears moments later, but the game has already
+missed it and does not bind controller mono speaker effects for the new device.
+
+Track the specific case where a capture-side hotplug delta asks the update
+thread to process render next, and also mark the short window where a render
+delta has returned from the backend but has not yet published its new endpoints.
+While that render pass is pending or in progress, make render/eAll endpoint
+enumeration wait briefly for the update thread to publish the new render
+endpoints. This avoids exposing a stale render collection mid-swap without
+adding a general delay to idle enumeration.
+---
+ dlls/mmdevapi/devenum.c | 29 +++++++++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+index 11111111111..22222222222 100644
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -1427,6 +1427,25 @@
+ 
+ static HANDLE g_update_thread;
+ static BOOL g_update_thread_running;
++static LONG render_update_in_progress;
++
++static void wait_for_render_update_if_needed(EDataFlow flow)
++{
++    unsigned int i;
++
++    if (flow == eCapture)
++        return;
++
++    if (!InterlockedCompareExchange(&render_update_in_progress, 0, 0))
++        return;
++
++    TRACE("Waiting for pending render endpoint update before enumerating flow %d.\n", flow);
++    for (i = 0; i < 200 && InterlockedCompareExchange(&render_update_in_progress, 0, 0); ++i)
++        Sleep(10);
++    if (i == 200)
++        WARN("Timed out waiting for pending render endpoint update.\n");
++}
++
+ static DWORD WINAPI update_thread_proc(void *user)
+ {
+     struct get_endpoint_ids_params params;
+@@ -1455,6 +1468,11 @@
+         if (FAILED(params.result))
+             goto end;
+ 
++        if (params.more_data && params.flow == eCapture)
++            InterlockedExchange(&render_update_in_progress, 1);
++        if (params.flow == eRender)
++            InterlockedExchange(&render_update_in_progress, 1);
++
+         /* FIXME: update default device when removed, though currently only core audio backend could potentially */
+         /* change the default device, and it doesn't have hotplug implemented. */
+         for (i = 0; i < params.num_removed; i++) {
+@@ -1524,11 +1540,15 @@
+         /* add devices only after removing devices */
+         add_endpoints_from_params(&params);
+ 
++        if (params.flow == eRender)
++            InterlockedExchange(&render_update_in_progress, 0);
++
+         if (params.more_data)
+             params.flow = params.flow == eRender ? eCapture : eRender;
+     }
+ 
+ end:
++    InterlockedExchange(&render_update_in_progress, 0);
+     free(params.endpoints);
+     return 0;
+ }
+@@ -2098,6 +2118,7 @@
+         return E_INVALIDARG;
+     if (mask & ~DEVICE_STATEMASK_ALL)
+         return E_INVALIDARG;
++    wait_for_render_update_if_needed(flow);
+     return MMDevCol_Create(devices, flow, mask);
+ }
+ 
+-- 
+2.54.0

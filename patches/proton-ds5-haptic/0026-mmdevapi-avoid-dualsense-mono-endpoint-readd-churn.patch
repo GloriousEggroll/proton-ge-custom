@@ -1,0 +1,119 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Mon, 6 Jul 2026 00:00:00 -0600
+Subject: [PATCH 26/26] mmdevapi: Avoid DualSense mono endpoint re-add churn.
+
+Spider-Man can reopen the DualSense mono speaker after a controller
+disconnect/reconnect only if the reactivated endpoint produces an
+OnDeviceAdded notification. However, sending both OnDeviceAdded and a duplicate
+ACTIVE OnDeviceStateChanged notification for the same existing MMDevice object
+can make the game re-enumerate managed audio devices too broadly and crash with
+an InvalidCastException after reconnect.
+
+Keep OnDeviceAdded for NOTPRESENT -> ACTIVE reactivation, but suppress the
+extra ACTIVE state notification for that path.
+
+Also do not delete the fake DualSense PnP AudioEndpoint while registering the
+mono speaker. The mmdevapi endpoint already has a stable GUID, and deleting the
+matching SWD AudioEndpoint during normal startup/reconnect causes unnecessary
+device-tree churn under games that are actively enumerating audio endpoints.
+---
+ dlls/mmdevapi/devenum.c | 56 +++---------------------------------------------
+ 1 file changed, 3 insertions(+), 53 deletions(-)
+
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+index 136f6fbf45f..6186b01a103 100644
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -707,12 +707,6 @@ static BOOL is_dualsense_mono_endpoint_name(const WCHAR *name)
+     return name && wcsstr(name, L"DualSense") && wcsstr(name, L"Internal Mono Speaker");
+ }
+ 
+-static BOOL is_dualsense_audioendpoint_name(const WCHAR *name)
+-{
+-    return name && (wcsstr(name, L"DualSense Wireless Controller Speaker") ||
+-            wcsstr(name, L"DualSense Edge Wireless Controller Speaker"));
+-}
+-
+ static void remove_dualsense_media_devices(void)
+ {
+     static const GUID MEDIA_ClassGUID = { 0x4d36e96c, 0xe325, 0x11ce, { 0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18 } };
+@@ -750,44 +745,6 @@ static void remove_dualsense_media_devices(void)
+     SetupDiDestroyDeviceInfoList(device_set);
+ }
+ 
+-static void remove_dualsense_audioendpoint_devices(void)
+-{
+-    static const GUID AudioEndpoint_ClassGUID = { 0xc166523c, 0xfe0c, 0x4a94, { 0xa5, 0x86, 0xf1, 0xa8, 0x0c, 0xfb, 0xbf, 0x3e } };
+-    HDEVINFO device_set;
+-    SP_DEVINFO_DATA device_info_data;
+-    DWORD index = 0;
+-
+-    device_set = SetupDiGetClassDevsW(&AudioEndpoint_ClassGUID, NULL, NULL, 0);
+-    if (device_set == INVALID_HANDLE_VALUE)
+-        return;
+-
+-    for (;;)
+-    {
+-        WCHAR friendly_name[256];
+-
+-        memset(&device_info_data, 0, sizeof(device_info_data));
+-        device_info_data.cbSize = sizeof(device_info_data);
+-
+-        if (!SetupDiEnumDeviceInfo(device_set, index, &device_info_data))
+-            break;
+-
+-        if (SetupDiGetDeviceRegistryPropertyW(device_set, &device_info_data, SPDRP_FRIENDLYNAME, NULL,
+-                (BYTE *)friendly_name, sizeof(friendly_name), NULL) &&
+-                is_dualsense_audioendpoint_name(friendly_name))
+-        {
+-            TRACE("Removing stale DualSense AudioEndpoint device %s.\n", debugstr_w(friendly_name));
+-            if (SetupDiRemoveDevice(device_set, &device_info_data))
+-                continue;
+-            WARN("Failed to remove stale DualSense AudioEndpoint device %s: 0x%lu.\n",
+-                    debugstr_w(friendly_name), GetLastError());
+-        }
+-
+-        index++;
+-    }
+-
+-    SetupDiDestroyDeviceInfoList(device_set);
+-}
+-
+ static void MMDevice_Register(const WCHAR *instguid, const WCHAR *friendly_name, const WCHAR *device_iname, const WCHAR *device_path,
+-        const GUID *container_id, BOOL skip_audioendpoint, EDataFlow flow)
++        const GUID *container_id, EDataFlow flow)
+ {
+@@ -839,11 +796,6 @@ static void MMDevice_Register(const WCHAR *instguid, const WCHAR *friendly_name,
+     {
+         WCHAR device_name[DEVICE_ID_LEN];
+ 
+-        if (skip_audioendpoint)
+-        {
+-            TRACE("Refreshing DualSense PnP AudioEndpoint registration for %s.\n", debugstr_w(friendly_name));
+-            remove_dualsense_audioendpoint_devices();
+-        }
+         if (swprintf(device_name, ARRAY_SIZE(device_name), L"SWD\\MMDEVAPI\\{0.0.%u.00000000}.%s", flow, instguid) != -1)
+         {
+             memset(&device_info_data, 0, sizeof(device_info_data));
+@@ -1144,8 +1096,7 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
+ 
+     MMDevice_Register(guidstr, friendly_name, device_iname,
+         device_path.vt == VT_LPWSTR ? device_path.pwszVal : NULL,
+-        container_id.vt == VT_CLSID ? container_id.puuid : &GUID_NULL,
+-        dualsense_mono_endpoint, flow);
++        container_id.vt == VT_CLSID ? container_id.puuid : &GUID_NULL, flow);
+     PropVariantClear(&device_path);
+     PropVariantClear(&container_id);
+ 
+@@ -1162,7 +1156,7 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
+         {
+             if (update_add || update_readd)
+                 IMMNotificationClient_OnDeviceAdded(wrapper->client, devid);
+-            if (update_add || update_state)
++            if (update_add || (update_state && !update_readd))
+                 IMMNotificationClient_OnDeviceStateChanged(wrapper->client, devid, state);
+         }
+         LeaveCriticalSection(&g_notif_lock);
+-- 
+2.54.0

@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Thu, 9 Jul 2026 06:05:00 -0600
+Subject: [PATCH] mmdevapi: Keep activated DualSense mono endpoints until
+ disconnect.
+
+Spider-Man Remastered needs the DualSense mono speaker endpoint to be visible
+long enough to bind controller speaker effects, then hidden from broad endpoint
+enumeration to avoid the game's managed audio layer seeing the special
+one-channel endpoint again. Do not remove the activated MMDevice from
+device_list at activation time, though: if it is detached early, the later
+physical unplug cannot match it and the game never receives OnDeviceRemoved
+for the exact controller-speaker endpoint it cached.
+
+Keep the activated mono endpoint tracked but hidden. Remove the fake PnP
+AudioEndpoint node and MMDevices registry key after activation so SetupAPI and
+fresh broad discovery do not see it, then let the real Pulse sink removal mark
+the object not-present, notify removal, and destroy it. That makes a later DS
+or DS Edge plug a genuinely new endpoint while still clearing stale app-side
+state for the previous physical device.
+---
+ dlls/mmdevapi/devenum.c | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+index 4731e8a6666..c4fa79e7777 100644
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -750,6 +750,18 @@ static BOOL collection_device_visible(const MMDevice *device, EDataFlow flow, DW
+             !should_hide_from_endpoint_collection(device);
+ }
+ 
++static void delete_mmdevice_registry_key(const GUID *guid, EDataFlow flow)
++{
++    HKEY root = flow == eRender ? key_render : key_capture;
++    WCHAR guidstr[39];
++    LONG ret;
++
++    StringFromGUID2(guid, guidstr, ARRAY_SIZE(guidstr));
++    if ((ret = RegDeleteTreeW(root, guidstr)) && ret != ERROR_FILE_NOT_FOUND)
++        WARN("Failed to remove DualSense mono endpoint registry key %s: %lu\n",
++                debugstr_guid(guid), ret);
++}
++
+ static void remove_dualsense_media_devices(void)
+ {
+     static const GUID MEDIA_ClassGUID = { 0x4d36e96c, 0xe325, 0x11ce, { 0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18 } };
+@@ -1659,7 +1672,7 @@ static HRESULT WINAPI MMDevice_Activate(IMMDevice *iface, REFIID riid, DWORD cls
+     if (!ppv)
+         return E_POINTER;
+ 
+-    if (This->state == DEVICE_STATE_NOTPRESENT)
++    if (This->removed || This->state == DEVICE_STATE_NOTPRESENT)
+         return E_NOTFOUND;
+ 
+     if (IsEqualIID(riid, &IID_IAudioClient) ||
+@@ -1673,6 +1686,7 @@ static HRESULT WINAPI MMDevice_Activate(IMMDevice *iface, REFIID riid, DWORD cls
+                     debugstr_guid(&This->devguid));
+             This->hide_from_collection = TRUE;
+             remove_mmdevice_audioendpoint_device(&This->devguid, This->flow);
++            delete_mmdevice_registry_key(&This->devguid, This->flow);
+         }
+     }else if (IsEqualIID(riid, &IID_IAudioEndpointVolume) ||
+             IsEqualIID(riid, &IID_IAudioEndpointVolumeEx))
+-- 
+2.54.0

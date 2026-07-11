@@ -1,0 +1,145 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Mon, 6 Jul 2026 00:00:00 -0600
+Subject: [PATCH 23/23] winepulse: Keep DS5 mono hotplug deltas pending.
+
+Spider-Man releases its DualSense mono speaker client when the controller is
+unplugged. On reconnect it relies on mmdevapi hotplug notifications to see the
+replacement controller speaker and recreate the effect stream.
+
+Pulse/PipeWire can report the USB card/sink event before the refreshed sink
+snapshot has actually changed. The previous code consumed that one event before
+the refresh produced a remove/add delta, leaving the old mono endpoint cached
+and giving the game no usable add notification for the replacement controller.
+
+Keep a render/capture event pending until the refresh produces an actual
+endpoint delta. Use a small stale-event budget so bogus events cannot cause
+unbounded refresh spam, and bound the idle condition wait so the update thread
+cannot disappear inside a single driver call after a controller swap.
+---
+ dlls/winepulse.drv/pulse.c | 60 +++++++++++++++++++++++++++++++++----
+ 1 file changed, 54 insertions(+), 6 deletions(-)
+
+diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -179,6 +179,8 @@ static pthread_mutex_t g_phys_mutex;
+ static pthread_cond_t g_phys_cond = PTHREAD_COND_INITIALIZER;
+ static unsigned int g_haptic_hotplug_generation;
+ static unsigned int g_phys_event_mask;
++static unsigned int g_phys_event_stale_render;
++static unsigned int g_phys_event_stale_capture;
+ static struct list g_phys_speakers = LIST_INIT(g_phys_speakers);
+ static struct list g_phys_sources = LIST_INIT(g_phys_sources);
+ static struct list g_phys_speakers_added = LIST_INIT(g_phys_speakers_added);
+@@ -244,6 +246,22 @@ static int pulse_cond_timedwait_ms(unsigned int timeout_ms)
+     return pthread_cond_timedwait(&pulse_cond, &pulse_mutex, &ts);
+ }
+ 
++static int g_phys_cond_timedwait_ms(unsigned int timeout_ms)
++{
++    struct timespec ts;
++
++    clock_gettime(CLOCK_REALTIME, &ts);
++    ts.tv_sec += timeout_ms / 1000;
++    ts.tv_nsec += (timeout_ms % 1000) * 1000000;
++    if (ts.tv_nsec >= 1000000000)
++    {
++        ts.tv_sec++;
++        ts.tv_nsec -= 1000000000;
++    }
++
++    return pthread_cond_timedwait(&g_phys_cond, &g_phys_mutex, &ts);
++}
++
+ static void pulse_broadcast(void)
+ {
+     pthread_cond_broadcast(&pulse_cond);
+@@ -550,6 +568,7 @@ static NTSTATUS pulse_get_endpoint_ids(void *args)
+     unsigned int retry;
+     unsigned int event_mask;
+     unsigned int other_event_mask;
++    unsigned int *event_stale;
+     BOOL refreshed;
+     BOOL unavailable = FALSE;
+     PhysDevice *dev, *dev_next;
+@@ -566,6 +585,7 @@ static NTSTATUS pulse_get_endpoint_ids(void *args)
+         list_removed = &g_phys_speakers_removed;
+         event_mask = PHYS_EVENT_RENDER;
+         other_event_mask = PHYS_EVENT_CAPTURE;
++        event_stale = &g_phys_event_stale_render;
+ 
+         other_list_added = &g_phys_sources_added;
+         other_list_removed = &g_phys_sources_removed;
+@@ -578,6 +598,7 @@ static NTSTATUS pulse_get_endpoint_ids(void *args)
+         list_removed = &g_phys_sources_removed;
+         event_mask = PHYS_EVENT_CAPTURE;
+         other_event_mask = PHYS_EVENT_RENDER;
++        event_stale = &g_phys_event_stale_capture;
+ 
+         other_list_added = &g_phys_speakers_added;
+         other_list_removed = &g_phys_speakers_removed;
+@@ -614,21 +635,32 @@ static NTSTATUS pulse_get_endpoint_ids(void *args)
+                     params->more_data = TRUE;
+                     goto done;
+                 }
+-                pthread_cond_wait(&g_phys_cond, &g_phys_mutex);
++                if (g_phys_cond_timedwait_ms(1000) == ETIMEDOUT)
++                    goto done;
+             }
+-            if (g_phys_event_mask & event_mask)
+-                g_phys_event_mask &= ~event_mask;
+             for (retry = 0; retry < 4 && !list_count(list_added) && !list_count(list_removed); ++retry)
+             {
+                 g_phys_unlock();
+-                poll(NULL, 0, 250);
++                if (retry)
++                    poll(NULL, 0, 250);
+                 refreshed = pulse_refresh_devices(params->flow);
+                 g_phys_lock();
+                 if (!refreshed)
+                     break;
+             }
+             if (!list_count(list_added) && !list_count(list_removed))
++            {
++                if (++*event_stale >= 8)
++                {
++                    TRACE("Dropping stale PulseAudio endpoint event for flow %d after %u refresh passes.\n",
++                            (int)params->flow, *event_stale);
++                    g_phys_event_mask &= ~event_mask;
++                    *event_stale = 0;
++                }
+                 goto done;
++            }
++            g_phys_event_mask &= ~event_mask;
++            *event_stale = 0;
+         }
+ 
+         params->default_idx = -1;
+@@ -682,6 +717,9 @@ done:
+         params->delta = TRUE;
+         params->result = S_OK;
+     }
++    TRACE("returning flow %d, result %#x, added %u, removed %u, more_data %d, event_mask %#x.\n",
++            (int)params->flow, (unsigned int)params->result, params->num, params->num_removed,
++            params->more_data, g_phys_event_mask);
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -839,9 +877,14 @@ static void pulse_subscribe_callback(pa_context *c, pa_subscription_event_type_t
+     TRACE("PulseAudio endpoint event facility %#x event %#x index %u.\n", facility, event, index);
+ 
+     g_phys_lock();
+     if (event_mask & PHYS_EVENT_RENDER)
++    {
+         ++g_haptic_hotplug_generation;
++        g_phys_event_stale_render = 0;
++    }
++    if (event_mask & PHYS_EVENT_CAPTURE)
++        g_phys_event_stale_capture = 0;
+     g_phys_event_mask |= event_mask;
+     pthread_cond_broadcast(&g_phys_cond);
+     g_phys_unlock();
+ }
+-- 
+2.54.0

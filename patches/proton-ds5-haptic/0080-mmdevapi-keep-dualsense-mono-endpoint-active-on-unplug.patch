@@ -1,0 +1,194 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Fri, 10 Jul 2026 15:05:00 -0600
+Subject: [PATCH] mmdevapi: Keep DualSense mono endpoint active on unplug.
+
+Spider-Man Remastered can release its controller speaker/effect stream when
+the logical MMDevice endpoint reports DEVICE_STATE_NOTPRESENT during controller
+unplug. If that stream is released before the replacement DualSense /
+DualSense Edge / DualShock speaker sink is added, winepulse has no live stream
+left to retarget, and effect output is lost on the first controller switch.
+
+The MMDevice entry is a stable app-facing controller speaker handle; the
+physical Pulse sink is still removed separately. Keep that logical endpoint
+active and skip the NOTPRESENT notification on physical unplug so the app-side
+stream can survive long enough for winepulse to retarget it when the next Sony
+controller speaker sink appears.
+
+When a controller speaker appears, re-signal the matching app-facing logical
+endpoint. Keep it visible through discovery so games like Spider-Man Remastered
+can open the controller effect endpoint, then hide it after successful
+activation so it is not left visible to fragile endpoint scanners. Model
+filtering prevents stale one-channel endpoints for another Sony controller
+model from being announced; DualShock shares the standard DualSense logical
+speaker identity because some games cache and reopen that known endpoint instead
+of activating a third DualShock-specific endpoint.
+
+Do not remove the activated fake AudioEndpoint devnode or registry entry while
+the game is running. Spider-Man can notice that PnP removal after opening the
+controller speaker and hit its endpoint InvalidCastException path. Hiding the
+MMDevice from later endpoint collections is enough; the opened stream remains
+valid for winepulse retargeting.
+
+Only endpoints that were actually activated by the game are kept alive on
+physical unplug. Visible probes that were re-signaled but never opened are
+removed normally so a stale endpoint from one Sony controller model cannot be
+selected after a later DS / DSE / DSH swap.
+---
+ dlls/mmdevapi/devenum.c | 86 ++++++++++++++++++++++--------------------------
+ 1 file changed, 40 insertions(+), 46 deletions(-)
+
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -876,6 +876,8 @@ static void resignal_visible_dualsense_mono_endpoints(enum dualsense_mono_model
+         {
+             if (!is_dualsense_mono_endpoint(device) || !device->hide_from_collection)
+                 continue;
++            if (dualsense_mono_endpoint_model(device) != model)
++                continue;
+ 
+             if (!hidden || device->dualsense_mono_activation_serial > hidden->dualsense_mono_activation_serial)
+                 hidden = device;
+@@ -891,6 +893,7 @@ static void resignal_visible_dualsense_mono_endpoints(enum dualsense_mono_model
+             set_device_state(hidden, DEVICE_STATE_ACTIVE);
+         }
+ 
++        hidden->hide_from_collection = FALSE;
+         add_endpoint_notification(&notifications, &count, &capacity, hidden);
+     }
+     else
+@@ -919,18 +921,31 @@ static void resignal_visible_dualsense_mono_endpoints(enum dualsense_mono_model
+     free(notifications);
+ }
+ 
++static BOOL has_hidden_dualsense_mono_endpoint(enum dualsense_mono_model model)
++{
++    MMDevice *device;
++    BOOL found = FALSE;
++
++    if (model == DUALSENSE_MONO_MODEL_UNKNOWN)
++        return FALSE;
++
++    EnterCriticalSection(&device_list_cs);
++    LIST_FOR_EACH_ENTRY(device, &device_list, MMDevice, entry)
++    {
++        if (is_dualsense_mono_endpoint(device) && device->hide_from_collection
++                && (device->state & DEVICE_STATE_ACTIVE)
++                && device->dualsense_mono_activation_serial
++                && dualsense_mono_endpoint_model(device) == model)
++        {
++            found = TRUE;
++            break;
++        }
++    }
++    LeaveCriticalSection(&device_list_cs);
++
++    return found;
++}
++
+-static void delete_mmdevice_registry_key(const GUID *guid, EDataFlow flow)
+-{
+-    HKEY root = flow == eRender ? key_render : key_capture;
+-    WCHAR guidstr[39];
+-    LONG ret;
+-
+-    StringFromGUID2(guid, guidstr, ARRAY_SIZE(guidstr));
+-    if ((ret = RegDeleteTreeW(root, guidstr)) && ret != ERROR_FILE_NOT_FOUND)
+-        WARN("Failed to remove DualSense mono endpoint registry key %s: %lu\n",
+-                debugstr_guid(guid), ret);
+-}
+-
+ static void remove_dualsense_media_devices(void)
+ {
+     static const GUID MEDIA_ClassGUID = { 0x4d36e96c, 0xe325, 0x11ce, { 0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18 } };
+@@ -1047,39 +1061,6 @@ static void remove_dualsense_audioendpoint_devices(void)
+     SetupDiDestroyDeviceInfoList(device_set);
+ }
+ 
+-static void remove_mmdevice_audioendpoint_device(const GUID *id, EDataFlow flow)
+-{
+-    static const GUID AudioEndpoint_ClassGUID = { 0xc166523c, 0xfe0c, 0x4a94, { 0xa5, 0x86, 0xf1, 0xa8, 0x0c, 0xfb, 0xbf, 0x3e } };
+-    SP_DEVINFO_DATA device_info_data;
+-    WCHAR device_name[DEVICE_ID_LEN];
+-    WCHAR guidstr[39];
+-    HDEVINFO device_set;
+-
+-    if (!StringFromGUID2(id, guidstr, ARRAY_SIZE(guidstr)))
+-        return;
+-    if (swprintf(device_name, ARRAY_SIZE(device_name), L"SWD\\MMDEVAPI\\{0.0.%u.00000000}.%s", flow, guidstr) == -1)
+-        return;
+-
+-    device_set = SetupDiCreateDeviceInfoList(&AudioEndpoint_ClassGUID, NULL);
+-    if (device_set == INVALID_HANDLE_VALUE)
+-        return;
+-
+-    memset(&device_info_data, 0, sizeof(device_info_data));
+-    device_info_data.cbSize = sizeof(device_info_data);
+-
+-    if (SetupDiOpenDeviceInfoW(device_set, device_name, NULL, 0, &device_info_data))
+-    {
+-        TRACE("Removing activated DualSense AudioEndpoint device %s.\n", debugstr_w(device_name));
+-        if (!SetupDiRemoveDevice(device_set, &device_info_data))
+-            WARN("Failed to remove activated DualSense AudioEndpoint device %s: 0x%lu.\n",
+-                    debugstr_w(device_name), GetLastError());
+-    }
+-    else
+-        TRACE("Activated DualSense AudioEndpoint device %s is not registered.\n", debugstr_w(device_name));
+-
+-    SetupDiDestroyDeviceInfoList(device_set);
+-}
+-
+ static void MMDevice_Register(const WCHAR *instguid, const WCHAR *friendly_name, const WCHAR *device_iname, const WCHAR *device_path,
+         const GUID *container_id, BOOL skip_audioendpoint, EDataFlow flow)
+ {
+@@ -1672,6 +1698,14 @@ static DWORD WINAPI update_thread_proc(void *user)
+                     BOOL dualsense_mono_endpoint = is_dualsense_mono_endpoint(dev);
+                     WCHAR devid[56];
+ 
++                    if (dualsense_mono_endpoint && dev->hide_from_collection)
++                    {
++                        dualsense_mono_render_removed_model = dualsense_mono_endpoint_model(dev);
++                        TRACE("Keeping activated disconnected DualSense mono endpoint %s active for stream retargeting.\n",
++                                debugstr_guid(&dev->devguid));
++                        break;
++                    }
++
+                     dev->state = DEVICE_STATE_NOTPRESENT;
+                     StringFromGUID2(&dev->devguid, guidstr, ARRAY_SIZE(guidstr));
+                     if (dev->flow == eRender)
+@@ -1695,13 +1729,6 @@ static DWORD WINAPI update_thread_proc(void *user)
+                     }
+                     LeaveCriticalSection(&g_notif_lock);
+ 
+-                    if (dualsense_mono_endpoint)
+-                    {
+-                        dualsense_mono_render_removed_model = dualsense_mono_endpoint_model(dev);
+-                        TRACE("Keeping disconnected DualSense mono endpoint %s for stable app-facing hotplug.\n",
+-                                debugstr_guid(&dev->devguid));
+-                    }
+-
+                     break;
+                 }
+             }
+@@ -1722,7 +1749,8 @@ static DWORD WINAPI update_thread_proc(void *user)
+ 
+                 dualsense_mono_render_add_model = DUALSENSE_MONO_MODEL_UNKNOWN;
+                 dualsense_mono_render_removed_model = DUALSENSE_MONO_MODEL_UNKNOWN;
+-                resignal_visible_dualsense_mono_endpoints(model, allow_hidden);
++                resignal_visible_dualsense_mono_endpoints(model,
++                        allow_hidden || has_hidden_dualsense_mono_endpoint(model));
+             }
+             InterlockedExchange(&render_update_in_progress, 0);
+         }
+@@ -1942,8 +1922,6 @@ static HRESULT WINAPI MMDevice_Activate(IMMDevice *iface, REFIID riid, DWORD cls
+                     debugstr_guid(&This->devguid));
+             This->hide_from_collection = TRUE;
+             This->dualsense_mono_activation_serial = InterlockedIncrement(&dualsense_mono_activation_serial);
+-            remove_mmdevice_audioendpoint_device(&This->devguid, This->flow);
+-            delete_mmdevice_registry_key(&This->devguid, This->flow);
+             retire_old_hidden_dualsense_mono_endpoints(This);
+         }
+     }else if (IsEqualIID(riid, &IID_IAudioEndpointVolume) ||
+-- 
+2.54.0

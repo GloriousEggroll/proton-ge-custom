@@ -1,0 +1,157 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Tue, 7 Jul 2026 16:20:00 -0600
+Subject: [PATCH] winepulse: Use the speaker profile for DualSense cards.
+
+PipeWire may select the DualSense "Direct" profile after hotplug. That
+profile exposes only the 4-channel direct device, so games like
+Spider-Man no longer see the controller's internal mono speaker endpoint.
+When the card is in Direct mode, switch Sony DualSense USB cards back to
+the speaker-capable default profile before Wine snapshots the PulseAudio
+endpoint list.
+
+Raw ALSA haptics still use the hw PCM directly, so the speaker profile is
+the correct view for the Pulse/mmdevapi endpoint list while haptic data
+continues to use the raw path.
+---
+ dlls/winepulse.drv/pulse.c | 118 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 118 insertions(+)
+
+diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+index 6d0fb122c4c..b9df714acf5 100644
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -1328,6 +1328,121 @@ static BOOL pulse_operation_wait_done(pa_mainloop *ml, pa_operation *op, const c
+     return TRUE;
+ }
+ 
++struct dualsense_card_profile_fix
++{
++    struct list entry;
++    uint32_t index;
++    char profile[128];
++};
++
++static BOOL pulse_card_info_is_dualsense(const pa_card_info *info)
++{
++    const char *product, *vendor;
++    unsigned int pid, vid;
++
++    if (!info || !info->proplist)
++        return FALSE;
++
++    vendor = pa_proplist_gets(info->proplist, PA_PROP_DEVICE_VENDOR_ID);
++    product = pa_proplist_gets(info->proplist, PA_PROP_DEVICE_PRODUCT_ID);
++    vid = vendor ? strtoul(vendor, NULL, 0) : 0;
++    pid = product ? strtoul(product, NULL, 0) : 0;
++    if (vid == 0x054c && (pid == 0x0ce6 || pid == 0x0df2))
++        return TRUE;
++
++    product = pa_proplist_gets(info->proplist, PA_PROP_DEVICE_PRODUCT_NAME);
++    return string_contains_dualsense_name(info->name) || string_contains_dualsense_name(product);
++}
++
++static BOOL pulse_card_profile_available(const pa_card_profile_info2 *profile)
++{
++    return profile && profile->n_sinks && profile->available != 0;
++}
++
++static const char *pulse_select_dualsense_speaker_profile(const pa_card_info *info)
++{
++    const pa_card_profile_info2 *profile;
++    const char *fallback = NULL;
++    unsigned int i;
++
++    if (!info->active_profile2 || strcmp(info->active_profile2->name, "Direct"))
++        return NULL;
++
++    for (i = 0; info->profiles2 && (profile = info->profiles2[i]); ++i)
++    {
++        const char *description = profile->description ? profile->description : "";
++        const char *name = profile->name ? profile->name : "";
++
++        if (!pulse_card_profile_available(profile))
++            continue;
++
++        if (!strcmp(name, "Default (Mic, Speaker)") || !strcmp(description, "Default (Mic, Speaker)"))
++            return name;
++        if (!fallback && strstr(description, "Speaker") && !strstr(description, "Headset"))
++            fallback = name;
++        if (!fallback && strstr(name, "HiFi"))
++            fallback = name;
++    }
++
++    return fallback;
++}
++
++static void pulse_dualsense_card_profile_cb(pa_context *ctx, const pa_card_info *info, int eol, void *userdata)
++{
++    struct list *fixes = userdata;
++    struct dualsense_card_profile_fix *fix;
++    const char *profile;
++
++    if (eol || !pulse_card_info_is_dualsense(info))
++        return;
++    if (!(profile = pulse_select_dualsense_speaker_profile(info)))
++        return;
++    if (!(fix = calloc(1, sizeof(*fix))))
++        return;
++
++    fix->index = info->index;
++    snprintf(fix->profile, sizeof(fix->profile), "%s", profile);
++    list_add_tail(fixes, &fix->entry);
++
++    TRACE("DualSense card %s is using Direct profile, will switch to %s.\n",
++            debugstr_a(info->name), debugstr_a(fix->profile));
++}
++
++static void pulse_fix_dualsense_card_profiles(pa_mainloop *ml, pa_context *ctx)
++{
++    struct list fixes = LIST_INIT(fixes);
++    struct dualsense_card_profile_fix *fix, *next;
++    pa_operation *op;
++
++    if ((op = pa_context_get_card_info_list(ctx, pulse_dualsense_card_profile_cb, &fixes)))
++    {
++        if (!pulse_operation_wait_done(ml, op, "DualSense card profile list"))
++            WARN("Failed to query PulseAudio card profiles.\n");
++        pa_operation_unref(op);
++    }
++
++    LIST_FOR_EACH_ENTRY_SAFE(fix, next, &fixes, struct dualsense_card_profile_fix, entry)
++    {
++        int success = 0;
++
++        TRACE("Switching DualSense card index %u to profile %s.\n", fix->index, debugstr_a(fix->profile));
++        if ((op = pa_context_set_card_profile_by_index(ctx, fix->index, fix->profile, pulse_context_op_cb, &success)))
++        {
++            if (!pulse_operation_wait_done(ml, op, "DualSense card profile switch") || !success)
++                WARN("Failed to switch DualSense card index %u to profile %s.\n", fix->index, debugstr_a(fix->profile));
++            else
++            {
++                g_phys_lock();
++                ++g_haptic_hotplug_generation;
++                g_phys_unlock();
++            }
++            pa_operation_unref(op);
++        }
++        list_remove(&fix->entry);
++        free(fix);
++    }
++}
++
+ static BOOL pulse_stream_wait_until_not(pa_mainloop *ml, pa_stream *stream, pa_stream_state_t wait_state, const char *what)
+ {
+     pa_usec_t deadline = pa_rtclock_now() + DUALSENSE_HAPTIC_REFRESH_USEC;
+@@ -1392,6 +1507,9 @@ static BOOL pulse_refresh_devices(EDataFlow flow)
+     if (!pulse_context_wait_ready(ml, ctx, "device refresh context"))
+         goto fail;
+ 
++    if (flow == eRender)
++        pulse_fix_dualsense_card_profiles(ml, ctx);
++
+     if (flow == eRender)
+         pulse_add_device(&current, eRender, NULL, 0, Speakers, 0, "", "PulseAudio Output");
+     else
+-- 
+2.50.0

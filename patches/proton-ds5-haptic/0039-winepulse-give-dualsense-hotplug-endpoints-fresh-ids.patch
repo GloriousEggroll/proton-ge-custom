@@ -1,0 +1,766 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Wed, 8 Jul 2026 08:40:00 -0600
+Subject: [PATCH] winepulse: treat DualSense hotplug as new devices
+
+Do not reconnect old DualSense mono speaker or haptic streams after a
+controller is unplugged. Once the backing Pulse/ALSA device is gone, the old
+stream is invalid and must not be retargeted to a later controller.
+
+Expose a fresh endpoint id for each transient DualSense audio hotplug event
+while still resolving that id back to the real Pulse device name for stream
+creation and property queries. Keep the visible controller speaker sink on its
+stable Pulse name, since games such as Spider-Man Remastered discover and reuse
+that endpoint directly for controller speaker effects.
+---
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -81,8 +81,6 @@
+ };
+ 
+ static struct list active_periods = LIST_INIT(active_periods);
+-static struct list dualsense_mono_streams = LIST_INIT(dualsense_mono_streams);
+-static struct list dualsense_pulse_haptic_streams = LIST_INIT(dualsense_pulse_haptic_streams);
+ 
+ struct pulse_stream
+ {
+@@ -170,6 +168,7 @@
+     GUID container_id;
+     char *raw_haptic_target;
+     char *raw_haptic_alsa_path;
++    char *endpoint_id;
+     char pulse_name[0];
+ } PhysDevice;
+ 
+@@ -179,7 +178,7 @@
+ static pthread_mutex_t g_phys_mutex;
+ static pthread_cond_t g_phys_cond = PTHREAD_COND_INITIALIZER;
+ static unsigned int g_haptic_hotplug_generation;
+-static unsigned int g_dualsense_mono_hotplug_generation;
++static unsigned int g_dualsense_endpoint_generation;
+ static unsigned int g_phys_event_mask;
+ static unsigned int g_phys_event_stale_render;
+ static unsigned int g_phys_event_stale_capture;
+@@ -289,6 +288,7 @@
+     free(dev->name);
+     free(dev->raw_haptic_target);
+     free(dev->raw_haptic_alsa_path);
++    free(dev->endpoint_id);
+     free(dev);
+ }
+ 
+@@ -307,12 +307,15 @@
+     return (struct pulse_stream *)(UINT_PTR)h;
+ }
+ 
+-static BOOL pulse_stream_dualsense_mono(const struct pulse_stream *stream);
+-static BOOL pulse_stream_dualsense_pulse_haptic(const struct pulse_stream *stream);
+-static HRESULT pulse_dualsense_mono_reconnect(struct pulse_stream *stream);
+-static HRESULT pulse_dualsense_pulse_haptic_reconnect(struct pulse_stream *stream);
+-static void pulse_reconnect_dualsense_mono_streams(struct pulse_period *current_period);
+-static void pulse_reconnect_dualsense_pulse_haptic_streams(struct pulse_period *current_period);
++static const char *pulse_endpoint_id(const PhysDevice *dev)
++{
++    return dev->endpoint_id ? dev->endpoint_id : dev->pulse_name;
++}
++
++static BOOL pulse_device_matches(const PhysDevice *dev, const char *name)
++{
++    return name && (!strcmp(name, dev->pulse_name) || !strcmp(name, pulse_endpoint_id(dev)));
++}
+ 
+ static void dump_attr(const pa_buffer_attr *attr)
+ {
+@@ -515,7 +518,7 @@
+ 
+     LIST_FOR_EACH_ENTRY(dev, list, PhysDevice, entry) {
+         name_len = lstrlenW(dev->name) + 1;
+-        len = strlen(dev->pulse_name) + 1;
++        len = strlen(pulse_endpoint_id(dev)) + 1;
+         *needed += name_len * sizeof(WCHAR) + ((len + 1) & ~1);
+ 
+         if (*needed > size)
+@@ -531,13 +534,13 @@
+ 
+     LIST_FOR_EACH_ENTRY(dev, list, PhysDevice, entry) {
+         name_len = lstrlenW(dev->name) + 1;
+-        len = strlen(dev->pulse_name) + 1;
++        len = strlen(pulse_endpoint_id(dev)) + 1;
+ 
+         (*endpoint)->name = *offset;
+         memcpy((char *)names + *offset, dev->name, name_len * sizeof(WCHAR));
+         *offset += name_len * sizeof(WCHAR);
+         (*endpoint)->device = *offset;
+-        memcpy((char *)names + *offset, dev->pulse_name, len);
++        memcpy((char *)names + *offset, pulse_endpoint_id(dev), len);
+         *offset += (len + 1) & ~1;
+         (*endpoint)++;
+     }
+@@ -812,14 +815,12 @@
+     pa_stream_state_t state;
+ 
+     if (!stream->stream)
+-        return stream->dataflow == eRender && (stream->haptic_alsa_path
+-                || pulse_stream_dualsense_mono(stream) || pulse_stream_dualsense_pulse_haptic(stream));
++        return stream->dataflow == eRender && stream->haptic_pcm && stream->haptic_alsa_path
++                && stream->haptic_alsa_path[0];
+ 
+     state = pa_stream_get_state(stream->stream);
+ 
+-    return state == PA_STREAM_READY || (stream->dataflow == eRender
+-            && (state == PA_STREAM_CREATING || pulse_stream_dualsense_mono(stream)
+-                    || pulse_stream_dualsense_pulse_haptic(stream)));
++    return state == PA_STREAM_READY || (stream->dataflow == eRender && state == PA_STREAM_CREATING);
+ }
+ 
+ static BOOL pulse_stream_ready(struct pulse_stream *stream)
+@@ -1165,12 +1166,6 @@
+             && (dev->product_id == 0x0ce6 || dev->product_id == 0x0df2);
+ }
+ 
+-static BOOL is_dualsense_speaker_sink(const PhysDevice *dev)
+-{
+-    return is_dualsense_audio_device(dev) && dev->flow == eRender && !dev->raw_haptic_target
+-            && strstr(dev->pulse_name, "Speaker__sink");
+-}
+-
+ static BOOL is_dualsense_haptic_format(const struct pulse_stream *stream)
+ {
+     return stream->dataflow == eRender && stream->ss.format == PA_SAMPLE_FLOAT32LE
+@@ -1188,26 +1183,22 @@
+     return stream->dataflow == eRender && stream->ss.channels == 1;
+ }
+ 
+-static BOOL pulse_stream_dualsense_mono(const struct pulse_stream *stream)
+-{
+-    return pulse_stream_dualsense_mono_format(stream) && string_contains_dualsense_name(stream->device);
+-}
+-
+-static BOOL pulse_stream_dualsense_pulse_haptic(const struct pulse_stream *stream)
++static BOOL pulse_set_endpoint_id(PhysDevice *dev)
+ {
+-    return is_dualsense_haptic_format(stream) && !stream->haptic_alsa_path
+-            && string_contains_dualsense_name(stream->device);
+-}
++    unsigned int generation;
++    size_t len;
+ 
+-static BOOL dualsense_render_event_pending(void)
+-{
+-    BOOL pending;
++    if (!is_dualsense_audio_device(dev) || (dev->flow == eRender && !dev->raw_haptic_target
++            && strstr(dev->pulse_name, "Speaker__sink")))
++        return !!(dev->endpoint_id = strdup(dev->pulse_name));
+ 
+-    g_phys_lock();
+-    pending = !!(g_phys_event_mask & PHYS_EVENT_RENDER);
+-    g_phys_unlock();
++    generation = ++g_dualsense_endpoint_generation;
++    len = strlen(dev->pulse_name) + sizeof("#wine-dualsense-hotplug-") + 10;
++    if (!(dev->endpoint_id = malloc(len)))
++        return FALSE;
+ 
+-    return pending;
++    snprintf(dev->endpoint_id, len, "%s#wine-dualsense-hotplug-%u", dev->pulse_name, generation);
++    return TRUE;
+ }
+ 
+ static void pulse_add_device(struct list *list, EDataFlow flow, pa_proplist *proplist, int index, EndpointFormFactor form,
+@@ -1231,6 +1221,7 @@
+     dev->min_period = 0;
+     dev->raw_haptic_target = NULL;
+     dev->raw_haptic_alsa_path = NULL;
++    dev->endpoint_id = NULL;
+     dev->ready = TRUE;
+     dev->length = 0;
+     dev->probe_status = -1;
+@@ -1258,6 +1249,11 @@
+         }
+     }
+     memcpy(dev->pulse_name, pulse_name, len + 1);
++    if (!pulse_set_endpoint_id(dev))
++    {
++        pulse_dev_free(dev);
++        return;
++    }
+ 
+     list_add_tail(list, &dev->entry);
+ 
+@@ -1302,6 +1298,40 @@
+     return NULL;
+ }
+ 
++static char *pulse_resolve_device_name(const char *device)
++{
++    static struct list *const lists[] =
++    {
++        &g_phys_speakers_added,
++        &g_phys_speakers,
++        &g_phys_sources_added,
++        &g_phys_sources,
++        NULL
++    };
++    struct list *const *list;
++    PhysDevice *dev;
++    char *ret = NULL;
++
++    if (!device || !device[0])
++        return NULL;
++
++    g_phys_lock();
++    for (list = lists; *list; ++list)
++    {
++        LIST_FOR_EACH_ENTRY(dev, *list, PhysDevice, entry)
++        {
++            if (!pulse_device_matches(dev, device))
++                continue;
++            ret = strdup(dev->pulse_name);
++            break;
++        }
++        if (ret)
++            break;
++    }
++    g_phys_unlock();
++    return ret;
++}
++
+ static void pulse_probe_device_list(pa_mainloop *ml, pa_context *ctx, struct list *list, BOOL render)
+ {
+     PhysDevice *dev;
+@@ -1548,11 +1578,7 @@
+             continue;
+         TRACE("PulseAudio endpoint %s was removed.\n", debugstr_a(dev->pulse_name));
+         if (flow == eRender && is_dualsense_audio_device(dev))
+-        {
+             ++g_haptic_hotplug_generation;
+-            if (is_dualsense_speaker_sink(dev))
+-                ++g_dualsense_mono_hotplug_generation;
+-        }
+         list_remove(&dev->entry);
+         list_add_tail(removed, &dev->entry);
+     }
+@@ -1568,11 +1594,7 @@
+ 
+         TRACE("PulseAudio endpoint %s was added.\n", debugstr_a(dev->pulse_name));
+         if (flow == eRender && is_dualsense_audio_device(dev))
+-        {
+             ++g_haptic_hotplug_generation;
+-            if (is_dualsense_speaker_sink(dev))
+-                ++g_dualsense_mono_hotplug_generation;
+-        }
+         list_remove(&dev->entry);
+         list_add_tail(added, &dev->entry);
+     }
+@@ -2118,30 +2140,18 @@
+     return S_OK;
+ }
+ 
+-static void pulse_stream_disconnect(struct pulse_stream *stream)
+-{
+-    if (!stream->stream)
+-        return;
+-
+-    if (PA_STREAM_IS_GOOD(pa_stream_get_state(stream->stream)))
+-        pa_stream_disconnect(stream->stream);
+-    pa_stream_unref(stream->stream);
+-    stream->stream = NULL;
+-    stream->update_timing_info_pending = FALSE;
+-}
+-
+ static HRESULT get_device_period_helper(EDataFlow flow, const char *pulse_name, REFERENCE_TIME *def, REFERENCE_TIME *min)
+ {
+     struct list *list = (flow == eRender) ? &g_phys_speakers : &g_phys_sources;
+     PhysDevice *dev;
+ 
+     if (!def && !min) {
+         return E_POINTER;
+     }
+ 
+     g_phys_lock();
+     LIST_FOR_EACH_ENTRY(dev, list, PhysDevice, entry) {
+-        if (strcmp(pulse_name, dev->pulse_name))
++        if (!pulse_device_matches(dev, pulse_name))
+             continue;
+ 
+         if (def)
+@@ -2157,7 +2179,7 @@
+     g_phys_lock();
+     LIST_FOR_EACH_ENTRY(dev, &g_phys_speakers, PhysDevice, entry)
+     {
+-        if (strcmp(pulse_name, dev->pulse_name))
++        if (!pulse_device_matches(dev, pulse_name))
+             continue;
+ 
+         if (dev->raw_haptic_target)
+@@ -2191,7 +2213,7 @@
+     g_phys_lock();
+     LIST_FOR_EACH_ENTRY(dev, &g_phys_speakers, PhysDevice, entry)
+     {
+-        if (strcmp(pulse_name, dev->pulse_name))
++        if (!pulse_device_matches(dev, pulse_name))
+         {
+             if (!fallback && is_dualsense_audio_device(dev) && dev->raw_haptic_alsa_path)
+                 fallback = dev;
+@@ -2238,7 +2260,7 @@
+                 continue;
+ 
+             direct = strstr(dev->pulse_name, "Direct__Direct__sink") || dev->raw_haptic_target;
+-            if (preferred && !strcmp(preferred, dev->pulse_name) && !direct)
++            if (preferred && pulse_device_matches(dev, preferred) && !direct)
+             {
+                 char *ret = strdup(dev->pulse_name);
+ 
+@@ -2493,33 +2515,6 @@
+     return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
+ }
+ 
+-static HRESULT pulse_haptic_stream_reconnect(struct pulse_stream *stream)
+-{
+-    char *alsa_path;
+-
+-    if (stream->haptic_pcm)
+-    {
+-        snd_pcm_close(stream->haptic_pcm);
+-        stream->haptic_pcm = NULL;
+-    }
+-
+-    if ((alsa_path = find_dualsense_haptic_alsa_path()))
+-    {
+-        free(stream->haptic_alsa_path);
+-        stream->haptic_alsa_path = alsa_path;
+-    }
+-    else if ((alsa_path = get_dualsense_haptic_alsa_path(stream->device, stream)))
+-    {
+-        free(stream->haptic_alsa_path);
+-        stream->haptic_alsa_path = alsa_path;
+-    }
+-
+-    if (!stream->haptic_alsa_path || !stream->haptic_alsa_path[0])
+-        return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
+-
+-    return pulse_haptic_stream_connect(stream, stream->haptic_alsa_path);
+-}
+-
+ static void pulse_haptic_drop_held(struct pulse_stream *stream)
+ {
+     TRACE("Dropping %lu bytes of pending DualSense haptic data.\n", (unsigned long)stream->held_bytes);
+@@ -2539,8 +2534,8 @@
+         snd_pcm_close(stream->haptic_pcm);
+         stream->haptic_pcm = NULL;
+     }
+-    /* Keep the stream on the raw-haptic retry path while hotplug settles; clearing this
+-     * pointer would make it fall back to the stale Pulse Direct sink during unplug. */
++    /* The unplugged controller is gone. Keep the old stream invalid instead of
++     * retargeting it to a later controller that may be a different device. */
+     if (stream->haptic_alsa_path)
+         stream->haptic_alsa_path[0] = 0;
+     stream->haptic_reconnect_time = 0;
+@@ -2551,41 +2546,11 @@
+ 
+ static BOOL pulse_haptic_refresh_path(struct pulse_stream *stream)
+ {
+-    pa_usec_t now = pa_rtclock_now();
+-    char *alsa_path;
+-    BOOL changed;
+-
+-    if (stream->haptic_path_check_time && now < stream->haptic_path_check_time)
+-        return stream->haptic_pcm != NULL;
+-
+     if (stream->haptic_pcm && stream->haptic_hotplug_generation == g_haptic_hotplug_generation)
+         return TRUE;
+-    if (!stream->haptic_pcm && stream->haptic_hotplug_generation == g_haptic_hotplug_generation)
+-        return FALSE;
+-
+-    stream->haptic_path_check_time = now + DUALSENSE_HAPTIC_REFRESH_USEC;
+-    stream->haptic_hotplug_generation = g_haptic_hotplug_generation;
+-    if (stream->haptic_pcm)
+-    {
+-        snd_pcm_close(stream->haptic_pcm);
+-        stream->haptic_pcm = NULL;
+-    }
+-    stream->haptic_reconnect_time = 0;
+ 
+-    if (!(alsa_path = find_dualsense_haptic_alsa_path()))
+-        return FALSE;
+-
+-    changed = !stream->haptic_alsa_path || strcmp(stream->haptic_alsa_path, alsa_path);
+-    TRACE("Refreshing DualSense haptic PCM %s%s%s.\n",
+-            debugstr_a(stream->haptic_alsa_path), changed ? " -> " : "",
+-            changed ? debugstr_a(alsa_path) : "");
+-    if (changed)
+-        free(stream->haptic_alsa_path);
+-    else
+-        free(alsa_path);
+-    if (changed)
+-        stream->haptic_alsa_path = alsa_path;
+-    return SUCCEEDED(pulse_haptic_stream_reconnect(stream));
++    TRACE("DualSense haptic stream no longer matches the current device generation.\n");
++    return FALSE;
+ }
+ 
+ static void pulse_haptic_advance(struct pulse_stream *stream, UINT32 frames, UINT32 frame_size)
+@@ -2620,7 +2585,7 @@
+     state = snd_pcm_state(stream->haptic_pcm);
+     if (state == SND_PCM_STATE_DISCONNECTED)
+     {
+-        WARN("DualSense haptic PCM disconnected; waiting for a new raw ALSA endpoint.\n");
++        WARN("DualSense haptic PCM disconnected; invalidating stream.\n");
+         pulse_haptic_invalidate(stream, "disconnect");
+         return;
+     }
+@@ -2697,6 +2662,7 @@
+     unsigned int i, bufsize_bytes;
+     HRESULT hr;
+     char *name, *haptic_target = NULL, *haptic_alsa_path = NULL, *dualsense_speaker = NULL;
++    char *resolved_device = NULL;
+     const char *connect_device;
+     BOOL haptic_candidate, dualsense_mono_candidate, dualsense_pulse_haptic_candidate = FALSE;
+ 
+@@ -2771,6 +2737,8 @@
+     connect_device = params->device;
+     if (dualsense_mono_candidate && (dualsense_speaker = get_dualsense_speaker_sink(params->device)))
+         connect_device = dualsense_speaker;
++    else if ((resolved_device = pulse_resolve_device_name(connect_device)))
++        connect_device = resolved_device;
+     if (haptic_candidate)
+     {
+         stream->haptic_alsa_path = strdup(haptic_alsa_path ? haptic_alsa_path : "");
+@@ -2801,12 +2769,6 @@
+     else
+     {
+         hr = pulse_stream_connect(stream, connect_device, haptic_target, stream->period_bytes);
+-        if (FAILED(hr) && dualsense_mono_candidate)
+-        {
+-            TRACE("Keeping DualSense mono speaker stream pending for %s.\n", debugstr_a(connect_device));
+-            pulse_stream_disconnect(stream);
+-            hr = S_OK;
+-        }
+     }
+     if (SUCCEEDED(hr)) {
+         UINT32 unalign;
+@@ -2850,23 +2812,8 @@
+             }
+         }
+         stream->device = strdup(connect_device);
+-        if (dualsense_pulse_haptic_candidate)
+-        {
+-            g_phys_lock();
+-            stream->haptic_hotplug_generation = g_haptic_hotplug_generation;
+-            g_phys_unlock();
+-            list_add_tail(&dualsense_pulse_haptic_streams, &stream->dualsense_pulse_haptic_entry);
+-            stream->dualsense_pulse_haptic_registered = TRUE;
+-        }
+-        if (dualsense_mono_candidate)
+-        {
+-            g_phys_lock();
++        if (dualsense_pulse_haptic_candidate || dualsense_mono_candidate)
+             stream->haptic_hotplug_generation = g_haptic_hotplug_generation;
+-            stream->dualsense_mono_hotplug_generation = g_dualsense_mono_hotplug_generation;
+-            g_phys_unlock();
+-            list_add_tail(&dualsense_mono_streams, &stream->dualsense_mono_entry);
+-            stream->dualsense_mono_registered = TRUE;
+-        }
+     }
+ 
+     *params->channel_count = stream->ss.channels;
+@@ -2887,6 +2834,7 @@
+     free(haptic_target);
+     free(haptic_alsa_path);
+     free(dualsense_speaker);
++    free(resolved_device);
+     pulse_unlock();
+     return STATUS_SUCCESS;
+ }
+@@ -3513,192 +3461,6 @@
+     TRACE("Created period %p, %s, %lld.\n", period, debugstr_a(period->device), (long long)period->period);
+ }
+ 
+-static HRESULT pulse_dualsense_mono_reconnect_internal(struct pulse_stream *stream, BOOL force)
+-{
+-    const char *current_device = NULL;
+-    unsigned int generation;
+-    pa_usec_t now;
+-    char *device = NULL;
+-    HRESULT hr;
+-
+-    if (!pulse_stream_dualsense_mono(stream) && !pulse_stream_dualsense_pulse_haptic(stream))
+-        return AUDCLNT_E_DEVICE_INVALIDATED;
+-
+-    g_phys_lock();
+-    generation = g_haptic_hotplug_generation;
+-    g_phys_unlock();
+-
+-    now = pa_rtclock_now();
+-    if (stream->stream && !PA_STREAM_IS_GOOD(pa_stream_get_state(stream->stream)))
+-    {
+-        pulse_stream_disconnect(stream);
+-        if (pulse_stream_dualsense_pulse_haptic(stream))
+-        {
+-            stream->haptic_reconnect_time = now + DUALSENSE_HAPTIC_REFRESH_USEC;
+-            return AUDCLNT_E_DEVICE_INVALIDATED;
+-        }
+-    }
+-
+-    if (stream->haptic_reconnect_time && now < stream->haptic_reconnect_time)
+-    {
+-        free(device);
+-        return AUDCLNT_E_DEVICE_INVALIDATED;
+-    }
+-    if (dualsense_render_event_pending())
+-    {
+-        TRACE("Deferring DualSense speaker/effects reconnect while render endpoint event is pending.\n");
+-        stream->haptic_reconnect_time = now + DUALSENSE_HAPTIC_REFRESH_USEC;
+-        return AUDCLNT_E_DEVICE_INVALIDATED;
+-    }
+-
+-    device = get_dualsense_speaker_sink(stream->device);
+-    if (!device)
+-    {
+-        TRACE("DualSense speaker/effects sink is not currently available, generation %u -> %u.\n",
+-                stream->haptic_hotplug_generation, generation);
+-        stream->haptic_hotplug_generation = generation;
+-        stream->haptic_reconnect_time = now + DUALSENSE_HAPTIC_REFRESH_USEC;
+-        return AUDCLNT_E_DEVICE_INVALIDATED;
+-    }
+-
+-    if (pulse_stream_ready(stream))
+-        current_device = pa_stream_get_device_name(stream->stream);
+-    if (current_device && !strcmp(current_device, device) && !strcmp(stream->device, device)
+-            && stream->haptic_hotplug_generation == generation)
+-    {
+-        stream->haptic_reconnect_time = 0;
+-        free(device);
+-        return S_OK;
+-    }
+-    if (!force && current_device && !strcmp(current_device, device) && !strcmp(stream->device, device)
+-            && !stream->haptic_reconnect_time)
+-    {
+-        TRACE("Deferring DualSense speaker/effects reconnect for reused sink %s, generation %u -> %u.\n",
+-                debugstr_a(device), stream->haptic_hotplug_generation, generation);
+-        stream->haptic_reconnect_time = now + DUALSENSE_HAPTIC_REFRESH_USEC;
+-        free(device);
+-        return AUDCLNT_E_DEVICE_INVALIDATED;
+-    }
+-
+-    TRACE("Reconnecting DualSense speaker/effects stream from %s/%s to %s, generation %u -> %u.\n",
+-            debugstr_a(stream->device), debugstr_a(current_device), debugstr_a(device),
+-            stream->haptic_hotplug_generation, generation);
+-
+-    stream->haptic_hotplug_generation = generation;
+-    stream->haptic_reconnect_time = now + DUALSENSE_HAPTIC_REFRESH_USEC;
+-    pulse_stream_disconnect(stream);
+-    hr = pulse_stream_connect(stream, device, NULL, stream->period_bytes);
+-    if (SUCCEEDED(hr) && pulse_stream_ready(stream))
+-    {
+-        int success = 1;
+-
+-        if (strcmp(stream->device, device))
+-        {
+-            if (stream->started)
+-            {
+-                remove_stream_from_period(stream);
+-                stream->period = NULL;
+-            }
+-            free(stream->device);
+-            stream->device = device;
+-            device = NULL;
+-            if (stream->started)
+-                pulse_add_stream_to_period(stream);
+-        }
+-        stream->haptic_hotplug_generation = generation;
+-        stream->haptic_reconnect_time = 0;
+-
+-        if (stream->started && pulse_stream_ready(stream) && pa_stream_is_corked(stream->stream))
+-        {
+-            if (!wait_pa_operation_complete(pa_stream_cork(stream->stream, 0, pulse_op_cb, &success)))
+-                success = 0;
+-            if (!success)
+-                hr = E_FAIL;
+-        }
+-    }
+-    else
+-    {
+-        pulse_stream_disconnect(stream);
+-        if (SUCCEEDED(hr))
+-            hr = AUDCLNT_E_DEVICE_INVALIDATED;
+-        stream->haptic_hotplug_generation = generation;
+-        stream->haptic_reconnect_time = pa_rtclock_now() + DUALSENSE_HAPTIC_REFRESH_USEC;
+-    }
+-
+-    free(device);
+-    return hr;
+-}
+-
+-static HRESULT pulse_dualsense_mono_reconnect(struct pulse_stream *stream)
+-{
+-    HRESULT hr;
+-
+-    hr = pulse_dualsense_mono_reconnect_internal(stream, FALSE);
+-    if (SUCCEEDED(hr))
+-    {
+-        g_phys_lock();
+-        stream->dualsense_mono_hotplug_generation = g_dualsense_mono_hotplug_generation;
+-        g_phys_unlock();
+-    }
+-    return hr;
+-}
+-
+-static HRESULT pulse_dualsense_pulse_haptic_reconnect(struct pulse_stream *stream)
+-{
+-    return pulse_dualsense_mono_reconnect_internal(stream, FALSE);
+-}
+-
+-static void pulse_reconnect_dualsense_mono_streams(struct pulse_period *current_period)
+-{
+-    struct pulse_stream *stream, *next;
+-    unsigned int generation;
+-
+-    if (list_empty(&dualsense_mono_streams))
+-        return;
+-
+-    g_phys_lock();
+-    generation = g_dualsense_mono_hotplug_generation;
+-    g_phys_unlock();
+-
+-    LIST_FOR_EACH_ENTRY_SAFE(stream, next, &dualsense_mono_streams, struct pulse_stream, dualsense_mono_entry)
+-    {
+-        if (!stream->started)
+-            continue;
+-        if (stream->period == current_period && stream->dualsense_mono_hotplug_generation == generation
+-                && pulse_stream_ready(stream))
+-            continue;
+-
+-        if (stream->dualsense_mono_hotplug_generation != generation || !pulse_stream_ready(stream))
+-            pulse_dualsense_mono_reconnect(stream);
+-    }
+-}
+-
+-static void pulse_reconnect_dualsense_pulse_haptic_streams(struct pulse_period *current_period)
+-{
+-    struct pulse_stream *stream, *next;
+-    unsigned int generation;
+-
+-    if (list_empty(&dualsense_pulse_haptic_streams))
+-        return;
+-
+-    g_phys_lock();
+-    generation = g_haptic_hotplug_generation;
+-    g_phys_unlock();
+-
+-    LIST_FOR_EACH_ENTRY_SAFE(stream, next, &dualsense_pulse_haptic_streams, struct pulse_stream,
+-            dualsense_pulse_haptic_entry)
+-    {
+-        if (!stream->started)
+-            continue;
+-        if (stream->period == current_period && stream->haptic_hotplug_generation == generation
+-                && pulse_stream_ready(stream))
+-            continue;
+-
+-        if (stream->haptic_hotplug_generation != generation || !pulse_stream_ready(stream))
+-            pulse_dualsense_pulse_haptic_reconnect(stream);
+-    }
+-}
+-
+ static NTSTATUS pulse_release_stream(void *args)
+ {
+     struct release_stream_params *params = args;
+@@ -3787,19 +3549,16 @@
+ 
+     if (pulse_stream_haptic(stream))
+     {
+-        if (stream->haptic_pcm || pulse_haptic_refresh_path(stream))
++        if (pulse_haptic_refresh_path(stream))
+         {
+             snd_pcm_prepare(stream->haptic_pcm);
+             pulse_write(stream);
+         }
++        else
++            params->result = AUDCLNT_E_DEVICE_INVALIDATED;
+     }
+     else
+     {
+-        if (pulse_stream_dualsense_mono(stream))
+-            pulse_dualsense_mono_reconnect(stream);
+-        else if (pulse_stream_dualsense_pulse_haptic(stream))
+-            pulse_dualsense_pulse_haptic_reconnect(stream);
+-
+         if (pulse_stream_ready(stream))
+         {
+             pulse_write(stream);
+@@ -4090,33 +3849,6 @@
+     written_bytes = params->written_frames * pa_frame_size(&stream->ss);
+     if (params->flags & AUDCLNT_BUFFERFLAGS_SILENT)
+         silence_buffer(stream->ss.format, buffer, written_bytes);
+-    if (pulse_stream_dualsense_mono(stream))
+-    {
+-        if (params->flags & AUDCLNT_BUFFERFLAGS_SILENT)
+-            stream->dualsense_mono_audio_active = FALSE;
+-        else
+-        {
+-            unsigned int generation;
+-
+-            g_phys_lock();
+-            generation = g_dualsense_mono_hotplug_generation;
+-            g_phys_unlock();
+-
+-            if (stream->dualsense_mono_hotplug_generation != generation)
+-                stream->dualsense_mono_audio_active = FALSE;
+-
+-            if (!stream->dualsense_mono_audio_active)
+-            {
+-                stream->dualsense_mono_audio_active = TRUE;
+-                if (!pulse_stream_ready(stream) || stream->dualsense_mono_hotplug_generation != generation)
+-                {
+-                    TRACE("Refreshing DualSense mono speaker stream for non-silent effect burst after speaker hotplug.\n");
+-                    if (SUCCEEDED(pulse_dualsense_mono_reconnect_internal(stream, TRUE)))
+-                        stream->dualsense_mono_hotplug_generation = generation;
+-                }
+-            }
+-        }
+-    }
+ 
+     if (stream->locked < 0)
+         pulse_wrap_buffer(stream, buffer, written_bytes);
+@@ -4289,6 +4021,7 @@
+     uint32_t current_device_index = PA_INVALID_INDEX;
+     struct find_monitor_of_sink_cb_param p;
+     const char *device_name;
++    char *resolved_device = NULL;
+     char *name;
+ 
+     pulse_lock();
+@@ -4313,6 +4046,8 @@
+ 
+     device_name = params->device;
+     if (device_name && !device_name[0]) device_name = NULL;
++    if ((resolved_device = pulse_resolve_device_name(device_name)))
++        device_name = resolved_device;
+ 
+     params->result = E_FAIL;
+     wait_pa_operation_complete(pa_context_get_sink_info_by_name(pulse_ctx, device_name, &sink_name_info_cb, &current_device_index));
+@@ -4324,6 +4059,7 @@
+     }
+ 
+     pulse_unlock();
++    free(resolved_device);
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -4335,7 +4071,7 @@
+ 
+     g_phys_lock();
+     LIST_FOR_EACH_ENTRY(dev, list, PhysDevice, entry) {
+-        if (strcmp(params->device, dev->pulse_name))
++        if (!pulse_device_matches(dev, params->device))
+             continue;
+ 
+         *params->fmt = dev->fmt;
+@@ -4650,7 +4386,7 @@
+ 
+     g_phys_lock();
+     LIST_FOR_EACH_ENTRY(dev, list, PhysDevice, entry) {
+-        if (strcmp(params->device, dev->pulse_name))
++        if (!pulse_device_matches(dev, params->device))
+             continue;
+         if (IsEqualPropertyKey(*params->prop, devicepath_key)) {
+             get_device_path(dev, params);

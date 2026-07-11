@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Wed, 8 Jul 2026 09:20:00 -0600
+Subject: [PATCH] winepulse: require real DualSense speaker streams
+
+The generic render path accepts a Pulse stream that is still creating after a
+short timeout by disconnecting it and continuing with a local-only render
+buffer. That avoids some game hangs, but it is wrong for DualSense controller
+speaker/effect streams: Spider-Man can successfully create the audio client,
+then write controller effect audio into a Wine stream that no longer has a
+Pulse sink backing it.
+
+Use a stricter connect path for DualSense mono speaker streams and
+Pulse-routed DualSense effect streams. These streams may need a little longer
+while PipeWire/Pulse exposes the controller speaker after profile changes, but
+they must not be accepted silently if no real controller speaker sink is ready.
+This keeps disconnect/replug semantics clean: old streams are still discarded,
+and newly created streams must bind to the newly connected controller.
+---
+diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -2036,8 +2036,8 @@ static HRESULT pulse_spec_from_waveformat(struct pulse_stream *stream, const WAV
+     return S_OK;
+ }
+ 
+-static HRESULT pulse_stream_connect(struct pulse_stream *stream, const char *pulse_name, const char *target_object,
+-        UINT32 period_bytes)
++static HRESULT pulse_stream_connect_timeout(struct pulse_stream *stream, const char *pulse_name, const char *target_object,
++        UINT32 period_bytes, unsigned int timeout_ms, BOOL allow_local_render_fallback)
+ {
+     pa_stream_flags_t flags = PA_STREAM_START_CORKED | PA_STREAM_START_UNMUTED | PA_STREAM_ADJUST_LATENCY;
+     pa_proplist *proplist = NULL;
+@@ -2102,14 +2102,15 @@ static HRESULT pulse_stream_connect(struct pulse_stream *stream, const char *pul
+     }
+     while (stream->stream && pa_stream_get_state(stream->stream) == PA_STREAM_CREATING)
+     {
+-        if (pulse_cond_timedwait_ms(target_object && target_object[0] ? 5000 : 500) == ETIMEDOUT)
++        if (pulse_cond_timedwait_ms(timeout_ms) == ETIMEDOUT)
+             break;
+     }
+     if (!stream->stream)
+         return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
+     if (pa_stream_get_state(stream->stream) != PA_STREAM_READY)
+     {
+-        if (stream->dataflow == eRender && pa_stream_get_state(stream->stream) == PA_STREAM_CREATING &&
++        if (allow_local_render_fallback && stream->dataflow == eRender
++                && pa_stream_get_state(stream->stream) == PA_STREAM_CREATING &&
+                 !(target_object && target_object[0]))
+         {
+             WARN("Render stream still creating; disconnecting Pulse stream and continuing locally.\n");
+@@ -2129,6 +2130,19 @@ static HRESULT pulse_stream_connect(struct pulse_stream *stream, const char *pul
+     return S_OK;
+ }
+ 
++static HRESULT pulse_stream_connect(struct pulse_stream *stream, const char *pulse_name, const char *target_object,
++        UINT32 period_bytes)
++{
++    return pulse_stream_connect_timeout(stream, pulse_name, target_object, period_bytes,
++            target_object && target_object[0] ? 5000 : 500, TRUE);
++}
++
++static HRESULT pulse_stream_connect_dualsense_speaker(struct pulse_stream *stream, const char *pulse_name,
++        UINT32 period_bytes)
++{
++    return pulse_stream_connect_timeout(stream, pulse_name, NULL, period_bytes, 5000, FALSE);
++}
++
+ static HRESULT get_device_period_helper(EDataFlow flow, const char *pulse_name, REFERENCE_TIME *def, REFERENCE_TIME *min)
+ {
+     struct list *list = (flow == eRender) ? &g_phys_speakers : &g_phys_sources;
+@@ -2746,7 +2760,7 @@ static NTSTATUS pulse_create_stream(void *args)
+                 /* The hidden haptic target is only for the raw ALSA split path. If raw
+                  * access is busy, connect directly to the controller speaker sink so controller
+                  * speaker/effect audio works before any hotplug reconnect happens. */
+-                hr = pulse_stream_connect(stream, connect_device, NULL, stream->period_bytes);
++                hr = pulse_stream_connect_dualsense_speaker(stream, connect_device, stream->period_bytes);
+             }
+         }
+         else
+@@ -2756,7 +2770,10 @@ static NTSTATUS pulse_create_stream(void *args)
+     }
+     else
+     {
+-        hr = pulse_stream_connect(stream, connect_device, haptic_target, stream->period_bytes);
++        if (dualsense_mono_candidate)
++            hr = pulse_stream_connect_dualsense_speaker(stream, connect_device, stream->period_bytes);
++        else
++            hr = pulse_stream_connect(stream, connect_device, haptic_target, stream->period_bytes);
+     }
+     if (SUCCEEDED(hr)) {
+         UINT32 unalign;
