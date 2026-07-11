@@ -23,15 +23,13 @@ This covers the audio regressions chased during the session:
 - Kirikiri-engine titles from the removed SteamGameId list use general WMA/AAC decoder behavior instead of forcing the input subtype/tag to PCM.
 
 The Pulse changes keep timer and buffer accounting stable when video playback is producing decoded audio in small bursts.
+
+This version intentionally does not reintroduce DualSense mono/haptic reconnect paths; those endpoints are now treated as removed on unplug and newly created on plug-in.
 ---
- dlls/msauddecmft/msauddecmft.c |   6 +-
- dlls/winepulse.drv/pulse.c     | 131 ++++++++++++++++++++++++++-------
- 2 files changed, 109 insertions(+), 28 deletions(-)
-diff --git a/dlls/msauddecmft/msauddecmft.c b/dlls/msauddecmft/msauddecmft.c
-index 672389564a2..9928ddf92da 100644
---- a/dlls/msauddecmft/msauddecmft.c
-+++ b/dlls/msauddecmft/msauddecmft.c
-@@ -34,13 +34,14 @@ WINE_DEFAULT_DEBUG_CHANNEL(dmo);
+diff -urN a/dlls/msauddecmft/msauddecmft.c b/dlls/msauddecmft/msauddecmft.c
+--- a/dlls/msauddecmft/msauddecmft.c	2026-07-08 08:31:13.934373703 -0600
++++ b/dlls/msauddecmft/msauddecmft.c	2026-07-08 08:32:19.455744577 -0600
+@@ -34,13 +34,14 @@
  #include "initguid.h"
  
  DEFINE_MEDIATYPE_GUID(MFAudioFormat_RAW_AAC,WAVE_FORMAT_RAW_AAC1);
@@ -48,7 +46,7 @@ index 672389564a2..9928ddf92da 100644
  }
  
  static HRESULT WINAPI aac_decoder_factory_CreateInstance(IClassFactory *iface, IUnknown *outer,
-@@ -125,6 +126,7 @@ HRESULT WINAPI DllRegisterServer(void)
+@@ -125,6 +126,7 @@
      {
          {MFMediaType_Audio, MFAudioFormat_Vorbis},
          {MFMediaType_Audio, MFAudioFormat_Opus},
@@ -56,9 +54,9 @@ index 672389564a2..9928ddf92da 100644
      };
      MFT_REGISTER_TYPE_INFO audio_decoder_mft_outputs[] =
      {
-diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
---- a/dlls/winepulse.drv/pulse.c
-+++ b/dlls/winepulse.drv/pulse.c
+diff -urN a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+--- a/dlls/winepulse.drv/pulse.c	2026-07-08 08:31:13.968566584 -0600
++++ b/dlls/winepulse.drv/pulse.c	2026-07-08 08:32:19.480456891 -0600
 @@ -27,7 +27,9 @@
  #include <stdarg.h>
  #include <stdlib.h>
@@ -69,8 +67,8 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
  #include <math.h>
  #include <poll.h>
  
-@@ -122,6 +124,8 @@
-     struct pulse_period *period;
+@@ -130,6 +132,8 @@
+     BOOL dualsense_mono_audio_active;
  };
  
 +static void pulse_write(struct pulse_stream *stream);
@@ -78,8 +76,8 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
  typedef struct _ACPacket
  {
      struct list entry;
-@@ -228,6 +232,22 @@
-     return pthread_cond_wait(&pulse_cond, &pulse_mutex);
+@@ -256,6 +260,22 @@
+     return pthread_cond_timedwait(&g_phys_cond, &g_phys_mutex, &ts);
  }
  
 +static int pulse_cond_timedwait_ms(unsigned int timeout_ms)
@@ -101,7 +99,7 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
  static void pulse_broadcast(void)
  {
      pthread_cond_broadcast(&pulse_cond);
-@@ -657,14 +677,32 @@
+@@ -727,14 +747,32 @@
  
  static void pulse_stream_state(pa_stream *s, void *user)
  {
@@ -134,29 +132,7 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
      dump_attr(attr);
  }
  
-@@ -701,9 +739,21 @@
- 
- static BOOL pulse_stream_valid(struct pulse_stream *stream)
- {
-+    pa_stream_state_t state;
-+
-     if (!stream->stream)
-         return stream->dataflow == eRender && stream->haptic_alsa_path;
- 
-+    state = pa_stream_get_state(stream->stream);
-+
-+    return state == PA_STREAM_READY || (stream->dataflow == eRender && state == PA_STREAM_CREATING);
-+}
-+
-+static BOOL pulse_stream_ready(struct pulse_stream *stream)
-+{
-+    if (!stream->stream)
-+        return FALSE;
-+
-     return pa_stream_get_state(stream->stream) == PA_STREAM_READY;
- }
- 
-@@ -1717,6 +1767,7 @@
+@@ -2043,6 +2081,7 @@
      attr.tlength = period_bytes * 3;
      attr.maxlength = stream->bufsize_frames * pa_frame_size(&stream->ss);
      attr.prebuf = 0;
@@ -164,22 +140,8 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
      dump_attr(&attr);
  
      /* If specific device was requested, use it exactly. For PipeWire raw
-@@ -1747,12 +1798,11 @@
-         {
-             WARN("Render stream still creating; disconnecting Pulse stream and continuing locally.\n");
-             pa_stream_disconnect(stream->stream);
--            while (pulse_ml && PA_STREAM_IS_GOOD(pa_stream_get_state(stream->stream)))
--                pulse_cond_wait();
-             pa_stream_unref(stream->stream);
-             stream->stream = NULL;
-             return S_OK;
-         }
-+        WARN("Stream failed to become ready, state %i\n", pa_stream_get_state(stream->stream));
-         return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
+@@ -2733,7 +2772,7 @@
      }
- 
-@@ -2383,7 +2433,7 @@
-         hr = pulse_stream_connect(stream, connect_device, haptic_target, stream->period_bytes);
      if (SUCCEEDED(hr)) {
          UINT32 unalign;
 -        const pa_buffer_attr *attr = pa_stream_get_buffer_attr(stream->stream);
@@ -187,7 +149,9 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
          SIZE_T size;
  
          stream->attr = *attr;
-@@ -2642,6 +2642,10 @@ static void pulse_write_index_catchup(struct pulse_stream *stream)
+@@ -2941,10 +2980,14 @@
+ 
+ static void pulse_write_index_catchup(struct pulse_stream *stream)
  {
 -    const pa_timing_info *ti = pa_stream_get_timing_info(stream->stream);
 +    const pa_timing_info *ti;
@@ -199,14 +163,16 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
 +
 +    ti = pa_stream_get_timing_info(stream->stream);
      if (!ti || ti->read_index <= ti->write_index) return;
-@@ -2655,5 +2658,6 @@ static void pulse_write_index_catchup(struct pulse_stream *stream)
+     if (ti->read_index_corrupt || ti->write_index_corrupt)
+     {
+@@ -2954,15 +2997,21 @@
+ 
      if (!silence_buf) silence_buf = calloc(1, silence_buf_size);
      frame_size = pa_frame_size(&stream->ss);
 +    if (!frame_size) return;
  
      while (ti && ti->read_index > ti->write_index)
      {
-@@ -2660,7 +2664,8 @@ static void pulse_write_index_catchup(struct pulse_stream *stream)
          write_index = ti->write_index;
 -        TRACE("stream %p, runnind %d, read is ahead of write %lld bytes.\n", stream, stream->started,
 +        TRACE("stream %p, running %d, read is ahead of write %lld bytes.\n", stream, stream->started,
@@ -215,19 +181,47 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
 -        to_write = min(ti->read_index - write_index, silence_buf_size) / frame_size * frame_size;
 +        to_write = min(ti->read_index - write_index, min(stream->period_bytes, silence_buf_size)) / frame_size * frame_size;
 +        if (!to_write) break;
++        if (!pulse_stream_ready(stream))
++            break;
          pa_stream_write(stream->stream, silence_buf, to_write, NULL, 0, PA_SEEK_RELATIVE);
++        if (!pulse_stream_ready(stream))
++            break;
          ti = pa_stream_get_timing_info(stream->stream);
-@@ -2683,6 +2688,9 @@ static void pulse_write(struct pulse_stream *stream)
+         if (ti && ti->write_index <= write_index)
+         {
+@@ -2985,7 +3034,10 @@
+     if (stream->dualsense_mono_registered && stream->haptic_hotplug_generation != g_haptic_hotplug_generation
+             && FAILED(pulse_retarget_dualsense_mono_stream(stream)))
          return;
-     }
  
 +    if (!pulse_stream_ready(stream))
 +        return;
 +
      bytes = pa_stream_writable_size(stream->stream);
  
-     pulse_write_index_catchup(stream);
-@@ -2952,13 +2952,15 @@ static void pa_streams_timer_cb(pa_mainloop_api *api, pa_time_event *e, const struct timeval *tv, void *userdata)
+     if (stream->just_underran)
+@@ -3211,7 +3263,7 @@
+ static void pa_streams_timer_cb(pa_mainloop_api *api, pa_time_event *e, const struct timeval *tv, void *userdata)
+ {
+     struct pulse_period *period = userdata;
+-    struct pulse_stream *stream;
++    struct pulse_stream *stream, *next;
+     BOOL reset_timeline = FALSE;
+     pa_usec_t next_timer;
+     int64_t adjust = 0;
+@@ -3229,7 +3281,7 @@
+         reset_timeline = TRUE;
+     }
+ 
+-    LIST_FOR_EACH_ENTRY(stream, &period->streams, struct pulse_stream, period_entry)
++    LIST_FOR_EACH_ENTRY_SAFE(stream, next, &period->streams, struct pulse_stream, period_entry)
+     {
+         if (stream->started)
+         {
+@@ -3238,16 +3290,18 @@
+                 stream->timeline_start_period_time = 0;
+                 stream->timeline_start_stream_time = 0;
+             }
 -            if (!stream->update_timing_info_pending && (o = pa_stream_update_timing_info(stream->stream, pulse_update_timing_cb, stream)))
 +            if (!pulse_stream_haptic(stream) && !pulse_stream_ready(stream))
 +                continue;
@@ -246,7 +240,7 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
              {
                  ERR("pa_stream_update_timing_info err %d.\n", pa_context_errno(pulse_ctx));
              }
-@@ -3584,7 +3649,7 @@
+@@ -4024,7 +4078,7 @@
          params->result = AUDCLNT_E_DEVICE_INVALIDATED;
          return STATUS_SUCCESS;
      }
@@ -255,7 +249,7 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
      if (stream->dataflow == eRender)
          lat = attr->minreq / pa_frame_size(&stream->ss);
      else
-@@ -3751,15 +3816,18 @@
+@@ -4191,15 +4245,18 @@
      new_ss = stream->ss;
      new_ss.rate = params->rate;
  
@@ -280,5 +274,3 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
          wait_pa_operation_complete(pa_stream_flush(stream->stream, pulse_op_cb, &success));
  
      stream->clock_lastpos = stream->clock_written = 0;
--- 
-2.54.0
