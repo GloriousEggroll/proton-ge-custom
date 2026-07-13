@@ -1,0 +1,643 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Mon, 13 Jul 2026 12:00:00 -0600
+Subject: [PATCH] mmdevapi,winepulse: Forget Sony controller endpoints on disconnect.
+
+Do not keep disconnected DualSense, DualSense Edge, or DualShock mono speaker endpoints alive for later retargeting.
+Spider-Man Remastered can crash when stale controller MMDevice/Pulse state survives a model swap and the game binds its controller-effect stream to an old endpoint.
+Treat every Sony controller connection as a fresh device: avoid persisted registry GUIDs for Sony controller backend names, delete endpoint state on removal, notify clients that the endpoint was removed, and stop retargeting existing mono streams to later hotplugged speakers.
+This keeps the prefix and Wine process from carrying controller identity across DS, DS Edge, and DualShock disconnect/reconnect cycles.
+
+---
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -107,6 +107,13 @@
+             wcsstr( name, L"Wireless Controller" ));
+ }
+ 
++static BOOL is_dualsense_backend_name( const char *name )
++{
++    return name && (strstr( name, "DualSense" ) || strstr( name, "DualShock" ) ||
++            strstr( name, "Wireless Controller" ) || strstr( name, "Wireless_Controller" ) ||
++            strstr( name, "Sony_Interactive_Entertainment" ));
++}
++
+ static BOOL device_is_published(const GUID *devguid, EDataFlow flow)
+ {
+     MMDevice *device;
+@@ -225,6 +232,29 @@
+     return NULL;
+ }
+ 
++static struct device *find_device_name_in_cache( const char *name, EDataFlow flow )
++{
++    struct device *dev;
++
++    LIST_FOR_EACH_ENTRY( dev, &devices_cache, struct device, entry )
++        if (dev->flow == flow && !strcmp( dev->name, name )) return dev;
++    return NULL;
++}
++
++static void remove_device_from_cache( const GUID *guid )
++{
++    struct device *dev, *next;
++
++    EnterCriticalSection( &devices_cache_cs );
++    LIST_FOR_EACH_ENTRY_SAFE( dev, next, &devices_cache, struct device, entry )
++    {
++        if (!IsEqualGUID( guid, &dev->guid )) continue;
++        list_remove( &dev->entry );
++        free( dev );
++    }
++    LeaveCriticalSection( &devices_cache_cs );
++}
++
+ BOOL get_device_name_from_guid( const GUID *guid, char **name, EDataFlow *flow )
+ {
+     struct device *dev;
+@@ -243,7 +273,7 @@
+     }
+ 
+     swprintf( key_name, ARRAY_SIZE(key_name), L"Software\\Wine\\Drivers\\%s\\devices", drvs.module_name );
+-    if (RegOpenKeyExW( HKEY_CURRENT_USER, key_name, 0, KEY_READ | KEY_WOW64_64KEY, &key )) {
++    if (RegOpenKeyExW( HKEY_CURRENT_USER, key_name, 0, KEY_READ | KEY_WRITE | KEY_WOW64_64KEY, &key )) {
+         LeaveCriticalSection( &devices_cache_cs );
+         return FALSE;
+     }
+@@ -267,16 +297,28 @@
+         else if (key_name[0] == '1') *flow = eCapture;
+         else continue;
+ 
+-        RegCloseKey( key );
+         TRACE( "Found matching device key %s for %s\n", wine_dbgstr_w(key_name), debugstr_guid(guid) );
+         size = WideCharToMultiByte( CP_UNIXCP, 0, key_name + 2, -1, NULL, 0, NULL, NULL );
+         if (!(*name = malloc( size ))) {
++            RegCloseKey( key );
+             LeaveCriticalSection( &devices_cache_cs );
+             return FALSE;
+         }
+         WideCharToMultiByte( CP_UNIXCP, 0, key_name + 2, -1, *name, size, NULL, NULL );
++        if (is_dualsense_backend_name( *name ))
++        {
++            TRACE( "Dropping persisted Sony controller device key %s for %s\n",
++                   debugstr_a(*name), debugstr_guid(guid) );
++            RegDeleteTreeW( key, key_name );
++            RegCloseKey( key );
++            free( *name );
++            *name = NULL;
++            LeaveCriticalSection( &devices_cache_cs );
++            return FALSE;
++        }
+         add_device_to_cache( guid, *name, *flow );
+ 
++        RegCloseKey( key );
+         LeaveCriticalSection( &devices_cache_cs );
+         return TRUE;
+     }
+@@ -287,7 +329,7 @@
+     return FALSE;
+ }
+ 
+-static void get_device_guid( EDataFlow flow, const char *dev_name, GUID *guid )
++static void get_device_guid( EDataFlow flow, const char *dev_name, BOOL create, GUID *guid )
+ {
+     WCHAR name[512];
+     DWORD type, size = sizeof(*guid);
+@@ -295,6 +337,24 @@
+     LSTATUS status;
+     int len;
+ 
++    if (is_dualsense_backend_name( dev_name ))
++    {
++        struct device *dev;
++
++        EnterCriticalSection( &devices_cache_cs );
++        if ((dev = find_device_name_in_cache( dev_name, flow )))
++            *guid = dev->guid;
++        else if (create)
++        {
++            CoCreateGuid( guid );
++            add_device_to_cache( guid, dev_name, flow );
++        }
++        else
++            memset( guid, 0, sizeof(*guid) );
++        LeaveCriticalSection( &devices_cache_cs );
++        return;
++    }
++
+     len = swprintf( name, ARRAY_SIZE(name), L"Software\\Wine\\Drivers\\%s\\devices\\%u,",
+                     drvs.module_name, flow == eCapture );
+     MultiByteToWideChar( CP_UNIXCP, 0, dev_name, -1, name + len, ARRAY_SIZE(name) - len );
+@@ -808,19 +868,32 @@
+     LeaveCriticalSection(&g_notif_lock);
+ }
+ 
+-static void set_device_state(MMDevice *device, DWORD state)
++static void notify_endpoint_removed(EDataFlow flow, const GUID *id)
+ {
+-    HKEY key, root = device->flow == eRender ? key_render : key_capture;
+-    WCHAR guidstr[39];
++    struct NotificationClientWrapper *wrapper;
++    WCHAR devid[56];
+ 
+-    device->state = state;
+-    StringFromGUID2(&device->devguid, guidstr, ARRAY_SIZE(guidstr));
+-    if (RegCreateKeyExW(root, guidstr, 0, NULL, 0, KEY_WRITE | KEY_READ | KEY_WOW64_64KEY,
+-            NULL, &key, NULL) == ERROR_SUCCESS)
++    swprintf(devid, 56, devid_formatW,
++            flow, id->Data1, id->Data2, id->Data3,
++            id->Data4[0], id->Data4[1], id->Data4[2], id->Data4[3],
++            id->Data4[4], id->Data4[5], id->Data4[6], id->Data4[7]);
++
++    EnterCriticalSection(&g_notif_lock);
++    LIST_FOR_EACH_ENTRY(wrapper, &g_notif_clients, struct NotificationClientWrapper, entry)
+     {
+-        RegSetValueExW(key, L"DeviceState", 0, REG_DWORD, (const BYTE *)&device->state, sizeof(DWORD));
+-        RegCloseKey(key);
++        IMMNotificationClient_OnDeviceStateChanged(wrapper->client, devid, DEVICE_STATE_NOTPRESENT);
++        IMMNotificationClient_OnDeviceRemoved(wrapper->client, devid);
+     }
++    LeaveCriticalSection(&g_notif_lock);
++}
++
++static void delete_device_state_key(MMDevice *device)
++{
++    HKEY root = device->flow == eRender ? key_render : key_capture;
++    WCHAR guidstr[39];
++
++    StringFromGUID2(&device->devguid, guidstr, ARRAY_SIZE(guidstr));
++    RegDeleteTreeW(root, guidstr);
+ }
+ 
+ static BOOL add_endpoint_notification(struct endpoint_notification **notifications,
+@@ -850,51 +923,22 @@
+     return TRUE;
+ }
+ 
+-static void resignal_visible_dualsense_mono_endpoints(enum dualsense_mono_model model, BOOL allow_hidden)
++static void resignal_visible_dualsense_mono_endpoints(enum dualsense_mono_model model)
+ {
+     struct endpoint_notification *notifications = NULL;
+     unsigned int count = 0, capacity = 0, i;
+-    MMDevice *device, *hidden = NULL;
++    MMDevice *device;
+ 
+     EnterCriticalSection(&device_list_cs);
+-    if (allow_hidden && model != DUALSENSE_MONO_MODEL_UNKNOWN)
+-    {
+-        LIST_FOR_EACH_ENTRY(device, &device_list, MMDevice, entry)
+-        {
+-            if (!is_dualsense_mono_endpoint(device) || !device->hide_from_collection)
+-                continue;
+-            if (dualsense_mono_endpoint_model(device) != model)
+-                continue;
+-
+-            if (!hidden || device->dualsense_mono_activation_serial > hidden->dualsense_mono_activation_serial)
+-                hidden = device;
+-        }
+-    }
+-
+-    if (hidden)
+-    {
+-        if (!(hidden->state & DEVICE_STATE_ACTIVE))
+-        {
+-            TRACE("Reactivating hidden DualSense mono endpoint %s after replacement speaker hotplug.\n",
+-                    debugstr_guid(&hidden->devguid));
+-            set_device_state(hidden, DEVICE_STATE_ACTIVE);
+-        }
+-
+-        hidden->hide_from_collection = FALSE;
+-        add_endpoint_notification(&notifications, &count, &capacity, hidden);
+-    }
+-    else
++    LIST_FOR_EACH_ENTRY(device, &device_list, MMDevice, entry)
+     {
+-        LIST_FOR_EACH_ENTRY(device, &device_list, MMDevice, entry)
+-        {
+-            if (!is_dualsense_mono_endpoint(device) || should_hide_from_endpoint_collection(device))
+-                continue;
+-            if (model != DUALSENSE_MONO_MODEL_UNKNOWN && dualsense_mono_endpoint_model(device) != model)
+-                continue;
++        if (!is_dualsense_mono_endpoint(device) || should_hide_from_endpoint_collection(device))
++            continue;
++        if (model != DUALSENSE_MONO_MODEL_UNKNOWN && dualsense_mono_endpoint_model(device) != model)
++            continue;
+ 
+-            if (!add_endpoint_notification(&notifications, &count, &capacity, device))
+-                break;
+-        }
++        if (!add_endpoint_notification(&notifications, &count, &capacity, device))
++            break;
+     }
+     LeaveCriticalSection(&device_list_cs);
+ 
+@@ -909,31 +953,6 @@
+     free(notifications);
+ }
+ 
+-static BOOL has_hidden_dualsense_mono_endpoint(enum dualsense_mono_model model)
+-{
+-    MMDevice *device;
+-    BOOL found = FALSE;
+-
+-    if (model == DUALSENSE_MONO_MODEL_UNKNOWN)
+-        return FALSE;
+-
+-    EnterCriticalSection(&device_list_cs);
+-    LIST_FOR_EACH_ENTRY(device, &device_list, MMDevice, entry)
+-    {
+-        if (is_dualsense_mono_endpoint(device) && device->hide_from_collection
+-                && (device->state & DEVICE_STATE_ACTIVE)
+-                && device->dualsense_mono_activation_serial
+-                && dualsense_mono_endpoint_model(device) == model)
+-        {
+-            found = TRUE;
+-            break;
+-        }
+-    }
+-    LeaveCriticalSection(&device_list_cs);
+-
+-    return found;
+-}
+-
+ static void remove_dualsense_media_devices(void)
+ {
+     static const GUID MEDIA_ClassGUID = { 0x4d36e96c, 0xe325, 0x11ce, { 0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18 } };
+@@ -1542,7 +1561,6 @@
+ static LONG dualsense_mono_render_add_pending;
+ static LONG dualsense_mono_activation_serial;
+ static enum dualsense_mono_model dualsense_mono_render_add_model;
+-static enum dualsense_mono_model dualsense_mono_render_removed_model;
+ 
+ static void add_endpoints_from_params(struct get_endpoint_ids_params *params)
+ {
+@@ -1553,7 +1571,7 @@
+         GUID guid;
+         const WCHAR *name = (WCHAR *)((char *)params->endpoints + params->endpoints[i].name);
+         const char *dev_name = (char *)params->endpoints + params->endpoints[i].device;
+-        get_device_guid(params->flow, dev_name, &guid);
++        get_device_guid(params->flow, dev_name, TRUE, &guid);
+         device = MMDevice_Create(name, &guid, params->flow, DEVICE_STATE_ACTIVE, params->default_idx == i);
+         if (device && params->flow == eRender && is_dualsense_mono_endpoint(device))
+         {
+@@ -1625,8 +1643,9 @@
+             GUID guid;
+             MMDevice *dev;
+             UINT i_removed = params.num + i;
++            const WCHAR *name = (WCHAR *)((char *)params.endpoints + params.endpoints[i_removed].name);
+             const char *dev_name = (char *)params.endpoints + params.endpoints[i_removed].device;
+-            get_device_guid( params.flow, dev_name, &guid );
++            get_device_guid( params.flow, dev_name, FALSE, &guid );
+ 
+             EnterCriticalSection(&device_list_cs);
+             LIST_FOR_EACH_ENTRY(dev, &device_list, MMDevice, entry) {
+@@ -1634,17 +1653,32 @@
+                 HKEY key, root;
+                 if (dev->flow != params.flow)
+                     continue;
+-                if (IsEqualGUID(&dev->devguid, &guid)) {
++                if (IsEqualGUID(&dev->devguid, &guid) ||
++                        (dev->drv_id && is_dualsense_mono_endpoint_name(name) && !wcscmp(dev->drv_id, name))) {
+                     struct NotificationClientWrapper *wrapper;
+                     const GUID *id = &dev->devguid;
+                     BOOL dualsense_mono_endpoint = is_dualsense_mono_endpoint(dev);
++                    BOOL sony_controller_endpoint = is_dualsense_endpoint_name(dev->drv_id);
+                     WCHAR devid[56];
+ 
+-                    if (dualsense_mono_endpoint && dev->hide_from_collection)
++                    if (sony_controller_endpoint)
+                     {
+-                        dualsense_mono_render_removed_model = dualsense_mono_endpoint_model(dev);
+-                        TRACE("Keeping activated disconnected DualSense mono endpoint %s active for stream retargeting.\n",
+-                                debugstr_guid(&dev->devguid));
++                        TRACE("Removing disconnected Sony controller endpoint %s from active device list.\n",
++                                debugstr_guid(id));
++                        if (dualsense_mono_endpoint)
++                        {
++                            remove_dualsense_audioendpoint_devices();
++                            remove_dualsense_media_devices();
++                        }
++                        notify_endpoint_removed(dev->flow, id);
++                        remove_device_from_cache(id);
++                        delete_device_state_key(dev);
++                        dev->removed = TRUE;
++                        dev->state = DEVICE_STATE_NOTPRESENT;
++                        list_remove(&dev->entry);
++                        list_init(&dev->entry);
++                        if (!dev->ref)
++                            MMDevice_Destroy(dev);
+                         break;
+                     }
+ 
+@@ -1685,14 +1719,9 @@
+             if (InterlockedExchange(&dualsense_mono_render_add_pending, 0))
+             {
+                 enum dualsense_mono_model model = dualsense_mono_render_add_model;
+-                enum dualsense_mono_model removed_model = dualsense_mono_render_removed_model;
+-                BOOL allow_hidden = model != DUALSENSE_MONO_MODEL_UNKNOWN &&
+-                        removed_model != DUALSENSE_MONO_MODEL_UNKNOWN && model == removed_model;
+ 
+                 dualsense_mono_render_add_model = DUALSENSE_MONO_MODEL_UNKNOWN;
+-                dualsense_mono_render_removed_model = DUALSENSE_MONO_MODEL_UNKNOWN;
+-                resignal_visible_dualsense_mono_endpoints(model,
+-                        allow_hidden || has_hidden_dualsense_mono_endpoint(model));
++                resignal_visible_dualsense_mono_endpoints(model);
+             }
+             InterlockedExchange(&render_update_in_progress, 0);
+         }
+@@ -1705,7 +1734,6 @@
+     InterlockedExchange(&render_update_in_progress, 0);
+     InterlockedExchange(&dualsense_mono_render_add_pending, 0);
+     dualsense_mono_render_add_model = DUALSENSE_MONO_MODEL_UNKNOWN;
+-    dualsense_mono_render_removed_model = DUALSENSE_MONO_MODEL_UNKNOWN;
+     free(params.endpoints);
+     return 0;
+ }
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -81,7 +81,6 @@
+ };
+ 
+ static struct list active_periods = LIST_INIT(active_periods);
+-static struct list dualsense_mono_streams = LIST_INIT(dualsense_mono_streams);
+ 
+ struct pulse_stream
+ {
+@@ -114,7 +113,6 @@
+     pa_usec_t haptic_reconnect_time;
+     pa_usec_t haptic_path_check_time;
+     unsigned int haptic_hotplug_generation;
+-    unsigned int dualsense_mono_hotplug_generation;
+     void *locked_ptr;
+     BOOL just_underran, pa_started, update_timing_info_pending;
+     pa_usec_t mmdev_period_usec;
+@@ -126,12 +124,8 @@
+     struct list dualsense_pulse_haptic_entry;
+     struct list packet_filled_head;
+     struct list period_entry;
+-    struct list dualsense_mono_entry;
+     struct pulse_period *period;
+-    BOOL dualsense_mono_stream;
+-    BOOL dualsense_mono_registered;
+     BOOL dualsense_pulse_haptic_registered;
+-    BOOL dualsense_mono_audio_active;
+ };
+ 
+ static void pulse_write(struct pulse_stream *stream);
+@@ -182,7 +176,6 @@
+ static unsigned int g_haptic_hotplug_generation;
+ static unsigned int g_dualsense_endpoint_generation;
+ static unsigned int g_dualsense_mono_speaker_add_generation;
+-static char *g_dualsense_mono_preferred_sink;
+ static unsigned int g_phys_event_mask;
+ static unsigned int g_phys_event_stale_render;
+ static unsigned int g_phys_event_stale_capture;
+@@ -584,7 +577,6 @@
+ }
+ 
+ static BOOL pulse_refresh_devices(EDataFlow flow);
+-static void pulse_retarget_dualsense_mono_streams(const char *preferred);
+ static BOOL is_dualsense_speaker_sink(const PhysDevice *dev);
+ 
+ /* for winepulse, this function can be called in a separate thread from other functions. */
+@@ -608,8 +600,6 @@
+     BOOL refreshed;
+     PhysDevice *dev, *dev_next;
+     BOOL delta = params->delta;
+-    BOOL retarget_dualsense_mono = FALSE;
+-    char *dualsense_mono_target = NULL;
+ 
+     TRACE("flow %d, delta %d\n", (int)params->flow, (int)params->delta);
+ 
+@@ -732,12 +722,6 @@
+         pulse_get_endpoints(list_removed, &endpoint, &offset, params->endpoints);
+ 
+         LIST_FOR_EACH_ENTRY_SAFE(dev, dev_next, list_added, PhysDevice, entry) {
+-            if (params->flow == eRender && is_dualsense_speaker_sink(dev))
+-            {
+-                retarget_dualsense_mono = TRUE;
+-                free(dualsense_mono_target);
+-                dualsense_mono_target = strdup(dev->pulse_name);
+-            }
+             list_remove(&dev->entry);
+             list_add_tail(list, &dev->entry);
+         }
+@@ -767,12 +751,6 @@
+         pulse_get_endpoints(list_added, &endpoint, &offset, params->endpoints);
+ 
+         LIST_FOR_EACH_ENTRY_SAFE(dev, dev_next, list_added, PhysDevice, entry) {
+-            if (params->flow == eRender && is_dualsense_speaker_sink(dev))
+-            {
+-                retarget_dualsense_mono = TRUE;
+-                free(dualsense_mono_target);
+-                dualsense_mono_target = strdup(dev->pulse_name);
+-            }
+             list_remove(&dev->entry);
+             list_add_tail(list, &dev->entry);
+         }
+@@ -781,14 +759,6 @@
+ done:
+     g_phys_unlock();
+ 
+-    if (retarget_dualsense_mono)
+-    {
+-        pulse_lock();
+-        pulse_retarget_dualsense_mono_streams(dualsense_mono_target);
+-        pulse_unlock();
+-    }
+-    free(dualsense_mono_target);
+-
+     if (needed > params->size) {
+         params->size = needed;
+         params->result = HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+@@ -871,9 +841,6 @@
+ {
+     pa_stream_state_t state;
+ 
+-    if (stream->dualsense_mono_stream || stream->dualsense_mono_registered)
+-        return TRUE;
+-
+     if (!stream->stream)
+         return stream->dataflow == eRender && stream->haptic_pcm && stream->haptic_alsa_path
+                 && stream->haptic_alsa_path[0];
+@@ -2462,119 +2429,6 @@
+     stream->update_timing_info_pending = FALSE;
+ }
+ 
+-static HRESULT pulse_retarget_dualsense_mono_stream(struct pulse_stream *stream, const char *preferred)
+-{
+-    char *dualsense_speaker;
+-    int success;
+-    HRESULT hr;
+-
+-    if (!stream->dualsense_mono_stream && !stream->dualsense_mono_registered
+-            && !pulse_stream_dualsense_mono(stream))
+-        return S_FALSE;
+-
+-    if (!(dualsense_speaker = get_dualsense_speaker_sink(preferred, TRUE)))
+-        return E_FAIL;
+-
+-    if (!strcmp(stream->device, dualsense_speaker))
+-    {
+-        if (pulse_stream_ready(stream))
+-        {
+-            TRACE("Skipping unchanged DualSense mono stream %p on %s.\n",
+-                    stream, debugstr_a(dualsense_speaker));
+-            stream->haptic_hotplug_generation = g_haptic_hotplug_generation;
+-            stream->dualsense_mono_hotplug_generation = g_dualsense_mono_speaker_add_generation;
+-            free(dualsense_speaker);
+-            return S_OK;
+-        }
+-
+-        free(dualsense_speaker);
+-        return E_FAIL;
+-    }
+-
+-    TRACE("Retargeting DualSense mono stream %p from %s to %s.\n",
+-            stream, debugstr_a(stream->device), debugstr_a(dualsense_speaker));
+-
+-    remove_stream_from_period(stream);
+-    stream->period = NULL;
+-    pulse_stream_disconnect(stream);
+-    free(stream->device);
+-    stream->device = dualsense_speaker;
+-    stream->timeline_start_period_time = 0;
+-    stream->timeline_start_stream_time = 0;
+-    stream->pa_started = FALSE;
+-    stream->update_timing_info_pending = FALSE;
+-
+-    hr = pulse_stream_connect_dualsense_speaker(stream, stream->device, stream->period_bytes);
+-    if (SUCCEEDED(hr))
+-    {
+-        stream->haptic_hotplug_generation = g_haptic_hotplug_generation;
+-        stream->dualsense_mono_hotplug_generation = g_dualsense_mono_speaker_add_generation;
+-        if (!stream->period)
+-            pulse_add_stream_to_period(stream);
+-        if (stream->started && pulse_stream_ready(stream) && pa_stream_is_corked(stream->stream))
+-        {
+-            success = 0;
+-            if (!wait_pa_operation_complete(pa_stream_cork(stream->stream, 0, pulse_op_cb, &success)))
+-                success = 0;
+-            if (!success)
+-                hr = E_FAIL;
+-        }
+-    }
+-    else
+-        WARN("Failed to retarget DualSense mono stream %p to %s: %#x.\n",
+-                stream, debugstr_a(stream->device), (unsigned int)hr);
+-
+-    return hr;
+-}
+-
+-static void pulse_set_dualsense_mono_preferred_sink(const char *preferred)
+-{
+-    char *copy;
+-
+-    if (!preferred)
+-    {
+-        free(g_dualsense_mono_preferred_sink);
+-        g_dualsense_mono_preferred_sink = NULL;
+-        return;
+-    }
+-
+-    if (!(copy = strdup(preferred)))
+-    {
+-        WARN("Failed to remember preferred DualSense mono sink %s.\n", debugstr_a(preferred));
+-        return;
+-    }
+-
+-    free(g_dualsense_mono_preferred_sink);
+-    g_dualsense_mono_preferred_sink = copy;
+-}
+-
+-static void pulse_retarget_dualsense_mono_streams(const char *preferred)
+-{
+-    struct pulse_stream *stream, *next;
+-    BOOL found = FALSE;
+-
+-    if (preferred)
+-    {
+-        TRACE("Forcing DualSense mono streams to newly-added speaker %s.\n", debugstr_a(preferred));
+-        pulse_set_dualsense_mono_preferred_sink(preferred);
+-    }
+-
+-    LIST_FOR_EACH_ENTRY_SAFE(stream, next, &dualsense_mono_streams, struct pulse_stream, dualsense_mono_entry)
+-    {
+-        found = TRUE;
+-        if (!preferred && stream->dualsense_mono_hotplug_generation == g_dualsense_mono_speaker_add_generation
+-                && stream->haptic_hotplug_generation == g_haptic_hotplug_generation
+-                && pulse_stream_ready(stream))
+-            continue;
+-
+-        pulse_retarget_dualsense_mono_stream(stream, preferred);
+-    }
+-
+-    if (preferred && !found)
+-        TRACE("No live DualSense mono streams were registered for preferred speaker %s.\n",
+-                debugstr_a(preferred));
+-}
+-
+ static char *find_dualsense_haptic_alsa_path(void)
+ {
+     snd_pcm_info_t *info;
+@@ -2979,7 +2833,6 @@
+ 
+     stream->dataflow = params->flow;
+     list_init(&stream->dualsense_pulse_haptic_entry);
+-    list_init(&stream->dualsense_mono_entry);
+     for (i = 0; i < ARRAY_SIZE(stream->vol); ++i)
+         stream->vol[i] = 1.f;
+ 
+@@ -3022,8 +2875,7 @@
+     stream->share = params->share;
+     stream->flags = params->flags;
+     connect_device = params->device;
+-    if (dualsense_mono_candidate && (dualsense_speaker = get_dualsense_speaker_sink(
+-            g_dualsense_mono_preferred_sink ? g_dualsense_mono_preferred_sink : params->device, TRUE)))
++    if (dualsense_mono_candidate && (dualsense_speaker = get_dualsense_speaker_sink(params->device, TRUE)))
+         connect_device = dualsense_speaker;
+     else if ((resolved_device = pulse_resolve_device_name(connect_device)))
+         connect_device = resolved_device;
+@@ -3114,14 +2966,7 @@
+         if (dualsense_pulse_haptic_candidate || dualsense_mono_candidate)
+             stream->haptic_hotplug_generation = g_haptic_hotplug_generation;
+         if (dualsense_mono_candidate)
+-        {
+-            stream->dualsense_mono_stream = TRUE;
+-            stream->dualsense_mono_hotplug_generation = g_dualsense_mono_preferred_sink &&
+-                    g_dualsense_mono_speaker_add_generation ?
+-                    g_dualsense_mono_speaker_add_generation - 1 : g_dualsense_mono_speaker_add_generation;
+-            list_add_tail(&dualsense_mono_streams, &stream->dualsense_mono_entry);
+-            stream->dualsense_mono_registered = TRUE;
+-        }
++            stream->haptic_hotplug_generation = g_haptic_hotplug_generation;
+     }
+ 
+     *params->channel_count = stream->ss.channels;
+@@ -3357,11 +3202,7 @@
+         return;
+     }
+ 
+-    if ((stream->dualsense_mono_stream || stream->dualsense_mono_registered || pulse_stream_dualsense_mono(stream))
+-            && (stream->dualsense_mono_hotplug_generation != g_dualsense_mono_speaker_add_generation
+-                || stream->haptic_hotplug_generation != g_haptic_hotplug_generation
+-                || !pulse_stream_ready(stream))
+-            && FAILED(pulse_retarget_dualsense_mono_stream(stream, g_dualsense_mono_preferred_sink)))
++    if (pulse_stream_dualsense_mono(stream) && !pulse_stream_ready(stream))
+         return;
+ 
+     if (!pulse_stream_ready(stream))
+@@ -3759,11 +3600,6 @@
+ 
+     pulse_lock();
+     remove_stream_from_period(stream);
+-    if (stream->dualsense_mono_registered)
+-    {
+-        list_remove(&stream->dualsense_mono_entry);
+-        stream->dualsense_mono_registered = FALSE;
+-    }
+     if (stream->dualsense_pulse_haptic_registered)
+     {
+         list_remove(&stream->dualsense_pulse_haptic_entry);
+-- 
+2.54.0
