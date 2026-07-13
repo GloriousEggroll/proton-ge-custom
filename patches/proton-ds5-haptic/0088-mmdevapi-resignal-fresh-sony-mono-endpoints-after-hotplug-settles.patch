@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Mon, 13 Jul 2026 13:00:00 -0600
+Subject: [PATCH] mmdevapi: Re-signal fresh Sony mono endpoints after hotplug settles.
+
+Spider-Man Remastered sometimes sees a newly connected DualSense,
+DualSense Edge, or DualShock controller speaker endpoint during the first
+hotplug notification, reads its properties, but does not activate the
+endpoint until a later unplug/replug cycle.  The endpoint exists and the
+Pulse path is valid; the failed case is missing the application's
+IMMDevice::Activate() call for the freshly added endpoint.
+
+Keep the disconnect model strict: removed controller endpoints are still
+deleted and forgotten.  For newly added visible controller speaker
+endpoints, send the existing immediate add notification and then queue one
+short delayed re-signal.  The delayed notification only fires if the exact
+same endpoint GUID is still present, active, and visible, so it does not
+preserve stale devices or resurrect endpoints already hidden after a
+successful activation.
+
+---
+ dlls/mmdevapi/devenum.c | 83 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 83 insertions(+)
+
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+index 7fd518de0f6..b9becb0ae30 100644
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -845,6 +845,12 @@ struct endpoint_notification
+     DWORD state;
+ };
+ 
++struct delayed_endpoint_notifications
++{
++    struct endpoint_notification *notifications;
++    unsigned int count;
++};
++
+ static void notify_endpoint_added_state(EDataFlow flow, const GUID *id, DWORD state)
+ {
+     struct NotificationClientWrapper *wrapper;
+@@ -922,6 +928,82 @@ static BOOL add_endpoint_notification(struct endpoint_notification **notification
+     return TRUE;
+ }
+ 
++static BOOL endpoint_notification_is_current_dualsense_mono(const struct endpoint_notification *notification)
++{
++    MMDevice *device;
++    BOOL found = FALSE;
++
++    EnterCriticalSection(&device_list_cs);
++    LIST_FOR_EACH_ENTRY(device, &device_list, MMDevice, entry)
++    {
++        if (device->flow != notification->flow ||
++                !IsEqualGUID(&device->devguid, &notification->guid) ||
++                !is_dualsense_mono_endpoint(device) ||
++                should_hide_from_endpoint_collection(device))
++            continue;
++
++        found = TRUE;
++        break;
++    }
++    LeaveCriticalSection(&device_list_cs);
++
++    return found;
++}
++
++static DWORD WINAPI delayed_endpoint_notification_thread(void *arg)
++{
++    struct delayed_endpoint_notifications *delayed = arg;
++    unsigned int i;
++
++    Sleep(300);
++
++    for (i = 0; i < delayed->count; ++i)
++    {
++        if (!endpoint_notification_is_current_dualsense_mono(&delayed->notifications[i]))
++            continue;
++
++        TRACE("Delayed re-signaling DualSense mono endpoint add %s after hotplug settled.\n",
++                debugstr_guid(&delayed->notifications[i].guid));
++        notify_endpoint_added_state(delayed->notifications[i].flow, &delayed->notifications[i].guid,
++                delayed->notifications[i].state);
++    }
++
++    free(delayed->notifications);
++    free(delayed);
++    return 0;
++}
++
++static void queue_delayed_endpoint_notifications(const struct endpoint_notification *notifications, unsigned int count)
++{
++    struct delayed_endpoint_notifications *delayed;
++    HANDLE thread;
++
++    if (!count)
++        return;
++
++    if (!(delayed = malloc(sizeof(*delayed))))
++        return;
++
++    if (!(delayed->notifications = malloc(count * sizeof(*delayed->notifications))))
++    {
++        free(delayed);
++        return;
++    }
++    memcpy(delayed->notifications, notifications, count * sizeof(*delayed->notifications));
++    delayed->count = count;
++
++    if (!(thread = CreateThread(NULL, 0, delayed_endpoint_notification_thread, delayed, 0, NULL)))
++    {
++        WARN("Failed to create delayed DualSense mono endpoint notification thread: %lu.\n",
++                GetLastError());
++        free(delayed->notifications);
++        free(delayed);
++        return;
++    }
++
++    CloseHandle(thread);
++}
++
+ static void resignal_visible_dualsense_mono_endpoints(enum dualsense_mono_model model)
+ {
+     struct endpoint_notification *notifications = NULL;
+@@ -949,6 +1027,7 @@ static void resignal_visible_dualsense_mono_endpoints(enum dualsense_mono_model
+                 notifications[i].state);
+     }
+ 
++    queue_delayed_endpoint_notifications(notifications, count);
+     free(notifications);
+ }
+ 
+-- 
+2.54.0
