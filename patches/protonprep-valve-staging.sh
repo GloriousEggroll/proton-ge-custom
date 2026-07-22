@@ -34,7 +34,6 @@ apply_all_in_dir() {
     pushd protonfixes
     git reset --hard HEAD
     git clean -xdf
-    apply_all_in_dir "../patches/protonfixes/upscalers"
     popd
 
     pushd wineopenxr
