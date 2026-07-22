@@ -65,6 +65,10 @@ apply_all_in_dir() {
 
     git revert --no-commit e813ca5771658b00875924ab88d525322e50d39f
 
+# This breaks our PS controller patches
+
+    git revert --no-commit f51244bab0701b292ab668bad3aeb1cdcd6ef84b
+
 ### END PROBLEMATIC COMMIT REVERT SECTION ###
 
 ### (2-2) EM-10/WINE-WAYLAND PATCH SECTION ###
@@ -245,14 +249,14 @@ apply_all_in_dir() {
     echo "WINE: -PENDING- ncrypt: NCryptDecrypt implementation (PSN Login for Ghost of Tsushima)"
     apply_patch "../patches/wine-hotfixes/pending/NCryptDecrypt_implementation.patch"
 
-    #https://github.com/Open-Wine-Components/umu-protonfixes/pull/370#issuecomment-3368898328
-    echo "WINE: -PENDING- add nvidia DLSS upgrade patch"
-    apply_patch "../patches/wine-hotfixes/pending/0001-HACK-kernelbase-allow-overriding-dlls-for-DLSS-XeSS-.patch"
-    apply_patch "../patches/wine-hotfixes/pending/0002-HACK-kernelbase-add-redirection-for-libxess_dx11.dll.patch"
-
     # https://github.com/GloriousEggroll/proton-ge-custom/issues/433
     echo "WINE: -PENDING- add Duet Knight Abyss fixes"
     apply_patch "../patches/wine-hotfixes/pending/0009-HACK-kernel32-Spoof-GetProcAddress-of-KiUserApcDispa.patch"
+
+    # Import upstream icuu forwarders patches to fix broken GoW2Hollow_Setup.exe for Gears of War 2 Hollow
+    echo "WINE: -PENDING-  Import upstream icuu forwarders patches to fix broken GoW2Hollow_Setup.exe for Gears of War 2 Hollow"
+    apply_patch "../patches/wine-hotfixes/pending/icuuc-icuin-forwarder-dlls.patch"
+
 
     # Separate OpenXR steam reliance
     # https://github.com/GloriousEggroll/proton-ge-custom/issues/214
@@ -292,14 +296,14 @@ apply_all_in_dir() {
     echo "WINE: add optiscaler patch"
     apply_patch "../patches/proton/0001-HACK-kernelbase-allow-overriding-dlls-for-DLSS-XeSS-.patch"
 
+    echo "WINE: -HOTFIX- Implement GE-Proton ffmpeg + winedmo only video playback rework patches"
+    apply_all_in_dir "../patches/ge-video-rework/"
+
     # https://github.com/xzn/proton-ds5-haptic
     echo "WINE: -HOTFIX- Add proton DS5 patches"
     for patch in ../patches/proton-ds5-haptic/*.patch; do
         apply_patch "$patch"
     done
-
-    echo "WINE: -HOTFIX- Implement GE-Proton ffmpeg + winedmo only video playback rework patches"
-    apply_all_in_dir "../patches/ge-video-rework/"
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
