@@ -1,0 +1,519 @@
+From 560c86a95d0912c57dffa0a02a3720f55f2da51a Mon Sep 17 00:00:00 2001
+From: Etaash Mathamsetty
+ <45927311+Etaash-mathamsetty@users.noreply.github.com>
+Date: Mon, 27 Apr 2026 13:42:01 -0500
+Subject: [PATCH 130/193] amdxc: Check for wmma support using vkd3d-proton.
+
+Requires a pretty new vkd3d-proton.
+---
+ dlls/amdxc64/Makefile.in                |   1 +
+ dlls/amdxc64/amdxc_interfaces.idl       |  22 ---
+ dlls/amdxc64/main.c                     |  74 ++-------
+ dlls/amdxc64/vkd3d_device_vkd3d_ext.idl | 193 ++++++++++++++++++++++++
+ dlls/amdxc64/vkd3d_vk_includes.h        | 159 +++++++++++++++++++
+ 5 files changed, 365 insertions(+), 84 deletions(-)
+ create mode 100644 dlls/amdxc64/vkd3d_device_vkd3d_ext.idl
+ create mode 100644 dlls/amdxc64/vkd3d_vk_includes.h
+
+diff --git a/dlls/amdxc64/Makefile.in b/dlls/amdxc64/Makefile.in
+index a27f1da40ff..23db2e957f3 100644
+--- a/dlls/amdxc64/Makefile.in
++++ b/dlls/amdxc64/Makefile.in
+@@ -7,3 +7,4 @@ EXTRADLLFLAGS = -mno-cygwin
+ SOURCES = \
+ 	main.c \
+ 	amdxc_interfaces.idl \
++	vkd3d_device_vkd3d_ext.idl \
+diff --git a/dlls/amdxc64/amdxc_interfaces.idl b/dlls/amdxc64/amdxc_interfaces.idl
+index a3bca8400ba..9fe6aa5e3bb 100644
+--- a/dlls/amdxc64/amdxc_interfaces.idl
++++ b/dlls/amdxc64/amdxc_interfaces.idl
+@@ -327,25 +327,3 @@ interface IAmdExtD3DDevice8 : IAmdExtD3DDevice7
+ {
+     HRESULT GetWaveMatrixProperties([in, out] SIZE_T *pCount, [in, out] AmdExtWaveMatrixProperties *pProperties);
+ }
+-
+-/* taken from vkd3d-proton */
+-
+-[
+-    uuid(39da4e09-bd1c-4198-9fae-86bbe3be41fd),
+-    object,
+-    local,
+-    pointer_default(unique)
+-]
+-interface ID3D12DXVKInteropDevice : IUnknown
+-{
+-    HRESULT GetDXGIAdapter(REFIID iid, void **object);
+-    HRESULT GetInstanceExtensions(UINT *extension_count, const char **extensions);
+-    HRESULT GetDeviceExtensions(UINT *extension_count, const char **extensions);
+-    HRESULT GetDeviceFeatures(const void **features);
+-    HRESULT GetVulkanHandles(VkInstance *vk_instance, VkPhysicalDevice *vk_physical_device, VkDevice *vk_device);
+-    HRESULT GetVulkanQueueInfo(ID3D12CommandQueue *queue, VkQueue *vk_queue, UINT32 *vk_queue_family);
+-    void GetVulkanImageLayout(ID3D12Resource *resource, D3D12_RESOURCE_STATES state, void *vk_layout);
+-    HRESULT GetVulkanResourceInfo(ID3D12Resource *resource, UINT64 *vk_handle, UINT64 *buffer_offset);
+-    HRESULT LockCommandQueue(ID3D12CommandQueue *queue);
+-    HRESULT UnlockCommandQueue(ID3D12CommandQueue *queue);
+-}
+diff --git a/dlls/amdxc64/main.c b/dlls/amdxc64/main.c
+index 45ab93ba13b..9f92e6c708c 100644
+--- a/dlls/amdxc64/main.c
++++ b/dlls/amdxc64/main.c
+@@ -34,79 +34,29 @@
+ #include "d3d12.h"
+ 
+ #include "amdxc_interfaces.h"
++#include "vkd3d_device_vkd3d_ext.h"
++#include "vkd3d_vk_includes.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(amdxc);
+ 
+ static BOOL check_fsr4_supported(ID3D12Device *device)
+ {
+-    ID3D12DXVKInteropDevice *interop;
+-    VkInstance instance;
+-    VkDevice vk_device;
+-    VkPhysicalDevice phys_device;
+-    VkPhysicalDeviceProperties2 prop = {0};
+-    VkPhysicalDeviceDriverProperties driver_prop = {0};
+-    const char **extensions = NULL;
+-    UINT extension_count = 0;
+-    UINT major, minor;
+-    BOOL has_float8 = FALSE, has_coopmat2 = FALSE, has_coopmat = FALSE;
+-    BOOL rdna3_workaround = FALSE, ret = FALSE;
+-    const char *env = getenv("DXIL_SPIRV_CONFIG");
+-
+-    if (FAILED(ID3D12Device_QueryInterface(device, &IID_ID3D12DXVKInteropDevice, (void **)&interop)))
+-        return FALSE;
+-
+-    if (FAILED(ID3D12DXVKInteropDevice_GetVulkanHandles(interop, &instance, &phys_device, &vk_device)))
+-        goto fail;
+-
+-    prop.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+-    prop.pNext = &driver_prop;
+-    driver_prop.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+-
+-    vkGetPhysicalDeviceProperties2(phys_device, &prop);
+-
+-    if (prop.properties.vendorID != 0x1002) goto fail;
+-    /* only RADV supports FSR4 */
+-    if (driver_prop.driverID != VK_DRIVER_ID_MESA_RADV) goto fail;
+-
+-    major = VK_API_VERSION_MAJOR(prop.properties.driverVersion);
+-    minor = VK_API_VERSION_MINOR(prop.properties.driverVersion);
+-
+-    if (FAILED(ID3D12DXVKInteropDevice_GetDeviceExtensions(interop, &extension_count, NULL)))
+-        goto fail;
++    BOOL ret = FALSE;
++    ID3D12DeviceExt3 *ext;
+ 
+-    extensions = malloc(sizeof(*extensions) * extension_count);
+-
+-    if (FAILED(ID3D12DXVKInteropDevice_GetDeviceExtensions(interop, &extension_count, extensions)))
+-        goto fail;
+-
+-    for (UINT i = 0; i < extension_count; i++)
+-    {
+-        if (!strcmp("VK_NV_cooperative_matrix2", extensions[i]))
+-            has_coopmat2 = TRUE;
+-        if (!strcmp("VK_KHR_cooperative_matrix", extensions[i]))
+-            has_coopmat = TRUE;
+-        if (!strcmp("VK_EXT_shader_float8", extensions[i]))
+-            has_float8 = TRUE;
+-    }
++    if (FAILED(ID3D12Device_QueryInterface(device, &IID_ID3D12DeviceExt3, (void **)&ext)))
++        return FALSE;
+ 
+-    if (env && strstr(env, "wmma_rdna3_workaround"))
+-        rdna3_workaround = TRUE;
++    ret = ID3D12DeviceExt3_SupportsAGSExtension(ext, D3D12_AGS_EXTENSION_WMMA_FP8_NATIVE);
+ 
+-    if (major > 25 || (major == 25 && minor >= 2))
++    if (!ret)
+     {
+-        /* RDNA 4+ */
+-        if (has_coopmat2 && has_float8) ret = TRUE;
+-        /*
+-         * RDNA3 (or RDNA 2/1 with layer),
+-         * ensure the user is doing stuff correctly
+-         */
+-        if (has_coopmat && rdna3_workaround) ret = TRUE;
++        const char *env = getenv("DXIL_SPIRV_CONFIG");
++        if (env && !strcmp(env, "wmma_rdna3_workaround"))
++            ret = ID3D12DeviceExt3_SupportsAGSExtension(ext, D3D12_AGS_EXTENSION_WMMA_FP8);
+     }
+ 
+-fail:
+-    if (extensions) free(extensions);
+-    ID3D12DXVKInteropDevice_Release(interop);
+-
++    ID3D12DeviceExt3_Release(ext);
+     return ret;
+ }
+ 
+diff --git a/dlls/amdxc64/vkd3d_device_vkd3d_ext.idl b/dlls/amdxc64/vkd3d_device_vkd3d_ext.idl
+new file mode 100644
+index 00000000000..f691c3219ee
+--- /dev/null
++++ b/dlls/amdxc64/vkd3d_device_vkd3d_ext.idl
+@@ -0,0 +1,193 @@
++/*
++ * * Copyright 2021 NVIDIA Corporation
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++import "d3d12.idl";
++import "vkd3d_vk_includes.h";
++
++[
++    uuid(11ea7a1a-0f6a-49bf-b612-3e30f8e201dd),
++    object,
++    local,
++    pointer_default(unique)
++]
++interface ID3D12DeviceExt : IUnknown
++{
++    HRESULT GetVulkanHandles(VkInstance *vk_instance, VkPhysicalDevice *vk_physical_device, VkDevice *vk_device);
++    BOOL GetExtensionSupport(D3D12_VK_EXTENSION extension);
++    HRESULT CreateCubinComputeShaderWithName(const void *cubin_data, UINT32 cubin_size, UINT32 block_x, UINT32 block_y, UINT32 block_z, const char *shader_name, D3D12_CUBIN_DATA_HANDLE **handle);
++    HRESULT DestroyCubinComputeShader(D3D12_CUBIN_DATA_HANDLE *handle);
++    HRESULT GetCudaTextureObject(D3D12_CPU_DESCRIPTOR_HANDLE srv_handle, D3D12_CPU_DESCRIPTOR_HANDLE sampler_handle, UINT32 *cuda_texture_handle);
++    HRESULT GetCudaSurfaceObject(D3D12_CPU_DESCRIPTOR_HANDLE uav_handle, UINT32 *cuda_surface_handle);
++    HRESULT CaptureUAVInfo(D3D12_UAV_INFO *uav_info);
++}
++
++[
++    uuid(39da4e09-bd1c-4198-9fae-86bbe3be41fd),
++    object,
++    local,
++    pointer_default(unique)
++]
++interface ID3D12DXVKInteropDevice : IUnknown
++{
++    HRESULT GetDXGIAdapter(REFIID iid, void **object);
++    HRESULT GetInstanceExtensions(UINT *extension_count, const char **extensions);
++    HRESULT GetDeviceExtensions(UINT *extension_count, const char **extensions);
++    HRESULT GetDeviceFeatures(const VkPhysicalDeviceFeatures2 **features);
++    HRESULT GetVulkanHandles(VkInstance *vk_instance, VkPhysicalDevice *vk_physical_device, VkDevice *vk_device);
++    HRESULT GetVulkanQueueInfo(ID3D12CommandQueue *queue, VkQueue *vk_queue, UINT32 *vk_queue_family);
++    void GetVulkanImageLayout(ID3D12Resource *resource, D3D12_RESOURCE_STATES state, VkImageLayout *vk_layout);
++    HRESULT GetVulkanResourceInfo(ID3D12Resource *resource, UINT64 *vk_handle, UINT64 *buffer_offset);
++    HRESULT LockCommandQueue(ID3D12CommandQueue *queue);
++    HRESULT UnlockCommandQueue(ID3D12CommandQueue *queue);
++}
++
++[
++    uuid(902d8115-59eb-4406-9518-fe00f991ee65),
++    object,
++    local,
++    pointer_default(unique)
++]
++interface ID3D12DXVKInteropDevice1 : ID3D12DXVKInteropDevice
++{
++    HRESULT GetVulkanResourceInfo1(ID3D12Resource *resource, UINT64 *vk_handle, UINT64 *buffer_offset, VkFormat *format);
++    HRESULT CreateInteropCommandQueue(const D3D12_COMMAND_QUEUE_DESC *pDesc, UINT32 vk_queue_family_index, ID3D12CommandQueue **ppQueue);
++    HRESULT CreateInteropCommandAllocator(D3D12_COMMAND_LIST_TYPE type, UINT32 vk_queue_family_index, ID3D12CommandAllocator **ppAllocator);
++    HRESULT BeginVkCommandBufferInterop(ID3D12CommandList *pCmdList, VkCommandBuffer *pCommandBuffer);
++    HRESULT EndVkCommandBufferInterop(ID3D12CommandList *pCmdList);
++}
++
++[
++    uuid(90ecf26e-b212-43f5-b62a-825ad7b1385e),
++    object,
++    local,
++    pointer_default(unique)
++]
++interface ID3D12DXVKInteropDevice2 : ID3D12DXVKInteropDevice1
++{
++    /* Unlike LockCommandQueue this doesn't drain or lock d3d12 queue but only locks the access to the underlying
++     * Vulkan queue so it can be used outside of d3d12. */
++    HRESULT LockVulkanQueue(ID3D12CommandQueue *queue);
++    HRESULT UnlockVulkanQueue(ID3D12CommandQueue *queue);
++}
++
++[
++    uuid(22a70184-a6a4-4c24-bf97-7d6df9f12d8a),
++    object,
++    local,
++    pointer_default(unique)
++]
++interface ID3D12DXVKInteropDevice3 : ID3D12DXVKInteropDevice2
++{
++    /* Returns VkDeviceMemory and memory offset corresponding to the D3D12 heap allocation.
++     * If the heap has no Vulkan backing allocation yet, this method fails. */
++    HRESULT GetVulkanHeapInfo(ID3D12Heap *heap, UINT64 *vk_memory, UINT64 *heap_offset,
++            UINT32 *vk_memory_type);
++}
++
++[
++    uuid(f3112584-41f9-348d-a59b-00b7e1d285d6),
++    object,
++    local,
++    pointer_default(unique)
++]
++interface ID3DLowLatencyDevice : IUnknown
++{
++    BOOL SupportsLowLatency();
++    HRESULT LatencySleep();
++    HRESULT SetLatencySleepMode(BOOL low_latency_mode, BOOL low_latency_boost, UINT32 minimum_interval_us);
++    HRESULT SetLatencyMarker(UINT64 frameID, UINT32 markerType);
++    HRESULT GetLatencyInfo(D3D12_LATENCY_RESULTS *latency_results);
++}
++
++[
++    uuid(099a73fd-2199-4f45-bf48-0eb86f6fdb65),
++    object,
++    local,
++    pointer_default(unique)
++]
++interface ID3D12DeviceExt1 : ID3D12DeviceExt
++{
++    HRESULT CreateResourceFromBorrowedHandle(const D3D12_RESOURCE_DESC1 *desc, UINT64 vk_handle, ID3D12Resource **resource);
++    HRESULT GetVulkanQueueInfoEx(ID3D12CommandQueue *queue, VkQueue *vk_queue, UINT32 *vk_queue_index, UINT32 *vk_queue_flags, UINT32 *vk_queue_family);
++}
++
++[
++    uuid(e859c4ac-ba8f-41c4-8eac-1137fde6158d),
++    object,
++    local,
++    pointer_default(unique)
++]
++interface ID3D12DeviceExt2 : ID3D12DeviceExt1
++{
++    BOOL SupportsCubin64bit();
++    HRESULT CreateCubinComputeShaderExV2(D3D12_CREATE_CUBIN_SHADER_PARAMS *params);
++    HRESULT GetCudaMergedTextureSamplerObject(D3D12_GET_CUDA_MERGED_TEXTURE_SAMPLER_OBJECT_PARAMS *params);
++    HRESULT GetCudaIndependentDescriptorObject(D3D12_GET_CUDA_INDEPENDENT_DESCRIPTOR_OBJECT_PARAMS *params);
++}
++
++[
++    uuid(3aefa75c-c9f3-4b7f-a180-5df695d083bf),
++    object,
++    local,
++    pointer_default(unique)
++]
++interface ID3D12DeviceExt3 : ID3D12DeviceExt2
++{
++    BOOL SupportsAGSExtension(D3D12_AGS_EXTENSION agsExtension);
++    HRESULT SetAGSUAVSlot(UINT uavSlot);
++}
++
++/* 1:1 implementation of ffx_antilag2_dx12.h */
++struct AmdAntiLagAPIData_v1
++{
++    UINT uiSize;
++    UINT uiVersion;
++    UINT eMode;
++    const char *sControlStr;
++    UINT uiControlStrLength;
++    UINT maxFPS;
++};
++
++
++struct AmdAntiLagAPIData_v2
++{
++    UINT uiSize;
++    UINT uiVersion;
++    struct
++    {
++        UINT unused0               : 1;
++        UINT unused1               : 1;
++        UINT signalFgFrameType     : 1;
++        UINT isInterpolatedFrame   : 1;
++        UINT signalGetUserInputIdx : 1;
++        UINT signalEndOfFrameIdx   : 1;
++        UINT reserved              :26;
++    } flags;
++    UINT64 iiFrameIdx;
++    UINT64 uiiReserved[19];
++};
++
++[
++    uuid(44085fbe-e839-40c5-bf38-0ebc5ab4d0a6),
++    object,
++    local,
++    pointer_default(unique)
++]
++interface IAmdExtAntiLagApi : IUnknown
++{
++    HRESULT UpdateAntiLagState(void *pData);
++}
+diff --git a/dlls/amdxc64/vkd3d_vk_includes.h b/dlls/amdxc64/vkd3d_vk_includes.h
+new file mode 100644
+index 00000000000..8f6b85d37bf
+--- /dev/null
++++ b/dlls/amdxc64/vkd3d_vk_includes.h
+@@ -0,0 +1,159 @@
++/*
++ * * Copyright 2021 NVIDIA Corporation
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++#ifndef __VKD3D_VK_INCLUDES_H
++#define __VKD3D_VK_INCLUDES_H
++
++typedef UINT64 VkCuFunctionNVX;
++typedef UINT64 VkCuModuleNVX;
++typedef UINT64 VkSurfaceKHR;
++
++typedef struct VkPhysicalDeviceFeatures2 VkPhysicalDeviceFeatures2;
++typedef struct VkPhysicalDevice_T *VkPhysicalDevice;
++typedef struct VkCommandBuffer_T *VkCommandBuffer;
++typedef struct VkInstance_T *VkInstance;
++typedef struct VkDevice_T *VkDevice;
++typedef struct VkQueue_T *VkQueue;
++
++typedef enum VkFormat VkFormat;
++typedef enum VkResult VkResult;
++typedef enum VkImageLayout VkImageLayout;
++
++typedef enum D3D12_VK_EXTENSION
++{
++    D3D12_VK_NVX_BINARY_IMPORT      = 0x1,
++    D3D12_VK_NVX_IMAGE_VIEW_HANDLE  = 0x2,
++    D3D12_VK_NV_LOW_LATENCY_2       = 0x3,
++    D3D12_VK_NV_OPTICAL_FLOW        = 0x4
++} D3D12_VK_EXTENSION;
++
++typedef enum D3D12_OUT_OF_BAND_CQ_TYPE
++{
++    OUT_OF_BAND_RENDER  = 0,
++    OUT_OF_BAND_PRESENT = 1
++} D3D12_OUT_OF_BAND_CQ_TYPE;
++
++typedef struct D3D12_CUBIN_DATA_HANDLE
++{
++    VkCuFunctionNVX vkCuFunction;
++    VkCuModuleNVX vkCuModule;
++    UINT32 blockX;
++    UINT32 blockY;
++    UINT32 blockZ;
++} D3D12_CUBIN_DATA_HANDLE;
++
++typedef struct D3D12_UAV_INFO
++{
++    UINT32 version;
++    UINT32 surfaceHandle;
++    UINT64 gpuVAStart;
++    UINT64 gpuVASize;
++} D3D12_UAV_INFO;
++
++typedef struct D3D12_FRAME_REPORT
++{
++    UINT64 frameID;
++    UINT64 inputSampleTime;
++    UINT64 simStartTime;
++    UINT64 simEndTime;
++    UINT64 renderSubmitStartTime;
++    UINT64 renderSubmitEndTime;
++    UINT64 presentStartTime;
++    UINT64 presentEndTime;
++    UINT64 driverStartTime;
++    UINT64 driverEndTime;
++    UINT64 osRenderQueueStartTime;
++    UINT64 osRenderQueueEndTime;
++    UINT64 gpuRenderStartTime;
++    UINT64 gpuRenderEndTime;
++    UINT32 gpuActiveRenderTimeUs;
++    UINT32 gpuFrameTimeUs;
++    UINT8 rsvd[120];
++} D3D12_FRAME_REPORT;
++
++typedef struct D3D12_LATENCY_RESULTS
++{
++    UINT32 version;
++    D3D12_FRAME_REPORT frame_reports[64];
++    UINT8 rsvd[32];
++} D3D12_LATENCY_RESULTS;
++
++typedef struct D3D12_CREATE_CUBIN_SHADER_PARAMS
++{
++    void *pNext;
++    const void *pCubin;
++    UINT32 size;
++    UINT32 blockX;
++    UINT32 blockY;
++    UINT32 blockZ;
++    UINT32 dynSharedMemBytes;
++    const char *pShaderName;
++    UINT32 flags;
++    D3D12_CUBIN_DATA_HANDLE *hShader;
++} D3D12_CREATE_CUBIN_SHADER_PARAMS;
++
++typedef struct D3D12_GET_CUDA_MERGED_TEXTURE_SAMPLER_OBJECT_PARAMS
++{
++    void *pNext;
++    SIZE_T texDesc;
++    SIZE_T smpDesc;
++    UINT64 textureHandle;
++} D3D12_GET_CUDA_MERGED_TEXTURE_SAMPLER_OBJECT_PARAMS;
++
++typedef enum D3D12_GET_CUDA_INDEPENDENT_DESCRIPTOR_OBJECT_TYPE
++{
++    D3D12_GET_CUDA_INDEPENDENT_DESCRIPTOR_OBJECT_SURFACE = 0,
++    D3D12_GET_CUDA_INDEPENDENT_DESCRIPTOR_OBJECT_TEXTURE = 1,
++    D3D12_GET_CUDA_INDEPENDENT_DESCRIPTOR_OBJECT_SAMPLER = 2,
++} D3D12_GET_CUDA_INDEPENDENT_DESCRIPTOR_OBJECT_TYPE;
++
++typedef struct D3D12_GET_CUDA_INDEPENDENT_DESCRIPTOR_OBJECT_PARAMS
++{
++    void *pNext;
++    D3D12_GET_CUDA_INDEPENDENT_DESCRIPTOR_OBJECT_TYPE type;
++    SIZE_T desc;
++    UINT64 handle;
++} D3D12_GET_CUDA_INDEPENDENT_DESCRIPTOR_OBJECT_PARAMS;
++
++typedef enum D3D12_AGS_EXTENSION
++{
++	/* As defined by ags headers. */
++    D3D12_AGS_EXTENSION_INTRINSICS_16 = 0,
++    D3D12_AGS_EXTENSION_INTRINSICS_17,
++    D3D12_AGS_EXTENSION_USER_MARKERS,
++    D3D12_AGS_EXTENSION_APP_REGISTRATION,
++    D3D12_AGS_EXTENSION_UAV_BIND_SLOT,
++    D3D12_AGS_EXTENSION_INTRINSICS_19,
++    D3D12_AGS_EXTENSION_BASE_VERTEX,
++    D3D12_AGS_EXTENSION_BASE_INSTANCE,
++    D3D12_AGS_EXTENSION_GET_WAVE_SIZE,
++    D3D12_AGS_EXTENSION_FLOAT_CONVERSION,
++    D3D12_AGS_EXTENSION_READ_LANE_AT,
++    D3D12_AGS_EXTENSION_RAY_HIT_TOKEN,
++    D3D12_AGS_EXTENSION_SHADER_TOKEN,
++
++    /* Not part of the existing header, but useful regardless.
++     * May include emulation path if enabled in build.
++	 * Shift this out of range to make sure we don't trample of any reserved bits
++	 * since it's convenient to keep the bitfield ordering for simple ABI compat. */
++    D3D12_AGS_EXTENSION_WMMA_FP8 = 100,
++
++    /* Supported only if FP8 is supported natively by hardware. */
++    D3D12_AGS_EXTENSION_WMMA_FP8_NATIVE
++} D3D12_AGS_EXTENSION;
++
++#endif  // __VKD3D_VK_INCLUDES_H
+-- 
+2.55.0
+

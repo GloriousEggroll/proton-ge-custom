@@ -1,0 +1,258 @@
+From ab36ba18713f3d767804b4ed4efabac06b349158 Mon Sep 17 00:00:00 2001
+From: Etaash Mathamsetty
+ <45927311+Etaash-mathamsetty@users.noreply.github.com>
+Date: Mon, 15 Jun 2026 00:07:33 -0400
+Subject: [PATCH 155/193] amdxc: Implement FSR 4.1.1 support
+
+---
+ dlls/amdxc64/main.c | 112 +++++++++++++++++++++++++-------------------
+ 1 file changed, 65 insertions(+), 47 deletions(-)
+
+diff --git a/dlls/amdxc64/main.c b/dlls/amdxc64/main.c
+index 439f1c14db1..b2538a3d16e 100644
+--- a/dlls/amdxc64/main.c
++++ b/dlls/amdxc64/main.c
+@@ -39,32 +39,32 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(amdxc);
+ 
+-static BOOL check_fsr4_supported(ID3D12Device *device)
++static void check_fsr4_supported(ID3D12Device *device, BOOL *fp8, BOOL *p_wmma)
+ {
+-    BOOL ret = FALSE;
+     ID3D12DeviceExt3 *ext;
++    const char *e;
++    BOOL wmma;
+ 
+-    if (FAILED(ID3D12Device_QueryInterface(device, &IID_ID3D12DeviceExt3, (void **)&ext)))
+-        return FALSE;
++    if (FAILED(ID3D12Device_QueryInterface(device, &IID_ID3D12DeviceExt3, (void **)&ext))) return;
+ 
+-    ret = ID3D12DeviceExt3_SupportsAGSExtension(ext, D3D12_AGS_EXTENSION_WMMA_FP8_NATIVE);
++    wmma = ID3D12DeviceExt3_SupportsAGSExtension(ext, D3D12_AGS_EXTENSION_WMMA_FP8);
++    *fp8 = ID3D12DeviceExt3_SupportsAGSExtension(ext, D3D12_AGS_EXTENSION_WMMA_FP8_NATIVE);
+ 
+-    if (!ret)
++    if (*fp8) TRACE("FSR4 FP8 supported!\n");
++    if ((e = getenv("DXIL_SPIRV_CONFIG")) && !strcmp(e, "wmma_rdna3_workaround"))
+     {
+-        const char *env = getenv("DXIL_SPIRV_CONFIG");
+-        if (env && !strcmp(env, "wmma_rdna3_workaround"))
+-            ret = ID3D12DeviceExt3_SupportsAGSExtension(ext, D3D12_AGS_EXTENSION_WMMA_FP8);
++        if ((*fp8 = wmma)) FIXME("FSR4 FP16 emulation is not recommended, please use FSR 4.1.1\n");
+     }
++    if (p_wmma) *p_wmma = wmma;
+ 
+     ID3D12DeviceExt3_Release(ext);
+-    return ret;
+ }
+ 
+ struct AMDFSR4FFX
+ {
+     IAmdExtFfxApi IAmdExtFfxApi_iface;
+     LONG ref;
+-    BOOL fsr4_supported;
++    BOOL fp8_supported;
+ };
+ 
+ static struct AMDFSR4FFX* impl_from_IAmdExtFfxApi(IAmdExtFfxApi* iface)
+@@ -105,23 +105,18 @@ typedef ULONG (*pfnConfigure)(void* context, const void* desc);
+ typedef ULONG (*pfnQuery)(void* context, void* desc);
+ typedef ULONG (*pfnDispatch)(void* context, const void* desc);
+ 
+-struct ffxProviderInterface
+-{
+-    ULONG64 versionId;
+-    const char* versionName;
+-    pfnCanProvide canProvide;
+-    pfnCreateContext createContext;
+-    pfnDestroyContext destroyContext;
+-    pfnConfigure configure;
+-    pfnQuery query;
+-    pfnDispatch dispatch;
+-};
+-
+ struct ffxExternalProvider
+ {
+-    ULONG structVersion;
+-    ULONG64 descType;
+-    struct ffxProviderInterface iface;
++    ULONG structVersion; /* 0x0 */
++    ULONG64 descType; /* 0x8 */
++    ULONG64 versionId; /* 0x10 */
++    const char* versionName; /* 0x18 */
++    pfnCanProvide canProvide; /* 0x20 */
++    pfnCreateContext createContext; /* 0x28 */
++    pfnDestroyContext destroyContext; /* 0x30 */
++    pfnConfigure configure; /* 0x38 */
++    pfnQuery query; /* 0x40 */
++    pfnDispatch dispatch; /* 0x48 */
+ };
+ 
+ static void dump_provider(struct ffxExternalProvider *provider)
+@@ -130,7 +125,7 @@ static void dump_provider(struct ffxExternalProvider *provider)
+ 
+     TRACE("returned provider: %lx %I64x %s\n",
+           provider->structVersion, provider->descType,
+-          debugstr_a(provider->iface.versionName));
++          debugstr_a(provider->versionName));
+ }
+ 
+ struct unk_data {
+@@ -151,15 +146,19 @@ HRESULT STDMETHODCALLTYPE AMDFSR4FFX_UpdateFfxApiProvider(IAmdExtFfxApi *iface,
+     updateffxapi_pfn_ex pfn_ex;
+     updateffxapi_pfn pfn;
+     HMODULE amdffx;
++    BOOL fsr4, fsr3;
+ 
+     TRACE("%p %p %u\n", iface, data, size);
+ 
+     if (!data) return E_INVALIDARG;
+ 
+     if ((env = getenv("MLFG_UPGRADE")) && !strcmp(env, "1"))
+-        unk_data[0].unk[2] = 1;
++        unk_data->unk[2] = 1;
++
++    fsr4 = (env = getenv("FSR4_UPGRADE")) && !strcmp(env, "1");
++    fsr3 = (env = getenv("FSR3_UPGRADE")) && !strcmp(env, "1");
+ 
+-    if ((env = getenv("FSR4_UPGRADE")) && !strcmp(env, "1"))
++    if (fsr4 || fsr3)
+     {
+         amdffx = LoadLibraryA("amdxcffx64");
+         if (!amdffx)
+@@ -168,12 +167,6 @@ HRESULT STDMETHODCALLTYPE AMDFSR4FFX_UpdateFfxApiProvider(IAmdExtFfxApi *iface,
+             return E_NOINTERFACE;
+         }
+ 
+-        if (!this->fsr4_supported)
+-        {
+-            ERR("FSR4 not supported on this system!\n");
+-            return E_NOINTERFACE;
+-        }
+-
+         pfn_ex = (updateffxapi_pfn_ex)GetProcAddress(amdffx, "UpdateFfxApiProviderEx");
+         pfn = (updateffxapi_pfn)GetProcAddress(amdffx, "UpdateFfxApiProvider");
+ 
+@@ -185,9 +178,21 @@ HRESULT STDMETHODCALLTYPE AMDFSR4FFX_UpdateFfxApiProvider(IAmdExtFfxApi *iface,
+             dump_provider(data);
+ 
+             return ret;
+-        } else if (pfn)
++        }
++        else if (pfn)
+         {
+-            HRESULT ret = pfn(data, size);
++            HRESULT ret;
++
++            /* ensure user doesn't do dumb things on legacy amdxcffx64 */
++            if (!this->fp8_supported)
++            {
++                ERR("FSR4 not supported on this system!\n");
++                return E_NOINTERFACE;
++            }
++
++            if (!fsr4) return E_NOINTERFACE;
++
++            ret = pfn(data, size);
+ 
+             TRACE("status: %lx\n", ret);
+             dump_provider(data);
+@@ -211,6 +216,8 @@ struct AmdExtD3DShaderIntrinsics
+ {
+     IAmdExtD3DShaderIntrinsics IAmdExtD3DShaderIntrinsics_iface;
+     LONG ref;
++    BOOL supports_wmma;
++    BOOL supports_fp8;
+ };
+ 
+ struct AmdExtD3DShaderIntrinsics* impl_from_IAmdExtD3DShaderIntrinsics(IAmdExtD3DShaderIntrinsics *iface)
+@@ -248,8 +255,11 @@ HRESULT STDMETHODCALLTYPE AmdExtD3DShaderIntrinsics_GetInfo(IAmdExtD3DShaderIntr
+ HRESULT STDMETHODCALLTYPE AmdExtD3DShaderIntrinsics_CheckSupport(IAmdExtD3DShaderIntrinsics *iface,
+                                                                  AmdExtD3DShaderIntrinsicsSupport opcode)
+ {
+-    if (opcode == AmdExtD3DShaderIntrinsicsSupport_Float8Conversion) return S_OK;
+-    if (opcode == AmdExtD3DShaderIntrinsicsSupport_WaveMatrix) return S_OK;
++    struct AmdExtD3DShaderIntrinsics *this = impl_from_IAmdExtD3DShaderIntrinsics(iface);
++    if (opcode == AmdExtD3DShaderIntrinsicsSupport_Float8Conversion)
++        return this->supports_fp8 ? S_OK : E_NOTIMPL;
++    if (opcode == AmdExtD3DShaderIntrinsicsSupport_WaveMatrix)
++        return this->supports_wmma ? S_OK : E_NOTIMPL;
+ 
+     FIXME("%p %u stub!\n", iface, opcode);
+     return S_OK;
+@@ -275,7 +285,7 @@ struct AmdExtD3DDevice8
+ {
+     IAmdExtD3DDevice8 IAmdExtD3DDevice8_iface;
+     LONG ref;
+-    BOOL fsr4_supported;
++    BOOL fp8_supported;
+ };
+ 
+ struct AmdExtD3DDevice8 *impl_from_IAmdExtD3DDevice8(IAmdExtD3DDevice8 *iface)
+@@ -407,12 +417,19 @@ HRESULT STDMETHODCALLTYPE AmdExtD3DDevice8_GetWaveMatrixProperties(IAmdExtD3DDev
+             AMD_EXT_WMMA_TYPE_FP32, AMD_EXT_WMMA_TYPE_FP32, FALSE
+         }
+     };
++    const char *e;
+ 
+     TRACE("%p %p %p\n", iface, pCount, pProperties);
+ 
+     if (!pCount) return E_INVALIDARG;
+ 
+-    if (!this->fsr4_supported)
++    if (!this->fp8_supported)
++    {
++        *pCount = 0;
++        return S_OK;
++    }
++
++    if ((e = getenv("FSR3_UPGRADE")) && !strcmp(e, "1"))
+     {
+         *pCount = 0;
+         return S_OK;
+@@ -480,6 +497,7 @@ HRESULT STDMETHODCALLTYPE AmdExtD3DFactory_CreateInterface(IAmdExtD3DFactory *if
+         struct AmdExtD3DShaderIntrinsics *this = calloc(1, sizeof(struct AmdExtD3DShaderIntrinsics));
+         this->IAmdExtD3DShaderIntrinsics_iface.lpVtbl = &AmdExtD3DShaderIntrinsics_vtable;
+         this->ref = 1;
++        check_fsr4_supported((ID3D12Device *)outer, &this->supports_fp8, &this->supports_wmma);
+         *out = &this->IAmdExtD3DShaderIntrinsics_iface;
+         return S_OK;
+     }
+@@ -488,8 +506,7 @@ HRESULT STDMETHODCALLTYPE AmdExtD3DFactory_CreateInterface(IAmdExtD3DFactory *if
+         struct AmdExtD3DDevice8 *this = calloc(1, sizeof(struct AmdExtD3DDevice8));
+         this->IAmdExtD3DDevice8_iface.lpVtbl = &AmdExtD3DDevice8_vtable;
+         this->ref = 1;
+-        this->fsr4_supported = check_fsr4_supported((ID3D12Device *)outer);
+-        TRACE("FSR 4 supported: %d\n", this->fsr4_supported);
++        check_fsr4_supported((ID3D12Device *)outer, &this->fp8_supported, NULL);
+         *out = &this->IAmdExtD3DDevice8_iface;
+         return S_OK;
+     }
+@@ -532,8 +549,7 @@ HRESULT CDECL AmdExtD3DCreateInterface(IUnknown *outer, REFIID iid, void **obj)
+         struct AMDFSR4FFX* ffx = calloc(1, sizeof(struct AMDFSR4FFX));
+         ffx->IAmdExtFfxApi_iface.lpVtbl = &AMDFSR4FFX_vtable;
+         ffx->ref = 1;
+-        ffx->fsr4_supported = check_fsr4_supported((ID3D12Device *)outer);
+-        TRACE("FSR 4 supported: %d\n", ffx->fsr4_supported);
++        check_fsr4_supported((ID3D12Device *)outer, &ffx->fp8_supported, NULL);
+         *obj = &ffx->IAmdExtFfxApi_iface;
+         return S_OK;
+     } else if (IsEqualGUID(iid, &IID_IAmdExtAntiLagApi)) {
+@@ -561,9 +577,11 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
+     {
+         case DLL_PROCESS_ATTACH:
+         {
+-            if ((env = getenv("FSR4_WATERMARK")) && !strcmp(env, "1"))
++            /* this creates a watermark for driver side FSR3 as well */
++            if ((env = getenv("FSR_WATERMARK")) && !strcmp(env, "1"))
+                 _putenv("MLSR-WATERMARK=1");
+-            if ((env = getenv("MLFG_WATERMARK")) && !strcmp(env, "1"))
++            /* same here */
++            if ((env = getenv("FSR_FG_WATERMARK")) && !strcmp(env, "1"))
+                 _putenv("MLFI-WATERMARK=1");
+             break;
+         }
+-- 
+2.55.0
+

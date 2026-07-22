@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Thu, 9 Jul 2026 03:25:00 -0600
+Subject: [PATCH] mmdevapi: Filter hidden DualSense mono endpoints from
+ existing collections.
+
+Spider-Man Remastered creates endpoint collection snapshots before opening the
+DualSense controller speaker. We hide the special one-channel mono endpoint
+after successful IAudioClient activation so later broad endpoint enumeration
+does not feed that endpoint back into the game's managed audio layer and trip
+its InvalidCastException path.
+
+That was not enough because IMMDeviceCollection stores a snapshot of endpoint
+pointers. A collection created before activation can still return the mono
+endpoint after the endpoint is marked hidden.
+
+Filter hidden DualSense mono endpoints dynamically from existing collection
+GetCount() and Item() calls. Normal endpoints remain snapshot-based; only
+devices that now satisfy the DualSense mono hide rule are skipped. Explicit
+references, GetDevice() by id, and already-created audio clients remain valid.
+---
+ dlls/mmdevapi/devenum.c | 33 +++++++++++++++++++++++++--------
+ 1 file changed, 25 insertions(+), 8 deletions(-)
+
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+index 88b80ec4444..55d6e1f5555 100644
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -1563,6 +1563,11 @@ static inline MMDevice *impl_from_IMMDevice(IMMDevice *iface)
+     return CONTAINING_RECORD(iface, MMDevice, IMMDevice_iface);
+ }
+ 
++static BOOL MMDevCol_device_visible(IMMDevice *iface)
++{
++    return !should_hide_from_endpoint_collection(impl_from_IMMDevice(iface));
++}
++
+ static HRESULT WINAPI MMDevice_QueryInterface(IMMDevice *iface, REFIID riid, void **ppv)
+ {
+     MMDevice *This = impl_from_IMMDevice(iface);
+@@ -1921,11 +1926,17 @@ static HRESULT WINAPI MMDevCol_GetCount(IMMDeviceCollection *iface, UINT *numdevs)
+ {
+     MMDevColImpl *This = impl_from_IMMDeviceCollection(iface);
++    UINT i;
+ 
+     TRACE("(%p)->(%p)\n", This, numdevs);
+     if (!numdevs)
+         return E_POINTER;
+ 
+-    *numdevs = This->devices_count;
++    *numdevs = 0;
++    for (i = 0; i < This->devices_count; ++i)
++    {
++        if (MMDevCol_device_visible(This->devices[i]))
++            (*numdevs)++;
++    }
+     return S_OK;
+ }
+ 
+@@ -1933,21 +1944,27 @@ static HRESULT WINAPI MMDevCol_Item(IMMDeviceCollection *iface, UINT n, IMMDevice **dev)
+ static HRESULT WINAPI MMDevCol_Item(IMMDeviceCollection *iface, UINT n, IMMDevice **dev)
+ {
+     MMDevColImpl *This = impl_from_IMMDeviceCollection(iface);
++    UINT i, index = 0;
+ 
+     TRACE("(%p)->(%u, %p)\n", This, n, dev);
+     if (!dev)
+         return E_POINTER;
+ 
+-    if (n >= This->devices_count)
++    *dev = NULL;
++    for (i = 0; i < This->devices_count; ++i)
+     {
+-        WARN("Could not obtain item %u\n", n);
+-        *dev = NULL;
+-        return E_INVALIDARG;
++        if (!MMDevCol_device_visible(This->devices[i]))
++            continue;
++        if (index++ == n)
++        {
++            *dev = This->devices[i];
++            IMMDevice_AddRef(*dev);
++            return S_OK;
++        }
+     }
+ 
+-    *dev = This->devices[n];
+-    IMMDevice_AddRef(*dev);
+-    return S_OK;
++    WARN("Could not obtain item %u\n", n);
++    return E_INVALIDARG;
+ }
+ 
+ static const IMMDeviceCollectionVtbl MMDevColVtbl =
+-- 
+2.54.0

@@ -1,0 +1,187 @@
+From 0e89579fd8ec61cce30350e9cf5a942bce0883cc Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?R=C3=A9mi=20Bernon?= <rbernon@codeweavers.com>
+Date: Sat, 20 Jun 2026 10:32:08 +0200
+Subject: [PATCH 022/193] winewayland: Make window lock mutex recursive.
+
+Every other driver does it, it will make life easier.
+---
+ dlls/winewayland.drv/wayland.c         |  3 +++
+ dlls/winewayland.drv/wayland_surface.c | 25 ++++++++++---------
+ dlls/winewayland.drv/waylanddrv.h      |  2 +-
+ dlls/winewayland.drv/window.c          | 34 ++++++++++++--------------
+ 4 files changed, 33 insertions(+), 31 deletions(-)
+
+diff --git a/dlls/winewayland.drv/wayland.c b/dlls/winewayland.drv/wayland.c
+index 967d89b0d06..247f76590db 100644
+--- a/dlls/winewayland.drv/wayland.c
++++ b/dlls/winewayland.drv/wayland.c
+@@ -297,6 +297,9 @@ BOOL wayland_process_init(void)
+         return FALSE;
+     }
+ 
++    /* initialize win data mutex */
++    wayland_window_init();
++
+     /* Populate registry */
+     wl_registry_add_listener(process_wayland.wl_registry, &registry_listener, NULL);
+ 
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index ebf38abc5ef..23eacae90ff 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -783,9 +783,10 @@ static void wayland_surface_reconfigure_subsurface(struct wayland_surface *surfa
+     struct wayland_surface *owner_surface;
+     int local_x, local_y, x, y;
+ 
+-    if (surface->processing.serial && surface->processing.processed &&
+-        (owner_data = wayland_win_data_get_nolock(surface->owner_hwnd)) &&
+-        (owner_surface = owner_data->wayland_surface))
++    if (!surface->processing.serial || !surface->processing.processed) return;
++    if (!(owner_data = wayland_win_data_get(surface->owner_hwnd))) return;
++
++    if ((owner_surface = owner_data->wayland_surface))
+     {
+         local_x = surface->window.rect.left - owner_surface->window.rect.left;
+         local_y = surface->window.rect.top - owner_surface->window.rect.top;
+@@ -803,6 +804,8 @@ static void wayland_surface_reconfigure_subsurface(struct wayland_surface *surfa
+ 
+         memset(&surface->processing, 0, sizeof(surface->processing));
+     }
++
++    wayland_win_data_release(owner_data);
+ }
+ 
+ /**********************************************************************
+@@ -1224,10 +1227,10 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
+         return;
+     }
+ 
+-    if (!(toplevel_data = wayland_win_data_get_nolock(toplevel)) || !(surface = toplevel_data->wayland_surface))
++    if (!(toplevel_data = wayland_win_data_get(toplevel)) || !(surface = toplevel_data->wayland_surface))
+     {
+-        wayland_client_surface_attach(client, NULL);
+-        return;
++        if (toplevel_data) wayland_win_data_release(toplevel_data);
++        return wayland_client_surface_attach(client, NULL);
+     }
+ 
+     if (client->toplevel != toplevel)
+@@ -1238,11 +1241,8 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
+             wl_subcompositor_get_subsurface(process_wayland.wl_subcompositor,
+                                             client->wl_surface,
+                                             surface->wl_surface);
+-        if (!client->wl_subsurface)
+-        {
+-            ERR("Failed to create client wl_subsurface\n");
+-            return;
+-        }
++        if (!client->wl_subsurface) goto done;
++
+         /* Present contents independently of the parent surface. */
+         wl_subsurface_set_desync(client->wl_subsurface);
+ 
+@@ -1255,6 +1255,9 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
+     wayland_surface_reconfigure_client(surface, client, &client_rect);
+     /* Commit to apply subsurface positioning. */
+     wl_surface_commit(surface->wl_surface);
++
++done:
++    wayland_win_data_release(toplevel_data);
+ }
+ 
+ static void dummy_buffer_release(void *data, struct wl_buffer *buffer)
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index dfc78a96955..26b4bbfedb4 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -387,7 +387,6 @@ struct wayland_win_data
+ };
+ 
+ struct wayland_win_data *wayland_win_data_get(HWND hwnd);
+-struct wayland_win_data *wayland_win_data_get_nolock(HWND hwnd);
+ void wayland_win_data_release(struct wayland_win_data *data);
+ 
+ struct wayland_client_surface *get_client_surface(HWND hwnd);
+@@ -395,6 +394,7 @@ void set_client_surface(HWND hwnd, struct wayland_client_surface *client);
+ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region);
+ struct wayland_shm_buffer *get_window_surface_contents(HWND hwnd);
+ void ensure_window_surface_contents(HWND hwnd);
++void wayland_window_init(void);
+ 
+ /**********************************************************************
+  *          Wayland Keyboard
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index 5b65f22e4ec..0b4c041fe50 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -105,22 +105,6 @@ static void wayland_win_data_destroy(struct wayland_win_data *data)
+     free(data);
+ }
+ 
+-/***********************************************************************
+- *           wayland_win_data_get_nolock
+- *
+- * Return the data structure associated with a window. This function does
+- * not lock the win_data_mutex, so it must be externally synchronized.
+- */
+-struct wayland_win_data *wayland_win_data_get_nolock(HWND hwnd)
+-{
+-    struct rb_entry *rb_entry;
+-
+-    if ((rb_entry = rb_get(&win_data_rb, hwnd)))
+-        return RB_ENTRY_VALUE(rb_entry, struct wayland_win_data, entry);
+-
+-    return NULL;
+-}
+-
+ /***********************************************************************
+  *           wayland_win_data_get
+  *
+@@ -128,10 +112,11 @@ struct wayland_win_data *wayland_win_data_get_nolock(HWND hwnd)
+  */
+ struct wayland_win_data *wayland_win_data_get(HWND hwnd)
+ {
+-    struct wayland_win_data *data;
++    struct rb_entry *entry;
+ 
+     pthread_mutex_lock(&win_data_mutex);
+-    if ((data = wayland_win_data_get_nolock(hwnd))) return data;
++    if ((entry = rb_get(&win_data_rb, hwnd)))
++        return RB_ENTRY_VALUE(entry, struct wayland_win_data, entry);
+     pthread_mutex_unlock(&win_data_mutex);
+ 
+     return NULL;
+@@ -453,7 +438,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+     if (!(managed = is_window_managed(hwnd, swp_flags, fullscreen)) && surface) owner = owner_hint;
+ 
+     if (!(data = wayland_win_data_get(hwnd))) return;
+-    owner_data = owner && owner != hwnd ? wayland_win_data_get_nolock(owner) : NULL;
++    owner_data = owner && owner != hwnd ? wayland_win_data_get(owner) : NULL;
+     owner_surface = owner_data ? owner_data->wayland_surface : NULL;
+ 
+     data->rects = *new_rects;
+@@ -482,6 +467,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+         wayland_win_data_update_wayland_state(data);
+     }
+ 
++    if (owner_data) wayland_win_data_release(owner_data);
+     wayland_win_data_release(data);
+ }
+ 
+@@ -902,3 +888,13 @@ void ensure_window_surface_contents(HWND hwnd)
+ 
+     wayland_win_data_release(data);
+ }
++
++void wayland_window_init(void)
++{
++    pthread_mutexattr_t attr;
++
++    pthread_mutexattr_init(&attr);
++    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
++    pthread_mutex_init(&win_data_mutex, &attr);
++    pthread_mutexattr_destroy(&attr);
++}
+-- 
+2.55.0
+

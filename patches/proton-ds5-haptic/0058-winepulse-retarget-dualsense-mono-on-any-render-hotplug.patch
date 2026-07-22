@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Thu, 9 Jul 2026 09:30:00 -0600
+Subject: [PATCH] winepulse: Retarget DualSense mono streams on render hotplug.
+
+Spider-Man Remastered keeps a controller mono speaker IAudioClient alive across
+controller swaps. The stream was only retargeted when the mono speaker add
+generation changed, but DS Edge -> DS swaps can leave the existing stream
+writing to the removed controller even after the replacement controller's
+speaker endpoint is visible.
+
+Use the broader DualSense render hotplug generation as an additional retarget
+trigger, and remember streams that were created for DualSense mono output so
+the retarget path still runs after their old PulseAudio stream has been
+invalidated. Also retarget registered mono streams as soon as a replacement
+DualSense speaker sink is added, since Spider-Man can stop touching the old
+mono client after the original sink disappears. When retargeting, detach the
+stream from its old Pulse period first so writes are scheduled against the new
+controller sink instead of the disconnected controller's period.
+---
+ dlls/winepulse.drv/pulse.c | 43 +++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 39 insertions(+), 4 deletions(-)
+
+diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+index 11111111111..22222222222 100644
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -128,5 +128,6 @@ struct pulse_stream
+     struct list dualsense_mono_entry;
+     struct pulse_period *period;
++    BOOL dualsense_mono_stream;
+     BOOL dualsense_mono_registered;
+     BOOL dualsense_pulse_haptic_registered;
+     BOOL dualsense_mono_audio_active;
+@@ -581,8 +581,9 @@ again:
+     }
+ }
+ 
+ static BOOL pulse_refresh_devices(EDataFlow flow);
++static void pulse_retarget_dualsense_mono_streams(void);
+ 
+ /* for winepulse, this function can be called in a separate thread from other functions. */
+ /* this function cannot be called from multiple threads at the same time however. */
+ /* for the list variable, all devices in it must be ready by the end of the lock. */
+@@ -855,7 +857,7 @@ static BOOL pulse_stream_valid(struct pulse_stream *stream)
+ {
+     pa_stream_state_t state;
+ 
+-    if (stream->dualsense_mono_registered)
++    if (stream->dualsense_mono_stream || stream->dualsense_mono_registered)
+         return TRUE;
+ 
+     if (!stream->stream)
+@@ -1578,4 +1580,5 @@ static BOOL pulse_refresh_devices(EDataFlow flow)
+     struct list *active = flow == eRender ? &g_phys_speakers : &g_phys_sources;
+     struct list *added = flow == eRender ? &g_phys_speakers_added : &g_phys_sources_added;
+     struct list *removed = flow == eRender ? &g_phys_speakers_removed : &g_phys_sources_removed;
++    BOOL dualsense_speaker_added = FALSE;
+     PhysDevice *dev, *next;
+@@ -1641,5 +1644,8 @@ static BOOL pulse_refresh_devices(EDataFlow flow)
+         {
+             ++g_haptic_hotplug_generation;
+             if (is_dualsense_speaker_sink(dev))
++            {
+                 ++g_dualsense_mono_speaker_add_generation;
++                dualsense_speaker_added = TRUE;
++            }
+         }
+@@ -1667,5 +1673,12 @@ static BOOL pulse_refresh_devices(EDataFlow flow)
+     LIST_FOR_EACH_ENTRY_SAFE(dev, next, &current, PhysDevice, entry)
+         pulse_dev_free(dev);
+ 
++    if (dualsense_speaker_added)
++    {
++        pulse_lock();
++        pulse_retarget_dualsense_mono_streams();
++        pulse_unlock();
++    }
++
+     pthread_cond_broadcast(&g_phys_cond);
+     return TRUE;
+@@ -2376,14 +2389,17 @@ static HRESULT pulse_retarget_dualsense_mono_stream(struct pulse_stream *stream)
+     int success;
+     HRESULT hr;
+ 
+-    if (!stream->dualsense_mono_registered && !pulse_stream_dualsense_mono(stream))
++    if (!stream->dualsense_mono_stream && !stream->dualsense_mono_registered
++            && !pulse_stream_dualsense_mono(stream))
+         return S_FALSE;
+ 
+     if (!(dualsense_speaker = get_dualsense_speaker_sink(NULL, TRUE)))
+         return E_FAIL;
+ 
+     TRACE("Retargeting DualSense mono stream %p from %s to %s.\n",
+             stream, debugstr_a(stream->device), debugstr_a(dualsense_speaker));
+ 
++    remove_stream_from_period(stream);
++    stream->period = NULL;
+     pulse_stream_disconnect(stream);
+     free(stream->device);
+@@ -2411,5 +2425,20 @@ static HRESULT pulse_retarget_dualsense_mono_stream(struct pulse_stream *stream)
+ 
+     return hr;
+ }
++
++static void pulse_retarget_dualsense_mono_streams(void)
++{
++    struct pulse_stream *stream, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE(stream, next, &dualsense_mono_streams, struct pulse_stream, dualsense_mono_entry)
++    {
++        if (stream->dualsense_mono_hotplug_generation == g_dualsense_mono_speaker_add_generation
++                && stream->haptic_hotplug_generation == g_haptic_hotplug_generation
++                && pulse_stream_ready(stream))
++            continue;
++
++        pulse_retarget_dualsense_mono_stream(stream);
++    }
++}
+ 
+ static char *find_dualsense_haptic_alsa_path(void)
+@@ -2944,6 +2973,7 @@ static NTSTATUS pulse_create_stream(void *args)
+             stream->haptic_hotplug_generation = g_haptic_hotplug_generation;
+         if (dualsense_mono_candidate)
+         {
++            stream->dualsense_mono_stream = TRUE;
+             stream->dualsense_mono_hotplug_generation = g_dualsense_mono_speaker_add_generation;
+             list_add_tail(&dualsense_mono_streams, &stream->dualsense_mono_entry);
+             stream->dualsense_mono_registered = TRUE;
+@@ -3176,8 +3206,10 @@ static void pulse_write(struct pulse_stream *stream)
+         return;
+     }
+ 
+-    if (stream->dualsense_mono_registered
+-            && stream->dualsense_mono_hotplug_generation != g_dualsense_mono_speaker_add_generation
++    if ((stream->dualsense_mono_stream || stream->dualsense_mono_registered || pulse_stream_dualsense_mono(stream))
++            && (stream->dualsense_mono_hotplug_generation != g_dualsense_mono_speaker_add_generation
++                || stream->haptic_hotplug_generation != g_haptic_hotplug_generation
++                || !pulse_stream_ready(stream))
+             && FAILED(pulse_retarget_dualsense_mono_stream(stream)))
+         return;
+ 
+-- 
+2.54.0

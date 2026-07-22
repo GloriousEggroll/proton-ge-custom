@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@proton.me>
+Date: Tue, 21 Jul 2026 00:00:00 -0600
+Subject: [PATCH] winedmo: propagate real video decoder format changes
+
+The no-op format-change handling added for Yakuza 5 also retried real
+decoder layout changes internally when the new sample fit in the caller's
+old allocation. This exposed a frame using the new dimensions before the
+source reader could propagate the new media type downstream.
+
+Killing Floor 3 negotiates a 1920x1080 H.264 output before the decoder
+discovers that a skills video is 960x544. Returning the smaller NV12 frame
+without a stream-change notification leaves Unreal copying 1920-byte rows
+from a 960-byte source and causes a render-thread access violation.
+
+Continue ignoring no-op notifications, but report every real media layout
+change through MF_E_TRANSFORM_STREAM_CHANGE. The updated current type is
+then available to the source reader before the pending frame is returned.
+---
+ dlls/winedmo/video_decoder.c | 32 +++-----------------------------
+ 1 file changed, 3 insertions(+), 29 deletions(-)
+
+--- a/dlls/winedmo/video_decoder.c
++++ b/dlls/winedmo/video_decoder.c
+@@ -1489,7 +1489,6 @@ static HRESULT WINAPI transform_ProcessOutput(IMFTransform *iface, DWORD flags,
+     INT64 output_pts, output_dur;
+     DWORD out_flags;
+     NTSTATUS ntstatus;
+-    BOOL retried_format_change = FALSE;
+     HRESULT hr;
+ 
+     TRACE("iface %p, flags %#lx, count %lu, samples %p, status %p.\n", iface, flags, count, samples, status);
+@@ -1505,7 +1504,6 @@ static HRESULT WINAPI transform_ProcessOutput(IMFTransform *iface, DWORD flags,
+         return E_INVALIDARG;
+     provided_sample = sample;
+ 
+-retry:
+     if (FAILED(hr = IMFMediaType_GetGUID(decoder->output_type, &MF_MT_SUBTYPE, &subtype)))
+         return hr;
+     if (FAILED(hr = IMFMediaType_GetUINT64(decoder->output_type, &MF_MT_FRAME_SIZE, &frame_size)))
+@@ -1545,37 +1543,9 @@ retry:
+             goto done;
+         if (type_changed)
+         {
+-            UINT32 new_sample_size;
+-            UINT64 new_frame_size;
+-            GUID new_subtype;
+-
+-            if (!retried_format_change
+-                    && SUCCEEDED(IMFMediaType_GetGUID(decoder->output_type, &MF_MT_SUBTYPE, &new_subtype))
+-                    && SUCCEEDED(IMFMediaType_GetUINT64(decoder->output_type, &MF_MT_FRAME_SIZE, &new_frame_size))
+-                    && SUCCEEDED(MFCalculateImageSize(&new_subtype, new_frame_size >> 32,
+-                            (UINT32)new_frame_size, &new_sample_size))
+-                    && new_sample_size <= sample_size)
+-            {
+-                retried_format_change = TRUE;
+-                if (buffer)
+-                {
+-                    IMFMediaBuffer_Release(buffer);
+-                    buffer = NULL;
+-                }
+-                if (decode_sample)
+-                {
+-                    IMFSample_Release(decode_sample);
+-                    decode_sample = NULL;
+-                }
+-                sample = provided_sample;
+-                goto retry;
+-            }
+-            else
+-            {
+-                samples[0].dwStatus |= MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE;
+-                *status |= MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE;
+-                hr = MF_E_TRANSFORM_STREAM_CHANGE;
+-            }
++            samples[0].dwStatus |= MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE;
++            *status |= MFT_OUTPUT_DATA_BUFFER_FORMAT_CHANGE;
++            hr = MF_E_TRANSFORM_STREAM_CHANGE;
+             goto done;
+         }
+ 
+-- 
+2.50.1

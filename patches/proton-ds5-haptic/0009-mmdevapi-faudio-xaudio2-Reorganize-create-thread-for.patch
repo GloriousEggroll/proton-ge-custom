@@ -1,0 +1,492 @@
+From ca2445d1d53b308163439a13150d771e9da4bb9d Mon Sep 17 00:00:00 2001
+From: JS Deck <jsdeckerido@gmail.com>
+Date: Wed, 24 Jun 2026 13:38:53 -0300
+Subject: [PATCH 09/11] mmdevapi/faudio/xaudio2: Reorganize create thread for
+ mastering audio; get default audio endpoint directly.
+
+---
+ libs/faudio/src/FAudio.c                |  33 +++-
+ libs/faudio/src/FAudio_internal.h       |   3 +
+ libs/faudio/src/FAudio_platform_win32.c | 216 ++++++++++++++++--------
+ 3 files changed, 183 insertions(+), 69 deletions(-)
+
+diff --git a/libs/faudio/src/FAudio.c b/libs/faudio/src/FAudio.c
+index 3944721d9cc..8bb047d21b7 100644
+--- a/libs/faudio/src/FAudio.c
++++ b/libs/faudio/src/FAudio.c
+@@ -130,6 +130,8 @@ uint32_t FAudioCOMConstructWithCustomAllocatorEXT(
+ #ifndef FAUDIO_DISABLE_DEBUGCONFIGURATION
+ 	FAudio_SetDebugConfiguration(*ppFAudio, &debugInit, NULL);
+ #endif /* FAUDIO_DISABLE_DEBUGCONFIGURATION */
++	(*ppFAudio)->platformLock = FAudio_PlatformCreateMutex();
++	LOG_MUTEX_CREATE((*ppFAudio), (*ppFAudio)->platformLock)
+ 	(*ppFAudio)->sourceLock = FAudio_PlatformCreateMutex();
+ 	LOG_MUTEX_CREATE((*ppFAudio), (*ppFAudio)->sourceLock)
+ 	(*ppFAudio)->submixLock = FAudio_PlatformCreateMutex();
+@@ -182,6 +184,8 @@ uint32_t FAudio_Release(FAudio *audio)
+ 		audio->pFree(audio->decodeCache);
+ 		audio->pFree(audio->resampleCache);
+ 		audio->pFree(audio->effectChainCache);
++		LOG_MUTEX_DESTROY(audio, audio->platformLock)
++		FAudio_PlatformDestroyMutex(audio->platformLock);
+ 		LOG_MUTEX_DESTROY(audio, audio->sourceLock)
+ 		FAudio_PlatformDestroyMutex(audio->sourceLock);
+ 		LOG_MUTEX_DESTROY(audio, audio->submixLock)
+@@ -768,6 +772,9 @@ static uint32_t CreateMasteringVoiceImpl(
+ 		&DATAFORMAT_SUBTYPE_IEEE_FLOAT
+ 	);
+ 
++	FAudio_PlatformLockMutex(audio->platformLock);
++	LOG_MUTEX_LOCK(audio, audio->platformLock)
++
+ 	/* Platform Device */
+ 	FAudio_PlatformInit(
+ 		audio,
+@@ -783,6 +790,9 @@ static uint32_t CreateMasteringVoiceImpl(
+ 		FAudioVoice_DestroyVoice(*ppMasteringVoice);
+ 		*ppMasteringVoice = NULL;
+ 
++		FAudio_PlatformUnlockMutex(audio->platformLock);
++		LOG_MUTEX_UNLOCK(audio, audio->platformLock)
++
+ 		/* Not the best code, but it's probably true? */
+ 		return FAUDIO_E_DEVICE_INVALIDATED;
+ 	}
+@@ -799,6 +809,11 @@ static uint32_t CreateMasteringVoiceImpl(
+ 		);
+ 	}
+ 
++	FAudio_PlatformAudioThread(audio->platform);
++
++	FAudio_PlatformUnlockMutex(audio->platformLock);
++	LOG_MUTEX_UNLOCK(audio, audio->platformLock)
++
+ 	return 0;
+ }
+ 
+@@ -2431,11 +2446,15 @@ static void destroy_voice(FAudioVoice *voice)
+ 	}
+ 	else if (voice->type == FAUDIO_VOICE_MASTER)
+ 	{
++		FAudio_PlatformLockMutex(voice->audio->platformLock);
++		LOG_MUTEX_LOCK(voice->audio, voice->audio->platformLock)
+ 		if (voice->audio->platform != NULL)
+ 		{
+ 			FAudio_PlatformQuit(voice->audio->platform);
+ 			voice->audio->platform = NULL;
+ 		}
++		FAudio_PlatformUnlockMutex(voice->audio->platformLock);
++		LOG_MUTEX_UNLOCK(voice->audio, voice->audio->platformLock)
+ 		if (voice->master.effectCache != NULL)
+ 		{
+ 			voice->audio->pFree(voice->master.effectCache);
+@@ -2582,11 +2601,11 @@ uint32_t FAudioSourceVoice_Start(
+ 		return 0;
+ 	}
+ 
+-
+ 	FAudio_assert(voice->type == FAUDIO_VOICE_SOURCE);
+ 
+ 	FAudio_assert(Flags == 0);
+ 	voice->src.active = 1;
++
+ 	LOG_API_EXIT(voice->audio)
+ 	return 0;
+ }
+@@ -2631,6 +2650,7 @@ uint32_t FAudioSourceVoice_SubmitSourceBuffer(
+ 	uint32_t adpcmMask, *adpcmByteCount;
+ 	uint32_t playBegin, playLength, loopBegin, loopLength, bufferLength;
+ 	FAudioBufferEntry *entry, *list;
++	uint32_t status = 0;
+ 
+ 	LOG_API_ENTER(voice->audio)
+ 	LOG_INFO(
+@@ -2655,6 +2675,17 @@ uint32_t FAudioSourceVoice_SubmitSourceBuffer(
+ 			(voice->src.wmadec == NULL && (pBufferWMA == NULL && voice->src.format->wFormatTag != FAUDIO_FORMAT_XMAUDIO2))	);
+ #endif /* HAVE_WMADEC */
+ 
++	FAudio_PlatformLockMutex(voice->audio->platformLock);
++	LOG_MUTEX_LOCK(voice->audio, voice->audio->platformLock)
++	if (voice->audio->platform)
++		status = FAudio_PlatformStatus(voice->audio->platform);
++	FAudio_PlatformUnlockMutex(voice->audio->platformLock);
++	LOG_MUTEX_UNLOCK(voice->audio, voice->audio->platformLock)
++	if (status) {
++		LOG_API_EXIT(voice->audio)
++		return status;
++	}
++
+ 	/* Start off with whatever they just sent us... */
+ 	playBegin = pBuffer->PlayBegin;
+ 	playLength = pBuffer->PlayLength;
+diff --git a/libs/faudio/src/FAudio_internal.h b/libs/faudio/src/FAudio_internal.h
+index 5c582d068c6..54ac2e71971 100644
+--- a/libs/faudio/src/FAudio_internal.h
++++ b/libs/faudio/src/FAudio_internal.h
+@@ -462,6 +462,7 @@ struct FAudio
+ 
+ 	/* Platform opaque pointer */
+ 	void *platform;
++	FAudioMutex platformLock;
+ };
+ 
+ struct FAudioVoice
+@@ -801,6 +802,8 @@ void FAudio_PlatformInit(
+ 	uint32_t *updateSize,
+ 	void** platformDevice
+ );
++void FAudio_PlatformAudioThread(void* platformDevice);
++uint32_t FAudio_PlatformStatus(void* platformDevice);
+ void FAudio_PlatformQuit(void* platformDevice);
+ 
+ uint32_t FAudio_PlatformGetDeviceCount(void);
+diff --git a/libs/faudio/src/FAudio_platform_win32.c b/libs/faudio/src/FAudio_platform_win32.c
+index 59d653317bb..4964e12812e 100644
+--- a/libs/faudio/src/FAudio_platform_win32.c
++++ b/libs/faudio/src/FAudio_platform_win32.c
+@@ -47,13 +47,6 @@ static CRITICAL_SECTION faudio_cs = { NULL, -1, 0, 0, 0, 0 };
+ static IMMDeviceEnumerator *device_enumerator;
+ static HRESULT init_hr = -1;
+ 
+-struct FAudioWin32PlatformData
+-{
+-	IAudioClient *client;
+-	HANDLE audioThread;
+-	HANDLE stopEvent;
+-};
+-
+ struct FAudioAudioClientThreadArgs
+ {
+ 	WAVEFORMATEXTENSIBLE format;
+@@ -63,6 +56,17 @@ struct FAudioAudioClientThreadArgs
+ 	UINT updateSize;
+ };
+ 
++struct FAudioWin32PlatformData
++{
++	struct FAudioAudioClientThreadArgs *args;
++	FAudio *audio;
++	IAudioClient *client;
++	HANDLE audioThread;
++	HANDLE stopEvent;
++	CRITICAL_SECTION threadCs;
++	REFERENCE_TIME duration;
++};
++
+ void FAudio_Log(char const *msg)
+ {
+ 	OutputDebugStringA(msg);
+@@ -73,9 +77,17 @@ static HRESULT (WINAPI *my_SetThreadDescription)(HANDLE, PCWSTR) = NULL;
+ 
+ static void FAudio_resolve_SetThreadDescription(void)
+ {
++	EnterCriticalSection(&faudio_cs);
++	if (my_SetThreadDescription) {
++		LeaveCriticalSection(&faudio_cs);
++		return;
++	}
++
+ 	kernelbase = LoadLibraryA("kernelbase.dll");
+-	if (!kernelbase)
++	if (!kernelbase) {
++		LeaveCriticalSection(&faudio_cs);
+ 		return;
++	}
+ 
+ 	my_SetThreadDescription = (HRESULT (WINAPI *)(HANDLE, PCWSTR)) GetProcAddress(kernelbase, "SetThreadDescription");
+ 	if (!my_SetThreadDescription)
+@@ -83,6 +95,7 @@ static void FAudio_resolve_SetThreadDescription(void)
+ 		FreeLibrary(kernelbase);
+ 		kernelbase = NULL;
+ 	}
++	LeaveCriticalSection(&faudio_cs);
+ }
+ 
+ static void FAudio_set_thread_name(char const *name)
+@@ -90,6 +103,9 @@ static void FAudio_set_thread_name(char const *name)
+ 	int ret;
+ 	WCHAR *nameW;
+ 
++	if (!my_SetThreadDescription)
++		FAudio_resolve_SetThreadDescription();
++
+ 	if (!my_SetThreadDescription)
+ 		return;
+ 
+@@ -207,6 +223,8 @@ static DWORD WINAPI FAudio_AudioClientThread(void *user)
+ fail_release:
+ 	IAudioRenderClient_Release(render_client);
+ fail_free:
++	CloseHandle(args->events[0]);
++	IAudioClient_Release(args->client);
+ 	FAudio_free(args);
+ 	return 0;
+ }
+@@ -350,6 +368,16 @@ static HRESULT FAudio_OpenDevice(uint32_t deviceIndex, const uint16_t *deviceId,
+ 		);
+ 	}
+ 
++	if (deviceIndex == 0) {
++		/* Default device. */
++		return IMMDeviceEnumerator_GetDefaultAudioEndpoint(
++			device_enumerator,
++			eRender,
++			eConsole,
++			device
++		);
++	}
++
+ 	hr = IMMDeviceEnumerator_EnumAudioEndpoints(
+ 		device_enumerator,
+ 		eRender,
+@@ -369,10 +397,7 @@ static HRESULT FAudio_OpenDevice(uint32_t deviceIndex, const uint16_t *deviceId,
+ 		return hr;
+ 	}
+ 
+-	if (deviceIndex == 0) {
+-		/* Default device. */
+-		actualIndex = defaultDeviceIndex;
+-	} else if (deviceIndex == defaultDeviceIndex) {
++	if (deviceIndex == defaultDeviceIndex) {
+ 		/* Open the device at index 0 instead of the "correct" one. */
+ 		actualIndex = 0;
+ 	} else {
+@@ -392,6 +417,93 @@ static HRESULT FAudio_OpenDevice(uint32_t deviceIndex, const uint16_t *deviceId,
+ 	return hr;
+ }
+ 
++uint32_t FAudio_PlatformStatus(void* platformDevice) {
++	struct FAudioWin32PlatformData *data = platformDevice;
++	uint32_t status = 0;
++	DWORD threadStatus = 0;
++	EnterCriticalSection(&data->threadCs);
++	if (
++		!data->args ||
++		(
++			data->audioThread &&
++			(!GetExitCodeThread(data->audioThread, &threadStatus) || threadStatus != STILL_ACTIVE)
++		)
++	)
++		status = FAUDIO_E_DEVICE_INVALIDATED;
++	LeaveCriticalSection(&data->threadCs);
++	return status;
++}
++
++void FAudio_PlatformAudioThread(void* platformDevice) {
++	HRESULT hr;
++	struct FAudioWin32PlatformData *data = platformDevice;
++	struct FAudioAudioClientThreadArgs *args = data->args;
++
++	HANDLE audioEvent = NULL;
++
++	EnterCriticalSection(&data->threadCs);
++	if (!data->args || data->audioThread) {
++		LeaveCriticalSection(&data->threadCs);
++		return;
++	}
++
++	audioEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
++	if (!audioEvent)
++		/* Failed to create FAudio thread buffer event! */
++		goto fail_args;
++
++	data->stopEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
++	if (!data->stopEvent)
++		/* Failed to create FAudio thread stop event! */
++		goto fail_close_audio_evt;
++
++	args->client = data->client;
++	args->events[0] = audioEvent;
++	args->events[1] = data->stopEvent;
++	args->audio = data->audio;
++
++	hr = IAudioClient_Initialize(
++		data->client,
++		AUDCLNT_SHAREMODE_SHARED,
++		AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
++		data->duration * 3,
++		0,
++		&args->format.Format,
++		&GUID_NULL
++	);
++	if (FAILED(hr))
++		/* Failed to initialize audio client! */
++		goto fail_close_stop_evt;
++
++	hr = IAudioClient_SetEventHandle(data->client, audioEvent);
++	if (FAILED(hr))
++		/* Failed to set audio client event! */
++		goto fail_close_stop_evt;
++
++
++	data->audioThread = CreateThread(NULL, 0, &FAudio_AudioClientThread, args, 0, NULL);
++	if (!data->audioThread)
++		/* Failed to create audio client thread! */
++		goto fail_close_stop_evt;
++
++	data->client = NULL;
++	LeaveCriticalSection(&data->threadCs);
++	return;
++
++fail_close_stop_evt:
++	CloseHandle(data->stopEvent);
++	data->stopEvent = NULL;
++fail_close_audio_evt:
++	CloseHandle(audioEvent);
++fail_args:
++	IAudioClient_Release(data->client);
++	data->client = NULL;
++	FAudio_free(data->args);
++	data->args = NULL;
++	LeaveCriticalSection(&data->threadCs);
++	return;
++}
++
+ void FAudio_PlatformInit(
+ 	FAudio *audio,
+ 	uint32_t flags,
+@@ -406,7 +518,6 @@ void FAudio_PlatformInit(
+ 	REFERENCE_TIME duration;
+ 	IMMDevice *device = NULL;
+ 	HRESULT hr;
+-	HANDLE audioEvent = NULL;
+ 	BOOL has_sse2 = IsProcessorFeaturePresent(PF_XMMI64_INSTRUCTIONS_AVAILABLE);
+ #if defined(__aarch64__) || defined(_M_ARM64) || defined(__arm64ec__) || defined(_M_ARM64EC)
+ 	BOOL has_neon = TRUE;
+@@ -416,7 +527,6 @@ void FAudio_PlatformInit(
+ 	BOOL has_neon = FALSE;
+ #endif
+ 	FAudio_INTERNAL_InitSIMDFunctions(has_sse2, has_neon);
+-	FAudio_resolve_SetThreadDescription();
+ 
+ 	FAudio_PlatformAddRef();
+ 
+@@ -452,20 +562,10 @@ void FAudio_PlatformInit(
+ 		);
+ 	}
+ 
+-	audioEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+-	if (!audioEvent)
+-		/* Failed to create FAudio thread buffer event! */
+-		goto fail_free_data;
+-
+-	data->stopEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+-	if (!data->stopEvent)
+-		/* Failed to create FAudio thread stop event! */
+-		goto fail_close_audio_evt;
+-
+ 	hr = FAudio_OpenDevice(deviceIndex, deviceId, &device);
+ 	if (!device)
+ 		/* Failed to get audio device! */
+-		goto fail_close_stop_evt;
++		goto fail_free_data;
+ 
+ 	hr = IMMDevice_Activate(
+ 		device,
+@@ -482,24 +582,6 @@ void FAudio_PlatformInit(
+ 	if (flags & FAUDIO_1024_QUANTUM) duration = 213333;
+ 	else duration = 100000;
+ 
+-	hr = IAudioClient_Initialize(
+-		data->client,
+-		AUDCLNT_SHAREMODE_SHARED,
+-		AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+-		duration * 3,
+-		0,
+-		&args->format.Format,
+-		&GUID_NULL
+-	);
+-	if (FAILED(hr))
+-		/* Failed to initialize audio client! */
+-		goto fail_audio;
+-
+-	hr = IAudioClient_SetEventHandle(data->client, audioEvent);
+-	if (FAILED(hr))
+-		/* Failed to set audio client event! */
+-		goto fail_audio;
+-
+ 	mixFormat->Format.wFormatTag = args->format.Format.wFormatTag;
+ 	mixFormat->Format.nChannels = args->format.Format.nChannels;
+ 	mixFormat->Format.nSamplesPerSec = args->format.Format.nSamplesPerSec;
+@@ -523,18 +605,13 @@ void FAudio_PlatformInit(
+ 		mixFormat->Format.cbSize = sizeof(FAudioWaveFormatEx);
+ 	}
+ 
+-	args->client = data->client;
+-	args->events[0] = audioEvent;
+-	args->events[1] = data->stopEvent;
+-	args->audio = audio;
++	data->audio = audio;
++	data->args = args;
++	InitializeCriticalSection(&data->threadCs);
++
+ 	if (flags & FAUDIO_1024_QUANTUM) args->updateSize = (UINT)(args->format.Format.nSamplesPerSec / (1000.0 / (64.0 / 3.0)));
+ 	else args->updateSize = args->format.Format.nSamplesPerSec / 100;
+ 
+-	data->audioThread = CreateThread(NULL, 0, &FAudio_AudioClientThread, args, 0, NULL);
+-	if (!data->audioThread)
+-		/* Failed to create audio client thread! */
+-		goto fail_audio;
+-
+ 	*updateSize = args->updateSize;
+ 	*platformDevice = data;
+ 	return;
+@@ -543,10 +620,6 @@ fail_audio:
+ 	IAudioClient_Release(data->client);
+ fail_device:
+ 	IMMDevice_Release(device);
+-fail_close_stop_evt:
+-	CloseHandle(data->stopEvent);
+-fail_close_audio_evt:
+-	CloseHandle(audioEvent);
+ fail_free_data:
+ 	FAudio_free(data);
+ fail_free_args:
+@@ -560,9 +633,25 @@ void FAudio_PlatformQuit(void* platformDevice)
+ {
+ 	struct FAudioWin32PlatformData *data = platformDevice;
+ 
+-	SetEvent(data->stopEvent);
+-	WaitForSingleObject(data->audioThread, INFINITE);
+-	if (data->client) IAudioClient_Release(data->client);
++	EnterCriticalSection(&data->threadCs);
++	if (data->audioThread) {
++		if (data->stopEvent)
++			SetEvent(data->stopEvent);
++		WaitForSingleObject(data->audioThread, INFINITE);
++		CloseHandle(data->audioThread);
++		data->audioThread = NULL;
++	}
++	LeaveCriticalSection(&data->threadCs);
++	DeleteCriticalSection(&data->threadCs);
++	if (data->stopEvent) {
++		CloseHandle(data->stopEvent);
++		data->stopEvent = NULL;
++	}
++	if (data->client) {
++		IAudioClient_Release(data->client);
++		data->client = NULL;
++	}
++	FAudio_free(data);
+ 	if (kernelbase)
+ 	{
+ 		my_SetThreadDescription = NULL;
+@@ -691,15 +780,6 @@ uint32_t FAudio_PlatformGetDeviceDetails(
+ 		IMMDevice_Release(device);
+ 		device = NULL;
+ 	}
+-	else
+-	{
+-		count = FAudio_PlatformGetDeviceCount();
+-		if (index >= count)
+-		{
+-			ret = FAUDIO_E_INVALID_CALL;
+-			goto fail_release;
+-		}
+-	}
+ 
+ 	hr = FAudio_OpenDevice(index, deviceId, &device);
+ 	if (FAILED(hr))
+-- 
+2.54.0
+

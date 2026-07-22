@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Tue, 21 Jul 2026 03:15:00 -0600
+Subject: [PATCH] mmdevapi: Give Sony mono hotplug a second settle pass.
+
+DualShock 4 exposes its controller speaker path differently from
+DualSense and DualSense Edge: Pulse presents it as the controller's
+Analog Stereo sink, not as an Internal Mono Speaker sink.  Spider-Man
+Remastered can see the fresh DSH endpoint on the first hotplug and even
+enumerate it at the head of the render collection, but still activate
+the normal render default.  Replugging the same DSH later makes the game
+activate the controller endpoint and output effects correctly.
+
+Standard DualSense and DualSense Edge can hit the same failure mode
+after a different Sony controller model is removed and the replacement
+model is connected: the fresh endpoint is visible, but the game
+activates the normal render default until another hotplug cycle nudges
+its endpoint refresh path.
+
+Keep the stricter disconnect semantics: removed Sony controller
+endpoints are still deleted and forgotten, and the delayed pass only
+fires if the exact fresh endpoint is still active and visible.
+
+---
+ dlls/mmdevapi/devenum.c | 31 ++++++++++++++++++++++---------
+ 1 file changed, 22 insertions(+), 9 deletions(-)
+
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+index 6829618afa3..0825a706ad2 100644
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -799,6 +799,7 @@ enum dualsense_mono_model
+ {
+     DUALSENSE_MONO_MODEL_UNKNOWN,
+     DUALSENSE_MONO_MODEL_STANDARD,
++    DUALSENSE_MONO_MODEL_DUALSHOCK,
+     DUALSENSE_MONO_MODEL_EDGE,
+ };
+ 
+@@ -810,6 +811,9 @@ static enum dualsense_mono_model dualsense_mono_endpoint_model_name(const WCHAR
+     if (wcsstr(name, L"Edge"))
+         return DUALSENSE_MONO_MODEL_EDGE;
+ 
++    if (wcsstr(name, L"DualShock"))
++        return DUALSENSE_MONO_MODEL_DUALSHOCK;
++
+     return DUALSENSE_MONO_MODEL_STANDARD;
+ }
+ 
+@@ -847,6 +851,7 @@ struct endpoint_notification
+     EDataFlow flow;
+     GUID guid;
+     DWORD state;
++    enum dualsense_mono_model model;
+ };
+ 
+ struct delayed_endpoint_notifications
+@@ -925,6 +930,7 @@ static BOOL add_endpoint_notification(struct endpoint_notification **notification
+     (*notifications)[*count].flow = device->flow;
+     (*notifications)[*count].guid = device->devguid;
+     (*notifications)[*count].state = device->state;
++    (*notifications)[*count].model = dualsense_mono_endpoint_model(device);
+     (*count)++;
+     return TRUE;
+ }
+@@ -983,25 +989,30 @@ static DWORD WINAPI delayed_endpoint_notification_thread(void *arg)
+ {
+     struct delayed_endpoint_notifications *delayed = arg;
+-    unsigned int i;
+-    BOOL signaled = FALSE;
++    static const DWORD delays[] = { 300, 1200 };
++    unsigned int pass, i;
+ 
+-    Sleep(300);
+-
+-    for (i = 0; i < delayed->count; ++i)
++    for (pass = 0; pass < ARRAY_SIZE(delays); ++pass)
+     {
+-        if (!endpoint_notification_is_current_dualsense_mono(&delayed->notifications[i]))
+-            continue;
++        BOOL signaled = FALSE;
+ 
+-        TRACE("Delayed re-signaling DualSense mono endpoint add %s after hotplug settled.\n",
+-                debugstr_guid(&delayed->notifications[i].guid));
+-        notify_endpoint_added_state(delayed->notifications[i].flow, &delayed->notifications[i].guid,
+-                delayed->notifications[i].state);
+-        signaled = TRUE;
+-    }
++        Sleep(delays[pass]);
+ 
+-    if (signaled)
+-        notify_current_render_default_device_changed();
++        for (i = 0; i < delayed->count; ++i)
++        {
++            if (!endpoint_notification_is_current_dualsense_mono(&delayed->notifications[i]))
++                continue;
++
++            TRACE("Delayed re-signaling DualSense mono endpoint add %s after hotplug settled, pass %u.\n",
++                    debugstr_guid(&delayed->notifications[i].guid), pass + 1);
++            notify_endpoint_added_state(delayed->notifications[i].flow, &delayed->notifications[i].guid,
++                    delayed->notifications[i].state);
++            signaled = TRUE;
++        }
++
++        if (signaled)
++            notify_current_render_default_device_changed();
++    }
+ 
+     free(delayed->notifications);
+     free(delayed);
+     return 0;
+-- 
+2.54.0

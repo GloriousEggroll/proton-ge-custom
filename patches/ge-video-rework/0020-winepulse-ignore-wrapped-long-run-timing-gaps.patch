@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Sat, 11 Jul 2026 11:05:00 -0600
+Subject: [PATCH] winepulse: Ignore wrapped long-run timing gaps.
+
+Riddle Joker can lose audio after roughly 1 hour 33 minutes, then recover with
+severe glitching. The failure log shows Pulse timing reaching the 48 kHz stereo
+float stream's 2 GiB position boundary, then `pulse_write_index_catchup()`
+interpreting a wrapped/stale timing index as a huge positive
+`read_index - write_index` gap. From there the catchup path writes silence or
+0-byte chunks, the stream underflows, and the audio remains unstable.
+
+Only catch up plausible gaps bounded by the stream's Pulse/local buffer sizes.
+If Pulse reports a multi-gigabyte gap, treat it as invalid timing information
+and leave normal render writes to continue instead of poisoning the stream with
+catchup writes.
+
+Also store the timer adjustment as signed and fix the impossible reset
+condition so large timing errors actually reset the timer baseline.
+---
+ dlls/winepulse.drv/pulse.c | 27 +++++++++++++++++++++------
+ 1 file changed, 21 insertions(+), 6 deletions(-)
+
+diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+index 11111111111..22222222222 100644
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -74,7 +74,7 @@ struct pulse_period
+     char *device;
+     pa_usec_t period;
+     pa_usec_t timer_last_time, stream_time;
+-    pa_usec_t adjust;
++    int64_t adjust;
+     struct list streams;
+     pa_time_event *time_event;
+     struct pulse_stream *timer_stream;
+@@ -3289,8 +3289,9 @@
+ static void pulse_write_index_catchup(struct pulse_stream *stream)
+ {
+     const pa_timing_info *ti;
+-    UINT32 frame_size, to_write;
+-    int64_t write_index;
++    UINT32 frame_size, to_write, max_write;
++    uint64_t max_gap;
++    int64_t gap, write_index;
+ 
+     if (!pulse_stream_ready(stream))
+         return;
+@@ -3310,10 +3311,24 @@ static void pulse_write_index_catchup(struct pulse_stream *stream)
+     while (ti && ti->read_index > ti->write_index)
+     {
+         write_index = ti->write_index;
++        gap = ti->read_index - write_index;
+         TRACE("stream %p, running %d, read is ahead of write %lld bytes.\n", stream, stream->started,
+-              (long long)(ti->read_index - write_index));
++              (long long)gap);
+ 
+-        to_write = min(ti->read_index - write_index, min(stream->period_bytes, silence_buf_size)) / frame_size * frame_size;
++        max_gap = max(stream->period_bytes * 8, stream->real_bufsize_bytes);
++        if (stream->attr.maxlength != (uint32_t)-1)
++            max_gap = max(max_gap, (uint64_t)stream->attr.maxlength);
++        if (!max_gap)
++            max_gap = silence_buf_size;
++        if (gap <= 0 || (uint64_t)gap > max_gap)
++        {
++            WARN("Ignoring implausible Pulse timing gap %lld bytes, limit %llu.\n",
++                    (long long)gap, (unsigned long long)max_gap);
++            break;
++        }
++
++        max_write = min(stream->period_bytes, silence_buf_size);
++        to_write = min((uint64_t)gap, (uint64_t)max_write) / frame_size * frame_size;
+         if (!to_write) break;
+         if (!pulse_stream_ready(stream))
+             break;
+@@ -3562,7 +3577,7 @@ static void pulse_update_timing_cb(pa_stream *s, int success, void *user)
+         TRACE("stream %p, peropd diff %lld, stream diff %lld.\n", stream,
+               (long long)(period_stream_time - stream->timeline_start_period_time),
+               (long long)(stream_time - stream->timeline_start_stream_time));
+-        if (period->adjust < -5 * period->period && period->adjust > 5 * period->period)
++        if (period->adjust < -(int64_t)(5 * period->period) || period->adjust > (int64_t)(5 * period->period))
+         {
+             WARN("stream %p, resetting period timing (adjust %lld).\n", stream, (long long)period->adjust);
+             period->adjust = 0;
+-- 
+2.54.0

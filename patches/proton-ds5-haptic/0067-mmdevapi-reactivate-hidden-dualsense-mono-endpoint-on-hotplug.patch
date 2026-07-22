@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Thu, 9 Jul 2026 17:45:00 -0600
+Subject: [PATCH] mmdevapi: Reactivate hidden DualSense mono endpoints on
+ hotplug.
+
+Spider-Man Remastered binds to the controller mono speaker endpoint that it
+activated at startup. We hide that endpoint from later endpoint collections to
+avoid the endpoint enumeration crash, but on disconnect it was left as
+NOTPRESENT. When a replacement DualSense or DualSense Edge was attached, only
+the newly-created model-specific mono endpoint was signalled, so the game kept
+its old endpoint id and controller speaker effects stopped after the first
+model switch.
+
+When a DualSense mono speaker hotplug batch completes, prefer any hidden mono
+endpoint that was previously activated by the game. Reactivate it, update the
+registry state, and send the add/state notifications for that logical endpoint.
+If no hidden logical endpoint exists, keep the existing behavior and notify the
+visible newly-added mono endpoint.
+---
+ dlls/mmdevapi/devenum.c | 80 +++++++++++++++++++++++++++++++++--------
+ 1 file changed, 61 insertions(+), 19 deletions(-)
+
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+index 88888888888..99999999999 100644
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -780,6 +780,48 @@ static void notify_endpoint_added_state(EDataFlow flow, const GUID *id, DWORD st
+     LeaveCriticalSection(&g_notif_lock);
+ }
+ 
++static void set_device_state(MMDevice *device, DWORD state)
++{
++    HKEY key, root = device->flow == eRender ? key_render : key_capture;
++    WCHAR guidstr[39];
++
++    device->state = state;
++    StringFromGUID2(&device->devguid, guidstr, ARRAY_SIZE(guidstr));
++    if (RegCreateKeyExW(root, guidstr, 0, NULL, 0, KEY_WRITE | KEY_READ | KEY_WOW64_64KEY,
++            NULL, &key, NULL) == ERROR_SUCCESS)
++    {
++        RegSetValueExW(key, L"DeviceState", 0, REG_DWORD, (const BYTE *)&device->state, sizeof(DWORD));
++        RegCloseKey(key);
++    }
++}
++
++static BOOL add_endpoint_notification(struct endpoint_notification **notifications,
++        unsigned int *count, unsigned int *capacity, const MMDevice *device)
++{
++    struct endpoint_notification *new_notifications;
++    unsigned int new_capacity;
++
++    if (*count == *capacity)
++    {
++        new_capacity = *capacity ? *capacity * 2 : 2;
++        new_notifications = realloc(*notifications, new_capacity * sizeof(**notifications));
++        if (!new_notifications)
++        {
++            WARN("Failed to allocate DualSense mono endpoint hotplug notifications.\n");
++            return FALSE;
++        }
++
++        *notifications = new_notifications;
++        *capacity = new_capacity;
++    }
++
++    (*notifications)[*count].flow = device->flow;
++    (*notifications)[*count].guid = device->devguid;
++    (*notifications)[*count].state = device->state;
++    (*count)++;
++    return TRUE;
++}
++
+ static void resignal_visible_dualsense_mono_endpoints(void)
+ {
+     struct endpoint_notification *notifications = NULL;
+@@ -789,28 +831,29 @@ static void resignal_visible_dualsense_mono_endpoints(void)
+     EnterCriticalSection(&device_list_cs);
+     LIST_FOR_EACH_ENTRY(device, &device_list, MMDevice, entry)
+     {
+-        if (!is_dualsense_mono_endpoint(device) || should_hide_from_endpoint_collection(device))
++        if (!is_dualsense_mono_endpoint(device) || !device->hide_from_collection)
+             continue;
+ 
+-        if (count == capacity)
++        if (!(device->state & DEVICE_STATE_ACTIVE))
+         {
+-            struct endpoint_notification *new_notifications;
+-            unsigned int new_capacity = capacity ? capacity * 2 : 2;
+-
+-            new_notifications = realloc(notifications, new_capacity * sizeof(*notifications));
+-            if (!new_notifications)
+-            {
+-                WARN("Failed to allocate DualSense mono endpoint hotplug notifications.\n");
+-                break;
+-            }
+-
+-            notifications = new_notifications;
+-            capacity = new_capacity;
++            TRACE("Reactivating hidden DualSense mono endpoint %s after replacement speaker hotplug.\n",
++                    debugstr_guid(&device->devguid));
++            set_device_state(device, DEVICE_STATE_ACTIVE);
+         }
+ 
+-        notifications[count].flow = device->flow;
+-        notifications[count].guid = device->devguid;
+-        notifications[count].state = device->state;
+-        count++;
++        if (!add_endpoint_notification(&notifications, &count, &capacity, device))
++            break;
++    }
++
++    if (!count)
++    {
++        LIST_FOR_EACH_ENTRY(device, &device_list, MMDevice, entry)
++        {
++            if (!is_dualsense_mono_endpoint(device) || should_hide_from_endpoint_collection(device))
++                continue;
++
++            if (!add_endpoint_notification(&notifications, &count, &capacity, device))
++                break;
++        }
+     }
+     LeaveCriticalSection(&device_list_cs);
+ 
+-- 
+2.54.0

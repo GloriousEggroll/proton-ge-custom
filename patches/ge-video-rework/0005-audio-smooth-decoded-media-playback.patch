@@ -23,16 +23,13 @@ This covers the audio regressions chased during the session:
 - Kirikiri-engine titles from the removed SteamGameId list use general WMA/AAC decoder behavior instead of forcing the input subtype/tag to PCM.
 
 The Pulse changes keep timer and buffer accounting stable when video playback is producing decoded audio in small bursts.
+
+This version intentionally does not reintroduce DualSense mono/haptic reconnect paths; those endpoints are now treated as removed on unplug and newly created on plug-in.
 ---
- dlls/msauddecmft/msauddecmft.c |   6 +-
- dlls/winepulse.drv/pulse.c     | 131 ++++++++++++++++++++++++++-------
- dlls/xaudio2_7/xaudio_dll.c    |  14 +++-
- 3 files changed, 121 insertions(+), 30 deletions(-)
-diff --git a/dlls/msauddecmft/msauddecmft.c b/dlls/msauddecmft/msauddecmft.c
-index 672389564a2..9928ddf92da 100644
---- a/dlls/msauddecmft/msauddecmft.c
-+++ b/dlls/msauddecmft/msauddecmft.c
-@@ -34,13 +34,14 @@ WINE_DEFAULT_DEBUG_CHANNEL(dmo);
+diff -urN a/dlls/msauddecmft/msauddecmft.c b/dlls/msauddecmft/msauddecmft.c
+--- a/dlls/msauddecmft/msauddecmft.c	2026-07-08 08:31:13.934373703 -0600
++++ b/dlls/msauddecmft/msauddecmft.c	2026-07-08 08:32:19.455744577 -0600
+@@ -34,13 +34,14 @@
  #include "initguid.h"
  
  DEFINE_MEDIATYPE_GUID(MFAudioFormat_RAW_AAC,WAVE_FORMAT_RAW_AAC1);
@@ -49,7 +46,7 @@ index 672389564a2..9928ddf92da 100644
  }
  
  static HRESULT WINAPI aac_decoder_factory_CreateInstance(IClassFactory *iface, IUnknown *outer,
-@@ -125,6 +126,7 @@ HRESULT WINAPI DllRegisterServer(void)
+@@ -125,6 +126,7 @@
      {
          {MFMediaType_Audio, MFAudioFormat_Vorbis},
          {MFMediaType_Audio, MFAudioFormat_Opus},
@@ -57,10 +54,9 @@ index 672389564a2..9928ddf92da 100644
      };
      MFT_REGISTER_TYPE_INFO audio_decoder_mft_outputs[] =
      {
-diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
-index 1965d8a257e..a6cc3f20921 100644
---- a/dlls/winepulse.drv/pulse.c
-+++ b/dlls/winepulse.drv/pulse.c
+diff -urN a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+--- a/dlls/winepulse.drv/pulse.c	2026-07-08 08:31:13.968566584 -0600
++++ b/dlls/winepulse.drv/pulse.c	2026-07-08 08:32:19.480456891 -0600
 @@ -27,7 +27,9 @@
  #include <stdarg.h>
  #include <stdlib.h>
@@ -71,8 +67,8 @@ index 1965d8a257e..a6cc3f20921 100644
  #include <math.h>
  #include <poll.h>
  
-@@ -126,6 +128,8 @@ struct pulse_stream
-     struct pulse_period *period;
+@@ -130,6 +132,8 @@
+     BOOL dualsense_mono_audio_active;
  };
  
 +static void pulse_write(struct pulse_stream *stream);
@@ -80,8 +76,8 @@ index 1965d8a257e..a6cc3f20921 100644
  typedef struct _ACPacket
  {
      struct list entry;
-@@ -182,6 +186,22 @@ static int pulse_cond_wait(void)
-     return pthread_cond_wait(&pulse_cond, &pulse_mutex);
+@@ -256,6 +260,22 @@
+     return pthread_cond_timedwait(&g_phys_cond, &g_phys_mutex, &ts);
  }
  
 +static int pulse_cond_timedwait_ms(unsigned int timeout_ms)
@@ -103,13 +99,13 @@ index 1965d8a257e..a6cc3f20921 100644
  static void pulse_broadcast(void)
  {
      pthread_cond_broadcast(&pulse_cond);
-@@ -410,14 +430,32 @@ static void pulse_contextcallback(pa_context *c, void *userdata)
+@@ -727,14 +747,32 @@
  
  static void pulse_stream_state(pa_stream *s, void *user)
  {
 +    struct pulse_stream *stream = user;
      pa_stream_state_t state = pa_stream_get_state(s);
-     TRACE("Stream state changed to %i\n", state);
+     TRACE("%p: Stream state changed to %i\n", user, state);
 +    if (stream && stream->dataflow == eRender && state == PA_STREAM_READY)
 +    {
 +        const pa_buffer_attr *attr = pa_stream_get_buffer_attr(s);
@@ -130,79 +126,22 @@ index 1965d8a257e..a6cc3f20921 100644
  static void pulse_attr_update(pa_stream *s, void *user) {
 +    struct pulse_stream *stream = user;
      const pa_buffer_attr *attr = pa_stream_get_buffer_attr(s);
-     TRACE("New attributes or device moved:\n");
+     TRACE("%p: New attributes or device moved:\n", user);
 +    if (stream && attr)
 +        stream->attr = *attr;
      dump_attr(attr);
  }
  
-@@ -447,6 +485,21 @@ static void silence_buffer(pa_sample_format_t format, BYTE *buffer, UINT32 bytes
- 
- static BOOL pulse_stream_valid(struct pulse_stream *stream)
- {
-+    pa_stream_state_t state;
-+
-+    if (!stream->stream)
-+        return stream->dataflow == eRender;
-+
-+    state = pa_stream_get_state(stream->stream);
-+
-+    return state == PA_STREAM_READY || (stream->dataflow == eRender && state == PA_STREAM_CREATING);
-+}
-+
-+static BOOL pulse_stream_ready(struct pulse_stream *stream)
-+{
-+    if (!stream->stream)
-+        return FALSE;
-+
-     return pa_stream_get_state(stream->stream) == PA_STREAM_READY;
- }
- 
-@@ -1199,7 +1252,8 @@ static HRESULT pulse_stream_connect(struct pulse_stream *stream, const char *pul
-     attr.minreq = attr.fragsize = period_bytes;
+@@ -2043,6 +2081,7 @@
      attr.tlength = period_bytes * 3;
      attr.maxlength = stream->bufsize_frames * pa_frame_size(&stream->ss);
      attr.prebuf = 0;
 +    stream->attr = attr;
      dump_attr(&attr);
  
-     /* If specific device was requested, use it exactly */
-@@ -1216,15 +1270,28 @@ static HRESULT pulse_stream_connect(struct pulse_stream *stream, const char *pul
-         WARN("Returns %i\n", ret);
-         return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
+     /* If specific device was requested, use it exactly. For PipeWire raw
+@@ -2733,7 +2772,7 @@
      }
--    while (pa_stream_get_state(stream->stream) == PA_STREAM_CREATING)
--        pulse_cond_wait();
--    if (pa_stream_get_state(stream->stream) != PA_STREAM_READY)
--        return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
--
-     if (stream->dataflow == eRender) {
-         pa_stream_set_underflow_callback(stream->stream, pulse_underflow_callback, stream);
-         pa_stream_set_started_callback(stream->stream, pulse_started_callback, stream);
-     }
-+    while (pa_stream_get_state(stream->stream) == PA_STREAM_CREATING)
-+    {
-+        if (pulse_cond_timedwait_ms(500) == ETIMEDOUT)
-+            break;
-+    }
-+    if (pa_stream_get_state(stream->stream) != PA_STREAM_READY)
-+    {
-+        if (stream->dataflow == eRender && pa_stream_get_state(stream->stream) == PA_STREAM_CREATING)
-+        {
-+            WARN("Render stream still creating; disconnecting Pulse stream and continuing locally.\n");
-+            pa_stream_disconnect(stream->stream);
-+            pa_stream_unref(stream->stream);
-+            stream->stream = NULL;
-+            return S_OK;
-+        }
-+        WARN("Stream failed to become ready, state %i\n", pa_stream_get_state(stream->stream));
-+        return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
-+    }
-     return S_OK;
- }
- 
-@@ -1309,7 +1376,7 @@ static NTSTATUS pulse_create_stream(void *args)
-     hr = pulse_stream_connect(stream, params->device, stream->period_bytes);
      if (SUCCEEDED(hr)) {
          UINT32 unalign;
 -        const pa_buffer_attr *attr = pa_stream_get_buffer_attr(stream->stream);
@@ -210,7 +149,7 @@ index 1965d8a257e..a6cc3f20921 100644
          SIZE_T size;
  
          stream->attr = *attr;
-@@ -1498,23 +1565,28 @@ write:
+@@ -2941,10 +2980,14 @@
  
  static void pulse_write_index_catchup(struct pulse_stream *stream)
  {
@@ -222,8 +161,11 @@ index 1965d8a257e..a6cc3f20921 100644
 +    if (!pulse_stream_ready(stream))
 +        return;
 +
-     ti = pa_stream_get_timing_info(stream->stream);
++    ti = pa_stream_get_timing_info(stream->stream);
      if (!ti || ti->read_index <= ti->write_index) return;
+     if (ti->read_index_corrupt || ti->write_index_corrupt)
+     {
+@@ -2954,15 +2997,21 @@
  
      if (!silence_buf) silence_buf = calloc(1, silence_buf_size);
      frame_size = pa_frame_size(&stream->ss);
@@ -239,163 +181,55 @@ index 1965d8a257e..a6cc3f20921 100644
 -        to_write = min(ti->read_index - write_index, silence_buf_size) / frame_size * frame_size;
 +        to_write = min(ti->read_index - write_index, min(stream->period_bytes, silence_buf_size)) / frame_size * frame_size;
 +        if (!to_write) break;
++        if (!pulse_stream_ready(stream))
++            break;
          pa_stream_write(stream->stream, silence_buf, to_write, NULL, 0, PA_SEEK_RELATIVE);
++        if (!pulse_stream_ready(stream))
++            break;
          ti = pa_stream_get_timing_info(stream->stream);
          if (ti && ti->write_index <= write_index)
-@@ -1530,7 +1602,12 @@ static void pulse_write(struct pulse_stream *stream)
-     /* write as much data to PA as we can */
-     UINT32 to_write;
-     BYTE *buf = stream->local_buffer + stream->pa_offs_bytes;
--    UINT32 bytes = pa_stream_writable_size(stream->stream);
-+    UINT32 bytes;
-+
-+    if (!pulse_stream_ready(stream))
-+        return;
-+
-+    bytes = pa_stream_writable_size(stream->stream);
- 
-     pulse_write_index_catchup(stream);
- 
-@@ -1696,17 +1773,20 @@ static void pa_streams_timer_cb(pa_mainloop_api *api, pa_time_event *e, const st
-     UINT32 adv_bytes;
-     int err;
- 
--    if (period->timer_stream && !period->timer_stream->started)
-+    if (period->timer_stream && (!period->timer_stream->started || !pulse_stream_ready(period->timer_stream)))
-         period->timer_stream = NULL;
- 
-     if (!period->timer_stream)
-     {
-         LIST_FOR_EACH_ENTRY(stream, &period->streams, struct pulse_stream, period_entry)
          {
--            if (stream->started)
-+            if (stream->started && pulse_stream_ready(stream))
-             {
-                 if ((err = pa_stream_get_time(stream->stream, &stream->stream_time)))
-+                {
-                     ERR("pa_stream_get_time error %d.\n", err);
-+                    continue;
-+                }
-                 stream->last_time = stream->stream_time;
-                 TRACE("period %p, stream %p is now timer stream, stream_time %llu.\n", period, stream, (long long)stream->stream_time);
-                 stream->stream_time -= period->period;
-@@ -1720,24 +1800,32 @@ static void pa_streams_timer_cb(pa_mainloop_api *api, pa_time_event *e, const st
-     if (period->timer_stream)
-     {
-         if ((err = pa_stream_get_time(period->timer_stream->stream, &stream_time)))
--            ERR("pa_stream_get_time error %d.\n", err);
--        if (stream_time > period->timer_stream->last_time)
-         {
--            period->timer_stream->stream_time += period->period;
--            adjust = period->timer_stream->stream_time - stream_time;
--            TRACE("period %p, stream_time %lld, adjust %lld.\n", period, (long long)stream_time, (long long)adjust);
--            if (adjust > (int64_t)(period->period / 3))
--                adjust = period->period / 3;
--            else if (adjust < -(int64_t)(period->period / 3))
--                adjust = -(int64_t)period->period / 3;
--            next_timer += adjust;
-+            ERR("pa_stream_get_time error %d.\n", err);
-+            period->timer_stream = NULL;
-         }
-         else
-         {
--            WARN("stream time did not advance, last_time %lld, stream_time %lld.\n",
--                    (long long)period->timer_stream->last_time, (long long)stream_time);
-+            if (stream_time > period->timer_stream->last_time)
-+            {
-+                period->timer_stream->stream_time += period->period;
-+                adjust = period->timer_stream->stream_time - stream_time;
-+                TRACE("period %p, stream_time %lld, adjust %lld.\n", period, (long long)stream_time, (long long)adjust);
-+                if (period->timer_stream->dataflow == eRender && adjust > 0)
-+                    adjust = 0;
-+                else if (adjust > (int64_t)(period->period / 3))
-+                    adjust = period->period / 3;
-+                else if (adjust < -(int64_t)(period->period / 3))
-+                    adjust = -(int64_t)period->period / 3;
-+                next_timer += adjust;
-+            }
-+            else
-+            {
-+                WARN("stream time did not advance, last_time %lld, stream_time %lld.\n",
-+                        (long long)period->timer_stream->last_time, (long long)stream_time);
-+            }
-+            period->timer_stream->last_time = stream_time;
-         }
--        period->timer_stream->last_time = stream_time;
+@@ -3211,7 +3263,7 @@
+ static void pa_streams_timer_cb(pa_mainloop_api *api, pa_time_event *e, const struct timeval *tv, void *userdata)
+ {
+     struct pulse_period *period = userdata;
+-    struct pulse_stream *stream;
++    struct pulse_stream *stream, *next;
+     BOOL reset_timeline = FALSE;
+     pa_usec_t next_timer;
+     int64_t adjust = 0;
+@@ -3229,7 +3281,7 @@
+         reset_timeline = TRUE;
      }
  
-     LIST_FOR_EACH_ENTRY(stream, &period->streams, struct pulse_stream, period_entry)
-@@ -1754,10 +1840,6 @@ static void pa_streams_timer_cb(pa_mainloop_api *api, pa_time_event *e, const st
-                 stream->lcl_offs_bytes %= stream->real_bufsize_bytes;
-                 stream->held_bytes -= adv_bytes;
+-    LIST_FOR_EACH_ENTRY(stream, &period->streams, struct pulse_stream, period_entry)
++    LIST_FOR_EACH_ENTRY_SAFE(stream, next, &period->streams, struct pulse_stream, period_entry)
+     {
+         if (stream->started)
+         {
+@@ -3238,16 +3290,18 @@
+                 stream->timeline_start_period_time = 0;
+                 stream->timeline_start_stream_time = 0;
              }
--            else if (stream->dataflow == eRender)
--            {
--                pulse_write_index_catchup(stream);
--            }
-             else if (stream->dataflow == eCapture)
+-            if (!stream->update_timing_info_pending && (o = pa_stream_update_timing_info(stream->stream, pulse_update_timing_cb, stream)))
++            if (!pulse_stream_haptic(stream) && !pulse_stream_ready(stream))
++                continue;
++            if (!pulse_stream_haptic(stream) && !stream->update_timing_info_pending && (o = pa_stream_update_timing_info(stream->stream, pulse_update_timing_cb, stream)))
              {
-                 pulse_read(stream);
-@@ -1859,12 +1941,13 @@ static NTSTATUS pulse_release_stream(void *args)
- 
-     pulse_lock();
-     remove_stream_from_period(stream);
--    if (PA_STREAM_IS_GOOD(pa_stream_get_state(stream->stream))) {
-+    if (stream->stream && PA_STREAM_IS_GOOD(pa_stream_get_state(stream->stream))) {
-         pa_stream_disconnect(stream->stream);
-         while (pulse_ml && PA_STREAM_IS_GOOD(pa_stream_get_state(stream->stream)))
-             pulse_cond_wait();
-     }
--    pa_stream_unref(stream->stream);
-+    if (stream->stream)
-+        pa_stream_unref(stream->stream);
-     pulse_unlock();
- 
-     if (stream->tmp_buffer) {
-@@ -1990,14 +2063,17 @@ static NTSTATUS pulse_start(void *args)
-         return STATUS_SUCCESS;
-     }
- 
--    pulse_write(stream);
--
--    if (pa_stream_is_corked(stream->stream))
-+    if (pulse_stream_ready(stream))
-     {
--        if (!wait_pa_operation_complete(pa_stream_cork(stream->stream, 0, pulse_op_cb, &success)))
--            success = 0;
--        if (!success)
--            params->result = E_FAIL;
-+        pulse_write(stream);
-+
-+        if (pa_stream_is_corked(stream->stream))
-+        {
-+            if (!wait_pa_operation_complete(pa_stream_cork(stream->stream, 0, pulse_op_cb, &success)))
-+                success = 0;
-+            if (!success)
-+                params->result = E_FAIL;
-+        }
-     }
- 
-     if (SUCCEEDED(params->result))
-@@ -2032,7 +2108,7 @@ static NTSTATUS pulse_stop(void *args)
-     }
- 
-     params->result = S_OK;
--    if (stream->dataflow == eRender)
-+    if (stream->dataflow == eRender && pulse_stream_ready(stream))
-     {
-         if (!wait_pa_operation_complete(pa_stream_cork(stream->stream, 1, pulse_op_cb, &success)))
-             success = 0;
-@@ -2076,7 +2152,7 @@ static NTSTATUS pulse_reset(void *args)
-     {
-         /* If there is still data in the render buffer it needs to be removed from the server */
-         int success = 0;
--        if (stream->held_bytes)
-+        if (stream->held_bytes && pulse_stream_ready(stream))
-             wait_pa_operation_complete(pa_stream_flush(stream->stream, pulse_op_cb, &success));
- 
-         if (success || !stream->held_bytes)
-@@ -2521,7 +2597,7 @@ static NTSTATUS pulse_get_latency(void *args)
+                 pa_operation_unref(o);
+                 stream->update_timing_info_pending = TRUE;
+             }
+-            else if (stream->update_timing_info_pending)
++            else if (!pulse_stream_haptic(stream) && stream->update_timing_info_pending)
+             {
+                 TRACE("pa_stream_update_timing_info is still pending.\n");
+             }
+-            else
++            else if (!pulse_stream_haptic(stream))
+             {
+                 ERR("pa_stream_update_timing_info err %d.\n", pa_context_errno(pulse_ctx));
+             }
+@@ -4024,7 +4078,7 @@
          params->result = AUDCLNT_E_DEVICE_INVALIDATED;
          return STATUS_SUCCESS;
      }
@@ -404,7 +238,7 @@ index 1965d8a257e..a6cc3f20921 100644
      if (stream->dataflow == eRender)
          lat = attr->minreq / pa_frame_size(&stream->ss);
      else
-@@ -2688,15 +2764,18 @@ static NTSTATUS pulse_set_sample_rate(void *args)
+@@ -4191,15 +4245,18 @@
      new_ss = stream->ss;
      new_ss.rate = params->rate;
  
@@ -429,45 +263,3 @@ index 1965d8a257e..a6cc3f20921 100644
          wait_pa_operation_complete(pa_stream_flush(stream->stream, pulse_op_cb, &success));
  
      stream->clock_lastpos = stream->clock_written = 0;
-diff --git a/dlls/xaudio2_7/xaudio_dll.c b/dlls/xaudio2_7/xaudio_dll.c
-index fe9351e8b4a..0f2e900fcfb 100644
---- a/dlls/xaudio2_7/xaudio_dll.c
-+++ b/dlls/xaudio2_7/xaudio_dll.c
-@@ -1748,6 +1748,7 @@ static HRESULT WINAPI IXAudio2Impl_CreateMasteringVoice(IXAudio2 *iface,
- {
-     IXAudio2Impl *This = impl_from_IXAudio2(iface);
-     FAudioEffectChain *chain;
-+    HRESULT hr;
- 
-     TRACE("(%p)->(%p, %u, %u, 0x%x, %p)\n", This,
-             ppMasteringVoice, inputChannels, inputSampleRate, flags, pEffectChain);
-@@ -1777,16 +1778,25 @@ static HRESULT WINAPI IXAudio2Impl_CreateMasteringVoice(IXAudio2 *iface,
- #if XAUDIO2_VER >= 8
-     TRACE("device id %s, category %#x\n", debugstr_w(deviceId), streamCategory);
- 
--    FAudio_CreateMasteringVoice8(This->faudio, &This->mst.faudio_voice, inputChannels,
-+    hr = FAudio_CreateMasteringVoice8(This->faudio, &This->mst.faudio_voice, inputChannels,
-             inputSampleRate, flags, NULL /* TODO: (uint16_t*)deviceId */,
-             This->mst.effect_chain, (FAudioStreamCategory)streamCategory);
- #else
-     TRACE("device index %u\n", index);
- 
--    FAudio_CreateMasteringVoice(This->faudio, &This->mst.faudio_voice, inputChannels,
-+    hr = FAudio_CreateMasteringVoice(This->faudio, &This->mst.faudio_voice, inputChannels,
-             inputSampleRate, flags, index, This->mst.effect_chain);
- #endif
- 
-+    if (FAILED(hr))
-+    {
-+        This->mst.effect_chain = NULL;
-+        *ppMasteringVoice = NULL;
-+        LeaveCriticalSection(&This->mst.lock);
-+        free_effect_chain(chain);
-+        return hr;
-+    }
-+
-     This->mst.in_use = TRUE;
- 
-     LeaveCriticalSection(&This->mst.lock);
--- 
-2.54.0

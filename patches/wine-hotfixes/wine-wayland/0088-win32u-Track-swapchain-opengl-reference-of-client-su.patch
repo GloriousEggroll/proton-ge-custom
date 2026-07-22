@@ -1,0 +1,109 @@
+From 171dff0a53d6af237ffd76927c2478bb0940751b Mon Sep 17 00:00:00 2001
+From: Etaash Mathamsetty
+ <45927311+Etaash-mathamsetty@users.noreply.github.com>
+Date: Sat, 18 Apr 2026 15:11:48 -0500
+Subject: [PATCH 088/193] win32u: Track swapchain/opengl reference of client
+ surface.
+
+---
+ dlls/win32u/opengl.c      | 12 ++++++++++--
+ dlls/win32u/vulkan.c      | 11 +++++++++++
+ include/wine/gdi_driver.h |  1 +
+ 3 files changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/win32u/opengl.c b/dlls/win32u/opengl.c
+index 03346f5b5f6..bb3a2e0eae0 100644
+--- a/dlls/win32u/opengl.c
++++ b/dlls/win32u/opengl.c
+@@ -117,7 +117,11 @@ void *opengl_drawable_create( UINT size, const struct opengl_drawable_funcs *fun
+     drawable->interval = INT_MIN;
+     drawable->doublebuffer = !!(pixel_formats[format - 1].pfd.dwFlags & PFD_DOUBLEBUFFER);
+     drawable->stereo = !!(pixel_formats[format - 1].pfd.dwFlags & PFD_STEREO);
+-    if ((drawable->client = client)) client_surface_add_ref( client );
++    if ((drawable->client = client))
++    {
++        client_surface_add_ref( client );
++        InterlockedIncrement( &client->busy_ref );
++    }
+     for (UINT i = 0; i < ARRAY_SIZE(drawable->buffer_map); i++) drawable->buffer_map[i] = GL_FRONT_LEFT + i;
+ 
+     TRACE( "created %s\n", debugstr_opengl_drawable( drawable ) );
+@@ -142,7 +146,11 @@ void opengl_drawable_release( struct opengl_drawable *drawable )
+ 
+         drawable->funcs->destroy( drawable );
+         if (drawable->surface) funcs->p_eglDestroySurface( egl->display, drawable->surface );
+-        if (drawable->client) client_surface_release( drawable->client );
++        if (drawable->client)
++        {
++            InterlockedDecrement( &drawable->client->busy_ref );
++            client_surface_release( drawable->client );
++        }
+         free( drawable );
+     }
+ }
+diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+index 911db797e49..8e2137f6824 100644
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -144,6 +144,7 @@ struct surface
+ {
+     struct vulkan_surface obj;
+     struct client_surface *client;
++    struct swapchain *swapchain;
+     HWND hwnd;
+ };
+ 
+@@ -2598,14 +2599,18 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
+                    create_info_host.imageFormat );
+     }
+ 
++    InterlockedIncrement( &surface->client->busy_ref );
++
+     if ((res = device->p_vkCreateSwapchainKHR( device->host.device, &create_info_host, NULL, &host_swapchain )))
+     {
++        InterlockedDecrement( &surface->client->busy_ref );
+         free( swapchain );
+         return res;
+     }
+ 
+     vulkan_object_init( &swapchain->obj.obj, host_swapchain );
+     swapchain->surface = surface;
++    surface->swapchain = swapchain;
+     swapchain->extents = create_info->imageExtent;
+     instance->p_insert_object( instance, &swapchain->obj.obj );
+ 
+@@ -2641,6 +2646,7 @@ void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client
+     struct vulkan_device *device = vulkan_device_from_handle( client_device );
+     struct vulkan_instance *instance = device->physical_device->instance;
+     struct swapchain *swapchain = swapchain_from_handle( client_swapchain );
++    struct surface *surface;
+ 
+     if (allocator) FIXME( "Support for allocation callbacks not implemented yet\n" );
+     if (!swapchain) return;
+@@ -2668,6 +2674,11 @@ void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client
+     }
+ 
+     device->p_vkDestroySwapchainKHR( device->host.device, swapchain->obj.host.swapchain, NULL );
++    if ((surface = swapchain->surface))
++    {
++        surface->swapchain = NULL;
++        InterlockedDecrement( &surface->client->busy_ref );
++    }
+     instance->p_remove_object( instance, &swapchain->obj.obj );
+ 
+     free( swapchain );
+diff --git a/include/wine/gdi_driver.h b/include/wine/gdi_driver.h
+index afc0d2880dd..01fbe13d115 100644
+--- a/include/wine/gdi_driver.h
++++ b/include/wine/gdi_driver.h
+@@ -263,6 +263,7 @@ struct client_surface
+     const struct client_surface_funcs *funcs;
+     struct list                        entry;          /* entry in win32u managed list */
+     LONG                               ref;            /* reference count */
++    LONG                               busy_ref;       /* count of drawables/swapchains referencing this surface */
+     HWND                               hwnd;           /* window the surface was created for */
+     LONG                               updated;        /* has been moved / resized / reparented */
+     LONG                               offscreen;      /* client window is offscreen */
+-- 
+2.55.0
+

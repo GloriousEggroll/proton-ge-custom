@@ -1,0 +1,211 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Wed, 8 Jul 2026 12:25:00 -0600
+Subject: [PATCH] mmdevapi: Drop stale DualSense mono endpoints on hotplug.
+
+Spider-Man Remastered keeps querying controller speaker endpoint IDs across
+DualSense unplug/replug and DS <-> DS Edge swaps. Leaving removed controller
+speaker MMDevice objects in the enumerator list lets the game reacquire old
+mono speaker GUIDs after the underlying Pulse/ALSA device is gone, which can
+break controller effect output or route the next activation through a stale
+endpoint.
+
+For DualSense mono speaker endpoints, keep the existing COM object alive if the
+game still holds a reference, but unlink it from mmdevapi's discoverable device
+list as soon as Pulse reports the endpoint removed. New controller connects are
+then treated as fresh endpoints with fresh GUIDs, while old references correctly
+report DEVICE_STATE_NOTPRESENT and cannot be activated.
+
+Since this path removes the endpoint from active enumeration, also send
+OnDeviceRemoved after the not-present state notification. This prevents games
+from retaining a stale controller-speaker cache entry across DualSense and
+DualSense Edge swaps.
+
+Also restore the normal MMDevice activation guard for not-present endpoints.
+This prevents stale controller speaker objects from creating new audio clients
+after unplug.
+
+When a replacement controller speaker is discovered, keep the new MMDevice out
+of active enumeration until its properties, fake AudioEndpoint node and mix
+format have been initialized. Suppress property notifications for unpublished
+devices so games see a clean remove/add transition instead of caching a
+half-created endpoint during DualSense model swaps.
+
+Also delete the removed mono endpoint's MMDevices registry key when the
+underlying controller speaker disappears. A disconnected controller should not
+leave a reconnectable endpoint identity behind; the next DualSense or
+DualSense Edge connect must be registered as a new endpoint.
+---
+ dlls/mmdevapi/devenum.c         | 66 ++++++++++++++++++++++++++++++++++++++---
+ dlls/mmdevapi/mmdevapi_private.h |  1 +
+ 2 files changed, 62 insertions(+), 6 deletions(-)
+
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+index 30ce4d60847..4b4c0e9fb1a 100644
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -104,6 +104,25 @@ static BOOL is_dualsense_endpoint_name( const WCHAR *name )
+     return name && (wcsstr( name, L"DualSense" ) || wcsstr( name, L"Wireless Controller" ));
+ }
+ 
++static BOOL device_is_published(const GUID *devguid, EDataFlow flow)
++{
++    MMDevice *device;
++    BOOL found = FALSE;
++
++    EnterCriticalSection(&device_list_cs);
++    LIST_FOR_EACH_ENTRY(device, &device_list, MMDevice, entry)
++    {
++        if (device->flow == flow && IsEqualGUID(&device->devguid, devguid))
++        {
++            found = TRUE;
++            break;
++        }
++    }
++    LeaveCriticalSection(&device_list_cs);
++
++    return found;
++}
++
+ typedef struct MMDevColImpl
+ {
+     IMMDeviceCollection IMMDeviceCollection_iface;
+@@ -584,7 +603,7 @@ static HRESULT MMDevice_SetPropValue(const GUID *devguid, DWORD flow, REFPROPERT
+     RegCloseKey(regkey);
+     TRACE("Writing %s returned %lu\n", debugstr_w(buffer), ret);
+ 
+-    if (SUCCEEDED(hr))
++    if (SUCCEEDED(hr) && device_is_published(devguid, flow))
+     {
+         struct NotificationClientWrapper *wrapper;
+         WCHAR devid[56];
+@@ -1074,9 +1074,7 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
+             return NULL;
+         cur->IMMDevice_iface.lpVtbl = &MMDeviceVtbl;
+         cur->IMMEndpoint_iface.lpVtbl = &MMEndpointVtbl;
+-        EnterCriticalSection(&device_list_cs);
+-        list_add_tail(&device_list, &cur->entry);
+-        LeaveCriticalSection(&device_list_cs);
++        list_init(&cur->entry);
+         update_add = TRUE;
+     } else {
+         if (cur->ref > 0)
+@@ -1091,6 +1091,7 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
+     cur->drv_id = wcsdup(name);
+     device_iname = cur->drv_id;
+     swprintf(friendly_name, FRIENDLY_NAME_MAX, friendly_name_fmt, device_desc, device_iname);
++    cur->removed = FALSE;
+ 
+     cur->flow = flow;
+     cur->state = state;
+@@ -1185,6 +1186,13 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
+     if (state == DEVICE_STATE_ACTIVE)
+         set_format(cur);
+ 
++    if (update_add)
++    {
++        EnterCriticalSection(&device_list_cs);
++        list_add_tail(&device_list, &cur->entry);
++        LeaveCriticalSection(&device_list_cs);
++    }
++
+     if (update_add || update_readd || update_state)
+     {
+         struct NotificationClientWrapper *wrapper;
+@@ -1343,6 +1344,8 @@ static void add_endpoints_from_params(struct get_endpoint_ids_params *params)
+     }
+ }
+ 
++static void MMDevice_Destroy(MMDevice *This);
++
+ static HANDLE g_update_thread;
+ static BOOL g_update_thread_running;
+ static DWORD WINAPI update_thread_proc(void *user)
+@@ -1394,6 +1395,7 @@ static DWORD WINAPI update_thread_proc(void *user)
+                 if (IsEqualGUID(&dev->devguid, &guid)) {
+                     struct NotificationClientWrapper *wrapper;
+                     const GUID *id = &dev->devguid;
++                    BOOL dualsense_mono_endpoint = is_dualsense_mono_endpoint(dev);
+                     WCHAR devid[56];
+ 
+                     dev->state = DEVICE_STATE_NOTPRESENT;
+@@ -1413,9 +1415,31 @@ static DWORD WINAPI update_thread_proc(void *user)
+                         id->Data4[4], id->Data4[5], id->Data4[6], id->Data4[7]);
+                     EnterCriticalSection(&g_notif_lock);
+                     LIST_FOR_EACH_ENTRY(wrapper, &g_notif_clients, struct NotificationClientWrapper, entry)
++                    {
+                         IMMNotificationClient_OnDeviceStateChanged(wrapper->client, devid, dev->state);
++                        if (dualsense_mono_endpoint)
++                            IMMNotificationClient_OnDeviceRemoved(wrapper->client, devid);
++                    }
+                     LeaveCriticalSection(&g_notif_lock);
+ 
++                    if (dualsense_mono_endpoint)
++                    {
++                        LONG delete_ret;
++
++                        TRACE("Removing disconnected DualSense mono endpoint %s from active device list.\n",
++                                debugstr_guid(&dev->devguid));
++                        if ((delete_ret = RegDeleteTreeW(root, guidstr)) && delete_ret != ERROR_FILE_NOT_FOUND)
++                            WARN("Failed to remove disconnected DualSense mono endpoint registry key %s: %lu\n",
++                                    debugstr_guid(&dev->devguid), delete_ret);
++                        dev->removed = TRUE;
++                        if (MMDevice_def_play == dev)
++                            MMDevice_def_play = NULL;
++                        list_remove(&dev->entry);
++                        list_init(&dev->entry);
++                        if (!dev->ref)
++                            MMDevice_Destroy(dev);
++                    }
++
+                     break;
+                 }
+             }
+@@ -1498,7 +1512,8 @@ end:
+ static void MMDevice_Destroy(MMDevice *This)
+ {
+     TRACE("Freeing %s\n", debugstr_w(This->drv_id));
+-    list_remove(&This->entry);
++    if (!list_empty(&This->entry))
++        list_remove(&This->entry);
+     free(This->drv_id);
+     free(This);
+ }
+@@ -1547,6 +1562,8 @@ static ULONG WINAPI MMDevice_Release(IMMDevice *iface)
+ 
+     ref = InterlockedDecrement(&This->ref);
+     TRACE("Refcount now %li\n", ref);
++    if (!ref && This->removed)
++        MMDevice_Destroy(This);
+     return ref;
+ }
+ 
+@@ -1560,9 +1577,13 @@ static HRESULT WINAPI MMDevice_Activate(IMMDevice *iface, REFIID riid, DWORD cls
+     if (!ppv)
+         return E_POINTER;
+ 
++    if (This->state == DEVICE_STATE_NOTPRESENT)
++        return E_NOTFOUND;
++
+     if (IsEqualIID(riid, &IID_IAudioClient) ||
+             IsEqualIID(riid, &IID_IAudioClient2) ||
+-            IsEqualIID(riid, &IID_IAudioClient3)){
++            IsEqualIID(riid, &IID_IAudioClient3))
++    {
+         hr = AudioClient_Create(&This->devguid, iface, (IAudioClient**)ppv);
+     }else if (IsEqualIID(riid, &IID_IAudioEndpointVolume) ||
+             IsEqualIID(riid, &IID_IAudioEndpointVolumeEx))
+diff --git a/dlls/mmdevapi/mmdevapi_private.h b/dlls/mmdevapi/mmdevapi_private.h
+index 6d6575547b6..480424b41d6 100644
+--- a/dlls/mmdevapi/mmdevapi_private.h
++++ b/dlls/mmdevapi/mmdevapi_private.h
+@@ -110,6 +110,7 @@ typedef struct MMDevice {
+     DWORD state;
+     GUID devguid;
+     WCHAR *drv_id;
++    BOOL removed;
+ 
+     struct list entry;
+ } MMDevice;
+-- 
+2.54.0

@@ -1,0 +1,284 @@
+From 09f044917f211721832971c9a143fc9d3735bc81 Mon Sep 17 00:00:00 2001
+From: Jiangyi Chen <chenjiangyi@uniontech.com>
+Date: Fri, 3 Apr 2026 17:26:50 +0800
+Subject: [PATCH 013/193] winewayland.drv: Add alpha-modifier-v1 protocol to
+ support change alpha by WAYLAND_SetLayeredWindowAttributes.
+
+Signed-off-by: chenjiangyi <chenjiangyi@uniontech.com>
+---
+ dlls/winewayland.drv/Makefile.in           |   1 +
+ dlls/winewayland.drv/alpha-modifier-v1.xml | 103 +++++++++++++++++++++
+ dlls/winewayland.drv/wayland.c             |   5 +
+ dlls/winewayland.drv/wayland_surface.c     |  30 ++++++
+ dlls/winewayland.drv/waylanddrv.h          |   4 +
+ dlls/winewayland.drv/window.c              |  10 ++
+ 6 files changed, 153 insertions(+)
+ create mode 100644 dlls/winewayland.drv/alpha-modifier-v1.xml
+
+diff --git a/dlls/winewayland.drv/Makefile.in b/dlls/winewayland.drv/Makefile.in
+index 0b78f768fb2..754ada75cb0 100644
+--- a/dlls/winewayland.drv/Makefile.in
++++ b/dlls/winewayland.drv/Makefile.in
+@@ -5,6 +5,7 @@ UNIX_LIBS = -lwin32u $(WAYLAND_CLIENT_LIBS) $(WAYLAND_EGL_LIBS) $(XKBCOMMON_LIBS
+ IMPORTS = user32 win32u
+ 
+ SOURCES = \
++	alpha-modifier-v1.xml \
+ 	cursor-shape-v1.xml \
+ 	display.c \
+ 	dllmain.c \
+diff --git a/dlls/winewayland.drv/alpha-modifier-v1.xml b/dlls/winewayland.drv/alpha-modifier-v1.xml
+new file mode 100644
+index 00000000000..ab0a401d1ab
+--- /dev/null
++++ b/dlls/winewayland.drv/alpha-modifier-v1.xml
+@@ -0,0 +1,103 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<protocol name="alpha_modifier_v1">
++  <copyright>
++    Copyright © 2024 Xaver Hugl
++
++    Permission is hereby granted, free of charge, to any person obtaining a
++    copy of this software and associated documentation files (the "Software"),
++    to deal in the Software without restriction, including without limitation
++    the rights to use, copy, modify, merge, publish, distribute, sublicense,
++    and/or sell copies of the Software, and to permit persons to whom the
++    Software is furnished to do so, subject to the following conditions:
++
++    The above copyright notice and this permission notice (including the next
++    paragraph) shall be included in all copies or substantial portions of the
++    Software.
++
++    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++    DEALINGS IN THE SOFTWARE.
++  </copyright>
++
++  <interface name="wp_alpha_modifier_v1" version="1">
++    <description summary="surface alpha modifier manager">
++      This interface allows a client to set a factor for the alpha values on a
++      surface, which can be used to offload such operations to the compositor,
++      which can in turn for example offload them to KMS.
++
++      Warning! The protocol described in this file is currently in the testing
++      phase. Backward compatible changes may be added together with the
++      corresponding interface version bump. Backward incompatible changes can
++      only be done by creating a new major version of the extension.
++    </description>
++
++    <request name="destroy" type="destructor">
++      <description summary="destroy the alpha modifier manager object">
++        Destroy the alpha modifier manager. This doesn't destroy objects
++        created with the manager.
++      </description>
++    </request>
++
++    <enum name="error">
++      <entry name="already_constructed" value="0"
++             summary="wl_surface already has a alpha modifier object"/>
++    </enum>
++
++    <request name="get_surface">
++      <description summary="create a new alpha modifier surface object">
++        Create a new alpha modifier surface object associated with the
++        given wl_surface. If there is already such an object associated with
++        the wl_surface, the already_constructed error will be raised.
++      </description>
++      <arg name="id" type="new_id" interface="wp_alpha_modifier_surface_v1"/>
++      <arg name="surface" type="object" interface="wl_surface"/>
++    </request>
++  </interface>
++
++  <interface name="wp_alpha_modifier_surface_v1" version="1">
++    <description summary="alpha modifier object for a surface">
++      This interface allows the client to set a factor for the alpha values on
++      a surface, which can be used to offload such operations to the compositor.
++      The default factor is UINT32_MAX.
++
++      This object has to be destroyed before the associated wl_surface. Once the
++      wl_surface is destroyed, all request on this object will raise the
++      no_surface error.
++    </description>
++
++    <enum name="error">
++      <entry name="no_surface" value="0" summary="wl_surface was destroyed"/>
++    </enum>
++
++    <request name="destroy" type="destructor">
++      <description summary="destroy the alpha modifier object">
++        This destroys the object, and is equivalent to set_multiplier with
++        a value of UINT32_MAX, with the same double-buffered semantics as
++        set_multiplier.
++      </description>
++    </request>
++
++    <request name="set_multiplier">
++      <description summary="specify the alpha multiplier">
++        Sets the alpha multiplier for the surface. The alpha multiplier is
++        double-buffered state, see wl_surface.commit for details.
++
++        This factor is applied in the compositor's blending space, as an
++        additional step after the processing of per-pixel alpha values for the
++        wl_surface. The exact meaning of the factor is thus undefined, unless
++        the blending space is specified in a different extension.
++
++        This multiplier is applied even if the buffer attached to the
++        wl_surface doesn't have an alpha channel; in that case an alpha value
++        of one is used instead.
++
++        Zero means completely transparent, UINT32_MAX means completely opaque.
++      </description>
++      <arg name="factor" type="uint"/>
++    </request>
++  </interface>
++</protocol>
+diff --git a/dlls/winewayland.drv/wayland.c b/dlls/winewayland.drv/wayland.c
+index cd28e2debd7..b557da7b6e6 100644
+--- a/dlls/winewayland.drv/wayland.c
++++ b/dlls/winewayland.drv/wayland.c
+@@ -205,6 +205,11 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
+         process_wayland.wp_pointer_warp_v1 =
+             wl_registry_bind(registry, id, &wp_pointer_warp_v1_interface, 1);
+     }
++    else if (strcmp(interface, "wp_alpha_modifier_v1") == 0)
++    {
++        process_wayland.wp_alpha_modifier_v1 =
++            wl_registry_bind(registry, id, &wp_alpha_modifier_v1_interface, 1);
++    }
+ }
+ 
+ static void registry_handle_global_remove(void *data, struct wl_registry *registry,
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 9f33f00ff64..916e3f4f6f6 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -173,6 +173,18 @@ struct wayland_surface *wayland_surface_create(HWND hwnd)
+         ERR("Failed to create wp_viewport Wayland surface\n");
+         goto err;
+     }
++    if (process_wayland.wp_alpha_modifier_v1)
++    {
++        COLORREF key;
++        DWORD flags;
++        BYTE alpha;
++
++        surface->wp_alpha_modifier_surface_v1 =
++            wp_alpha_modifier_v1_get_surface(process_wayland.wp_alpha_modifier_v1, surface->wl_surface);
++
++        if (!NtUserGetLayeredWindowAttributes(hwnd, &key, &alpha, &flags)) flags = 0;
++        wayland_surface_set_opacity(surface, alpha, flags);
++    }
+ 
+     surface->window.scale = 1.0;
+ 
+@@ -212,6 +224,12 @@ void wayland_surface_destroy(struct wayland_surface *surface)
+ 
+     wayland_surface_clear_role(surface);
+ 
++    if (surface->wp_alpha_modifier_surface_v1)
++    {
++        wp_alpha_modifier_surface_v1_destroy(surface->wp_alpha_modifier_surface_v1);
++        surface->wp_alpha_modifier_surface_v1 = NULL;
++    }
++
+     if (surface->wp_viewport)
+     {
+         wp_viewport_destroy(surface->wp_viewport);
+@@ -1327,3 +1345,15 @@ void wayland_surface_assign_icon(struct wayland_surface *surface)
+                                               surface->xdg_toplevel, surface->xdg_toplevel_icon);
+     }
+ }
++
++void wayland_surface_set_opacity(struct wayland_surface *surface, BYTE alpha, UINT flags)
++{
++    uint32_t opacity;
++
++    if (!surface->wp_alpha_modifier_surface_v1) return;
++
++    opacity = (flags & LWA_ALPHA) ? (UINT32_MAX / 0xff) * alpha : UINT32_MAX;
++    wp_alpha_modifier_surface_v1_set_multiplier(surface->wp_alpha_modifier_surface_v1, opacity);
++    wl_surface_commit(surface->wl_surface);
++    wl_display_flush(process_wayland.wl_display);
++}
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index 8f4b87be3c4..8d1a1d58204 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -39,6 +39,7 @@
+ #include "wlr-data-control-unstable-v1-client-protocol.h"
+ #include "xdg-toplevel-icon-v1-client-protocol.h"
+ #include "pointer-warp-v1-client-protocol.h"
++#include "alpha-modifier-v1-client-protocol.h"
+ 
+ #include "windef.h"
+ #include "winbase.h"
+@@ -180,6 +181,7 @@ struct wayland
+     struct xdg_toplevel_icon_manager_v1 *xdg_toplevel_icon_manager_v1;
+     struct wp_cursor_shape_manager_v1 *wp_cursor_shape_manager_v1;
+     struct wp_pointer_warp_v1 *wp_pointer_warp_v1;
++    struct wp_alpha_modifier_v1 *wp_alpha_modifier_v1;
+     struct wayland_seat seat;
+     struct wayland_keyboard keyboard;
+     struct wayland_pointer pointer;
+@@ -286,6 +288,7 @@ struct wayland_surface
+             HWND toplevel_hwnd;
+         };
+     };
++    struct wp_alpha_modifier_surface_v1 *wp_alpha_modifier_surface_v1;
+ 
+     struct wayland_surface_config pending, requested, processing, current;
+     BOOL resizing;
+@@ -337,6 +340,7 @@ void wayland_surface_ensure_contents(struct wayland_surface *surface);
+ void wayland_surface_set_title(struct wayland_surface *surface, LPCWSTR title);
+ void wayland_surface_assign_icon(struct wayland_surface *surface);
+ void wayland_surface_set_icon_buffer(struct wayland_surface *surface, UINT type, const ICONINFO *ii);
++void wayland_surface_set_opacity(struct wayland_surface *surface, BYTE alpha, UINT flags);
+ 
+ static inline BOOL wayland_surface_is_toplevel(struct wayland_surface *surface)
+ {
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index acb67809031..88f215d7929 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -645,9 +645,14 @@ LRESULT WAYLAND_DesktopWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+ void WAYLAND_SetLayeredWindowAttributes(HWND hwnd, COLORREF key, BYTE alpha, DWORD flags)
+ {
+     struct wayland_win_data *data;
++    struct wayland_surface *surface;
+ 
+     if (!(data = wayland_win_data_get(hwnd))) return;
++
++    if ((surface = data->wayland_surface))
++        wayland_surface_set_opacity(surface, alpha, flags);
+     data->layered_attribs_set = TRUE;
++
+     wayland_win_data_release(data);
+ }
+ 
+@@ -699,6 +704,7 @@ void WAYLAND_SetWindowIcons(HWND hwnd, HICON icon, const ICONINFO *ii, HICON ico
+ void WAYLAND_SetWindowStyle(HWND hwnd, INT offset, STYLESTRUCT *style)
+ {
+     struct wayland_win_data *data;
++    struct wayland_surface *surface;
+     DWORD changed = style->styleNew ^ style->styleOld;
+ 
+     if (hwnd == NtUserGetDesktopWindow()) return;
+@@ -706,7 +712,11 @@ void WAYLAND_SetWindowStyle(HWND hwnd, INT offset, STYLESTRUCT *style)
+ 
+     /* Changing WS_EX_LAYERED resets attributes */
+     if (offset == GWL_EXSTYLE && (changed & WS_EX_LAYERED))
++    {
++        if ((surface = data->wayland_surface))
++            wayland_surface_set_opacity(surface, 0, 0);
+         data->layered_attribs_set = FALSE;
++    }
+ 
+     wayland_win_data_release(data);
+ }
+-- 
+2.55.0
+

@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Mon, 13 Jul 2026 13:45:00 -0600
+Subject: [PATCH] mmdevapi: Re-signal current default after Sony mono hotplug.
+
+Spider-Man Remastered sometimes receives the newly added controller
+speaker endpoint and calls IMMDeviceEnumerator::GetDevice() for it, but
+does not run the later endpoint-list refresh that activates the
+controller-effect stream.  In the working cases the game follows the
+fresh endpoint notification with a default-render refresh, enumerates the
+render collection, and activates the controller endpoint from the list.
+
+After the delayed fresh-endpoint re-signal, also notify clients that the
+current real render default is still the default.  This does not make the
+controller endpoint the default and does not preserve disconnected
+controller state; it only nudges clients to re-run their render endpoint
+refresh path after the hotplug batch has settled.
+
+---
+ dlls/mmdevapi/devenum.c | 34 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 34 insertions(+)
+
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+index b9becb0ae30..5f9bb874bb7 100644
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -954,11 +954,41 @@ static BOOL endpoint_notification_is_current_dualsense_mono(const struct endpoin
+     return found;
+ }
+ 
++static void notify_current_render_default_device_changed(void)
++{
++    struct NotificationClientWrapper *wrapper;
++    MMDevice *device = MMDevice_def_play;
++    const GUID *id;
++    WCHAR devid[56];
++
++    if (!device)
++        return;
++
++    id = &device->devguid;
++    swprintf(devid, 56, devid_formatW,
++            eRender, id->Data1, id->Data2, id->Data3,
++            id->Data4[0], id->Data4[1], id->Data4[2], id->Data4[3],
++            id->Data4[4], id->Data4[5], id->Data4[6], id->Data4[7]);
++
++    TRACE("Re-signaling current render default %s after Sony controller hotplug settled.\n",
++            debugstr_w(devid));
++
++    EnterCriticalSection(&g_notif_lock);
++    LIST_FOR_EACH_ENTRY(wrapper, &g_notif_clients, struct NotificationClientWrapper, entry)
++    {
++        IMMNotificationClient_OnDefaultDeviceChanged(wrapper->client, eRender, eConsole, devid);
++        IMMNotificationClient_OnDefaultDeviceChanged(wrapper->client, eRender, eMultimedia, devid);
++        IMMNotificationClient_OnDefaultDeviceChanged(wrapper->client, eRender, eCommunications, devid);
++    }
++    LeaveCriticalSection(&g_notif_lock);
++}
++
+ static DWORD WINAPI delayed_endpoint_notification_thread(void *arg)
+ {
+     struct delayed_endpoint_notifications *delayed = arg;
+     unsigned int i;
++    BOOL signaled = FALSE;
+ 
+     Sleep(300);
+ 
+     for (i = 0; i < delayed->count; ++i)
+@@ -983,8 +1018,12 @@ static DWORD WINAPI delayed_endpoint_notification_thread(void *arg)
+                 debugstr_guid(&delayed->notifications[i].guid));
+         notify_endpoint_added_state(delayed->notifications[i].flow, &delayed->notifications[i].guid,
+                 delayed->notifications[i].state);
++        signaled = TRUE;
+     }
+ 
++    if (signaled)
++        notify_current_render_default_device_changed();
++
+     free(delayed->notifications);
+     free(delayed);
+     return 0;
+-- 
+2.54.0

@@ -1,0 +1,1013 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Sun, 28 Jun 2026 00:00:00 -0600
+Subject: [PATCH 13/13] winepulse: Route DualSense USB haptics to the raw
+ ALSA node.
+
+PipeWire exposes the DualSense USB audio function as a raw internal node with
+four AUX channels, then publishes the user-visible controller speaker as a
+one-channel split sink. XAudio2 haptic streams are four-channel GameEffects
+streams targeting the controller endpoint; routing those streams through the
+public split sink can leave the haptic actuator channels accepted by PipeWire
+but not actually delivered to the USB haptics endpoint.
+
+Keep normal endpoint enumeration and mono controller-speaker playback on the
+public Pulse sink, but remember PipeWire raw haptic metadata from the endpoint.
+When an application opens the known four-channel float32 48 kHz DualSense or
+DualSense Edge render stream, bypass Pulse routing for that haptic stream and
+write directly to the raw ALSA PCM path as 16-bit 48 kHz 4-channel samples.
+Normal game audio and controller-speaker audio continue to use Pulse.
+
+USB hotplug can invalidate or delay creation of the raw ALSA PCM while
+applications keep their existing audio client stream alive. Keep known
+DualSense haptic streams pending even when the controller is absent at stream
+creation, then reopen the raw PCM on later writes. Avoid live Pulse/PipeWire
+queries and snd_pcm_drop() in the reconnect path so unplugging the controller
+cannot block the game thread. If cached Pulse metadata is unavailable or stale
+after a late USB plug, scan ALSA PCM hints and cards for a Sony/DualSense
+playback PCM that can actually open as 48 kHz, 4-channel, S16, and use it as
+the raw haptic target.
+
+Also keep the stream lifecycle aligned with the direct ALSA backend so start,
+stop, reset, release, render-buffer draining, and render-position accounting do
+not treat the haptic stream as a half-created Pulse stream.
+
+---
+diff --git a/dlls/winepulse.drv/Makefile.in b/dlls/winepulse.drv/Makefile.in
+--- a/dlls/winepulse.drv/Makefile.in
++++ b/dlls/winepulse.drv/Makefile.in
+@@ -1,8 +1,8 @@
+ MODULE    = winepulse.drv
+ UNIXLIB   = winepulse.so
+ IMPORTS   = dxguid uuid winmm user32 advapi32 ole32
+-UNIX_LIBS    = $(PULSE_LIBS) $(PTHREAD_LIBS) $(UDEV_LIBS) -lm
+-UNIX_CFLAGS  = $(PULSE_CFLAGS) $(UDEV_CFLAGS)
++UNIX_LIBS    = $(PULSE_LIBS) $(PTHREAD_LIBS) $(UDEV_LIBS) $(ALSA_LIBS) -lm
++UNIX_CFLAGS  = $(PULSE_CFLAGS) $(UDEV_CFLAGS) $(ALSA_CFLAGS)
+ 
+ SOURCES = \
+ 	pulse.c
+diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -31,6 +31,7 @@
+ #include <math.h>
+ #include <poll.h>
+ 
++#include <alsa/asoundlib.h>
+ #include <pulse/pulseaudio.h>
+ 
+ #include "ntstatus.h"
+@@ -83,6 +84,8 @@
+ 
+     char *device;
+     pa_stream *stream;
++    snd_pcm_t *haptic_pcm;
++    char *haptic_alsa_path;
+     pa_sample_spec ss;
+     pa_channel_map map;
+     pa_buffer_attr attr;
+@@ -101,6 +104,11 @@
+     SIZE_T peek_ofs, read_offs_bytes, lcl_offs_bytes, pa_offs_bytes;
+     SIZE_T tmp_buffer_bytes, held_bytes, peek_len, peek_buffer_len, pa_held_bytes, max_pa_held_bytes;
+     BYTE *local_buffer, *tmp_buffer, *peek_buffer;
++    int16_t *haptic_buffer;
++    SIZE_T haptic_buffer_frames;
++    pa_usec_t haptic_reconnect_time;
++    pa_usec_t haptic_path_check_time;
++    unsigned int haptic_hotplug_generation;
+     void *locked_ptr;
+     BOOL just_underran;
+     pa_usec_t mmdev_period_usec;
+@@ -146,6 +154,8 @@
+     REFERENCE_TIME min_period, def_period;
+     WAVEFORMATEXTENSIBLE fmt;
+     GUID container_id;
++    char *raw_haptic_target;
++    char *raw_haptic_alsa_path;
+     char pulse_name[0];
+ } PhysDevice;
+ 
+@@ -154,6 +164,7 @@
+ 
+ static pthread_mutex_t g_phys_mutex;
+ static pthread_cond_t g_phys_cond = PTHREAD_COND_INITIALIZER;
++static unsigned int g_haptic_hotplug_generation;
+ static struct list g_phys_speakers = LIST_INIT(g_phys_speakers);
+ static struct list g_phys_sources = LIST_INIT(g_phys_sources);
+ static struct list g_phys_speakers_added = LIST_INIT(g_phys_speakers_added);
+@@ -177,6 +188,17 @@
+     return STATUS_SUCCESS;
+ }
+ 
++#define DUALSENSE_HAPTIC_REFRESH_USEC 1000000
++
++static int16_t float_to_s16(float sample)
++{
++    if (sample > 1.0f) sample = 1.0f;
++    else if (sample < -1.0f) sample = -1.0f;
++
++    return sample < 0.0f ? sample * 32768.0f : sample * 32767.0f;
++}
++
++
+ static void g_phys_lock(void)
+ {
+     pthread_mutex_lock(&g_phys_mutex);
+@@ -212,6 +234,8 @@
+     pthread_mutex_destroy(&dev->ready_mutex);
+     pthread_cond_destroy(&dev->ready_cond);
+     free(dev->name);
++    free(dev->raw_haptic_target);
++    free(dev->raw_haptic_alsa_path);
+     free(dev);
+ }
+ 
+@@ -642,9 +666,17 @@
+ 
+ static BOOL pulse_stream_valid(struct pulse_stream *stream)
+ {
++    if (!stream->stream)
++        return stream->dataflow == eRender && stream->haptic_alsa_path;
++
+     return pa_stream_get_state(stream->stream) == PA_STREAM_READY;
+ }
+ 
++static BOOL pulse_stream_haptic(struct pulse_stream *stream)
++{
++    return stream->dataflow == eRender && stream->haptic_alsa_path;
++}
++
+ static void pulse_contextcallback(pa_context *c, void *userdata)
+ {
+     switch (pa_context_get_state(c))
+@@ -920,6 +952,24 @@
+         dev->container_id = get_container_id(buffer);
+ }
+ 
++static BOOL is_dualsense_audio_device(const PhysDevice *dev)
++{
++    return dev->bus_type == phys_device_bus_usb && dev->vendor_id == 0x054c
++            && (dev->product_id == 0x0ce6 || dev->product_id == 0x0df2);
++}
++
++static BOOL is_dualsense_haptic_format(const struct pulse_stream *stream)
++{
++    return stream->dataflow == eRender && stream->ss.format == PA_SAMPLE_FLOAT32LE
++            && stream->ss.rate == 48000 && stream->ss.channels == 4;
++}
++
++static BOOL string_contains_dualsense_name(const char *name)
++{
++    return name && (strstr(name, "DualSense") || strstr(name, "Wireless_Controller")
++            || strstr(name, "Wireless Controller") || strstr(name, "Sony_Interactive_Entertainment"));
++}
++
+ static void pulse_add_device(struct list *list, pa_proplist *proplist, int index, EndpointFormFactor form,
+                              UINT channel_mask, const char *pulse_name, const char *desc)
+ {
+@@ -939,12 +989,34 @@
+     dev->channel_mask = channel_mask;
+     dev->def_period = 0;
+     dev->min_period = 0;
++    dev->raw_haptic_target = NULL;
++    dev->raw_haptic_alsa_path = NULL;
+     dev->ready = TRUE;
+     dev->length = 0;
+     dev->probe_status = -1;
+     pthread_mutex_init(&dev->ready_mutex, NULL);
+     pthread_cond_init(&dev->ready_cond, NULL);
+     fill_device_info(dev, proplist);
++    if (dev->flow == eRender && is_dualsense_audio_device(dev) && proplist)
++    {
++        const char *target = pa_proplist_gets(proplist, "api.alsa.split.name");
++        const char *alsa_path = pa_proplist_gets(proplist, "api.alsa.path");
++
++        if (target && target[0])
++        {
++            size_t target_len = strlen(target) + 1;
++
++            if ((dev->raw_haptic_target = malloc(target_len)))
++                memcpy(dev->raw_haptic_target, target, target_len);
++        }
++        if (alsa_path && alsa_path[0])
++        {
++            size_t alsa_path_len = strlen(alsa_path) + 1;
++
++            if ((dev->raw_haptic_alsa_path = malloc(alsa_path_len)))
++                memcpy(dev->raw_haptic_alsa_path, alsa_path, alsa_path_len);
++        }
++    }
+     memcpy(dev->pulse_name, pulse_name, len + 1);
+ 
+     list_add_tail(list, &dev->entry);
+@@ -1398,9 +1470,11 @@
+     return S_OK;
+ }
+ 
+-static HRESULT pulse_stream_connect(struct pulse_stream *stream, const char *pulse_name, UINT32 period_bytes)
++static HRESULT pulse_stream_connect(struct pulse_stream *stream, const char *pulse_name, const char *target_object,
++        UINT32 period_bytes)
+ {
+     pa_stream_flags_t flags = PA_STREAM_START_CORKED | PA_STREAM_START_UNMUTED | PA_STREAM_ADJUST_LATENCY;
++    pa_proplist *proplist = NULL;
+     int ret;
+     char buffer[64];
+     static LONG number;
+@@ -1409,7 +1483,24 @@
+ 
+     ret = InterlockedIncrement(&number);
+     sprintf(buffer, "audio stream #%i", ret);
+-    stream->stream = pa_stream_new(pulse_ctx, buffer, &stream->ss, &stream->map);
++
++    if (target_object && target_object[0])
++    {
++        if ((proplist = pa_proplist_new()))
++        {
++            pa_proplist_sets(proplist, "target.object", target_object);
++            pa_proplist_sets(proplist, "node.target", target_object);
++            pa_proplist_sets(proplist, "media.class", "Stream/Output/Audio/Internal");
++            pa_proplist_sets(proplist, "node.dont-fallback", "true");
++            pa_proplist_sets(proplist, "stream.dont-remix", "true");
++        }
++    }
++
++    stream->stream = proplist
++            ? pa_stream_new_with_proplist(pulse_ctx, buffer, &stream->ss, &stream->map, proplist)
++            : pa_stream_new(pulse_ctx, buffer, &stream->ss, &stream->map);
++    if (proplist)
++        pa_proplist_free(proplist);
+ 
+     if (!stream->stream) {
+         WARN("pa_stream_new returned error %i\n", pa_context_errno(pulse_ctx));
+@@ -1427,8 +1518,10 @@
+     attr.prebuf = 0;
+     dump_attr(&attr);
+ 
+-    /* If specific device was requested, use it exactly */
+-    if (pulse_name[0])
++    /* If specific device was requested, use it exactly. For PipeWire raw
++     * haptic targets, keep the public DualSense sink as the Pulse device and
++     * let target.object select the hidden split ALSA node. */
++    if (pulse_name && pulse_name[0])
+         flags |= PA_STREAM_DONT_MOVE;
+     else
+         pulse_name = NULL;  /* use default */
+@@ -1442,9 +1535,26 @@
+         return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
+     }
+-    while (pa_stream_get_state(stream->stream) == PA_STREAM_CREATING)
+-        pulse_cond_wait();
++    while (stream->stream && pa_stream_get_state(stream->stream) == PA_STREAM_CREATING)
++    {
++        if (pulse_cond_timedwait_ms(target_object && target_object[0] ? 5000 : 500) == ETIMEDOUT)
++            break;
++    }
++    if (!stream->stream)
++        return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
+     if (pa_stream_get_state(stream->stream) != PA_STREAM_READY)
++    {
++        if (stream->dataflow == eRender && pa_stream_get_state(stream->stream) == PA_STREAM_CREATING &&
++                !(target_object && target_object[0]))
++        {
++            WARN("Render stream still creating; disconnecting Pulse stream and continuing locally.\n");
++            pa_stream_disconnect(stream->stream);
++            pa_stream_unref(stream->stream);
++            stream->stream = NULL;
++            return S_OK;
++        }
++        WARN("Stream failed to become ready, state %i\n", pa_stream_get_state(stream->stream));
+         return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
++    }
+ 
+     if (stream->dataflow == eRender) {
+         pa_stream_set_underflow_callback(stream->stream, pulse_underflow_callback, stream);
+@@ -1480,13 +1589,513 @@
+     return E_FAIL;
+ }
+ 
++static char *get_dualsense_haptic_target(const char *pulse_name, const struct pulse_stream *stream)
++{
++    PhysDevice *dev;
++
++    if (stream->dataflow != eRender || stream->ss.format != PA_SAMPLE_FLOAT32LE
++            || stream->ss.rate != 48000 || stream->ss.channels != 4 || !pulse_name || !pulse_name[0])
++        return NULL;
++
++    g_phys_lock();
++    LIST_FOR_EACH_ENTRY(dev, &g_phys_speakers, PhysDevice, entry)
++    {
++        if (strcmp(pulse_name, dev->pulse_name))
++            continue;
++
++        if (dev->raw_haptic_target)
++        {
++            size_t len = strlen(dev->raw_haptic_target) + 1;
++            char *target = malloc(len);
++
++            if (target)
++                memcpy(target, dev->raw_haptic_target, len);
++
++            g_phys_unlock();
++            return target;
++        }
++        break;
++    }
++    g_phys_unlock();
++    return NULL;
++}
++
++static BOOL dualsense_haptic_pcm_path_works(const char *path);
++
++static char *get_dualsense_haptic_alsa_path(const char *pulse_name, const struct pulse_stream *stream)
++{
++    PhysDevice *dev, *fallback = NULL;
++    char *path = NULL;
++
++    if (stream->dataflow != eRender || stream->ss.format != PA_SAMPLE_FLOAT32LE
++            || stream->ss.rate != 48000 || stream->ss.channels != 4 || !pulse_name || !pulse_name[0])
++        return NULL;
++
++    g_phys_lock();
++    LIST_FOR_EACH_ENTRY(dev, &g_phys_speakers, PhysDevice, entry)
++    {
++        if (strcmp(pulse_name, dev->pulse_name))
++        {
++            if (!fallback && is_dualsense_audio_device(dev) && dev->raw_haptic_alsa_path)
++                fallback = dev;
++            continue;
++        }
++
++        if (dev->raw_haptic_alsa_path && dualsense_haptic_pcm_path_works(dev->raw_haptic_alsa_path))
++        {
++            size_t len = strlen(dev->raw_haptic_alsa_path) + 1;
++
++            if (path)
++                free(path);
++            if ((path = malloc(len)))
++                memcpy(path, dev->raw_haptic_alsa_path, len);
++        }
++        break;
++    }
++    if (!path && fallback && dualsense_haptic_pcm_path_works(fallback->raw_haptic_alsa_path))
++    {
++        size_t len = strlen(fallback->raw_haptic_alsa_path) + 1;
++
++        if ((path = malloc(len)))
++            memcpy(path, fallback->raw_haptic_alsa_path, len);
++    }
++    g_phys_unlock();
++    return path;
++}
++
++static char *find_dualsense_haptic_alsa_path(void)
++{
++    snd_pcm_info_t *info;
++    char *card_name = NULL, *card_longname = NULL, *path = NULL;
++    void **hints = NULL, **hint;
++    int card = -1, err;
++
++    if (snd_device_name_hint(-1, "pcm", &hints) >= 0)
++    {
++        for (hint = hints; *hint; ++hint)
++        {
++            char *name = snd_device_name_get_hint(*hint, "NAME");
++            char *desc = snd_device_name_get_hint(*hint, "DESC");
++            char *ioid = snd_device_name_get_hint(*hint, "IOID");
++
++            if (name && (!ioid || strcmp(ioid, "Input")) &&
++                    (string_contains_dualsense_name(name) || string_contains_dualsense_name(desc)))
++            {
++                TRACE("Checking DualSense haptic PCM hint %s: %s\n", debugstr_a(name), debugstr_a(desc));
++                if (dualsense_haptic_pcm_path_works(name))
++                {
++                    path = strdup(name);
++                    TRACE("Selected DualSense haptic PCM hint %s.\n", debugstr_a(path));
++                }
++            }
++
++            free(name);
++            free(desc);
++            free(ioid);
++            if (path) break;
++        }
++        snd_device_name_free_hint(hints);
++        if (path) return path;
++    }
++
++    snd_pcm_info_alloca(&info);
++    while ((err = snd_card_next(&card)) >= 0 && card >= 0)
++    {
++        char card_path[32];
++        snd_ctl_t *ctl;
++        int device = -1;
++        BOOL card_match;
++
++        free(card_name);
++        free(card_longname);
++        card_name = card_longname = NULL;
++        snd_card_get_name(card, &card_name);
++        snd_card_get_longname(card, &card_longname);
++        card_match = string_contains_dualsense_name(card_name) || string_contains_dualsense_name(card_longname);
++
++        TRACE("Checking ALSA card %d for DualSense haptics: %s / %s\n",
++                card, debugstr_a(card_name), debugstr_a(card_longname));
++
++        snprintf(card_path, sizeof(card_path), "hw:%d", card);
++        if ((err = snd_ctl_open(&ctl, card_path, 0)) < 0)
++        {
++            TRACE("Unable to open ALSA control %s while finding DualSense haptics: %d (%s)\n",
++                    card_path, err, snd_strerror(err));
++            continue;
++        }
++
++        while ((err = snd_ctl_pcm_next_device(ctl, &device)) >= 0 && device >= 0)
++        {
++            const char *pcm_name;
++
++            snd_pcm_info_set_device(info, device);
++            snd_pcm_info_set_subdevice(info, 0);
++            snd_pcm_info_set_stream(info, SND_PCM_STREAM_PLAYBACK);
++            if (snd_ctl_pcm_info(ctl, info) < 0)
++                continue;
++
++            pcm_name = snd_pcm_info_get_name(info);
++            if (!card_match && !string_contains_dualsense_name(pcm_name))
++                continue;
++
++            if ((path = malloc(32)))
++            {
++                snprintf(path, 32, "hw:%d,%d", card, device);
++                TRACE("Checking DualSense haptic PCM candidate %s: %s\n",
++                        debugstr_a(path), debugstr_a(pcm_name));
++                if (dualsense_haptic_pcm_path_works(path))
++                {
++                    TRACE("Selected DualSense haptic PCM candidate %s.\n", debugstr_a(path));
++                    break;
++                }
++                free(path);
++                path = NULL;
++            }
++        }
++        snd_ctl_close(ctl);
++        if (path)
++            break;
++    }
++
++    free(card_name);
++    free(card_longname);
++    return path;
++}
++
++static BOOL dualsense_haptic_pcm_path_works(const char *path)
++{
++    snd_pcm_hw_params_t *hw_params;
++    snd_pcm_t *pcm;
++    unsigned int rate = 48000;
++    int err;
++
++    if ((err = snd_pcm_open(&pcm, path, SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK)) < 0)
++    {
++        TRACE("DualSense haptic PCM candidate %s rejected: open failed %d (%s)\n",
++                debugstr_a(path), err, snd_strerror(err));
++        return FALSE;
++    }
++
++    hw_params = malloc(snd_pcm_hw_params_sizeof());
++    if (!hw_params)
++    {
++        snd_pcm_close(pcm);
++        return FALSE;
++    }
++
++    err = snd_pcm_hw_params_any(pcm, hw_params);
++    if (err >= 0)
++        err = snd_pcm_hw_params_set_access(pcm, hw_params, SND_PCM_ACCESS_RW_INTERLEAVED);
++    if (err >= 0)
++        err = snd_pcm_hw_params_set_format(pcm, hw_params, SND_PCM_FORMAT_S16_LE);
++    if (err >= 0)
++        err = snd_pcm_hw_params_set_rate_near(pcm, hw_params, &rate, NULL);
++    if (err >= 0 && rate != 48000)
++        err = -EINVAL;
++    if (err >= 0)
++        err = snd_pcm_hw_params_set_channels(pcm, hw_params, 4);
++
++    free(hw_params);
++    snd_pcm_close(pcm);
++    if (err < 0)
++        TRACE("DualSense haptic PCM candidate %s rejected: unsupported 48 kHz S16 4-channel playback (%d: %s)\n",
++                debugstr_a(path), err, snd_strerror(err));
++    return err >= 0;
++}
++
++static HRESULT pulse_haptic_stream_connect(struct pulse_stream *stream, const char *alsa_path)
++{
++    snd_pcm_hw_params_t *hw_params;
++    snd_pcm_sw_params_t *sw_params;
++    snd_pcm_uframes_t buffer_frames;
++    snd_pcm_uframes_t period_frames;
++    unsigned int rate = stream->ss.rate;
++    int err;
++
++    stream->attr.minreq = stream->period_bytes;
++    stream->attr.fragsize = stream->period_bytes;
++    stream->attr.tlength = stream->period_bytes * 3;
++    stream->attr.maxlength = stream->bufsize_frames * pa_frame_size(&stream->ss);
++    stream->attr.prebuf = 0;
++
++    if ((err = snd_pcm_open(&stream->haptic_pcm, alsa_path, SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK)) < 0)
++    {
++        WARN("Unable to open DualSense haptic PCM \"%s\": %d (%s)\n", alsa_path, err, snd_strerror(err));
++        return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
++    }
++
++    hw_params = malloc(snd_pcm_hw_params_sizeof());
++    sw_params = malloc(snd_pcm_sw_params_sizeof());
++    if (!hw_params || !sw_params)
++    {
++        free(hw_params);
++        free(sw_params);
++        snd_pcm_close(stream->haptic_pcm);
++        stream->haptic_pcm = NULL;
++        return E_OUTOFMEMORY;
++    }
++
++    if ((err = snd_pcm_hw_params_any(stream->haptic_pcm, hw_params)) < 0 ||
++            (err = snd_pcm_hw_params_set_access(stream->haptic_pcm, hw_params, SND_PCM_ACCESS_RW_INTERLEAVED)) < 0 ||
++            (err = snd_pcm_hw_params_set_format(stream->haptic_pcm, hw_params, SND_PCM_FORMAT_S16_LE)) < 0 ||
++            (err = snd_pcm_hw_params_set_rate_near(stream->haptic_pcm, hw_params, &rate, NULL)) < 0 ||
++            (err = snd_pcm_hw_params_set_channels(stream->haptic_pcm, hw_params, 4)) < 0)
++    {
++        WARN("Unable to configure DualSense haptic PCM \"%s\": %d (%s)\n", alsa_path, err, snd_strerror(err));
++        goto failed;
++    }
++
++    period_frames = stream->period_bytes / pa_frame_size(&stream->ss);
++    if ((err = snd_pcm_hw_params_set_period_size_near(stream->haptic_pcm, hw_params, &period_frames, NULL)) < 0)
++        WARN("Unable to set DualSense haptic period to %lu frames: %d (%s)\n",
++                period_frames, err, snd_strerror(err));
++
++    buffer_frames = stream->bufsize_frames > period_frames * 4 ? stream->bufsize_frames : period_frames * 4;
++    if ((err = snd_pcm_hw_params_set_buffer_size_near(stream->haptic_pcm, hw_params, &buffer_frames)) < 0)
++        WARN("Unable to set DualSense haptic buffer to %lu frames: %d (%s)\n",
++                buffer_frames, err, snd_strerror(err));
++
++    if ((err = snd_pcm_hw_params(stream->haptic_pcm, hw_params)) < 0)
++    {
++        WARN("Unable to apply DualSense haptic hw params: %d (%s)\n", err, snd_strerror(err));
++        goto failed;
++    }
++
++    if ((err = snd_pcm_sw_params_current(stream->haptic_pcm, sw_params)) < 0 ||
++            (err = snd_pcm_sw_params_set_start_threshold(stream->haptic_pcm, sw_params, 1)) < 0 ||
++            (err = snd_pcm_sw_params_set_stop_threshold(stream->haptic_pcm, sw_params, buffer_frames)) < 0 ||
++            (err = snd_pcm_sw_params(stream->haptic_pcm, sw_params)) < 0)
++    {
++        WARN("Unable to apply DualSense haptic sw params: %d (%s)\n", err, snd_strerror(err));
++        goto failed;
++    }
++
++    if ((err = snd_pcm_prepare(stream->haptic_pcm)) < 0)
++    {
++        WARN("Unable to prepare DualSense haptic PCM: %d (%s)\n", err, snd_strerror(err));
++        goto failed;
++    }
++
++    free(hw_params);
++    free(sw_params);
++    TRACE("Opened DualSense haptic PCM \"%s\" at %u Hz, %u channels.\n", alsa_path, rate, stream->ss.channels);
++    stream->haptic_hotplug_generation = g_haptic_hotplug_generation;
++    return S_OK;
++
++failed:
++    free(hw_params);
++    free(sw_params);
++    snd_pcm_close(stream->haptic_pcm);
++    stream->haptic_pcm = NULL;
++    return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
++}
++
++static HRESULT pulse_haptic_stream_reconnect(struct pulse_stream *stream)
++{
++    char *alsa_path;
++
++    if (stream->haptic_pcm)
++    {
++        snd_pcm_close(stream->haptic_pcm);
++        stream->haptic_pcm = NULL;
++    }
++
++    if ((alsa_path = find_dualsense_haptic_alsa_path()))
++    {
++        free(stream->haptic_alsa_path);
++        stream->haptic_alsa_path = alsa_path;
++    }
++    else if ((alsa_path = get_dualsense_haptic_alsa_path(stream->device, stream)))
++    {
++        free(stream->haptic_alsa_path);
++        stream->haptic_alsa_path = alsa_path;
++    }
++
++    if (!stream->haptic_alsa_path || !stream->haptic_alsa_path[0])
++        return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
++
++    return pulse_haptic_stream_connect(stream, stream->haptic_alsa_path);
++}
++
++static void pulse_haptic_drop_held(struct pulse_stream *stream)
++{
++    TRACE("Dropping %lu bytes of pending DualSense haptic data.\n", (unsigned long)stream->held_bytes);
++    stream->pa_offs_bytes += stream->held_bytes;
++    stream->pa_offs_bytes %= stream->real_bufsize_bytes;
++    stream->lcl_offs_bytes += stream->held_bytes;
++    stream->lcl_offs_bytes %= stream->real_bufsize_bytes;
++    stream->pa_held_bytes = 0;
++    stream->held_bytes = 0;
++}
++
++static void pulse_haptic_invalidate(struct pulse_stream *stream, const char *reason)
++{
++    TRACE("Invalidating DualSense haptic PCM after %s.\n", reason);
++    if (stream->haptic_pcm)
++    {
++        snd_pcm_close(stream->haptic_pcm);
++        stream->haptic_pcm = NULL;
++    }
++    /* Keep the stream on the raw-haptic retry path while hotplug settles; clearing this
++     * pointer would make it fall back to the stale Pulse Direct sink during unplug. */
++    if (stream->haptic_alsa_path)
++        stream->haptic_alsa_path[0] = 0;
++    stream->haptic_reconnect_time = 0;
++    stream->haptic_path_check_time = 0;
++    stream->haptic_hotplug_generation = g_haptic_hotplug_generation;
++    pulse_haptic_drop_held(stream);
++}
++
++static BOOL pulse_haptic_refresh_path(struct pulse_stream *stream)
++{
++    pa_usec_t now = pa_rtclock_now();
++    char *alsa_path;
++    BOOL changed;
++
++    if (stream->haptic_path_check_time && now < stream->haptic_path_check_time)
++        return stream->haptic_pcm != NULL;
++
++    if (stream->haptic_pcm && stream->haptic_hotplug_generation == g_haptic_hotplug_generation)
++        return TRUE;
++    if (!stream->haptic_pcm && stream->haptic_hotplug_generation == g_haptic_hotplug_generation)
++        return FALSE;
++
++    stream->haptic_path_check_time = now + DUALSENSE_HAPTIC_REFRESH_USEC;
++    stream->haptic_hotplug_generation = g_haptic_hotplug_generation;
++    if (stream->haptic_pcm)
++    {
++        snd_pcm_close(stream->haptic_pcm);
++        stream->haptic_pcm = NULL;
++    }
++    stream->haptic_reconnect_time = 0;
++
++    if (!(alsa_path = find_dualsense_haptic_alsa_path()))
++        return FALSE;
++
++    changed = !stream->haptic_alsa_path || strcmp(stream->haptic_alsa_path, alsa_path);
++    TRACE("Refreshing DualSense haptic PCM %s%s%s.\n",
++            debugstr_a(stream->haptic_alsa_path), changed ? " -> " : "",
++            changed ? debugstr_a(alsa_path) : "");
++    if (changed)
++        free(stream->haptic_alsa_path);
++    else
++        free(alsa_path);
++    if (changed)
++        stream->haptic_alsa_path = alsa_path;
++    return SUCCEEDED(pulse_haptic_stream_reconnect(stream));
++}
++
++static void pulse_haptic_advance(struct pulse_stream *stream, UINT32 frames, UINT32 frame_size)
++{
++    SIZE_T bytes = (SIZE_T)frames * frame_size;
++
++    stream->pa_offs_bytes += bytes;
++    stream->pa_offs_bytes %= stream->real_bufsize_bytes;
++    stream->lcl_offs_bytes += bytes;
++    stream->lcl_offs_bytes %= stream->real_bufsize_bytes;
++    stream->pa_held_bytes -= min(stream->pa_held_bytes, bytes);
++    stream->held_bytes -= min(stream->held_bytes, bytes);
++}
++
++static void pulse_haptic_write(struct pulse_stream *stream)
++{
++    snd_pcm_state_t state;
++    snd_pcm_sframes_t avail, written;
++    UINT32 frame_size = pa_frame_size(&stream->ss);
++    UINT32 held_frames = stream->held_bytes / frame_size;
++    UINT32 frames, contiguous_frames, i, c;
++    const float *src;
++    int err;
++
++    if (!pulse_stream_haptic(stream) || !held_frames)
++        return;
++    if (!pulse_haptic_refresh_path(stream))
++        return;
++    if (!stream->haptic_pcm)
++        return;
++
++    state = snd_pcm_state(stream->haptic_pcm);
++    if (state == SND_PCM_STATE_DISCONNECTED)
++    {
++        WARN("DualSense haptic PCM disconnected; waiting for a new raw ALSA endpoint.\n");
++        pulse_haptic_invalidate(stream, "disconnect");
++        return;
++    }
++    else if (state == SND_PCM_STATE_XRUN || state == SND_PCM_STATE_SUSPENDED)
++    {
++        if ((err = snd_pcm_recover(stream->haptic_pcm, state == SND_PCM_STATE_XRUN ? -EPIPE : -ESTRPIPE, 1)) < 0)
++        {
++            WARN("DualSense haptic PCM state recover failed from %s: %d (%s)\n",
++                    snd_pcm_state_name(state), err, snd_strerror(err));
++            pulse_haptic_invalidate(stream, "state recovery failure");
++            return;
++        }
++    }
++
++    avail = snd_pcm_avail_update(stream->haptic_pcm);
++    if (avail < 0)
++    {
++        if ((err = snd_pcm_recover(stream->haptic_pcm, avail, 1)) < 0)
++        {
++            WARN("DualSense haptic PCM recover failed: %d (%s)\n", err, snd_strerror(err));
++            pulse_haptic_invalidate(stream, "availability recovery failure");
++            return;
++        }
++        avail = snd_pcm_avail_update(stream->haptic_pcm);
++    }
++    if (avail <= 0)
++        return;
++
++    contiguous_frames = (stream->real_bufsize_bytes - stream->pa_offs_bytes) / frame_size;
++    frames = min(min((UINT32)avail, held_frames), contiguous_frames);
++    if (!frames)
++        return;
++    src = (const float *)(stream->local_buffer + stream->pa_offs_bytes);
++    if (frames > stream->haptic_buffer_frames)
++    {
++        int16_t *buffer = realloc(stream->haptic_buffer, frames * stream->ss.channels * sizeof(*buffer));
++
++        if (!buffer)
++            return;
++        stream->haptic_buffer = buffer;
++        stream->haptic_buffer_frames = frames;
++    }
++
++    for (i = 0; i < frames; ++i)
++        for (c = 0; c < stream->ss.channels; ++c)
++            stream->haptic_buffer[i * stream->ss.channels + c] =
++                    float_to_s16(src[i * stream->ss.channels + c]);
++
++    written = snd_pcm_writei(stream->haptic_pcm, stream->haptic_buffer, frames);
++    if (written < 0)
++    {
++        if ((err = snd_pcm_recover(stream->haptic_pcm, written, 1)) < 0)
++        {
++            WARN("DualSense haptic PCM write failed: %ld/%d (%s)\n", written, err, snd_strerror(err));
++            pulse_haptic_invalidate(stream, "write recovery failure");
++            return;
++        }
++        written = snd_pcm_writei(stream->haptic_pcm, stream->haptic_buffer, frames);
++        if (written < 0)
++        {
++            WARN("DualSense haptic PCM write failed after recover: %ld (%s)\n",
++                    written, snd_strerror(written));
++            pulse_haptic_invalidate(stream, "write failure");
++            return;
++        }
++    }
++
++    pulse_haptic_advance(stream, written, frame_size);
++}
+ static NTSTATUS pulse_create_stream(void *args)
+ {
+     struct create_stream_params *params = args;
+     struct pulse_stream *stream;
+     unsigned int i, bufsize_bytes;
+     HRESULT hr;
+-    char *name;
++    char *name, *haptic_target = NULL, *haptic_alsa_path = NULL;
++    const char *connect_device;
++    BOOL haptic_candidate;
+ 
+     if (params->share == AUDCLNT_SHAREMODE_EXCLUSIVE) {
+         params->result = AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED;
+@@ -1522,6 +2129,23 @@
+     if (FAILED(hr))
+         goto exit;
+ 
++    haptic_candidate = is_dualsense_haptic_format(stream)
++            && (string_contains_dualsense_name(params->device)
++                    || (haptic_target = get_dualsense_haptic_target(params->device, stream)));
++    if (haptic_candidate)
++    {
++        stream->map.map[0] = PA_CHANNEL_POSITION_AUX0;
++        stream->map.map[1] = PA_CHANNEL_POSITION_AUX1;
++        stream->map.map[2] = PA_CHANNEL_POSITION_AUX2;
++        stream->map.map[3] = PA_CHANNEL_POSITION_AUX3;
++        haptic_alsa_path = get_dualsense_haptic_alsa_path(params->device, stream);
++        if (!haptic_alsa_path)
++            haptic_alsa_path = find_dualsense_haptic_alsa_path();
++        TRACE("Routing DualSense haptic stream from %s through %s%s.\n",
++                params->device, haptic_alsa_path ? "raw ALSA PCM " : "Pulse device ",
++                haptic_alsa_path ? haptic_alsa_path : params->device);
++    }
++
+     stream->def_period = params->period;
+     stream->duration = params->duration;
+ 
+@@ -1535,7 +2159,34 @@
+ 
+     stream->share = params->share;
+     stream->flags = params->flags;
+-    hr = pulse_stream_connect(stream, params->device, stream->period_bytes);
++    connect_device = params->device;
++    if (haptic_candidate)
++    {
++        stream->haptic_alsa_path = strdup(haptic_alsa_path ? haptic_alsa_path : "");
++        if (stream->haptic_alsa_path)
++        {
++            if (stream->haptic_alsa_path[0])
++                hr = pulse_haptic_stream_connect(stream, stream->haptic_alsa_path);
++            else
++                hr = AUDCLNT_E_ENDPOINT_CREATE_FAILED;
++            if (FAILED(hr))
++            {
++                TRACE("Falling back to Pulse routing for DualSense haptic stream.\n");
++                free(stream->haptic_alsa_path);
++                stream->haptic_alsa_path = NULL;
++                if ((dualsense_speaker = get_dualsense_speaker_sink(connect_device)))
++                    connect_device = dualsense_speaker;
++                /* The hidden haptic target is only for the raw ALSA split path. If raw
++                 * access is busy, connect directly to the controller speaker sink so controller
++                 * speaker/effect audio works before any hotplug reconnect happens. */
++                hr = pulse_stream_connect(stream, connect_device, NULL, stream->period_bytes);
++            }
++        }
++        else
++            hr = E_OUTOFMEMORY;
++    }
++    else
++        hr = pulse_stream_connect(stream, connect_device, haptic_target, stream->period_bytes);
+     if (SUCCEEDED(hr)) {
+         UINT32 unalign;
+         const pa_buffer_attr *attr = pulse_stream_ready(stream) ? pa_stream_get_buffer_attr(stream->stream) : &stream->attr;
+@@ -1591,9 +2237,12 @@
+             pa_stream_unref(stream->stream);
+         }
+         free(stream->device);
++        free(stream->haptic_alsa_path);
+         free(stream);
+     }
+ 
++    free(haptic_target);
++    free(haptic_alsa_path);
+     pulse_unlock();
+     return STATUS_SUCCESS;
+ }
+@@ -1771,7 +2420,15 @@
+     /* write as much data to PA as we can */
+     UINT32 to_write;
+     BYTE *buf = stream->local_buffer + stream->pa_offs_bytes;
+-    UINT32 bytes = pa_stream_writable_size(stream->stream);
++    UINT32 bytes;
++
++    if (pulse_stream_haptic(stream))
++    {
++        pulse_haptic_write(stream);
++        return;
++    }
++
++    bytes = pa_stream_writable_size(stream->stream);
+ 
+     pulse_write_index_catchup(stream);
+ 
+@@ -1989,11 +2646,14 @@
+             {
+                 pulse_write(stream);
+ 
+-                /* regardless of what PA does, advance one per`iod */
+-                adv_bytes = min(stream->period_bytes, stream->held_bytes);
+-                stream->lcl_offs_bytes += adv_bytes;
+-                stream->lcl_offs_bytes %= stream->real_bufsize_bytes;
+-                stream->held_bytes -= adv_bytes;
++                if (!pulse_stream_haptic(stream))
++                {
++                    /* regardless of what PA does, advance one period */
++                    adv_bytes = min(stream->period_bytes, stream->held_bytes);
++                    stream->lcl_offs_bytes += adv_bytes;
++                    stream->lcl_offs_bytes %= stream->real_bufsize_bytes;
++                    stream->held_bytes -= adv_bytes;
++                }
+             }
+             else if (stream->dataflow == eRender)
+             {
+@@ -2100,12 +2760,20 @@
+ 
+     pulse_lock();
+     remove_stream_from_period(stream);
+-    if (PA_STREAM_IS_GOOD(pa_stream_get_state(stream->stream))) {
+-        pa_stream_disconnect(stream->stream);
+-        while (pulse_ml && PA_STREAM_IS_GOOD(pa_stream_get_state(stream->stream)))
+-            pulse_cond_wait();
++    if (stream->stream)
++    {
++        if (PA_STREAM_IS_GOOD(pa_stream_get_state(stream->stream))) {
++            pa_stream_disconnect(stream->stream);
++            while (pulse_ml && PA_STREAM_IS_GOOD(pa_stream_get_state(stream->stream)))
++                pulse_cond_wait();
++        }
++        pa_stream_unref(stream->stream);
++    }
++    if (stream->haptic_pcm)
++    {
++        snd_pcm_drop(stream->haptic_pcm);
++        snd_pcm_close(stream->haptic_pcm);
+     }
+-    pa_stream_unref(stream->stream);
+     pulse_unlock();
+ 
+     if (stream->tmp_buffer) {
+@@ -2119,7 +2787,9 @@
+                             &size, MEM_RELEASE);
+     }
+     free(stream->peek_buffer);
++    free(stream->haptic_buffer);
+     free(stream->device);
++    free(stream->haptic_alsa_path);
+     free(stream);
+     return STATUS_SUCCESS;
+ }
+@@ -2153,14 +2823,25 @@
+         return STATUS_SUCCESS;
+     }
+ 
+-    pulse_write(stream);
+-
+-    if (pa_stream_is_corked(stream->stream))
++    if (pulse_stream_haptic(stream))
+     {
+-        if (!wait_pa_operation_complete(pa_stream_cork(stream->stream, 0, pulse_op_cb, &success)))
+-            success = 0;
+-        if (!success)
+-            params->result = E_FAIL;
++        if (stream->haptic_pcm || pulse_haptic_refresh_path(stream))
++        {
++            snd_pcm_prepare(stream->haptic_pcm);
++            pulse_write(stream);
++        }
++    }
++    else if (pulse_stream_ready(stream))
++    {
++        pulse_write(stream);
++
++        if (pa_stream_is_corked(stream->stream))
++        {
++            if (!wait_pa_operation_complete(pa_stream_cork(stream->stream, 0, pulse_op_cb, &success)))
++                success = 0;
++            if (!success)
++                params->result = E_FAIL;
++        }
+     }
+ 
+     if (SUCCEEDED(params->result))
+@@ -2194,7 +2875,15 @@
+     }
+ 
+     params->result = S_OK;
+-    if (stream->dataflow == eRender)
++    if (pulse_stream_haptic(stream))
++    {
++        if (stream->haptic_pcm)
++        {
++            snd_pcm_drop(stream->haptic_pcm);
++            snd_pcm_prepare(stream->haptic_pcm);
++        }
++    }
++    else if (stream->dataflow == eRender && pulse_stream_ready(stream))
+     {
+         if (!wait_pa_operation_complete(pa_stream_cork(stream->stream, 1, pulse_op_cb, &success)))
+             success = 0;
+@@ -2238,7 +2927,16 @@
+     {
+         /* If there is still data in the render buffer it needs to be removed from the server */
+         int success = 0;
+-        if (stream->held_bytes)
++        if (stream->held_bytes && pulse_stream_haptic(stream))
++        {
++            if (stream->haptic_pcm)
++            {
++                snd_pcm_drop(stream->haptic_pcm);
++                snd_pcm_prepare(stream->haptic_pcm);
++            }
++            success = 1;
++        }
++        else if (stream->held_bytes && pulse_stream_ready(stream))
+             wait_pa_operation_complete(pa_stream_flush(stream->stream, pulse_op_cb, &success));
+ 
+         if (success || !stream->held_bytes)

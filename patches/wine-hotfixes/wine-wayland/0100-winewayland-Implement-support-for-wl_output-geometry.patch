@@ -1,0 +1,166 @@
+From 8c11729aa0309318fe787081c4d501dc9c0dbc21 Mon Sep 17 00:00:00 2001
+From: Etaash Mathamsetty
+ <45927311+Etaash-mathamsetty@users.noreply.github.com>
+Date: Wed, 22 Apr 2026 01:31:18 -0500
+Subject: [PATCH 100/193] winewayland: Implement support for wl_output geometry
+ events.
+
+---
+ dlls/winewayland.drv/display.c        | 42 ++++++++++++++++++++++++---
+ dlls/winewayland.drv/wayland_output.c | 28 ++++++++++++++++--
+ dlls/winewayland.drv/waylanddrv.h     |  3 ++
+ 3 files changed, 66 insertions(+), 7 deletions(-)
+
+diff --git a/dlls/winewayland.drv/display.c b/dlls/winewayland.drv/display.c
+index 69537478cf0..4e89375fbd9 100644
+--- a/dlls/winewayland.drv/display.c
++++ b/dlls/winewayland.drv/display.c
+@@ -208,20 +208,36 @@ static void wayland_add_device_source(const struct gdi_device_manager *device_ma
+ static UINT get_edid(struct output_info *output_info, unsigned char **edid)
+ {
+     struct wayland_output_mode *mode = output_info->output->current_mode;
++    const char *model = output_info->output->model;
+     unsigned int edid_size = 128, extensions = 0;
++    unsigned char l[3] = {19, 1, 13}; /* SAM */
+     unsigned int i, mwidth, mheight;
+     unsigned char *data, *p, c;
++    char temp_model[13] = {0};
+ 
+     if (!(*edid = calloc(edid_size, sizeof(**edid))))
+         return 0;
+ 
+     data = *edid;
+ 
+-    /* assume ~150 dpi */
+-    mwidth = mode->width / 60;
+-    mheight = mode->width / 60;
++    mwidth = output_info->output->physical_w;
++    mheight = output_info->output->physical_h;
++
++    if (mwidth == 0 || mheight == 0)
++    {
++        /* assume ~150 dpi */
++        mwidth = mode->width / 60;
++        mheight = mode->width / 60;
++    }
+ 
+     *(uint64_t*)data = 0x00ffffffffffff00;
++
++    /* we cannot get this information from wayland, so make something up */
++    data[8] = ((l[0] & 0x1f) << 2) | ((l[1] & 0x18) >> 3);
++    data[9] = ((l[1] & 0x7) << 5) | (l[2] & 0x1f);
++    data[10] = 0xad;
++    data[11] = 0xde;
++    /* serial number is all zeros */
+     data[16] = 0xFF;
+     data[17] = 31; /* 2021 */
+     data[18] = 1;
+@@ -248,7 +264,25 @@ static UINT get_edid(struct output_info *output_info, unsigned char **edid)
+ 
+     p += 18;
+     p[3] = 0xfc;
+-    strcpy( (char *)p + 5, "Default" );
++
++    if (model) lstrcpynA(temp_model, model, sizeof(temp_model));
++    else strcpy(temp_model, "Default");
++
++    for (i = 0; i < sizeof(temp_model); i++)
++    {
++        if (!temp_model[i])
++        {
++            temp_model[i++] = '\n';
++            break;
++        }
++    }
++    for (; i < sizeof(temp_model); i++)
++    {
++        if (!temp_model[i]) temp_model[i] = ' ';
++    }
++
++    TRACE("edid model %s\n", debugstr_an(temp_model, sizeof(temp_model)));
++    memcpy((char *)p + 5, temp_model, sizeof(temp_model));
+ 
+     p += 18;
+     p[3] = 0x10;
+diff --git a/dlls/winewayland.drv/wayland_output.c b/dlls/winewayland.drv/wayland_output.c
+index 4e2cb1d73be..6332247ca50 100644
+--- a/dlls/winewayland.drv/wayland_output.c
++++ b/dlls/winewayland.drv/wayland_output.c
+@@ -39,7 +39,7 @@ static uint32_t next_output_id = 0;
+ #define WAYLAND_OUTPUT_CHANGED_NAME       0x02
+ #define WAYLAND_OUTPUT_CHANGED_LOGICAL_XY 0x04
+ #define WAYLAND_OUTPUT_CHANGED_LOGICAL_WH 0x08
+-#define WAYLAND_OUTPUT_CHANGED_TRANSFORM  0x10
++#define WAYLAND_OUTPUT_CHANGED_GEOMETRY   0x10
+ 
+ /**********************************************************************
+  *          Output handling
+@@ -136,9 +136,15 @@ static void wayland_output_done(struct wayland_output *output)
+     /* Update current state from pending state. */
+     pthread_mutex_lock(&process_wayland.output_mutex);
+ 
+-    if (output->pending_flags & WAYLAND_OUTPUT_CHANGED_TRANSFORM)
++    if (output->pending_flags & WAYLAND_OUTPUT_CHANGED_GEOMETRY)
+     {
++        free(output->current.make);
++        free(output->current.model);
+         output->current.transform = output->pending.transform;
++        output->current.physical_w = output->pending.physical_w;
++        output->current.physical_h = output->pending.physical_h;
++        output->current.make = output->pending.make;
++        output->current.model = output->pending.model;
+     }
+ 
+     if (output->pending_flags & WAYLAND_OUTPUT_CHANGED_MODES)
+@@ -216,8 +222,12 @@ static void output_handle_geometry(void *data, struct wl_output *wl_output,
+     struct wayland_output *output = data;
+ 
+     output->pending.transform = output_transform;
++    output->pending.physical_w = physical_width;
++    output->pending.physical_h = physical_height;
++    output->pending.model = strdup(model);
++    output->pending.make = strdup(make);
+ 
+-    output->pending_flags |= WAYLAND_OUTPUT_CHANGED_TRANSFORM;
++    output->pending_flags |= WAYLAND_OUTPUT_CHANGED_GEOMETRY;
+ }
+ 
+ static void output_handle_mode(void *data, struct wl_output *wl_output,
+@@ -358,6 +368,18 @@ BOOL wayland_output_create(uint32_t id, uint32_t version)
+         goto err;
+     }
+ 
++    if (!(output->current.model = strdup("Monitor")))
++    {
++        ERR("Couldn't allocate space for output model\n");
++        goto err;
++    }
++
++    if (!(output->current.make = strdup("Wine")))
++    {
++        ERR("Couldn't allocate space for output make\n");
++        goto err;
++    }
++
+     if (process_wayland.zxdg_output_manager_v1)
+         wayland_output_use_xdg_extension(output);
+ 
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index dafb96c8a42..ffb973b0110 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -255,8 +255,11 @@ struct wayland_output_state
+     struct rb_tree modes;
+     struct wayland_output_mode *current_mode;
+     char *name;
++    char *make;
++    char *model;
+     int logical_x, logical_y;
+     int logical_w, logical_h;
++    int physical_w, physical_h;
+     int transform;
+ };
+ 
+-- 
+2.55.0
+

@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Thu, 9 Jul 2026 05:05:00 -0600
+Subject: [PATCH] winepulse: Bind DualSense mono streams only to speaker sinks.
+
+During a controller model swap PipeWire can expose the new controller's
+monitor, mic, or direct render nodes before the actual controller speaker sink.
+DualSense mono effect streams should not bind to those transient endpoints:
+if they do, Spider-Man loses controller speaker effects until the same
+controller is disconnected and connected a second time.
+
+Keep the existing fallback behavior for haptic routing, but require mono
+speaker/effect streams to wait for a real DualSense Speaker__sink before
+initial binding or live retargeting.
+---
+ dlls/winepulse.drv/pulse.c | 15 ++++++++++-----
+ 1 file changed, 10 insertions(+), 5 deletions(-)
+
+diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -2266,40 +2266,44 @@ static char *get_dualsense_haptic_alsa_path(const char *pulse_name, const struc
+     return path;
+ }
+ 
+-static char *get_dualsense_speaker_sink(const char *preferred)
++static char *get_dualsense_speaker_sink(const char *preferred, BOOL require_speaker)
+ {
+     static struct list *const lists[] = { &g_phys_speakers_added, &g_phys_speakers, NULL };
+     struct list *const *list;
+     PhysDevice *dev;
+     char *fallback = NULL, *direct_fallback = NULL;
+ 
+     g_phys_lock();
+     for (list = lists; *list; ++list)
+     {
+         LIST_FOR_EACH_ENTRY(dev, *list, PhysDevice, entry)
+         {
+-            BOOL direct;
++            BOOL direct, speaker;
+ 
+             if (!is_dualsense_audio_device(dev))
+                 continue;
+ 
+             direct = strstr(dev->pulse_name, "Direct__Direct__sink") || dev->raw_haptic_target;
++            speaker = is_dualsense_speaker_sink(dev);
++            if (require_speaker && !speaker)
++                continue;
++
+             if (preferred && pulse_device_matches(dev, preferred) && !direct)
+             {
+                 char *ret = strdup(dev->pulse_name);
+ 
+                 g_phys_unlock();
+                 free(fallback);
+                 free(direct_fallback);
+                 return ret;
+             }
+ 
+-            if (!direct && (!fallback || strstr(dev->pulse_name, "Speaker__sink")))
++            if (!direct && (!fallback || speaker))
+             {
+                 free(fallback);
+                 fallback = strdup(dev->pulse_name);
+             }
+-            else if (direct && !direct_fallback)
++            else if (!require_speaker && direct && !direct_fallback)
+                 direct_fallback = strdup(dev->pulse_name);
+         }
+     }
+@@ -2335,7 +2339,7 @@ static HRESULT pulse_retarget_dualsense_mono_stream(struct pulse_stream *stream)
+     if (!stream->dualsense_mono_registered && !pulse_stream_dualsense_mono(stream))
+         return S_FALSE;
+ 
+-    if (!(dualsense_speaker = get_dualsense_speaker_sink(NULL)))
++    if (!(dualsense_speaker = get_dualsense_speaker_sink(NULL, TRUE)))
+         return E_FAIL;
+ 
+     TRACE("Retargeting DualSense mono stream %p from %s to %s.\n",
+@@ -2822,7 +2826,7 @@ static NTSTATUS pulse_create_stream(void *args)
+     stream->share = params->share;
+     stream->flags = params->flags;
+     connect_device = params->device;
+-    if (dualsense_mono_candidate && (dualsense_speaker = get_dualsense_speaker_sink(params->device)))
++    if (dualsense_mono_candidate && (dualsense_speaker = get_dualsense_speaker_sink(params->device, TRUE)))
+         connect_device = dualsense_speaker;
+     else if ((resolved_device = pulse_resolve_device_name(connect_device)))
+         connect_device = resolved_device;
+@@ -2840,7 +2844,7 @@ static NTSTATUS pulse_create_stream(void *args)
+             {
+                 TRACE("Falling back to Pulse routing for DualSense haptic stream.\n");
+                 free(stream->haptic_alsa_path);
+                 stream->haptic_alsa_path = NULL;
+-                if ((dualsense_speaker = get_dualsense_speaker_sink(connect_device)))
++                if ((dualsense_speaker = get_dualsense_speaker_sink(connect_device, FALSE)))
+                     connect_device = dualsense_speaker;
+                 /* The hidden haptic target is only for the raw ALSA split path. If raw
+                  * access is busy, connect directly to the controller speaker sink so controller
+-- 
+2.54.0
