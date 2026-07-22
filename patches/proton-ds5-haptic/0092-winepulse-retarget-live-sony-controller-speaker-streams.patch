@@ -1,0 +1,383 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Tue, 21 Jul 2026 13:20:00 -0600
+Subject: [PATCH] winepulse: Retarget live Sony controller speaker streams.
+
+Spider-Man Remastered keeps its controller-effect IAudioClient alive across
+Sony controller hotplug. The mmdevapi side correctly removes the old physical
+endpoint and announces the new one, but the game often keeps writing to the
+already-open one-channel effect stream instead of activating the replacement
+endpoint, especially after switching between DualSense, DualSense Edge, and
+DualShock controllers.
+
+Keep the endpoint/device policy strict: disconnected controller endpoints are
+still removed and forgotten. Only retarget already-open Sony controller speaker
+streams to the real PulseAudio sink from the latest connected Sony controller
+speaker. This avoids keeping stale MMDevice state while preserving the stream
+continuity that the game expects for controller speaker effects.
+
+---
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -84,6 +84,7 @@
+ };
+ 
+ static struct list active_periods = LIST_INIT(active_periods);
++static struct list dualsense_mono_streams = LIST_INIT(dualsense_mono_streams);
+ 
+ struct pulse_stream
+ {
+@@ -124,10 +125,13 @@
+     INT64 clock_lastpos, clock_written;
+ 
+     struct list packet_free_head;
++    struct list dualsense_mono_entry;
+     struct list dualsense_pulse_haptic_entry;
+     struct list packet_filled_head;
+     struct list period_entry;
+     struct pulse_period *period;
++    unsigned int dualsense_mono_hotplug_generation;
++    BOOL dualsense_mono_registered;
+     BOOL dualsense_pulse_haptic_registered;
+ };
+ 
+@@ -179,6 +183,7 @@
+ static unsigned int g_haptic_hotplug_generation;
+ static unsigned int g_dualsense_endpoint_generation;
+ static unsigned int g_dualsense_mono_speaker_add_generation;
++static char *g_dualsense_mono_preferred_sink;
+ static unsigned int g_phys_event_mask;
+ static unsigned int g_phys_event_stale_render;
+ static unsigned int g_phys_event_stale_capture;
+@@ -474,6 +479,8 @@
+ 
+     free( silence_buf );
+     silence_buf = NULL;
++    free(g_dualsense_mono_preferred_sink);
++    g_dualsense_mono_preferred_sink = NULL;
+ 
+     pthread_mutex_destroy(&pulse_mutex);
+     pthread_mutex_destroy(&g_phys_mutex);
+@@ -581,6 +586,7 @@
+ 
+ static BOOL pulse_refresh_devices(EDataFlow flow);
+ static BOOL is_dualsense_speaker_sink(const PhysDevice *dev);
++static void pulse_retarget_dualsense_mono_streams(const char *preferred);
+ 
+ /* for winepulse, this function can be called in a separate thread from other functions. */
+ /* this function cannot be called from multiple threads at the same time however. */
+@@ -603,6 +609,7 @@
+     BOOL refreshed;
+     PhysDevice *dev, *dev_next;
+     BOOL delta = params->delta;
++    char *dualsense_mono_target = NULL;
+ 
+     TRACE("flow %d, delta %d\n", (int)params->flow, (int)params->delta);
+ 
+@@ -725,6 +732,16 @@
+         pulse_get_endpoints(list_removed, &endpoint, &offset, params->endpoints);
+ 
+         LIST_FOR_EACH_ENTRY_SAFE(dev, dev_next, list_added, PhysDevice, entry) {
++            if (params->flow == eRender && is_dualsense_speaker_sink(dev))
++            {
++                char *target = strdup(dev->pulse_name);
++
++                if (target)
++                {
++                    free(dualsense_mono_target);
++                    dualsense_mono_target = target;
++                }
++            }
+             list_remove(&dev->entry);
+             list_add_tail(list, &dev->entry);
+         }
+@@ -754,6 +771,16 @@
+         pulse_get_endpoints(list_added, &endpoint, &offset, params->endpoints);
+ 
+         LIST_FOR_EACH_ENTRY_SAFE(dev, dev_next, list_added, PhysDevice, entry) {
++            if (params->flow == eRender && is_dualsense_speaker_sink(dev))
++            {
++                char *target = strdup(dev->pulse_name);
++
++                if (target)
++                {
++                    free(dualsense_mono_target);
++                    dualsense_mono_target = target;
++                }
++            }
+             list_remove(&dev->entry);
+             list_add_tail(list, &dev->entry);
+         }
+@@ -762,6 +789,14 @@
+ done:
+     g_phys_unlock();
+ 
++    if (dualsense_mono_target)
++    {
++        pulse_lock();
++        pulse_retarget_dualsense_mono_streams(dualsense_mono_target);
++        pulse_unlock();
++        free(dualsense_mono_target);
++    }
++
+     if (needed > params->size) {
+         params->size = needed;
+         params->result = HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+@@ -844,6 +879,9 @@
+ {
+     pa_stream_state_t state;
+ 
++    if (stream->dualsense_mono_registered)
++        return TRUE;
++
+     if (!stream->stream)
+         return stream->dataflow == eRender && stream->haptic_pcm && stream->haptic_alsa_path
+                 && stream->haptic_alsa_path[0];
+@@ -1641,6 +1681,7 @@
+     pa_mainloop *ml;
+     pa_context *ctx;
+     pa_operation *o;
++    char *dualsense_mono_target = NULL;
+ 
+     if (!(ml = pa_mainloop_new()))
+         return FALSE;
+@@ -1694,7 +1735,9 @@
+         {
+             ++g_haptic_hotplug_generation;
+             if (is_dualsense_speaker_sink(dev))
++            {
+                 ++g_dualsense_mono_speaker_add_generation;
++            }
+         }
+         list_remove(&dev->entry);
+         list_add_tail(removed, &dev->entry);
+@@ -1714,7 +1757,16 @@
+         {
+             ++g_haptic_hotplug_generation;
+             if (is_dualsense_speaker_sink(dev))
++            {
++                char *target = strdup(dev->pulse_name);
++
+                 ++g_dualsense_mono_speaker_add_generation;
++                if (target)
++                {
++                    free(dualsense_mono_target);
++                    dualsense_mono_target = target;
++                }
++            }
+         }
+         list_remove(&dev->entry);
+         list_add_tail(added, &dev->entry);
+@@ -1722,6 +1774,14 @@
+ 
+     g_phys_unlock();
+ 
++    if (dualsense_mono_target)
++    {
++        pulse_lock();
++        pulse_retarget_dualsense_mono_streams(dualsense_mono_target);
++        pulse_unlock();
++        free(dualsense_mono_target);
++    }
++
+     pa_context_unref(ctx);
+     pa_mainloop_free(ml);
+ 
+@@ -1732,6 +1792,7 @@
+     return TRUE;
+ 
+ fail:
++    free(dualsense_mono_target);
+     pa_context_unref(ctx);
+     pa_mainloop_free(ml);
+     LIST_FOR_EACH_ENTRY_SAFE(dev, next, &current, PhysDevice, entry)
+@@ -2420,6 +2458,130 @@
+     return pulse_stream_dualsense_mono_format(stream) && string_contains_dualsense_name(stream->device);
+ }
+ 
++static void pulse_stream_disconnect(struct pulse_stream *stream)
++{
++    if (!stream->stream)
++        return;
++
++    if (PA_STREAM_IS_GOOD(pa_stream_get_state(stream->stream)))
++        pa_stream_disconnect(stream->stream);
++    pa_stream_unref(stream->stream);
++    stream->stream = NULL;
++    stream->pa_started = FALSE;
++    stream->update_timing_info_pending = FALSE;
++}
++
++static void pulse_set_dualsense_mono_preferred_sink(const char *preferred)
++{
++    char *copy;
++
++    if (!preferred)
++    {
++        free(g_dualsense_mono_preferred_sink);
++        g_dualsense_mono_preferred_sink = NULL;
++        return;
++    }
++
++    if (!(copy = strdup(preferred)))
++    {
++        WARN("Failed to remember preferred Sony controller speaker sink %s.\n", debugstr_a(preferred));
++        return;
++    }
++
++    free(g_dualsense_mono_preferred_sink);
++    g_dualsense_mono_preferred_sink = copy;
++}
++
++static HRESULT pulse_retarget_dualsense_mono_stream(struct pulse_stream *stream, const char *preferred)
++{
++    char *dualsense_speaker;
++    const pa_buffer_attr *attr;
++    HRESULT hr;
++    int success;
++
++    if (!stream->dualsense_mono_registered && !pulse_stream_dualsense_mono(stream))
++        return S_FALSE;
++
++    if (!(dualsense_speaker = get_dualsense_speaker_sink(preferred, TRUE)))
++        return E_FAIL;
++
++    pulse_set_dualsense_mono_preferred_sink(dualsense_speaker);
++
++    if (stream->device && !strcmp(stream->device, dualsense_speaker) && pulse_stream_ready(stream))
++    {
++        stream->dualsense_mono_hotplug_generation = g_dualsense_mono_speaker_add_generation;
++        stream->haptic_hotplug_generation = g_haptic_hotplug_generation;
++        free(dualsense_speaker);
++        return S_FALSE;
++    }
++
++    TRACE("Retargeting Sony controller mono stream %p from %s to %s.\n",
++            stream, debugstr_a(stream->device), debugstr_a(dualsense_speaker));
++
++    pulse_stream_disconnect(stream);
++    free(stream->device);
++    stream->device = dualsense_speaker;
++    stream->timeline_start_period_time = 0;
++    stream->timeline_start_stream_time = 0;
++    stream->update_timing_info_pending = FALSE;
++
++    hr = pulse_stream_connect_dualsense_speaker(stream, stream->device, stream->period_bytes);
++    if (FAILED(hr))
++    {
++        WARN("Failed to retarget Sony controller mono stream %p to %s: %#x.\n",
++                stream, debugstr_a(stream->device), (unsigned int)hr);
++        return hr;
++    }
++
++    if ((attr = pa_stream_get_buffer_attr(stream->stream)))
++        stream->attr = *attr;
++
++    stream->dualsense_mono_hotplug_generation = g_dualsense_mono_speaker_add_generation;
++    stream->haptic_hotplug_generation = g_haptic_hotplug_generation;
++    stream->just_underran = TRUE;
++
++    if (!stream->period)
++        pulse_add_stream_to_period(stream);
++    if (stream->started && pulse_stream_ready(stream) && pa_stream_is_corked(stream->stream))
++    {
++        success = 0;
++        if (!wait_pa_operation_complete(pa_stream_cork(stream->stream, 0, pulse_op_cb, &success)))
++            success = 0;
++        if (!success)
++            hr = E_FAIL;
++    }
++
++    return hr;
++}
++
++static void pulse_retarget_dualsense_mono_streams(const char *preferred)
++{
++    struct pulse_stream *stream, *next;
++    BOOL found = FALSE;
++
++    if (preferred)
++    {
++        TRACE("New Sony controller speaker sink %s is preferred for live mono streams.\n",
++                debugstr_a(preferred));
++        pulse_set_dualsense_mono_preferred_sink(preferred);
++    }
++
++    LIST_FOR_EACH_ENTRY_SAFE(stream, next, &dualsense_mono_streams, struct pulse_stream, dualsense_mono_entry)
++    {
++        found = TRUE;
++        if (!preferred && stream->dualsense_mono_hotplug_generation == g_dualsense_mono_speaker_add_generation
++                && stream->haptic_hotplug_generation == g_haptic_hotplug_generation
++                && pulse_stream_ready(stream))
++            continue;
++
++        pulse_retarget_dualsense_mono_stream(stream, preferred);
++    }
++
++    if (preferred && !found)
++        TRACE("No live Sony controller mono streams were registered for preferred speaker %s.\n",
++                debugstr_a(preferred));
++}
++
+ static char *find_dualsense_haptic_alsa_path(void)
+ {
+     snd_pcm_info_t *info;
+@@ -2823,6 +2985,7 @@
+     }
+ 
+     stream->dataflow = params->flow;
++    list_init(&stream->dualsense_mono_entry);
+     list_init(&stream->dualsense_pulse_haptic_entry);
+     for (i = 0; i < ARRAY_SIZE(stream->vol); ++i)
+         stream->vol[i] = 1.f;
+@@ -2866,7 +3029,8 @@
+     stream->share = params->share;
+     stream->flags = params->flags;
+     connect_device = params->device;
+-    if (dualsense_mono_candidate && (dualsense_speaker = get_dualsense_speaker_sink(params->device, TRUE)))
++    if (dualsense_mono_candidate && (dualsense_speaker = get_dualsense_speaker_sink(
++            g_dualsense_mono_preferred_sink ? g_dualsense_mono_preferred_sink : params->device, TRUE)))
+         connect_device = dualsense_speaker;
+     else if ((resolved_device = pulse_resolve_device_name(connect_device)))
+         connect_device = resolved_device;
+@@ -2957,7 +3121,11 @@
+         if (dualsense_pulse_haptic_candidate || dualsense_mono_candidate)
+             stream->haptic_hotplug_generation = g_haptic_hotplug_generation;
+         if (dualsense_mono_candidate)
+-            stream->haptic_hotplug_generation = g_haptic_hotplug_generation;
++        {
++            stream->dualsense_mono_hotplug_generation = g_dualsense_mono_speaker_add_generation;
++            list_add_tail(&dualsense_mono_streams, &stream->dualsense_mono_entry);
++            stream->dualsense_mono_registered = TRUE;
++        }
+     }
+ 
+     *params->channel_count = stream->ss.channels;
+@@ -3193,6 +3361,13 @@
+         return;
+     }
+ 
++    if (stream->dualsense_mono_registered
++            && (stream->dualsense_mono_hotplug_generation != g_dualsense_mono_speaker_add_generation
++                || stream->haptic_hotplug_generation != g_haptic_hotplug_generation
++                || !pulse_stream_ready(stream))
++            && FAILED(pulse_retarget_dualsense_mono_stream(stream, g_dualsense_mono_preferred_sink)))
++        return;
++
+     if (pulse_stream_dualsense_mono(stream) && !pulse_stream_ready(stream))
+         return;
+ 
+@@ -3588,6 +3763,11 @@
+ 
+     pulse_lock();
+     remove_stream_from_period(stream);
++    if (stream->dualsense_mono_registered)
++    {
++        list_remove(&stream->dualsense_mono_entry);
++        stream->dualsense_mono_registered = FALSE;
++    }
+     if (stream->dualsense_pulse_haptic_registered)
+     {
+         list_remove(&stream->dualsense_pulse_haptic_entry);
+-- 
+2.54.0

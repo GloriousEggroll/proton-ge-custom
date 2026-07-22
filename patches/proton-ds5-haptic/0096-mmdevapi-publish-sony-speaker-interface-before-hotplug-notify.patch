@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Tue, 21 Jul 2026 20:15:00 -0600
+Subject: [PATCH] mmdevapi: Publish Sony speaker interface before hotplug notify.
+
+SetupDiCreateDeviceInterfaceW() creates the fake AudioEndpoint interface,
+but Wine's SetupAPI does not mark a newly created interface as linked and
+present.  The existing fake-audio enumeration workaround only writes
+Control\\Linked when an application later enumerates the interface class.
+
+This leaves a race during Sony controller swaps: mmdevapi can send the
+endpoint-added notification while the matching PnP interface is not yet
+published.  Spider-Man Remastered sees the MMDevice and its properties, but
+does not activate it.  A later physical replug appears to fix the endpoint
+because it provokes another full interface enumeration.
+
+For a freshly registered Sony controller speaker, enumerate the render or
+capture interface class once before MMDevice_Register() returns.  This uses
+the existing SetupAPI fake-audio path to publish the exact new interface
+before mmdevapi sends endpoint notifications.  It does not preserve any
+state after disconnect or change default-device selection.
+
+---
+ dlls/mmdevapi/devenum.c | 20 ++++++++++++++++++--
+ 1 file changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+index 7fdfc4325b1..38411f3785a 100644
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -1281,8 +1281,24 @@ static void MMDevice_Register(const WCHAR *instguid, const WCHAR *friendly_name,
+                 memset(&device_interface_data, 0, sizeof(device_interface_data));
+                 device_interface_data.cbSize = sizeof(device_interface_data);
+ 
+-                if (!SetupDiCreateDeviceInterfaceW(device_set, &device_info_data, flow == eRender ? &DEVINTERFACE_AUDIO_RENDER : &DEVINTERFACE_AUDIO_CAPTURE, NULL, 0, &device_interface_data))
+-                    WARN("SetupDiCreateDeviceInterfaceW failed.");
++                {
++                    const GUID *interface_class = flow == eRender ?
++                            &DEVINTERFACE_AUDIO_RENDER : &DEVINTERFACE_AUDIO_CAPTURE;
++                    HDEVINFO interface_set;
++
++                    if (!SetupDiCreateDeviceInterfaceW(device_set, &device_info_data,
++                            interface_class, NULL, 0, &device_interface_data))
++                        WARN("SetupDiCreateDeviceInterfaceW failed.");
++                    else if (is_dualsense_device_path(device_path))
++                    {
++                        interface_set = SetupDiGetClassDevsW(interface_class, NULL, NULL,
++                                DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
++                        if (interface_set == INVALID_HANDLE_VALUE)
++                            WARN("Failed to publish fresh Sony controller speaker interface: %lu.\n", GetLastError());
++                        else
++                            SetupDiDestroyDeviceInfoList(interface_set);
++                    }
++                }
+             }
+             else
+                 WARN("SetupDiCreateDeviceInfoW failed.");
+-- 
+2.54.0

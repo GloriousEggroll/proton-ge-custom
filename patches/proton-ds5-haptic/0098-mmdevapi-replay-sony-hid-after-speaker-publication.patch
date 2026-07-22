@@ -1,0 +1,570 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Tue, 21 Jul 2026 21:45:00 -0600
+Subject: [PATCH] sechost: Order Sony HID arrival after speaker publication.
+
+A hotplugged USB Sony controller publishes its HID interface before
+PipeWire/Pulse has reported the matching controller speaker and mmdevapi
+has completed its AudioEndpoint update. Applications which associate the
+controller with its speaker during that first HID arrival can therefore
+miss the speaker for the lifetime of the connection.
+
+Do not repair that race by fabricating a HID remove/arrival pair after the
+fact. Replaying the HID lifecycle tears down live application controller
+objects and can make managed audio code activate the new endpoint through
+an object of the old type.
+
+Instead, hold the original USB Sony HID arrival in sechost, keyed by the
+device container ID. Once mmdevapi has completed endpoint publication and
+sent the matching endpoint notifications, signal sechost to deliver that
+original arrival exactly once. Continue processing unrelated PnP events
+while it is pending, cancel it if the physical HID is removed, and use a
+bounded timeout so HID input remains available if no controller speaker is
+reported.
+
+Remove the delayed synthetic MMDevice replug notifications; endpoint
+publication and HID arrival now have a deterministic order without
+inventing either endpoint or HID lifecycles. No controller state is kept
+after the pending arrival is delivered or cancelled.
+
+---
+--- a/dlls/mmdevapi/Makefile.in
++++ b/dlls/mmdevapi/Makefile.in
+@@ -1,5 +1,5 @@
+ MODULE    = mmdevapi.dll
+-IMPORTS   = ole32 oleaut32 user32 advapi32 version setupapi
++IMPORTS   = ole32 oleaut32 user32 advapi32 version setupapi sechost
+ DELAYIMPORTS = winmm
+ 
+ SOURCES = \
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -37,6 +37,7 @@
+ #include "audiopolicy.h"
+ #include "spatialaudioclient.h"
+ #include "setupapi.h"
++#include "wine/plugplay.h"
+ 
+ #include "mmdevapi_private.h"
+ #include "devpkey.h"
+@@ -852,16 +853,11 @@
+ {
+     EDataFlow flow;
+     GUID guid;
++    GUID container_id;
+     DWORD state;
+     enum dualsense_mono_model model;
+ };
+ 
+-struct delayed_endpoint_notifications
+-{
+-    struct endpoint_notification *notifications;
+-    unsigned int count;
+-};
+-
+ static void notify_endpoint_added_state(EDataFlow flow, const GUID *id, DWORD state)
+ {
+     struct NotificationClientWrapper *wrapper;
+@@ -913,6 +909,7 @@
+         unsigned int *count, unsigned int *capacity, const MMDevice *device)
+ {
+     struct endpoint_notification *new_notifications;
++    PROPVARIANT container_id;
+     unsigned int new_capacity;
+ 
+     if (*count == *capacity)
+@@ -931,133 +928,19 @@
+ 
+     (*notifications)[*count].flow = device->flow;
+     (*notifications)[*count].guid = device->devguid;
++    (*notifications)[*count].container_id = GUID_NULL;
+     (*notifications)[*count].state = device->state;
+     (*notifications)[*count].model = dualsense_mono_endpoint_model(device);
+-    (*count)++;
+-    return TRUE;
+-}
+-
+-static BOOL endpoint_notification_is_current_dualsense_mono(const struct endpoint_notification *notification)
+-{
+-    MMDevice *device;
+-    BOOL found = FALSE;
+-
+-    EnterCriticalSection(&device_list_cs);
+-    LIST_FOR_EACH_ENTRY(device, &device_list, MMDevice, entry)
+-    {
+-        if (device->flow != notification->flow ||
+-                !IsEqualGUID(&device->devguid, &notification->guid) ||
+-                !is_dualsense_mono_endpoint(device) ||
+-                should_hide_from_endpoint_collection(device))
+-            continue;
+-
+-        found = TRUE;
+-        break;
+-    }
+-    LeaveCriticalSection(&device_list_cs);
+-
+-    return found;
+-}
+-
+-static void notify_current_render_default_device_changed(void)
+-{
+-    struct NotificationClientWrapper *wrapper;
+-    MMDevice *device = MMDevice_def_play;
+-    const GUID *id;
+-    WCHAR devid[56];
+-
+-    if (!device)
+-        return;
+-
+-    id = &device->devguid;
+-    swprintf(devid, 56, devid_formatW,
+-            eRender, id->Data1, id->Data2, id->Data3,
+-            id->Data4[0], id->Data4[1], id->Data4[2], id->Data4[3],
+-            id->Data4[4], id->Data4[5], id->Data4[6], id->Data4[7]);
+-
+-    TRACE("Re-signaling current render default %s after Sony controller hotplug settled.\n",
+-            debugstr_w(devid));
+-
+-    EnterCriticalSection(&g_notif_lock);
+-    LIST_FOR_EACH_ENTRY(wrapper, &g_notif_clients, struct NotificationClientWrapper, entry)
+-    {
+-        IMMNotificationClient_OnDefaultDeviceChanged(wrapper->client, eRender, eConsole, devid);
+-        IMMNotificationClient_OnDefaultDeviceChanged(wrapper->client, eRender, eMultimedia, devid);
+-        IMMNotificationClient_OnDefaultDeviceChanged(wrapper->client, eRender, eCommunications, devid);
+-    }
+-    LeaveCriticalSection(&g_notif_lock);
+-}
+ 
+-static DWORD WINAPI delayed_endpoint_notification_thread(void *arg)
+-{
+-    struct delayed_endpoint_notifications *delayed = arg;
+-    static const DWORD delays[] = { 300, 1200 };
+-    unsigned int pass, i;
+-
+-    for (pass = 0; pass < ARRAY_SIZE(delays); ++pass)
+-    {
+-        BOOL signaled = FALSE;
+-
+-        Sleep(delays[pass]);
+-
+-        for (i = 0; i < delayed->count; ++i)
+-        {
+-            if (!endpoint_notification_is_current_dualsense_mono(&delayed->notifications[i]))
+-                continue;
+-
+-            TRACE("Delayed re-signaling Sony mono endpoint %s %s after hotplug settled, pass %u.\n",
+-                    pass ? "replug" : "add", debugstr_guid(&delayed->notifications[i].guid), pass + 1);
+-
+-            if (pass)
+-            {
+-                notify_endpoint_removed(delayed->notifications[i].flow, &delayed->notifications[i].guid);
+-                Sleep(50);
+-                if (!endpoint_notification_is_current_dualsense_mono(&delayed->notifications[i]))
+-                    continue;
+-            }
+-            notify_endpoint_added_state(delayed->notifications[i].flow, &delayed->notifications[i].guid,
+-                    delayed->notifications[i].state);
+-            signaled = TRUE;
+-        }
+-
+-        if (signaled && !pass)
+-            notify_current_render_default_device_changed();
+-    }
+-
+-    free(delayed->notifications);
+-    free(delayed);
+-    return 0;
+-}
+-
+-static void queue_delayed_endpoint_notifications(const struct endpoint_notification *notifications, unsigned int count)
+-{
+-    struct delayed_endpoint_notifications *delayed;
+-    HANDLE thread;
+-
+-    if (!count)
+-        return;
+-
+-    if (!(delayed = malloc(sizeof(*delayed))))
+-        return;
+-
+-    if (!(delayed->notifications = malloc(count * sizeof(*delayed->notifications))))
+-    {
+-        free(delayed);
+-        return;
+-    }
+-    memcpy(delayed->notifications, notifications, count * sizeof(*delayed->notifications));
+-    delayed->count = count;
+-
+-    if (!(thread = CreateThread(NULL, 0, delayed_endpoint_notification_thread, delayed, 0, NULL)))
+-    {
+-        WARN("Failed to create delayed DualSense mono endpoint notification thread: %lu.\n",
+-                GetLastError());
+-        free(delayed->notifications);
+-        free(delayed);
+-        return;
+-    }
++    PropVariantInit(&container_id);
++    if (SUCCEEDED(MMDevice_GetPropValue(&device->devguid, device->flow,
++            (const PROPERTYKEY *)&DEVPKEY_Device_ContainerId, &container_id)) &&
++            container_id.vt == VT_CLSID)
++        (*notifications)[*count].container_id = *container_id.puuid;
++    PropVariantClear(&container_id);
+ 
+-    CloseHandle(thread);
++    (*count)++;
++    return TRUE;
+ }
+ 
+ static void resignal_visible_dualsense_mono_endpoints(enum dualsense_mono_model model)
+@@ -1085,9 +968,10 @@
+                 debugstr_guid(&notifications[i].guid));
+         notify_endpoint_added_state(notifications[i].flow, &notifications[i].guid,
+                 notifications[i].state);
++        if (!IsEqualGUID(&notifications[i].container_id, &GUID_NULL))
++            __wine_sechost_signal_sony_audio_endpoint_ready(&notifications[i].container_id);
+     }
+ 
+-    queue_delayed_endpoint_notifications(notifications, count);
+     free(notifications);
+ }
+ 
+@@ -1874,14 +1758,18 @@
+ 
+         if (params.flow == eRender)
+         {
++            enum dualsense_mono_model model = DUALSENSE_MONO_MODEL_UNKNOWN;
++            BOOL resignal = FALSE;
++
+             if (InterlockedExchange(&dualsense_mono_render_add_pending, 0))
+             {
+-                enum dualsense_mono_model model = dualsense_mono_render_add_model;
+-
++                model = dualsense_mono_render_add_model;
+                 dualsense_mono_render_add_model = DUALSENSE_MONO_MODEL_UNKNOWN;
+-                resignal_visible_dualsense_mono_endpoints(model);
++                resignal = TRUE;
+             }
+             InterlockedExchange(&render_update_in_progress, 0);
++            if (resignal)
++                resignal_visible_dualsense_mono_endpoints(model);
+         }
+ 
+         if (params.more_data)
+--- a/dlls/sechost/Makefile.in
++++ b/dlls/sechost/Makefile.in
+@@ -1,6 +1,6 @@
+ MODULE    = sechost.dll
+ IMPORTLIB = sechost
+-IMPORTS   = kernelbase
++IMPORTS   = kernelbase setupapi
+ DELAYIMPORTS = rpcrt4
+ 
+ SOURCES = \
+--- a/dlls/sechost/sechost.spec
++++ b/dlls/sechost/sechost.spec
+@@ -117,6 +117,7 @@
+ @ stub I_ScSendTSMessage
+ @ stdcall I_ScUnregisterDeviceNotification(ptr)
+ @ stub I_ScValidatePnPService
++@ stdcall __wine_sechost_signal_sony_audio_endpoint_ready(ptr)
+ @ stub LocalGetConditionForString
+ @ stub LocalGetReferencedTokenTypesForCondition
+ @ stub LocalGetStringForCondition
+--- a/dlls/sechost/service.c
++++ b/dlls/sechost/service.c
+@@ -27,7 +27,9 @@
+ #include "winsvc.h"
+ #include "winternl.h"
+ #include "winuser.h"
++#include "winreg.h"
+ #include "dbt.h"
++#include "setupapi.h"
+ 
+ #include "wine/debug.h"
+ #include "wine/exception.h"
+@@ -2014,6 +2016,13 @@
+ 
+ static HANDLE device_notify_thread;
+ static struct list device_notify_list = LIST_INIT(device_notify_list);
++static struct list pending_sony_hid_list = LIST_INIT(pending_sony_hid_list);
++static SRWLOCK pending_sony_hid_lock = SRWLOCK_INIT;
++
++static const GUID hid_device_interface_guid =
++        {0x4d1e55b2, 0xf16f, 0x11cf, {0x88, 0xcb, 0x00, 0x11, 0x11, 0x00, 0x00, 0x30}};
++static const DEVPROPKEY device_container_id_key =
++        {{0x8c7ed206, 0x3f8a, 0x4827, {0xb3, 0xab, 0xae, 0x9e, 0x1f, 0xae, 0xfc, 0x6c}}, 2};
+ 
+ struct device_notify
+ {
+@@ -2024,6 +2033,16 @@
+     DEV_BROADCAST_HDR header[]; /* variable size */
+ };
+ 
++struct pending_sony_hid
++{
++    struct list entry;
++    GUID container_id;
++    HANDLE ready_event;
++    WCHAR *path;
++    DEV_BROADCAST_HDR *header;
++    BOOL cancelled;
++};
++
+ C_ASSERT( sizeof(struct device_notify) == offsetof(struct device_notify, header[0]) );
+ 
+ static struct device_notify *device_notify_copy( struct device_notify *notify, DEV_BROADCAST_HDR *header )
+@@ -2065,14 +2084,211 @@
+     return TRUE;
+ }
+ 
++static void dispatch_device_notification( DWORD code, const WCHAR *path, DEV_BROADCAST_HDR *header )
++{
++    struct device_notify *notify, *event, *next;
++    struct list events = LIST_INIT(events);
++
++    /* Make a copy to avoid a hang if a callback tries to register or unregister for notifications. */
++    EnterCriticalSection( &service_cs );
++    LIST_FOR_EACH_ENTRY( notify, &device_notify_list, struct device_notify, entry )
++    {
++        if (!notification_filter_matches( notify->header, notify->path, header, path )) continue;
++        if (!(event = device_notify_copy( notify, header ))) break;
++        list_add_tail( &events, &event->entry );
++    }
++    LeaveCriticalSection( &service_cs );
++
++    LIST_FOR_EACH_ENTRY_SAFE( event, next, &events, struct device_notify, entry )
++    {
++        event->callback( event->handle, code, event->header );
++        list_remove( &event->entry );
++        free( event );
++    }
++}
++
++static BOOL contains_string_i( const WCHAR *string, const WCHAR *substring )
++{
++    SIZE_T length = wcslen( substring );
++
++    while (*string)
++    {
++        if (!wcsnicmp( string, substring, length )) return TRUE;
++        string++;
++    }
++    return FALSE;
++}
++
++static BOOL is_sony_usb_audio_hid( const DEV_BROADCAST_HDR *header )
++{
++    const DEV_BROADCAST_DEVICEINTERFACE_W *iface = (const DEV_BROADCAST_DEVICEINTERFACE_W *)header;
++    const WCHAR *name;
++
++    if (header->dbch_devicetype != DBT_DEVTYP_DEVICEINTERFACE ||
++            header->dbch_size < offsetof(DEV_BROADCAST_DEVICEINTERFACE_W, dbcc_name[1]) ||
++            !IsEqualGUID( &iface->dbcc_classguid, &hid_device_interface_guid ))
++        return FALSE;
++
++    name = iface->dbcc_name;
++    if (!contains_string_i( name, L"vid_054c" ) || !contains_string_i( name, L"mi_03" ))
++        return FALSE;
++
++    return contains_string_i( name, L"pid_05c4" ) || contains_string_i( name, L"pid_09cc" ) ||
++            contains_string_i( name, L"pid_0ce6" ) || contains_string_i( name, L"pid_0df2" );
++}
++
++static BOOL get_interface_container_id( const WCHAR *path, GUID *container_id )
++{
++    SP_DEVICE_INTERFACE_DETAIL_DATA_W *detail = NULL;
++    SP_DEVICE_INTERFACE_DATA iface = {sizeof(iface)};
++    SP_DEVINFO_DATA device = {sizeof(device)};
++    DEVPROPTYPE type;
++    HDEVINFO set;
++    DWORD size;
++    BOOL ret = FALSE;
++
++    if ((set = SetupDiCreateDeviceInfoList( NULL, NULL )) == INVALID_HANDLE_VALUE)
++        return FALSE;
++
++    if (!SetupDiOpenDeviceInterfaceW( set, path, 0, &iface ))
++        goto done;
++
++    SetupDiGetDeviceInterfaceDetailW( set, &iface, NULL, 0, &size, NULL );
++    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || !(detail = malloc( size )))
++        goto done;
++
++    detail->cbSize = sizeof(*detail);
++    if (!SetupDiGetDeviceInterfaceDetailW( set, &iface, detail, size, NULL, &device ))
++        goto done;
++
++    ret = SetupDiGetDevicePropertyW( set, &device, &device_container_id_key, &type,
++            (BYTE *)container_id, sizeof(*container_id), NULL, 0 ) && type == DEVPROP_TYPE_GUID;
++
++done:
++    free( detail );
++    SetupDiDestroyDeviceInfoList( set );
++    return ret;
++}
++
++static DWORD WINAPI pending_sony_hid_proc( void *arg )
++{
++    struct pending_sony_hid *pending = arg;
++    BOOL dispatch;
++    DWORD wait;
++
++    wait = WaitForSingleObject( pending->ready_event, 3000 );
++
++    AcquireSRWLockExclusive( &pending_sony_hid_lock );
++    dispatch = !pending->cancelled;
++    list_remove( &pending->entry );
++    if (dispatch)
++    {
++        TRACE( "Dispatching original Sony HID arrival for container %s.\n",
++                debugstr_guid( &pending->container_id ) );
++        dispatch_device_notification( DBT_DEVICEARRIVAL, pending->path, pending->header );
++    }
++    ReleaseSRWLockExclusive( &pending_sony_hid_lock );
++
++    if (wait == WAIT_TIMEOUT)
++        WARN( "Timed out waiting for Sony speaker container %s before HID arrival.\n",
++                debugstr_guid( &pending->container_id ) );
++
++    CloseHandle( pending->ready_event );
++    free( pending->header );
++    free( pending->path );
++    free( pending );
++    return 0;
++}
++
++static BOOL queue_sony_hid_arrival( const WCHAR *path, const DEV_BROADCAST_HDR *header )
++{
++    const DEV_BROADCAST_DEVICEINTERFACE_W *iface = (const DEV_BROADCAST_DEVICEINTERFACE_W *)header;
++    struct pending_sony_hid *pending = NULL, *old;
++    HANDLE thread;
++
++    if (!is_sony_usb_audio_hid( header ) ||
++            !(pending = calloc( 1, sizeof(*pending) )) ||
++            !(pending->path = wcsdup( path ? path : L"" )) ||
++            !(pending->header = malloc( header->dbch_size )) ||
++            !(pending->ready_event = CreateEventW( NULL, TRUE, FALSE, NULL )) ||
++            !get_interface_container_id( iface->dbcc_name, &pending->container_id ))
++        goto failed;
++
++    memcpy( pending->header, header, header->dbch_size );
++
++    AcquireSRWLockExclusive( &pending_sony_hid_lock );
++    LIST_FOR_EACH_ENTRY( old, &pending_sony_hid_list, struct pending_sony_hid, entry )
++    {
++        if (!IsEqualGUID( &old->container_id, &pending->container_id )) continue;
++        old->cancelled = TRUE;
++        SetEvent( old->ready_event );
++    }
++    list_add_tail( &pending_sony_hid_list, &pending->entry );
++    ReleaseSRWLockExclusive( &pending_sony_hid_lock );
++
++    TRACE( "Holding original Sony HID arrival for speaker container %s.\n",
++            debugstr_guid( &pending->container_id ) );
++    if ((thread = CreateThread( NULL, 0, pending_sony_hid_proc, pending, 0, NULL )))
++    {
++        CloseHandle( thread );
++        return TRUE;
++    }
++
++    AcquireSRWLockExclusive( &pending_sony_hid_lock );
++    list_remove( &pending->entry );
++    ReleaseSRWLockExclusive( &pending_sony_hid_lock );
++
++failed:
++    if (pending)
++    {
++        if (pending->ready_event) CloseHandle( pending->ready_event );
++        free( pending->header );
++        free( pending->path );
++        free( pending );
++    }
++    return FALSE;
++}
++
++static void cancel_pending_sony_hid( const DEV_BROADCAST_HDR *header )
++{
++    const DEV_BROADCAST_DEVICEINTERFACE_W *iface = (const DEV_BROADCAST_DEVICEINTERFACE_W *)header;
++    struct pending_sony_hid *pending;
++
++    if (!is_sony_usb_audio_hid( header )) return;
++
++    AcquireSRWLockExclusive( &pending_sony_hid_lock );
++    LIST_FOR_EACH_ENTRY( pending, &pending_sony_hid_list, struct pending_sony_hid, entry )
++    {
++        const DEV_BROADCAST_DEVICEINTERFACE_W *pending_iface =
++                (const DEV_BROADCAST_DEVICEINTERFACE_W *)pending->header;
++
++        if (wcsicmp( pending_iface->dbcc_name, iface->dbcc_name )) continue;
++        pending->cancelled = TRUE;
++        SetEvent( pending->ready_event );
++    }
++    ReleaseSRWLockExclusive( &pending_sony_hid_lock );
++}
++
++void WINAPI __wine_sechost_signal_sony_audio_endpoint_ready( const GUID *container_id )
++{
++    struct pending_sony_hid *pending;
++
++    TRACE( "container %s\n", debugstr_guid( container_id ) );
++
++    AcquireSRWLockExclusive( &pending_sony_hid_lock );
++    LIST_FOR_EACH_ENTRY( pending, &pending_sony_hid_list, struct pending_sony_hid, entry )
++    {
++        if (IsEqualGUID( &pending->container_id, container_id )) SetEvent( pending->ready_event );
++    }
++    ReleaseSRWLockExclusive( &pending_sony_hid_lock );
++}
++
+ static DWORD WINAPI device_notify_proc( void *arg )
+ {
+     WCHAR endpoint[] = L"\\pipe\\wine_plugplay";
+     WCHAR protseq[] = L"ncacn_np";
+     RPC_WSTR binding_str;
+     DWORD err = ERROR_SUCCESS;
+-    struct device_notify *notify, *event, *next;
+-    struct list events = LIST_INIT(events);
+     plugplay_rpc_handle handle = NULL;
+     DWORD code = 0;
+     unsigned int size;
+@@ -2131,22 +2347,17 @@
+             break;
+         }
+ 
+-        /* Make a copy to avoid a hang if a callback tries to register or unregister for notifications. */
+-        EnterCriticalSection( &service_cs );
+-        LIST_FOR_EACH_ENTRY( notify, &device_notify_list, struct device_notify, entry )
++        if (code == DBT_DEVICEARRIVAL && queue_sony_hid_arrival( path, (DEV_BROADCAST_HDR *)buf ))
+         {
+-            if (!notification_filter_matches( notify->header, notify->path, (DEV_BROADCAST_HDR *)buf, path )) continue;
+-            if (!(event = device_notify_copy( notify, (DEV_BROADCAST_HDR *)buf ))) break;
+-            list_add_tail( &events, &event->entry );
++            MIDL_user_free(buf);
++            MIDL_user_free(path);
++            continue;
+         }
+-        LeaveCriticalSection(&service_cs);
+ 
+-        LIST_FOR_EACH_ENTRY_SAFE( event, next, &events, struct device_notify, entry )
+-        {
+-            event->callback( event->handle, code, event->header );
+-            list_remove( &event->entry );
+-            free( event );
+-        }
++        if (code == DBT_DEVICEREMOVECOMPLETE)
++            cancel_pending_sony_hid( (DEV_BROADCAST_HDR *)buf );
++
++        dispatch_device_notification( code, path, (DEV_BROADCAST_HDR *)buf );
+ 
+         MIDL_user_free(buf);
+         MIDL_user_free(path);
+--- a/include/wine/plugplay.idl
++++ b/include/wine/plugplay.idl
+@@ -28,6 +28,7 @@
+ cpp_quote("#endif")
+ 
+ typedef DWORD (__stdcall *device_notify_callback)(HANDLE handle, DWORD flags, DEV_BROADCAST_HDR *header);
++void __stdcall __wine_sechost_signal_sony_audio_endpoint_ready(const GUID *container_id);
+ HDEVNOTIFY __stdcall I_ScRegisterDeviceNotification(HANDLE handle, DEV_BROADCAST_HDR *filter, device_notify_callback callback);
+ BOOL __stdcall I_ScUnregisterDeviceNotification(HDEVNOTIFY handle);
+ 
