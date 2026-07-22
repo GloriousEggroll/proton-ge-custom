@@ -236,6 +236,9 @@ apply_all_in_dir() {
     echo "WINE: -HOTFIX- Validate Winsock connect address arguments"
     apply_patch "../patches/wine-hotfixes/pending/ws2_32-validate-connect-address.patch"
 
+    echo "WINE: -HOTFIX- Fall back when GnuTLS lacks NO_SHUFFLE_EXTENSIONS"
+    apply_patch "../patches/wine-hotfixes/pending/secur32-fallback-without-no-shuffle-extensions.patch"
+
 ### END WINE HOTFIX/BACKPORT SECTION ###
 
 ### (2-6) WINE PENDING UPSTREAM SECTION ###
