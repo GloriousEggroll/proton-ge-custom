@@ -224,6 +224,9 @@ apply_all_in_dir() {
     echo "WINE: -GAME FIXES- add fixes Guilty Gear Accent Core Plus R intro video (win32u related)"
     apply_patch "../patches/game-patches/0001-win32u-Avoid-zero-WM_ACTIVATEAPP-lparam-on-first-for.patch"
 
+    echo "WINE: -GAME FIXES- make MapleStory launch: avoid NULL deref in CharPrevA/CharPrevExA"
+    apply_patch "../patches/game-patches/maplestory-kernelbase-charprev-null.patch"
+
     echo "WINE: -GAME FIXES- make MapleStory launch: accept SPI_SETSTICKYKEYS/SPI_SETFILTERKEYS"
     apply_patch "../patches/game-patches/maplestory-spi-stickykeys-filterkeys.patch"
 
