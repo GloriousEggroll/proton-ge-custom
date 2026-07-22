@@ -34,6 +34,8 @@ apply_all_in_dir() {
     pushd protonfixes
     git reset --hard HEAD
     git clean -xdf
+    echo "PROTONFIXES: add optiscaler support"
+    apply_all_in_dir "../patches/protonfixes/"
     popd
 
     pushd wineopenxr
@@ -305,6 +307,7 @@ apply_all_in_dir() {
 
     echo "WINE: add optiscaler patch"
     apply_patch "../patches/proton/0001-HACK-kernelbase-allow-overriding-dlls-for-DLSS-XeSS-.patch"
+    apply_patch "../patches/proton/0002-HACK-ntdll-add-optiscaler-inection-hack.patch"
 
     echo "WINE: -HOTFIX- Implement GE-Proton ffmpeg + winedmo only video playback rework patches"
     apply_all_in_dir "../patches/ge-video-rework/"
