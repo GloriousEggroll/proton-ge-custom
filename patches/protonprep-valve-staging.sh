@@ -64,10 +64,6 @@ apply_all_in_dir() {
 
     git revert --no-commit e813ca5771658b00875924ab88d525322e50d39f
 
-# This breaks our PS controller patches
-
-    git revert --no-commit f51244bab0701b292ab668bad3aeb1cdcd6ef84b
-
 ### END PROBLEMATIC COMMIT REVERT SECTION ###
 
 ### (2-2) EM-10/WINE-WAYLAND PATCH SECTION ###
@@ -244,6 +240,9 @@ apply_all_in_dir() {
 
     echo "WINE: -HOTFIX- Fall back when GnuTLS lacks NO_SHUFFLE_EXTENSIONS"
     apply_patch "../patches/wine-hotfixes/pending/secur32-fallback-without-no-shuffle-extensions.patch"
+
+    echo "WINE: -HOTFIX- Preserve driver-reported OpenGL GPU identity"
+    apply_patch "../patches/wine-hotfixes/pending/wined3d-preserve-runtime-opengl-gpu-description.patch"
 
 ### END WINE HOTFIX/BACKPORT SECTION ###
 
