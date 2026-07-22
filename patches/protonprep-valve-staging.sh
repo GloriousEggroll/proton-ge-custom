@@ -233,6 +233,9 @@ apply_all_in_dir() {
     echo "WINE: -HOTFIX- Add GetFileVersionInfoByHandle version export stub"
     apply_patch "../patches/wine-hotfixes/pending/version-GetFileVersionInfoByHandle-stub.patch"
 
+    echo "WINE: -HOTFIX- Validate Winsock connect address arguments"
+    apply_patch "../patches/wine-hotfixes/pending/ws2_32-validate-connect-address.patch"
+
 ### END WINE HOTFIX/BACKPORT SECTION ###
 
 ### (2-6) WINE PENDING UPSTREAM SECTION ###
