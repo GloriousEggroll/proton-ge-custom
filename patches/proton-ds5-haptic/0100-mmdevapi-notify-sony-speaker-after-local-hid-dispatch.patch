@@ -1,0 +1,150 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Thu, 23 Jul 2026 00:30:00 -0600
+Subject: [PATCH] mmdevapi: Notify Sony speaker after local HID dispatch
+
+The cross-process endpoint-ready event releases every sechost HID waiter,
+but it does not tell mmdevapi when the HID arrival callback in its own
+process has completed.  A replacement controller speaker can therefore be
+published and enumerated before the application has associated the fresh
+HID device.  In that failure mode the application sees the endpoint but
+does not activate it until a later physical replug.
+
+Give each pending HID arrival a process-local completion event.  Before
+releasing the shared ready event, duplicate the local completion handle and
+wait for the corresponding HID arrival callback to finish.  Re-signal the
+already-published speaker endpoint only after that local callback.  The wait
+is bounded so input still comes up if an application blocks a notification.
+
+This does not retain disconnected devices or synthesize a remove/reconnect
+cycle.  The completion event exists only while the original arrival is
+pending and is destroyed with it.
+---
+ dlls/mmdevapi/devenum.c |  8 ++++----
+ dlls/sechost/service.c  | 36 +++++++++++++++++++++++++++++++++---
+ 2 files changed, 37 insertions(+), 7 deletions(-)
+
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+index 7161a943..d6fe6aec 100644
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -964,12 +964,12 @@ static void resignal_visible_dualsense_mono_endpoints(enum dualsense_mono_model
+ 
+     for (i = 0; i < count; i++)
+     {
+-        TRACE("Re-signaling DualSense mono endpoint add %s after hotplug batch.\n",
++        if (!IsEqualGUID(&notifications[i].container_id, &GUID_NULL))
++            __wine_sechost_signal_sony_audio_endpoint_ready(&notifications[i].container_id);
++        TRACE("Re-signaling DualSense mono endpoint add %s after HID arrival dispatch.\n",
+                 debugstr_guid(&notifications[i].guid));
+         notify_endpoint_added_state(notifications[i].flow, &notifications[i].guid,
+                 notifications[i].state);
+-        if (!IsEqualGUID(&notifications[i].container_id, &GUID_NULL))
+-            __wine_sechost_signal_sony_audio_endpoint_ready(&notifications[i].container_id);
+     }
+ 
+     free(notifications);
+diff --git a/dlls/sechost/service.c b/dlls/sechost/service.c
+index 68a6a5c1..77b860fc 100644
+--- a/dlls/sechost/service.c
++++ b/dlls/sechost/service.c
+@@ -2038,6 +2038,7 @@ struct pending_sony_hid
+     struct list entry;
+     GUID container_id;
+     HANDLE ready_event;
++    HANDLE dispatched_event;
+     WCHAR *path;
+     DEV_BROADCAST_HDR *header;
+     BOOL cancelled;
+@@ -2200,7 +2201,6 @@ static DWORD WINAPI pending_sony_hid_proc( void *arg )
+ 
+     AcquireSRWLockExclusive( &pending_sony_hid_lock );
+     dispatch = !pending->cancelled;
+-    list_remove( &pending->entry );
+     ReleaseSRWLockExclusive( &pending_sony_hid_lock );
+ 
+     if (dispatch)
+@@ -2210,10 +2210,17 @@ static DWORD WINAPI pending_sony_hid_proc( void *arg )
+         dispatch_device_notification( DBT_DEVICEARRIVAL, pending->path, pending->header );
+     }
+ 
++    SetEvent( pending->dispatched_event );
++
++    AcquireSRWLockExclusive( &pending_sony_hid_lock );
++    list_remove( &pending->entry );
++    ReleaseSRWLockExclusive( &pending_sony_hid_lock );
++
+     if (wait == WAIT_TIMEOUT)
+         WARN( "Timed out waiting for Sony speaker container %s before HID arrival.\n",
+                 debugstr_guid( &pending->container_id ) );
+ 
++    CloseHandle( pending->dispatched_event );
+     CloseHandle( pending->ready_event );
+     free( pending->header );
+     free( pending->path );
+@@ -2235,6 +2242,8 @@ static BOOL queue_sony_hid_arrival( const WCHAR *path, const DEV_BROADCAST_HDR *
+         goto failed;
+     if (!(pending->ready_event = create_sony_audio_ready_event( &pending->container_id )))
+         goto failed;
++    if (!(pending->dispatched_event = CreateEventW( NULL, TRUE, FALSE, NULL )))
++        goto failed;
+ 
+     memcpy( pending->header, header, header->dbch_size );
+ 
+@@ -2245,6 +2254,7 @@ static BOOL queue_sony_hid_arrival( const WCHAR *path, const DEV_BROADCAST_HDR *
+         TRACE( "Ignoring duplicate pending Sony HID arrival for container %s.\n",
+                 debugstr_guid( &pending->container_id ) );
+         ReleaseSRWLockExclusive( &pending_sony_hid_lock );
++        CloseHandle( pending->dispatched_event );
+         CloseHandle( pending->ready_event );
+         free( pending->header );
+         free( pending->path );
+@@ -2269,6 +2279,7 @@ static BOOL queue_sony_hid_arrival( const WCHAR *path, const DEV_BROADCAST_HDR *
+ failed:
+     if (pending)
+     {
++        if (pending->dispatched_event) CloseHandle( pending->dispatched_event );
+         if (pending->ready_event) CloseHandle( pending->ready_event );
+         free( pending->header );
+         free( pending->path );
+@@ -2299,11 +2310,23 @@ static void cancel_pending_sony_hid( const DEV_BROADCAST_HDR *header )
+ 
+ void WINAPI __wine_sechost_signal_sony_audio_endpoint_ready( const GUID *container_id )
+ {
++    struct pending_sony_hid *pending;
++    HANDLE dispatched_event = NULL;
+     WCHAR name[80];
+     HANDLE event;
+ 
+     TRACE( "container %s\n", debugstr_guid( container_id ) );
+ 
++    AcquireSRWLockShared( &pending_sony_hid_lock );
++    LIST_FOR_EACH_ENTRY( pending, &pending_sony_hid_list, struct pending_sony_hid, entry )
++    {
++        if (!IsEqualGUID( &pending->container_id, container_id )) continue;
++        DuplicateHandle( GetCurrentProcess(), pending->dispatched_event, GetCurrentProcess(),
++                &dispatched_event, SYNCHRONIZE, FALSE, 0 );
++        break;
++    }
++    ReleaseSRWLockShared( &pending_sony_hid_lock );
++
+     get_sony_audio_ready_event_name( container_id, name );
+     if ((event = OpenEventW( EVENT_MODIFY_STATE, FALSE, name )))
+     {
+@@ -2313,6 +2336,14 @@ void WINAPI __wine_sechost_signal_sony_audio_endpoint_ready( const GUID *contain
+     else
+         TRACE( "No pending cross-process Sony HID arrival for container %s.\n",
+                 debugstr_guid( container_id ) );
++
++    if (dispatched_event)
++    {
++        if (WaitForSingleObject( dispatched_event, 1000 ) == WAIT_TIMEOUT)
++            WARN( "Timed out waiting for local Sony HID arrival dispatch for container %s.\n",
++                    debugstr_guid( container_id ) );
++        CloseHandle( dispatched_event );
++    }
+ }
+ 
+ static DWORD WINAPI device_notify_proc( void *arg )
+-- 
+2.54.0

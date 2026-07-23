@@ -1,0 +1,180 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Thu, 23 Jul 2026 01:30:00 -0600
+Subject: [PATCH] mmdevapi: Release Sony HID after complete audio hotplug
+
+The render-side controller speaker is published before winepulse processes
+the capture-side endpoints belonging to the same USB audio function.  The
+Sony HID ready event was released immediately after that render update, so
+applications could receive the controller arrival and probe its audio
+association while its microphone and monitor endpoints were still being
+registered.  Spider-Man then enumerates the speaker but declines to activate
+it until another physical replug.
+
+Keep the early render notification needed to refresh existing endpoint
+collections, but retain a copy of the exact speaker and container identity
+through the remaining endpoint delta chain.  Once no more render or capture
+deltas remain, release the held HID arrival and issue the post-HID speaker
+notification.
+
+Accumulate endpoints if another render delta joins the same batch, and
+validate each copied endpoint before the final notification so a controller
+removed during the update cannot be resurrected.
+---
+ dlls/mmdevapi/devenum.c | 96 +++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 84 insertions(+), 12 deletions(-)
+
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+index d6fe6aec..2d10f238 100644
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -943,10 +943,49 @@ static BOOL add_endpoint_notification(struct endpoint_notification **notificatio
+     return TRUE;
+ }
+ 
+-static void resignal_visible_dualsense_mono_endpoints(enum dualsense_mono_model model)
++static BOOL endpoint_notification_is_current_dualsense_mono(
++        const struct endpoint_notification *notification, BOOL require_visible)
+ {
+-    struct endpoint_notification *notifications = NULL;
+-    unsigned int count = 0, capacity = 0, i;
++    MMDevice *device;
++    BOOL found = FALSE;
++
++    EnterCriticalSection(&device_list_cs);
++    LIST_FOR_EACH_ENTRY(device, &device_list, MMDevice, entry)
++    {
++        if (device->flow != notification->flow ||
++                !IsEqualGUID(&device->devguid, &notification->guid) ||
++                !is_dualsense_mono_endpoint(device) ||
++                device->removed || !(device->state & DEVICE_STATE_ACTIVE) ||
++                (require_visible && should_hide_from_endpoint_collection(device)))
++            continue;
++
++        found = TRUE;
++        break;
++    }
++    LeaveCriticalSection(&device_list_cs);
++
++    return found;
++}
++
++static BOOL endpoint_notification_exists(const struct endpoint_notification *notifications,
++        unsigned int count, const MMDevice *device)
++{
++    unsigned int i;
++
++    for (i = 0; i < count; ++i)
++    {
++        if (notifications[i].flow == device->flow &&
++                IsEqualGUID(&notifications[i].guid, &device->devguid))
++            return TRUE;
++    }
++
++    return FALSE;
++}
++
++static unsigned int collect_visible_dualsense_mono_endpoints(enum dualsense_mono_model model,
++        struct endpoint_notification **notifications, unsigned int *count, unsigned int *capacity)
++{
++    unsigned int start = *count;
+     MMDevice *device;
+ 
+     EnterCriticalSection(&device_list_cs);
+@@ -956,23 +995,39 @@ static void resignal_visible_dualsense_mono_endpoints(enum dualsense_mono_model
+             continue;
+         if (model != DUALSENSE_MONO_MODEL_UNKNOWN && dualsense_mono_endpoint_model(device) != model)
+             continue;
++        if (endpoint_notification_exists(*notifications, *count, device))
++            continue;
+ 
+-        if (!add_endpoint_notification(&notifications, &count, &capacity, device))
++        if (!add_endpoint_notification(notifications, count, capacity, device))
+             break;
+     }
+     LeaveCriticalSection(&device_list_cs);
+ 
+-    for (i = 0; i < count; i++)
++    return start;
++}
++
++static void notify_dualsense_mono_endpoints(const struct endpoint_notification *notifications,
++        unsigned int start, unsigned int count, BOOL release_hid)
++{
++    unsigned int i;
++
++    for (i = start; i < count; ++i)
+     {
+-        if (!IsEqualGUID(&notifications[i].container_id, &GUID_NULL))
++        if (release_hid && !endpoint_notification_is_current_dualsense_mono(&notifications[i], FALSE))
++            continue;
++
++        if (release_hid && !IsEqualGUID(&notifications[i].container_id, &GUID_NULL))
+             __wine_sechost_signal_sony_audio_endpoint_ready(&notifications[i].container_id);
++        if (release_hid && !endpoint_notification_is_current_dualsense_mono(&notifications[i], TRUE))
++            continue;
+-        TRACE("Re-signaling DualSense mono endpoint add %s after HID arrival dispatch.\n",
+-                debugstr_guid(&notifications[i].guid));
++
++        TRACE("Re-signaling DualSense mono endpoint add %s %s.\n",
++                debugstr_guid(&notifications[i].guid),
++                release_hid ? "after complete audio hotplug and HID arrival dispatch" :
++                "before completing the audio hotplug batch");
+         notify_endpoint_added_state(notifications[i].flow, &notifications[i].guid,
+                 notifications[i].state);
+     }
+-
+-    free(notifications);
+ }
+ 
+ static void remove_dualsense_media_devices(void)
+@@ -1649,6 +1704,8 @@ static void wait_for_render_update_if_needed(EDataFlow flow)
+ static DWORD WINAPI update_thread_proc(void *user)
+ {
+     struct get_endpoint_ids_params params;
++    struct endpoint_notification *pending_hid_notifications = NULL;
++    unsigned int pending_hid_count = 0, pending_hid_capacity = 0;
+     UINT i;
+ 
+     params.flow = eRender;
+@@ -1763,13 +1820,28 @@ static DWORD WINAPI update_thread_proc(void *user)
+ 
+             if (InterlockedExchange(&dualsense_mono_render_add_pending, 0))
+             {
++                unsigned int start;
++
+                 model = dualsense_mono_render_add_model;
+                 dualsense_mono_render_add_model = DUALSENSE_MONO_MODEL_UNKNOWN;
+                 resignal = TRUE;
++                start = collect_visible_dualsense_mono_endpoints(model, &pending_hid_notifications,
++                        &pending_hid_count, &pending_hid_capacity);
++                notify_dualsense_mono_endpoints(pending_hid_notifications, start,
++                        pending_hid_count, FALSE);
+             }
+             InterlockedExchange(&render_update_in_progress, 0);
+-            if (resignal)
+-                resignal_visible_dualsense_mono_endpoints(model);
++            if (resignal && !pending_hid_count)
++                WARN("No visible Sony controller speaker endpoint was available for HID release.\n");
++        }
++
++        if (!params.more_data && pending_hid_count)
++        {
++            notify_dualsense_mono_endpoints(pending_hid_notifications, 0,
++                    pending_hid_count, TRUE);
++            free(pending_hid_notifications);
++            pending_hid_notifications = NULL;
++            pending_hid_count = pending_hid_capacity = 0;
+         }
+ 
+         if (params.more_data)
+@@ -1780,6 +1852,7 @@ end:
+     InterlockedExchange(&render_update_in_progress, 0);
+     InterlockedExchange(&dualsense_mono_render_add_pending, 0);
+     dualsense_mono_render_add_model = DUALSENSE_MONO_MODEL_UNKNOWN;
++    free(pending_hid_notifications);
+     free(params.endpoints);
+     return 0;
+ }
+-- 
+2.50.1
