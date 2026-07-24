@@ -1,0 +1,140 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Thu, 23 Jul 2026 14:20:00 -0600
+Subject: [PATCH] winepulse: Rebase playback after sustained CPU starvation.
+
+The long-run timing-gap guard correctly rejects corrupt multi-gigabyte Pulse
+indexes, but it also rejects a genuine large underrun after the Wine process
+is starved of CPU time.  In that case Pulse's read index and requested writable
+size advance by the same amount while Wine's relative writes remain behind the
+read index forever.  Continuing to append at that stale write position cannot
+restore playback.
+
+Distinguish a real starvation gap from corrupt timing data by comparing the
+read/write gap with pa_stream_writable_size() within one normal stream buffer.
+Some Pulse-compatible servers can temporarily return an unavailable or stale
+writable size from the timing callback, so also accept a gap bounded to five
+minutes of the stream's actual byte rate.  This remains far below the wrapped
+multi-gigabyte or exabyte indexes this guard was introduced to reject.
+
+For a confirmed starvation gap, make the next non-empty render write use
+PA_SEEK_RELATIVE_ON_READ.  This places current audio at Pulse's playback
+position and discards only the already missed interval, without allocating or
+writing a potentially huge silence backlog.  Do not let a zero-byte timer
+write consume the pending rebase before game audio arrives.
+
+Reset the stream timing source while rebasing, as the old timeline includes
+the discarded interval.  Also skip the ordinary underrun silence prebuffer for
+that write because Pulse's accumulated writable request can be several
+megabytes after a CPU stall.
+---
+ dlls/winepulse.drv/pulse.c | 58 +++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 51 insertions(+), 7 deletions(-)
+
+diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+index 33333333333..44444444444 100644
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -111,6 +111,6 @@ struct pulse_stream
+     unsigned int haptic_hotplug_generation;
+     void *locked_ptr;
+-    BOOL just_underran, pa_started, update_timing_info_pending;
++    BOOL just_underran, pa_started, update_timing_info_pending, rebase_write_index;
+     pa_usec_t mmdev_period_usec;
+     pa_usec_t timeline_start_stream_time, timeline_start_period_time;
+ 
+@@ -3198,9 +3198,11 @@ exit:
+     return STATUS_SUCCESS;
+ }
+ 
+-static int write_buffer(const struct pulse_stream *stream, BYTE *buffer, UINT32 bytes)
++static int write_buffer(struct pulse_stream *stream, BYTE *buffer, UINT32 bytes)
+ {
+     const float *vol = stream->vol;
++    pa_seek_mode_t seek;
++    int ret;
+     UINT32 i, channels, mute = 0;
+     BOOL adjust = FALSE;
+     BYTE *end;
+@@ -3334,14 +3336,25 @@ static int write_buffer(const struct pulse_stream *stream, BYTE *buffer, UINT32 b
+     }
+ 
+ write:
+-    return pa_stream_write(stream->stream, buffer, bytes, NULL, 0, PA_SEEK_RELATIVE);
++    if (!bytes)
++        return 0;
++
++    seek = stream->rebase_write_index ? PA_SEEK_RELATIVE_ON_READ : PA_SEEK_RELATIVE;
++    ret = pa_stream_write(stream->stream, buffer, bytes, NULL, 0, seek);
++    if (!ret && stream->rebase_write_index)
++    {
++        TRACE("Rebased stream %p write index on Pulse read index.\n", stream);
++        stream->rebase_write_index = FALSE;
++    }
++    return ret;
+ }
+ 
+ static void pulse_write_index_catchup(struct pulse_stream *stream)
+ {
+     const pa_timing_info *ti;
++    size_t writable;
+     UINT32 frame_size, to_write, max_write;
+-    uint64_t max_gap;
++    uint64_t gap_delta, max_gap, sane_gap;
+     int64_t gap, write_index;
+ 
+     if (!pulse_stream_ready(stream))
+@@ -3371,8 +3385,38 @@ static void pulse_write_index_catchup(struct pulse_stream *stream)
+             max_gap = max(max_gap, (uint64_t)stream->attr.maxlength);
+         if (!max_gap)
+             max_gap = silence_buf_size;
+-        if (gap <= 0 || (uint64_t)gap > max_gap)
++        sane_gap = max(max_gap, (uint64_t)stream->ss.rate * frame_size * 300);
++        if (gap <= 0)
++            break;
++
++        if ((uint64_t)gap > max_gap)
+         {
++            writable = pa_stream_writable_size(stream->stream);
++            gap_delta = (uint64_t)-1;
++            if (writable != (size_t)-1)
++                gap_delta = (uint64_t)gap > (uint64_t)writable
++                        ? (uint64_t)gap - (uint64_t)writable
++                        : (uint64_t)writable - (uint64_t)gap;
++
++            if (gap_delta <= max_gap || (uint64_t)gap <= sane_gap)
++            {
++                WARN("Recovering Pulse stream %p from %lld-byte starvation gap "
++                        "(writable %zu, tolerance %llu, sane limit %llu).\n", stream,
++                        (long long)gap, writable, (unsigned long long)max_gap,
++                        (unsigned long long)sane_gap);
++                stream->rebase_write_index = TRUE;
++                stream->just_underran = FALSE;
++                stream->pa_started = FALSE;
++                stream->timeline_start_period_time = 0;
++                stream->timeline_start_stream_time = 0;
++                if (stream->period && stream->period->timer_stream == stream)
++                {
++                    stream->period->timer_stream = NULL;
++                    stream->period->adjust = 0;
++                }
++                break;
++            }
++
+             WARN("Ignoring implausible Pulse timing gap %lld bytes, limit %llu.\n",
+                     (long long)gap, (unsigned long long)max_gap);
+             break;
+@@ -3419,8 +3461,9 @@ static void pulse_write(struct pulse_stream *stream)
+ 
+     if (stream->just_underran)
+     {
+-        /* prebuffer with silence if needed */
+-        if(stream->pa_held_bytes < bytes){
++        /* Do not fill an accumulated starvation request before rebasing it. */
++        if (!stream->rebase_write_index && stream->pa_held_bytes < bytes)
++        {
+             to_write = bytes - stream->pa_held_bytes;
+             TRACE("prebuffering %u frames of silence\n",
+                     (int)(to_write / pa_frame_size(&stream->ss)));
+-- 
+2.54.0
