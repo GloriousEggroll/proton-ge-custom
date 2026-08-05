@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Wed, 5 Aug 2026 05:50:00 -0600
+Subject: [PATCH] winmm: Compact successfully enumerated MMDevices.
+
+Endpoint collections can change while WinMM initializes their entries, and an
+individual Item() or endpoint initialization can fail.  WINMM_EnumDevices()
+ignored both failures, retained the original collection count, and could leave
+NULL entries in its public device map.  waveOutGetDevCapsW() then dereferenced
+such an entry when Black Desert enumerated wave output devices.
+
+Build a compact map containing only successfully initialized endpoints and
+move the default endpoint to map index zero afterwards.  Also reject a NULL map
+entry defensively in the wave input/output capability APIs instead of
+dereferencing it.
+
+---
+ dlls/winmm/waveform.c | 62 ++++++++++++++++++++++++++++++-------------
+ 1 file changed, 44 insertions(+), 18 deletions(-)
+
+diff --git a/dlls/winmm/waveform.c b/dlls/winmm/waveform.c
+index 9becbc35..4192e41e 100644
+--- a/dlls/winmm/waveform.c
++++ b/dlls/winmm/waveform.c
+@@ -574,16 +574,17 @@ static HRESULT WINMM_EnumDevices(WINMM_MMDevice **devices,
+     }
+ 
+     if(*devcount > 0){
+-        UINT n, count = 1;
++        UINT n, count = 0, default_index = ~0u;
++        UINT capacity = *devcount;
+         IMMDevice *def_dev = NULL;
+ 
+-        *devices = calloc(*devcount, sizeof(WINMM_MMDevice));
++        *devices = calloc(capacity, sizeof(WINMM_MMDevice));
+         if(!*devices){
+             IMMDeviceCollection_Release(devcoll);
+             return E_OUTOFMEMORY;
+         }
+ 
+-        *map = calloc(*devcount, sizeof(WINMM_MMDevice *));
++        *map = calloc(capacity, sizeof(WINMM_MMDevice *));
+         if(!*map){
+             IMMDeviceCollection_Release(devcoll);
+             free(*devices);
+@@ -594,25 +595,40 @@ static HRESULT WINMM_EnumDevices(WINMM_MMDevice **devices,
+         IMMDeviceEnumerator_GetDefaultAudioEndpoint(devenum,
+                 flow, eConsole, &def_dev);
+ 
+-        for(n = 0; n < *devcount; ++n){
++        for(n = 0; n < capacity; ++n){
+             IMMDevice *device;
++            WINMM_MMDevice *mmdevice;
+ 
+             hr = IMMDeviceCollection_Item(devcoll, n, &device);
+-            if(SUCCEEDED(hr)){
+-                WINMM_InitMMDevice(flow, device, &(*devices)[n], n);
+-
+-                if(device == def_dev)
+-                    (*map)[0] = &(*devices)[n];
+-                else{
+-                    (*map)[count] = &(*devices)[n];
+-                    ++count;
+-                }
++            if(FAILED(hr)){
++                WARN("Failed to get endpoint %u: %08lx\n", n, hr);
++                continue;
++            }
+ 
++            mmdevice = &(*devices)[count];
++            hr = WINMM_InitMMDevice(flow, device, mmdevice, count);
++            if(FAILED(hr)){
++                WARN("Failed to initialize endpoint %u: %08lx\n", n, hr);
+                 IMMDevice_Release(device);
++                continue;
+             }
++
++            (*map)[count] = mmdevice;
++            if(device == def_dev)
++                default_index = count;
++            ++count;
++
++            IMMDevice_Release(device);
+         }
+ 
+-        IMMDevice_Release(def_dev);
++        if(def_dev)
++            IMMDevice_Release(def_dev);
++
++        if(default_index != ~0u && default_index != 0){
++            WINMM_MMDevice *tmp = (*map)[0];
++            (*map)[0] = (*map)[default_index];
++            (*map)[default_index] = tmp;
++        }
+ 
+         *devcount = count;
+     }
+@@ -2620,6 +2636,7 @@ UINT WINAPI waveOutGetDevCapsA(UINT_PTR uDeviceID, LPWAVEOUTCAPSA lpCaps,
+ UINT WINAPI waveOutGetDevCapsW(UINT_PTR uDeviceID, LPWAVEOUTCAPSW lpCaps,
+			       UINT uSize)
+ {
++    WINMM_MMDevice *mmdevice;
+     WAVEOUTCAPSW mapper_caps, *caps;
+     HRESULT hr;
+ 
+@@ -2654,7 +2671,9 @@ UINT WINAPI waveOutGetDevCapsW(UINT_PTR uDeviceID, LPWAVEOUTCAPSW lpCaps,
+ 
+             LeaveCriticalSection(&device->lock);
+         }else{
+-            caps = &read_map(g_out_map, uDeviceID)->out_caps;
++            if(!(mmdevice = read_map(g_out_map, uDeviceID)))
++                return MMSYSERR_BADDEVICEID;
++            caps = &mmdevice->out_caps;
+         }
+     }
+ 
+@@ -3339,6 +3358,7 @@ UINT WINAPI waveInGetNumDevs(void)
+  */
+ UINT WINAPI waveInGetDevCapsW(UINT_PTR uDeviceID, LPWAVEINCAPSW lpCaps, UINT uSize)
+ {
++    WINMM_MMDevice *mmdevice;
+     WAVEINCAPSW mapper_caps, *caps;
+     HRESULT hr;
+ 
+@@ -3372,7 +3392,9 @@ UINT WINAPI waveInGetDevCapsW(UINT_PTR uDeviceID, LPWAVEINCAPSW lpCaps, UINT uSi
+ 
+             LeaveCriticalSection(&device->lock);
+         }else{
+-            caps = &read_map(g_in_map, uDeviceID)->in_caps;
++            if(!(mmdevice = read_map(g_in_map, uDeviceID)))
++                return MMSYSERR_BADDEVICEID;
++            caps = &mmdevice->in_caps;
+         }
+     }
+ 
+-- 
+2.50.1

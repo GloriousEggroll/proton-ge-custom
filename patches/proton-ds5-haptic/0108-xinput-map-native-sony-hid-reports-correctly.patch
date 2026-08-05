@@ -1,0 +1,224 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Wed, 5 Aug 2026 08:10:00 -0600
+Subject: [PATCH] xinput: Map native Sony HID reports correctly
+
+When a native DualShock or DualSense hidraw device is explicitly exposed as
+XInput, its HID report still uses Sony's button and axis layout. The generic
+Wine XInput conversion assumes Xbox ordering, which swaps the face buttons,
+interprets the right stick as triggers, and interprets the triggers as stick
+axes.
+
+Detect supported Sony devices on both sides of the WINEXINPUT bridge and map
+their reports explicitly. This preserves the generic mapping for every other
+controller and only affects Sony devices which have already been opted into
+Wine's XInput compatibility path.
+---
+ dlls/xinput1_3/main.c     | 47 ++++++++++++++++++++++++++++++++++++++++--
+ dlls/winexinput.sys/main.c | 30 +++++++++++++++++++++++----
+ 2 files changed, 72 insertions(+), 5 deletions(-)
+
+diff --git a/dlls/xinput1_3/main.c b/dlls/xinput1_3/main.c
+--- a/dlls/xinput1_3/main.c
++++ b/dlls/xinput1_3/main.c
+@@ -64,6 +64,7 @@ struct xinput_controller
+     {
+         PHIDP_PREPARSED_DATA preparsed;
+         HIDP_CAPS caps;
++        BOOL is_sony_gamepad;
+         HIDP_VALUE_CAPS lx_caps;
+         HIDP_VALUE_CAPS ly_caps;
+         HIDP_VALUE_CAPS lt_caps;
+@@ -101,6 +102,8 @@ static SRWLOCK state_lock = SRWLOCK_INIT;
+ static SRWLOCK state_lock = SRWLOCK_INIT;
+ static XINPUT_STATE current_state[XUSER_MAX_COUNT];
+ 
++static BOOL is_sony_gamepad_path(const WCHAR *path);
++
+ static void set_current_state(UINT index, const XINPUT_STATE *state)
+ {
+     AcquireSRWLockExclusive(&state_lock);
+@@ -364,6 +367,7 @@ static BOOL controller_init(struct xinput_controller *controller, PHIDP_PREPARSE
+     XINPUT_STATE state = {0};
+ 
+     controller->hid.caps = *caps;
++    controller->hid.is_sony_gamepad = is_sony_gamepad_path(device_path);
+     if (!(controller->hid.feature_report_buf = calloc(1, controller->hid.caps.FeatureReportByteLength))) goto failed;
+     if (!controller_check_caps(controller, device, preparsed)) goto failed;
+ 
+@@ -567,6 +571,18 @@ static LONG scale_value(ULONG value, const HIDP_VALUE_CAPS *caps, LONG min, LONG
+     return min + MulDiv(tmp - caps->LogicalMin, max - min, caps->LogicalMax - caps->LogicalMin);
+ }
+ 
++static BOOL is_sony_gamepad_path(const WCHAR *path)
++{
++    UINT vid, pid;
++
++    if (swscanf(path, L"\\\\?\\HID#VID_%04x&PID_%04x", &vid, &pid) != 2 &&
++        swscanf(path, L"\\\\?\\hid#vid_%04x&pid_%04x", &vid, &pid) != 2)
++        return FALSE;
++
++    if (vid != 0x054c) return FALSE;
++    return pid == 0x05c4 || pid == 0x09cc || pid == 0x0ce6 || pid == 0x0df2;
++}
++
+ /* read the controller state from the HID device, xinput_cs must be held */
+ static void read_controller_state(struct xinput_controller *controller)
+ {
+@@ -574,7 +590,7 @@ static void read_controller_state(struct xinput_controller *controller)
+     char *report_buf = controller->hid.input_report_buf;
+     XINPUT_STATE state;
+     NTSTATUS status;
+-    USAGE buttons[11];
++    USAGE buttons[32];
+     ULONG i, button_length, value;
+     BOOL ret;
+ 
+@@ -599,6 +615,25 @@ static void read_controller_state(struct xinput_controller *controller)
+     state.Gamepad.wButtons = 0;
+     for (i = 0; i < button_length; i++)
+     {
++        if (controller->hid.is_sony_gamepad)
++        {
++            switch (buttons[i])
++            {
++            case 1: state.Gamepad.wButtons |= XINPUT_GAMEPAD_X; break; /* Square */
++            case 2: state.Gamepad.wButtons |= XINPUT_GAMEPAD_A; break; /* Cross */
++            case 3: state.Gamepad.wButtons |= XINPUT_GAMEPAD_B; break; /* Circle */
++            case 4: state.Gamepad.wButtons |= XINPUT_GAMEPAD_Y; break; /* Triangle */
++            case 5: state.Gamepad.wButtons |= XINPUT_GAMEPAD_LEFT_SHOULDER; break;
++            case 6: state.Gamepad.wButtons |= XINPUT_GAMEPAD_RIGHT_SHOULDER; break;
++            case 9: state.Gamepad.wButtons |= XINPUT_GAMEPAD_BACK; break; /* Create/Share */
++            case 10: state.Gamepad.wButtons |= XINPUT_GAMEPAD_START; break; /* Options */
++            case 11: state.Gamepad.wButtons |= XINPUT_GAMEPAD_LEFT_THUMB; break;
++            case 12: state.Gamepad.wButtons |= XINPUT_GAMEPAD_RIGHT_THUMB; break;
++            case 13: state.Gamepad.wButtons |= XINPUT_GAMEPAD_GUIDE; break;
++            }
++            continue;
++        }
++
+         switch (buttons[i])
+         {
+         case 1: state.Gamepad.wButtons |= XINPUT_GAMEPAD_A; break;
+@@ -643,22 +678,32 @@ static void read_controller_state(struct xinput_controller *controller)
+ 
+     status = HidP_GetUsageValue(HidP_Input, HID_USAGE_PAGE_GENERIC, 0, HID_USAGE_GENERIC_Y, &value, controller->hid.preparsed, report_buf, report_len);
+     if (status != HIDP_STATUS_SUCCESS) WARN("HidP_GetUsageValue HID_USAGE_PAGE_GENERIC / HID_USAGE_GENERIC_Y returned %#lx\n", status);
++    else if (controller->hid.is_sony_gamepad)
++        state.Gamepad.sThumbLY = scale_value(value, &controller->hid.ly_caps, 32767, -32768);
+     else state.Gamepad.sThumbLY = scale_value(value, &controller->hid.ly_caps, -32768, 32767);
+ 
+     status = HidP_GetUsageValue(HidP_Input, HID_USAGE_PAGE_GENERIC, 0, HID_USAGE_GENERIC_RX, &value, controller->hid.preparsed, report_buf, report_len);
+     if (status != HIDP_STATUS_SUCCESS) WARN("HidP_GetUsageValue HID_USAGE_PAGE_GENERIC / HID_USAGE_GENERIC_RX returned %#lx\n", status);
++    else if (controller->hid.is_sony_gamepad)
++        state.Gamepad.bLeftTrigger = scale_value(value, &controller->hid.rx_caps, 0, 255);
+     else state.Gamepad.sThumbRX = scale_value(value, &controller->hid.rx_caps, -32768, 32767);
+ 
+     status = HidP_GetUsageValue(HidP_Input, HID_USAGE_PAGE_GENERIC, 0, HID_USAGE_GENERIC_RY, &value, controller->hid.preparsed, report_buf, report_len);
+     if (status != HIDP_STATUS_SUCCESS) WARN("HidP_GetUsageValue HID_USAGE_PAGE_GENERIC / HID_USAGE_GENERIC_RY returned %#lx\n", status);
++    else if (controller->hid.is_sony_gamepad)
++        state.Gamepad.bRightTrigger = scale_value(value, &controller->hid.ry_caps, 0, 255);
+     else state.Gamepad.sThumbRY = scale_value(value, &controller->hid.ry_caps, -32768, 32767);
+ 
+     status = HidP_GetUsageValue(HidP_Input, HID_USAGE_PAGE_GENERIC, 0, HID_USAGE_GENERIC_RZ, &value, controller->hid.preparsed, report_buf, report_len);
+     if (status != HIDP_STATUS_SUCCESS) WARN("HidP_GetUsageValue HID_USAGE_PAGE_GENERIC / HID_USAGE_GENERIC_RZ returned %#lx\n", status);
++    else if (controller->hid.is_sony_gamepad)
++        state.Gamepad.sThumbRY = scale_value(value, &controller->hid.rt_caps, 32767, -32768);
+     else state.Gamepad.bRightTrigger = scale_value(value, &controller->hid.rt_caps, 0, 255);
+ 
+     status = HidP_GetUsageValue(HidP_Input, HID_USAGE_PAGE_GENERIC, 0, HID_USAGE_GENERIC_Z, &value, controller->hid.preparsed, report_buf, report_len);
+     if (status != HIDP_STATUS_SUCCESS) WARN("HidP_GetUsageValue HID_USAGE_PAGE_GENERIC / HID_USAGE_GENERIC_Z returned %#lx\n", status);
++    else if (controller->hid.is_sony_gamepad)
++        state.Gamepad.sThumbRX = scale_value(value, &controller->hid.lt_caps, -32768, 32767);
+     else state.Gamepad.bLeftTrigger = scale_value(value, &controller->hid.lt_caps, 0, 255);
+ 
+     if (controller->enabled)
+diff --git a/dlls/winexinput.sys/main.c b/dlls/winexinput.sys/main.c
+--- a/dlls/winexinput.sys/main.c
++++ b/dlls/winexinput.sys/main.c
+@@ -160,6 +160,7 @@ struct func_device
+     HIDP_VALUE_CAPS ry_caps;
+     HIDP_VALUE_CAPS rt_caps;
+     HIDP_DEVICE_DESC device_desc;
++    BOOL is_sony_gamepad;
+ 
+     /* everything below requires holding the cs */
+     CRITICAL_SECTION cs;
+@@ -192,11 +193,21 @@ static LONG scale_value(ULONG value, const HIDP_VALUE_CAPS *caps, LONG min, LONG
+     return min + MulDiv(tmp - caps->LogicalMin, max - min, caps->LogicalMax - caps->LogicalMin);
+ }
+ 
++static USAGE sony_button_to_xinput_usage(USAGE usage)
++{
++    static const USAGE map[] =
++    {
++        0, 3, 1, 2, 4, 5, 6, 0, 0, 7, 8, 9, 10,
++    };
++
++    return usage < ARRAY_SIZE(map) ? map[usage] : 0;
++}
++
+ static void translate_report_to_xinput_state(struct func_device *fdo)
+ {
+     ULONG lx = 0, ly = 0, rx = 0, ry = 0, lt = 0, rt = 0, hat = 0;
+     PHIDP_PREPARSED_DATA preparsed;
+-    USAGE usages[10];
++    USAGE usages[32];
+     NTSTATUS status;
+     ULONG i, count;
+ 
+@@ -232,15 +243,28 @@ static void translate_report_to_xinput_state(struct func_device *fdo)
+     else fdo->xinput_state.buttons = hat << 10;
+     for (i = 0; i < count; i++)
+     {
+-        if (usages[i] < 1 || usages[i] > 10) continue;
+-        fdo->xinput_state.buttons |= (1 << (usages[i] - 1));
++        USAGE usage = fdo->is_sony_gamepad ? sony_button_to_xinput_usage(usages[i]) : usages[i];
++
++        if (usage < 1 || usage > 10) continue;
++        fdo->xinput_state.buttons |= (1 << (usage - 1));
+     }
+     fdo->xinput_state.lx_axis = scale_value(lx, &fdo->lx_caps, 0, 65535);
+-    fdo->xinput_state.ly_axis = scale_value(-ly - 1, &fdo->ly_caps, 0, 65535);
+-    fdo->xinput_state.rx_axis = scale_value(rx, &fdo->rx_caps, 0, 65535);
+-    fdo->xinput_state.ry_axis = scale_value(-ry - 1, &fdo->ry_caps, 0, 65535);
+-    rt = scale_value(rt, &fdo->rt_caps, 0, 255);
+-    lt = scale_value(lt, &fdo->lt_caps, 0, 255);
++    if (fdo->is_sony_gamepad)
++    {
++        fdo->xinput_state.ly_axis = scale_value(ly, &fdo->ly_caps, 65535, 0);
++        fdo->xinput_state.rx_axis = scale_value(lt, &fdo->lt_caps, 0, 65535);
++        fdo->xinput_state.ry_axis = scale_value(rt, &fdo->rt_caps, 65535, 0);
++        lt = scale_value(rx, &fdo->rx_caps, 0, 255);
++        rt = scale_value(ry, &fdo->ry_caps, 0, 255);
++    }
++    else
++    {
++        fdo->xinput_state.ly_axis = scale_value(-ly - 1, &fdo->ly_caps, 0, 65535);
++        fdo->xinput_state.rx_axis = scale_value(rx, &fdo->rx_caps, 0, 65535);
++        fdo->xinput_state.ry_axis = scale_value(-ry - 1, &fdo->ry_caps, 0, 65535);
++        rt = scale_value(rt, &fdo->rt_caps, 0, 255);
++        lt = scale_value(lt, &fdo->lt_caps, 0, 255);
++    }
+     fdo->xinput_state.trigger = 0x8000 + (lt - rt) * 128;
+ }
+ 
+@@ -843,6 +867,7 @@ static NTSTATUS WINAPI add_device(DRIVER_OBJECT *driver, DEVICE_OBJECT *bus_devi
+     WCHAR bus_id[MAX_DEVICE_ID_LEN], *device_id, instance_id[MAX_DEVICE_ID_LEN];
+     struct func_device *fdo;
+     DEVICE_OBJECT *device;
++    UINT vid, pid;
+     NTSTATUS status;
+ 
+     TRACE("driver %p, bus_device %p.\n", driver, bus_device);
+@@ -876,6 +901,8 @@ static NTSTATUS WINAPI add_device(DRIVER_OBJECT *driver, DEVICE_OBJECT *bus_devi
+     fdo = device->DeviceExtension;
+     fdo->base.is_fdo = TRUE;
+     swprintf(fdo->base.device_id, MAX_DEVICE_ID_LEN, L"WINEXINPUT\\%s", device_id);
++    if (swscanf(device_id, L"VID_%04x&PID_%04x", &vid, &pid) == 2 && vid == 0x054c)
++        fdo->is_sony_gamepad = pid == 0x05c4 || pid == 0x09cc || pid == 0x0ce6 || pid == 0x0df2;
+ 
+     fdo->bus_device = bus_device;
+     wcscpy(fdo->instance_id, instance_id);
+-- 
+2.55.0

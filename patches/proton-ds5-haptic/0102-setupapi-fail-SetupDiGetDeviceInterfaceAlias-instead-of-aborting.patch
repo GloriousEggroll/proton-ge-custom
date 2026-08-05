@@ -1,0 +1,109 @@
+From 73bb38d009e85b34a82350d53f64de221892a4d8 Mon Sep 17 00:00:00 2001
+From: Fabian Wosar <fwosar@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 12:55:32 +0100
+Subject: [PATCH] setupapi: Implement SetupDiGetDeviceInterfaceAlias.
+
+As an unimplemented stub this raised a noncontinuable exception, which kills
+the caller. PortAudio's WDM/KS backend calls it for every KSCATEGORY_AUDIO
+interface it enumerates, to work out whether a device plays back or records,
+so a game using PortAudio died on startup rather than falling back to one of
+its other backends. Reproduced with Black Desert Online.
+
+Implement the Windows alias relationship: two interfaces belong to the same
+device instance, use the same reference string, and expose different interface
+classes. Device info sets usually load only their requested class, so load the
+requested alias class for the source instance before the final lookup.
+
+Interfaces without a registered alias still return
+ERROR_NO_SUCH_DEVICE_INTERFACE. This keeps PortAudio's WDM/KS probe from
+aborting on fake KSCATEGORY_AUDIO nodes without globally hiding valid aliases
+used during HID and controller discovery.
+---
+ dlls/setupapi/devinst.c     | 60 ++++++++++++++++++++++++++++++++++++++++
+ dlls/setupapi/setupapi.spec |  2 +-
+ 2 files changed, 61 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/setupapi/devinst.c b/dlls/setupapi/devinst.c
+--- a/dlls/setupapi/devinst.c
++++ b/dlls/setupapi/devinst.c
+@@ -2877,6 +2877,66 @@ BOOL WINAPI SetupDiEnumDeviceInterfaces(HDEVINFO devinfo,
+     return FALSE;
+ }
+ 
++/***********************************************************************
++ *		SetupDiGetDeviceInterfaceAlias (SETUPAPI.@)
++ *
++ * Two device interfaces are aliases of each other when the same device instance
++ * exposes them under the same reference string, but in different interface
++ * classes.
++ */
++BOOL WINAPI SetupDiGetDeviceInterfaceAlias(HDEVINFO devinfo, SP_DEVICE_INTERFACE_DATA *iface_data,
++        const GUID *alias_class, SP_DEVICE_INTERFACE_DATA *alias_data)
++{
++    struct device_iface *iface, *alias;
++    unsigned int pass;
++
++    TRACE("devinfo %p, iface_data %p, alias_class %s, alias_data %p\n",
++            devinfo, iface_data, debugstr_guid(alias_class), alias_data);
++
++    if (!(iface = get_device_iface(devinfo, iface_data)))
++        return FALSE;
++
++    if (iface->device->set != devinfo || iface->device->removed ||
++            (iface->flags & SPINT_REMOVED))
++    {
++        SetLastError(ERROR_NO_SUCH_DEVICE_INTERFACE);
++        return FALSE;
++    }
++
++    if (!alias_class || !alias_data || alias_data->cbSize != sizeof(*alias_data))
++    {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++
++    for (pass = 0; pass < 2; ++pass)
++    {
++        LIST_FOR_EACH_ENTRY(alias, &iface->device->interfaces, struct device_iface, entry)
++        {
++            if (alias == iface || (alias->flags & SPINT_REMOVED) ||
++                    !IsEqualGUID(&alias->class, alias_class))
++                continue;
++
++            if ((!alias->refstr && !iface->refstr) ||
++                    (alias->refstr && iface->refstr && !wcsicmp(alias->refstr, iface->refstr)))
++            {
++                copy_device_iface_data(alias_data, alias);
++                SetLastError(ERROR_SUCCESS);
++                return TRUE;
++            }
++        }
++
++        /* Device info sets normally contain only the class requested when they
++         * were created. Load this device's requested alias class before the
++         * second lookup. create_device() reuses the existing device object. */
++        if (!pass)
++            SETUPDI_EnumerateInterfaces(devinfo, alias_class, iface->device->instanceId, 0);
++    }
++
++    SetLastError(ERROR_NO_SUCH_DEVICE_INTERFACE);
++    return FALSE;
++}
++
+ /***********************************************************************
+  *		SetupDiDestroyDeviceInfoList (SETUPAPI.@)
+   *
+diff --git a/dlls/setupapi/setupapi.spec b/dlls/setupapi/setupapi.spec
+--- a/dlls/setupapi/setupapi.spec
++++ b/dlls/setupapi/setupapi.spec
+@@ -354,7 +354,7 @@
+ @ stdcall SetupDiGetDeviceInstallParamsW(ptr ptr ptr)
+ @ stdcall SetupDiGetDeviceInstanceIdA(ptr ptr ptr long ptr)
+ @ stdcall SetupDiGetDeviceInstanceIdW(ptr ptr ptr long ptr)
+-@ stub SetupDiGetDeviceInterfaceAlias
++@ stdcall SetupDiGetDeviceInterfaceAlias(ptr ptr ptr ptr)
+ @ stdcall SetupDiGetDeviceInterfaceDetailA(long ptr ptr long ptr ptr)
+ @ stdcall SetupDiGetDeviceInterfaceDetailW(long ptr ptr long ptr ptr)
+ @ stdcall SetupDiGetDeviceInterfacePropertyKeys(ptr ptr ptr long ptr long)
+-- 
+2.55.0

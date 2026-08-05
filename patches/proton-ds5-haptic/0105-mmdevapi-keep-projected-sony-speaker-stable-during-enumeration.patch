@@ -1,0 +1,146 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Wed, 5 Aug 2026 05:45:00 -0600
+Subject: [PATCH] mmdevapi: Keep the projected Sony speaker stable during
+ enumeration.
+
+The stale-collection compatibility path used to find the current Sony speaker
+again for every Item() call.  Initializing item zero activates the speaker and
+hides it from subsequent endpoint collections.  As a result, the same
+collection could include the speaker in GetCount() and item zero, then change
+its index domain before item one was requested.
+
+Retain the projected endpoint when GetCount() establishes the enumeration and
+use that same endpoint for all following Item() calls.  Refresh it on the next
+GetCount(), allowing long-lived collections to observe later hotplug events
+without changing underneath an enumeration already in progress.
+
+---
+ dlls/mmdevapi/devenum.c | 41 +++++++++++++++++++++++------------------
+ 1 file changed, 23 insertions(+), 18 deletions(-)
+
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+index 4619391e..f13d5859 100644
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -142,6 +142,7 @@ typedef struct MMDevColImpl
+     UINT devices_count;
+     EDataFlow flow;
+     DWORD state;
++    MMDevice *dualsense_mono;
+ } MMDevColImpl;
+ 
+ typedef struct IPropertyBagImpl {
+@@ -2229,6 +2230,7 @@ static HRESULT MMDevCol_Create(IMMDeviceCollection **ppv, EDataFlow flow, DWORD
+     This->devices_count = 0;
+     This->flow = flow;
+     This->state = state;
++    This->dualsense_mono = NULL;
+     *ppv = &This->IMMDeviceCollection_iface;
+ 
+     EnterCriticalSection(&device_list_cs);
+@@ -2286,6 +2288,8 @@ static void MMDevCol_Destroy(MMDevColImpl *This)
+     UINT i;
+     for (i = 0; i < This->devices_count; i++)
+         IMMDevice_Release(This->devices[i]);
++    if (This->dualsense_mono)
++        IMMDevice_Release(&This->dualsense_mono->IMMDevice_iface);
+ 
+     free(This->devices);
+     free(This);
+@@ -2350,10 +2354,18 @@ static MMDevice *MMDevCol_current_dualsense_mono_endpoint(MMDevColImpl *This)
+     return found;
+ }
+ 
++static void MMDevCol_refresh_dualsense_mono_endpoint(MMDevColImpl *This)
++{
++    MMDevice *dualsense_mono = MMDevCol_current_dualsense_mono_endpoint(This);
++
++    if (This->dualsense_mono)
++        IMMDevice_Release(&This->dualsense_mono->IMMDevice_iface);
++    This->dualsense_mono = dualsense_mono;
++}
++
+ static HRESULT WINAPI MMDevCol_GetCount(IMMDeviceCollection *iface, UINT *numdevs)
+ {
+     MMDevColImpl *This = impl_from_IMMDeviceCollection(iface);
+-    MMDevice *dualsense_mono;
+     UINT i;
+ 
+     TRACE("(%p)->(%p)\n", This, numdevs);
+@@ -2361,18 +2373,17 @@ static HRESULT WINAPI MMDevCol_GetCount(IMMDeviceCollection *iface, UINT *numdev
+         return E_POINTER;
+ 
+     *numdevs = 0;
+-    dualsense_mono = MMDevCol_current_dualsense_mono_endpoint(This);
+-    if (dualsense_mono)
++    MMDevCol_refresh_dualsense_mono_endpoint(This);
++    if (This->dualsense_mono)
+         (*numdevs)++;
+ 
+     for (i = 0; i < This->devices_count; ++i)
+     {
+         if (MMDevCol_device_visible(This->devices[i]) &&
+-                (!dualsense_mono || impl_from_IMMDevice(This->devices[i]) != dualsense_mono))
++                (!This->dualsense_mono ||
++                impl_from_IMMDevice(This->devices[i]) != This->dualsense_mono))
+             (*numdevs)++;
+     }
+-    if (dualsense_mono)
+-        IMMDevice_Release(&dualsense_mono->IMMDevice_iface);
+ 
+     return S_OK;
+ }
+@@ -2380,7 +2391,6 @@ static HRESULT WINAPI MMDevCol_GetCount(IMMDeviceCollection *iface, UINT *numdev
+ static HRESULT WINAPI MMDevCol_Item(IMMDeviceCollection *iface, UINT n, IMMDevice **dev)
+ {
+     MMDevColImpl *This = impl_from_IMMDeviceCollection(iface);
+-    MMDevice *dualsense_mono;
+     UINT i, index = 0;
+ 
+     TRACE("(%p)->(%u, %p)\n", This, n, dev);
+@@ -2388,34 +2398,31 @@ static HRESULT WINAPI MMDevCol_Item(IMMDeviceCollection *iface, UINT n, IMMDevic
+         return E_POINTER;
+ 
+     *dev = NULL;
+-    dualsense_mono = MMDevCol_current_dualsense_mono_endpoint(This);
+-    if (dualsense_mono && n == 0)
++    if (This->dualsense_mono && n == 0)
+     {
+         TRACE("Returning current Sony controller speaker %s through stale collection.\n",
+-                debugstr_guid(&dualsense_mono->devguid));
+-        *dev = &dualsense_mono->IMMDevice_iface;
++                debugstr_guid(&This->dualsense_mono->devguid));
++        *dev = &This->dualsense_mono->IMMDevice_iface;
++        IMMDevice_AddRef(*dev);
+         return S_OK;
+     }
+-    if (dualsense_mono)
++    if (This->dualsense_mono)
+         index = 1;
+ 
+     for (i = 0; i < This->devices_count; ++i)
+     {
+         if (!MMDevCol_device_visible(This->devices[i]))
+             continue;
+-        if (dualsense_mono && impl_from_IMMDevice(This->devices[i]) == dualsense_mono)
++        if (This->dualsense_mono &&
++                impl_from_IMMDevice(This->devices[i]) == This->dualsense_mono)
+             continue;
+         if (index++ == n)
+         {
+             *dev = This->devices[i];
+             IMMDevice_AddRef(*dev);
+-            if (dualsense_mono)
+-                IMMDevice_Release(&dualsense_mono->IMMDevice_iface);
+             return S_OK;
+         }
+     }
+-    if (dualsense_mono)
+-        IMMDevice_Release(&dualsense_mono->IMMDevice_iface);
+ 
+     WARN("Could not obtain item %u\n", n);
+     return E_INVALIDARG;
+-- 
+2.50.1
+
