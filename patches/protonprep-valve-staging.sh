@@ -53,6 +53,16 @@ apply_all_in_dir() {
     echo "DISCORD: -DISCORD RPC BRIDGE- patch steam/umu helpers"
     apply_all_in_dir "patches/discordrpc/helpers"
 
+    git checkout -- \
+        lsteamclient/Makefile.in \
+        lsteamclient/gen_wrapper.py \
+        lsteamclient/steam_input_manual.c \
+        lsteamclient/steamclient_private.h \
+        lsteamclient/winISteamInput.c
+
+    echo "LSTEAMCLIENT: add XInput-backed Steam Input fallback"
+    apply_all_in_dir "patches/lsteamclient"
+
 ### (2) WINE PATCHING ###
 
     pushd wine
