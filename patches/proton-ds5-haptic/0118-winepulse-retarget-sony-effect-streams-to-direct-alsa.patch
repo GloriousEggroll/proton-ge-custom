@@ -1,0 +1,134 @@
+From ecd6142bd1cc563f83818b223de0e3ba332cde76 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Thu, 6 Aug 2026 19:42:00 -0600
+Subject: [PATCH] winepulse: Retarget Sony effect streams to direct ALSA
+
+DualShock 4 exposes a public stereo PipeWire sink but no hidden four-channel
+split node. Consequently, adding a DS4 after a DualSense leaves the live
+four-channel effects stream attached to the removed DualSense PipeWire node.
+The game does not necessarily recreate that Windows stream after hotplug.
+
+When a Sony speaker appears without a split target, discover its working
+four-channel ALSA PCM after releasing the endpoint-list lock and retarget all
+registered Sony effect streams to it. Keep the existing PipeWire split-node
+path for DualSense and DualSense Edge devices.
+---
+ dlls/winepulse.drv/pulse.c | 40 +++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 36 insertions(+), 4 deletions(-)
+
+diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+index 813856b425d..60bcab80d46 100644
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -590,6 +590,8 @@ static BOOL pulse_refresh_devices(EDataFlow flow);
+ static BOOL is_dualsense_speaker_sink(const PhysDevice *dev);
+ static void pulse_retarget_dualsense_mono_streams(const char *preferred);
+ static void pulse_retarget_dualsense_haptic_streams(const char *target);
++static void pulse_retarget_dualsense_haptic_streams_to_alsa(const char *path);
++static char *find_dualsense_haptic_alsa_path(void);
+ 
+ /* for winepulse, this function can be called in a separate thread from other functions. */
+ /* this function cannot be called from multiple threads at the same time however. */
+@@ -612,8 +614,10 @@ static NTSTATUS pulse_get_endpoint_ids(void *args)
+     BOOL refreshed;
+     PhysDevice *dev, *dev_next;
+     BOOL delta = params->delta;
++    BOOL find_dualsense_haptic_alsa = FALSE;
+     char *dualsense_mono_target = NULL;
+     char *dualsense_haptic_target = NULL;
++    char *dualsense_haptic_alsa_path = NULL;
+ 
+     TRACE("flow %d, delta %d\n", (int)params->flow, (int)params->delta);
+ 
+@@ -745,6 +749,8 @@ static NTSTATUS pulse_get_endpoint_ids(void *args)
+                     free(dualsense_mono_target);
+                     dualsense_mono_target = target;
+                 }
++                if (!dev->raw_haptic_target)
++                    find_dualsense_haptic_alsa = TRUE;
+             }
+             if (params->flow == eRender && dev->raw_haptic_target)
+             {
+@@ -794,6 +800,8 @@ static NTSTATUS pulse_get_endpoint_ids(void *args)
+                     free(dualsense_mono_target);
+                     dualsense_mono_target = target;
+                 }
++                if (!dev->raw_haptic_target)
++                    find_dualsense_haptic_alsa = TRUE;
+             }
+             if (params->flow == eRender && dev->raw_haptic_target)
+             {
+@@ -813,16 +821,25 @@ done:
+ done:
+     g_phys_unlock();
+ 
+-    if (dualsense_mono_target || dualsense_haptic_target)
++    /* DualShock 4 publishes only its public stereo PipeWire sink. Discover
++     * its four-channel ALSA PCM after releasing the physical-device lock so
++     * an existing DualSense effects stream can move to the newly added pad. */
++    if (!dualsense_haptic_target && find_dualsense_haptic_alsa)
++        dualsense_haptic_alsa_path = find_dualsense_haptic_alsa_path();
++
++    if (dualsense_mono_target || dualsense_haptic_target || dualsense_haptic_alsa_path)
+     {
+         pulse_lock();
+         if (dualsense_mono_target)
+             pulse_retarget_dualsense_mono_streams(dualsense_mono_target);
+         if (dualsense_haptic_target)
+             pulse_retarget_dualsense_haptic_streams(dualsense_haptic_target);
++        else if (dualsense_haptic_alsa_path)
++            pulse_retarget_dualsense_haptic_streams_to_alsa(dualsense_haptic_alsa_path);
+         pulse_unlock();
+         free(dualsense_mono_target);
+         free(dualsense_haptic_target);
++        free(dualsense_haptic_alsa_path);
+     }
+ 
+     if (needed > params->size) {
+@@ -3019,14 +3036,14 @@ static void pulse_haptic_drop_held(struct pulse_stream *stream)
+     stream->held_bytes = 0;
+ }
+ 
+-static HRESULT pulse_retarget_dualsense_haptic_stream(struct pulse_stream *stream, const char *target)
++static HRESULT pulse_retarget_dualsense_haptic_stream_path(struct pulse_stream *stream, const char *target)
+ {
+     char *path;
+     HRESULT hr;
+ 
+     if (!stream->dualsense_haptic_registered)
+         return S_FALSE;
+-    if (!(path = make_pipewire_dualsense_haptic_path(target)))
++    if (!(path = strdup(target)))
+         return E_OUTOFMEMORY;
+ 
+     TRACE("Retargeting Sony controller haptic stream %p from %s to %s.\n",
+@@ -3065,10 +3082,25 @@ static HRESULT pulse_retarget_dualsense_haptic_stream(struct pulse_stream *stre
+ static void pulse_retarget_dualsense_haptic_streams(const char *target)
+ {
+     struct pulse_stream *stream, *next;
++    char *path;
++
++    if (!(path = make_pipewire_dualsense_haptic_path(target)))
++        return;
++
++    LIST_FOR_EACH_ENTRY_SAFE(stream, next, &dualsense_haptic_streams,
++            struct pulse_stream, dualsense_haptic_entry)
++        pulse_retarget_dualsense_haptic_stream_path(stream, path);
++    free(path);
++}
++
++static void pulse_retarget_dualsense_haptic_streams_to_alsa(const char *path)
++{
++    struct pulse_stream *stream, *next;
+ 
++    TRACE("Retargeting live Sony controller effect streams to ALSA PCM %s.\n", debugstr_a(path));
+     LIST_FOR_EACH_ENTRY_SAFE(stream, next, &dualsense_haptic_streams,
+             struct pulse_stream, dualsense_haptic_entry)
+-        pulse_retarget_dualsense_haptic_stream(stream, target);
++        pulse_retarget_dualsense_haptic_stream_path(stream, path);
+ }
+ 
+ static void pulse_haptic_invalidate(struct pulse_stream *stream, const char *reason)
+-- 
+2.50.1
+

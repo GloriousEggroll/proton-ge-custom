@@ -1,0 +1,153 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Wed, 5 Aug 2026 11:00:00 -0600
+Subject: [PATCH] hid/winepulse: Optionally expose Windows Sony controller identity
+
+Some games pair the native Sony HID device with its audio endpoint by
+container ID, but still require the Windows HID product identity "Wireless
+Controller" and the Windows four-channel USB audio layout before enabling
+adaptive triggers, audio haptics, and controller speaker effects.
+
+Keep the real model-specific MMDevAPI endpoint name so hotplug and application
+endpoint selection continue to distinguish DualShock, DualSense, and
+DualSense Edge speakers. When explicitly enabled, change only the HID product
+identity and restore the quad mix format hidden by PipeWire's mono UCM speaker
+split.
+---
+ dlls/hidclass.sys/device.c | 20 +++++++++++++++++++-
+ dlls/winebus.sys/main.c    | 19 ++++++++++++++++++-
+ dlls/winepulse.drv/pulse.c | 32 ++++++++++++++++++++++++++++++++
+ 3 files changed, 69 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/hidclass.sys/device.c b/dlls/hidclass.sys/device.c
+--- a/dlls/hidclass.sys/device.c
++++ b/dlls/hidclass.sys/device.c
+@@ -404,6 +404,16 @@ static const struct device_strings device_strings[] =
+     { .id = L"VID_054C&PID_0DF2", .product = L"DualSense Edge Wireless Controller" },
+ };
+ 
++static BOOL use_windows_sony_controller_names(void)
++{
++    static const WCHAR name[] = L"PROTON_SONY_WINDOWS_DEVICE_NAMES";
++    WCHAR value[2];
++    SIZE_T len;
++
++    return !RtlQueryEnvironmentVariable(NULL, name, ARRAY_SIZE(name) - 1,
++            value, ARRAY_SIZE(value) - 1, &len) && len == 1 && value[0] == '1';
++}
++
+ static const WCHAR *find_device_string( const WCHAR *device_id, ULONG index )
+ {
+     const WCHAR *match_id = wcsrchr( device_id, '\\' ) + 1;
+@@ -413,8 +423,16 @@ static const WCHAR *find_device_string( const WCHAR *device_id, ULONG index )
+     if (index != HID_STRING_ID_IPRODUCT) return NULL;
+ 
+     for (i = 0; i < ARRAY_SIZE(device_strings); ++i)
+-        if (!wcsnicmp( device_strings[i].id, match_id, 17 ))
++    {
++        if (!wcsnicmp( device_strings[i].id, match_id, 17 ))
++        {
++            if (use_windows_sony_controller_names() &&
++                    (!wcsicmp(device_strings[i].id, L"VID_054C&PID_0CE6") ||
++                    !wcsicmp(device_strings[i].id, L"VID_054C&PID_0DF2")))
++                return L"Wireless Controller";
+             return device_strings[i].product;
++        }
++    }
+ 
+     return NULL;
+ }
+diff --git a/dlls/winebus.sys/main.c b/dlls/winebus.sys/main.c
+--- a/dlls/winebus.sys/main.c
++++ b/dlls/winebus.sys/main.c
+@@ -295,6 +295,16 @@ static WCHAR *get_compatible_ids(DEVICE_OBJECT *device)
+     return dst;
+ }
+ 
++static BOOL use_windows_sony_controller_names(void)
++{
++    static const WCHAR name[] = L"PROTON_SONY_WINDOWS_DEVICE_NAMES";
++    WCHAR value[2];
++    SIZE_T len;
++
++    return !RtlQueryEnvironmentVariable(NULL, name, ARRAY_SIZE(name) - 1,
++            value, ARRAY_SIZE(value) - 1, &len) && len == 1 && value[0] == '1';
++}
++
+ static WCHAR *get_device_text(DEVICE_OBJECT *device)
+ {
+     struct device_extension *ext = device->DeviceExtension;
+@@ -302,7 +312,14 @@ static WCHAR *get_device_text(DEVICE_OBJECT *device)
+     DWORD size;
+     WCHAR *dst;
+ 
+-    if (ext->desc.vid == 0x054c && ext->desc.pid == 0x0ce6)
++    if (use_windows_sony_controller_names() && ext->desc.vid == 0x054c &&
++            (ext->desc.pid == 0x05c4 || ext->desc.pid == 0x09cc ||
++            ext->desc.pid == 0x0ba0 || ext->desc.pid == 0x0ce6 ||
++            ext->desc.pid == 0x0df2))
++    {
++        src = L"Wireless Controller";
++    }
++    else if (ext->desc.vid == 0x054c && ext->desc.pid == 0x0ce6)
+         src = L"DualSense Wireless Controller";
+ 
+     size = (wcslen(src) + 1) * sizeof(WCHAR);
+diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -1266,6 +1266,34 @@ static BOOL is_dualsense_speaker_sink(const PhysDevice *dev)
+                     && strstr(dev->pulse_name, "Wireless_Controller"))));
+ }
+ 
++static BOOL use_windows_sony_controller_names(void)
++{
++    const char *env = getenv("PROTON_SONY_WINDOWS_DEVICE_NAMES");
++
++    return env && env[0] == '1' && !env[1];
++}
++
++static void apply_windows_sony_audio_format(PhysDevice *dev)
++{
++    WAVEFORMATEX *wfx = &dev->fmt.Format;
++
++    if (!use_windows_sony_controller_names() || !is_dualsense_speaker_sink(dev))
++        return;
++
++    /* Windows exposes the DualSense USB audio function as a four-channel
++     * endpoint. PipeWire's UCM profile splits out the controller speaker as a
++     * mono sink, but games still use this endpoint for channels 3 and 4 of the
++     * raw haptic stream. Keep the probed sample representation and restore the
++     * Windows channel layout advertised to applications. */
++    wfx->wFormatTag = WAVE_FORMAT_EXTENSIBLE;
++    wfx->nChannels = 4;
++    wfx->nSamplesPerSec = 48000;
++    wfx->nBlockAlign = wfx->nChannels * wfx->wBitsPerSample / 8;
++    wfx->nAvgBytesPerSec = wfx->nSamplesPerSec * wfx->nBlockAlign;
++    wfx->cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
++    dev->fmt.dwChannelMask = KSAUDIO_SPEAKER_QUAD;
++}
++
+ static BOOL is_dualsense_edge_speaker_sink(const PhysDevice *dev)
+ {
+     return is_dualsense_speaker_sink(dev) &&
+@@ -1499,6 +1527,9 @@ static void pulse_probe_device_list(pa_mainloop *ml, pa_context *ctx, struct lis
+     PhysDevice *dev;
+ 
+     LIST_FOR_EACH_ENTRY(dev, list, PhysDevice, entry)
++    {
+         pulse_probe_settings(ml, ctx, render, dev->pulse_name, &dev->fmt, &dev->def_period, &dev->min_period);
++        apply_windows_sony_audio_format(dev);
++    }
+ }
+ 
+@@ -2046,6 +2077,7 @@ static NTSTATUS pulse_test_connect(void *args)
+ 
+     LIST_FOR_EACH_ENTRY(dev, &g_phys_speakers, PhysDevice, entry) {
+         pulse_probe_settings(ml, ctx, 1, dev->pulse_name, &dev->fmt, &dev->def_period, &dev->min_period);
++        apply_windows_sony_audio_format(dev);
+     }
+ 
+     LIST_FOR_EACH_ENTRY(dev, &g_phys_sources, PhysDevice, entry) {
+-- 
+2.55.0

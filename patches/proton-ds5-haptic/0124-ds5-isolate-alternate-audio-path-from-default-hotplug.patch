@@ -1,0 +1,156 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Sun, 9 Aug 2026 12:05:00 -0600
+Subject: [PATCH] ds5: Isolate alternate audio path from default hotplug
+
+The optional persistent Windows-style Sony endpoint path rewrote the endpoint
+cleanup used by every game. Even with the option disabled, the new routine
+queried instance and container properties for every AudioEndpoint during the
+time-sensitive controller replacement sequence. It also left an extra haptic
+target lookup active for ordinary streams.
+
+Keep the original controller-speaker cleanup routine intact for the default
+path. Put the broader container-aware cleanup in a separate routine used only
+when PROTON_KEEP_SONY_AUDIO_ENDPOINT_VISIBLE is enabled, and only discover the
+PipeWire haptic parent when its alternate route is enabled. This restores the
+pre-alternate-path hotplug behavior for games such as Spider-Man while keeping
+the opt-in Assassin's Creed path available.
+---
+ dlls/mmdevapi/devenum.c     | 59 ++++++++++++++++++++++++++++++++-----
+ dlls/winepulse.drv/pulse.c |  2 +-
+ 2 files changed, 52 insertions(+), 9 deletions(-)
+
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -1083,16 +1083,17 @@
+ 
+ static BOOL is_dualsense_audioendpoint_name(const WCHAR *name)
+ {
+-    if (!name)
+-        return FALSE;
+-
+     return is_dualsense_mono_endpoint_name(name) ||
+-            wcsstr(name, L"Wireless Controller Speaker") ||
++            (name && (wcsstr(name, L"Wireless Controller Speaker") ||
+             wcsstr(name, L"DualShock 4 Wireless Controller Speaker") ||
+             wcsstr(name, L"DualSense Wireless Controller Speaker") ||
+-            wcsstr(name, L"DualSense Edge Wireless Controller Speaker") ||
+-            (keep_sony_audio_endpoint_visible() &&
+-            (wcsstr(name, L"DualSense") || wcsstr(name, L"DualShock")));
++            wcsstr(name, L"DualSense Edge Wireless Controller Speaker")));
++}
++
++static BOOL is_persistent_sony_audioendpoint_name(const WCHAR *name)
++{
++    return is_dualsense_audioendpoint_name(name) ||
++            (name && (wcsstr(name, L"DualSense") || wcsstr(name, L"DualShock")));
+ }
+ 
+ static BOOL is_dualsense_audioendpoint_container(const GUID *container_id)
+@@ -1104,7 +1105,45 @@ static BOOL is_dualsense_audioendpoint_container(const GUID *container_id)
+             product == 0x0ce6 || product == 0x0df2);
+ }
+ 
+-static void remove_dualsense_audioendpoint_devices(const GUID *keep_container_id)
++static void remove_dualsense_audioendpoint_devices(void)
++{
++    static const GUID AudioEndpoint_ClassGUID = { 0xc166523c, 0xfe0c, 0x4a94, { 0xa5, 0x86, 0xf1, 0xa8, 0x0c, 0xfb, 0xbf, 0x3e } };
++    HDEVINFO device_set;
++    SP_DEVINFO_DATA device_info_data;
++    DWORD index = 0;
++
++    device_set = SetupDiGetClassDevsW(&AudioEndpoint_ClassGUID, NULL, NULL, 0);
++    if (device_set == INVALID_HANDLE_VALUE)
++        return;
++
++    for (;;)
++    {
++        WCHAR friendly_name[256];
++
++        memset(&device_info_data, 0, sizeof(device_info_data));
++        device_info_data.cbSize = sizeof(device_info_data);
++
++        if (!SetupDiEnumDeviceInfo(device_set, index, &device_info_data))
++            break;
++
++        if (SetupDiGetDeviceRegistryPropertyW(device_set, &device_info_data, SPDRP_FRIENDLYNAME, NULL,
++                (BYTE *)friendly_name, sizeof(friendly_name), NULL) &&
++                is_dualsense_audioendpoint_name(friendly_name))
++        {
++            TRACE("Removing stale DualSense AudioEndpoint device %s.\n", debugstr_w(friendly_name));
++            if (SetupDiRemoveDevice(device_set, &device_info_data))
++                continue;
++            WARN("Failed to remove stale DualSense AudioEndpoint device %s: 0x%lu.\n",
++                    debugstr_w(friendly_name), GetLastError());
++        }
++
++        index++;
++    }
++
++    SetupDiDestroyDeviceInfoList(device_set);
++}
++
++static void remove_persistent_sony_audioendpoint_devices(const GUID *keep_container_id)
+ {
+     static const GUID AudioEndpoint_ClassGUID = { 0xc166523c, 0xfe0c, 0x4a94, { 0xa5, 0x86, 0xf1, 0xa8, 0x0c, 0xfb, 0xbf, 0x3e } };
+     HDEVINFO device_set;
+@@ -1134,8 +1173,7 @@ static void remove_dualsense_audioendpoint_devices(const GUID *keep_container_i
+         SetupDiGetDeviceInstanceIdW(device_set, &device_info_data, instance_id,
+                 ARRAY_SIZE(instance_id), NULL);
+ 
+-        if (keep_sony_audio_endpoint_visible() &&
+-                SetupDiGetDeviceRegistryPropertyW(device_set, &device_info_data, SPDRP_BASE_CONTAINERID,
++        if (SetupDiGetDeviceRegistryPropertyW(device_set, &device_info_data, SPDRP_BASE_CONTAINERID,
+                 NULL, (BYTE *)container_id_string, sizeof(container_id_string), NULL) &&
+                 SUCCEEDED(CLSIDFromString(container_id_string, &container_id)) &&
+                 is_dualsense_audioendpoint_container(&container_id))
+@@ -1143,7 +1181,7 @@ static void remove_dualsense_audioendpoint_devices(const GUID *keep_container_i
+             sony = TRUE;
+             keep = keep_container_id && IsEqualGUID(keep_container_id, &container_id);
+         }
+-        else if (is_dualsense_audioendpoint_name(friendly_name))
++        else if (is_persistent_sony_audioendpoint_name(friendly_name))
+             sony = TRUE;
+ 
+         if (sony && !keep)
+@@ -1215,8 +1253,11 @@ static void MMDevice_Register(const WCHAR *instguid, const WCHAR *friendly_name,
+ 
+         if (skip_audioendpoint && is_dualsense_device_path(device_path))
+         {
+-            remove_dualsense_audioendpoint_devices(IsEqualGUID(container_id, &GUID_NULL) ?
+-                    NULL : container_id);
++            if (keep_sony_audio_endpoint_visible())
++                remove_persistent_sony_audioendpoint_devices(IsEqualGUID(container_id, &GUID_NULL) ?
++                        NULL : container_id);
++            else
++                remove_dualsense_audioendpoint_devices();
+             skip_audioendpoint = FALSE;
+         }
+ 
+@@ -1816,7 +1857,10 @@ static DWORD WINAPI update_thread_proc(void *user)
+                                 debugstr_guid(id));
+                         if (dualsense_mono_endpoint)
+                         {
+-                            remove_dualsense_audioendpoint_devices(NULL);
++                            if (keep_sony_audio_endpoint_visible())
++                                remove_persistent_sony_audioendpoint_devices(NULL);
++                            else
++                                remove_dualsense_audioendpoint_devices();
+                             remove_dualsense_media_devices();
+                         }
+                         notify_endpoint_removed(dev->flow, id);
+diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -3331,7 +3331,7 @@ static NTSTATUS pulse_create_stream(void *args)
+     /* A Sony endpoint name satisfies the first side of the expression above,
+      * so retrieve its hidden PipeWire parent separately instead of losing it
+      * to short-circuit evaluation. */
+-    if (haptic_candidate && !haptic_target)
++    if (use_pipewire_dualsense_haptic_target() && haptic_candidate && !haptic_target)
+         haptic_target = get_dualsense_haptic_target(params->device, stream);
+     dualsense_mono_candidate = !haptic_candidate && pulse_stream_dualsense_mono_format(stream)
+             && string_contains_dualsense_name(params->device);
+-- 
+2.55.0

@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Wed, 5 Aug 2026 18:00:00 -0600
+Subject: [PATCH] sechost: Resolve Sony HID container through USB parent
+
+The HID interface notification for a newly connected Sony controller can
+race SetupAPI's device installation.  WineBus has already assigned the USB
+interface its connection container ID, but a concurrent present-device
+enumeration can temporarily remove that property from the derived HID
+record.  get_interface_container_id() then fails and sechost dispatches the
+HID arrival immediately instead of holding it until the controller speaker
+endpoint has been published.
+
+On a later replug the persisted HID record usually has the property in time,
+which explains why controller effect audio starts working only after the
+same controller is unplugged and plugged in again.
+
+If the HID record has no usable container ID, derive its matching USB
+interface instance from the notification path and read the container from
+that current parent record.  This only repairs ordering for the fresh
+arrival; it does not retain disconnected HID or audio devices.
+---
+ dlls/sechost/service.c | 44 +++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 43 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/sechost/service.c b/dlls/sechost/service.c
+--- a/dlls/sechost/service.c
++++ b/dlls/sechost/service.c
+@@ -2140,6 +2140,46 @@ static BOOL is_sony_usb_audio_hid( const DEV_BROADCAST_HDR *header )
+             contains_string_i( name, L"pid_0ce6" ) || contains_string_i( name, L"pid_0df2" );
+ }
+ 
++static const GUID null_guid;
++
++static BOOL get_sony_usb_parent_container_id( const WCHAR *path, GUID *container_id )
++{
++    WCHAR instance[256], *dst = instance;
++    const WCHAR *src = path;
++    SP_DEVINFO_DATA device = {sizeof(device)};
++    DEVPROPTYPE type;
++    HDEVINFO set;
++    BOOL ret = FALSE;
++
++    while (*src && wcsnicmp( src, L"hid#", 4 )) src++;
++    if (!*src) return FALSE;
++    src += 4;
++
++    memcpy( dst, L"USB\\", 4 * sizeof(*dst) );
++    dst += 4;
++    while (*src && !(src[0] == '#' && src[1] == '{') && dst < instance + ARRAY_SIZE(instance) - 1)
++    {
++        WCHAR ch = *src++;
++        *dst++ = ch == '#' ? '\\' : ch;
++    }
++    *dst = 0;
++
++    if (!*src || dst == instance + ARRAY_SIZE(instance) - 1 ||
++            (set = SetupDiCreateDeviceInfoList( NULL, NULL )) == INVALID_HANDLE_VALUE)
++        return FALSE;
++
++    if (SetupDiOpenDeviceInfoW( set, instance, NULL, 0, &device ))
++        ret = SetupDiGetDevicePropertyW( set, &device, &device_container_id_key, &type,
++                (BYTE *)container_id, sizeof(*container_id), NULL, 0 ) &&
++                type == DEVPROP_TYPE_GUID && !IsEqualGUID( container_id, &null_guid );
++
++    if (ret)
++        TRACE( "Resolved Sony HID container %s through USB parent %s.\n",
++                debugstr_guid( container_id ), debugstr_w( instance ) );
++    SetupDiDestroyDeviceInfoList( set );
++    return ret;
++}
++
+ static BOOL get_interface_container_id( const WCHAR *path, GUID *container_id )
+ {
+     SP_DEVICE_INTERFACE_DETAIL_DATA_W *detail = NULL;
+@@ -2171,7 +2211,9 @@ static BOOL get_interface_container_id( const WCHAR *path, GUID *container_id )
+ done:
+     free( detail );
+     SetupDiDestroyDeviceInfoList( set );
+-    return ret;
++    if (ret && !IsEqualGUID( container_id, &null_guid )) return TRUE;
++
++    return get_sony_usb_parent_container_id( path, container_id );
+ }
+ 
+ static void get_sony_audio_ready_event_name( const GUID *container_id, WCHAR *name )
+-- 
+2.54.0

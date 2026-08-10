@@ -1,0 +1,290 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Sun, 9 Aug 2026 20:00:00 -0600
+Subject: [PATCH] ds5: Select Windows Sony audio mode from application probes
+
+The default Sony controller-speaker path deliberately hides the mono endpoint
+after activation and gives every physical connection fresh auxiliary endpoint
+identities. This is required for reliable Spider-Man controller-audio
+hotplugging.
+
+Some games instead enumerate the Sony endpoint's complete legacy format matrix
+before opening it. They expect the Windows four-channel 48 kHz layout, keep
+the endpoint visible, and route paired effect and haptic streams through
+PipeWire's hidden non-event parent. These requirements were previously enabled
+from Proton with per-game environment variables.
+
+Expose the canonical Windows PnP identity from initial enumeration for known
+Sony controllers. Keep the direct HID product string separate: DualSense and
+DualSense Edge continue to report their model-specific strings to applications
+on the default path, while DualShock 4 retains its native Windows "Wireless
+Controller" string. This lets games recognize the Windows PnP device without
+changing the HID/audio identity used by the default hotplug path.
+
+Use the capability sweep itself as the audio compatibility signal. After eight
+shared-mode format probes against one Sony audio client, or an explicit
+four-channel float probe, switch that process to the Windows-style audio path.
+Restore an endpoint hidden by the initial probe, publish a process-lifetime
+named event for the endpoint and hotplug ordering code, and pass the decision
+directly to winepulse so both sides switch on the same API call. The event and
+all automatic state disappear with the process; no controller identity or mode
+is stored in the prefix.
+
+Applications which directly open a mono or stereo controller-speaker stream
+never cross the threshold and retain the established default hotplug path.
+Manual environment overrides remain available for diagnostics.
+
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -794,11 +794,31 @@
+     return env && env[0] == '1' && !env[1];
+ }
+ 
++#define SONY_WINDOWS_AUDIO_MODE_EVENT L"__wine_sony_windows_audio_mode"
++#define SONY_AUDIO_CAPABILITY_PROBE_THRESHOLD 8
++
++static LONG sony_windows_audio_mode;
++static HANDLE sony_windows_audio_mode_event;
++
++static BOOL sony_windows_audio_mode_event_enabled(void)
++{
++    HANDLE event;
++    BOOL enabled;
++
++    if (!(event = OpenEventW(SYNCHRONIZE, FALSE, SONY_WINDOWS_AUDIO_MODE_EVENT)))
++        return FALSE;
++    enabled = WaitForSingleObject(event, 0) == WAIT_OBJECT_0;
++    CloseHandle(event);
++    return enabled;
++}
++
+ static BOOL keep_sony_audio_endpoint_visible(void)
+ {
+     const char *env = getenv("PROTON_KEEP_SONY_AUDIO_ENDPOINT_VISIBLE");
+ 
+-    return env && env[0] == '1' && !env[1];
++    return (env && env[0] == '1' && !env[1]) ||
++            InterlockedCompareExchange(&sony_windows_audio_mode, 0, 0) ||
++            sony_windows_audio_mode_event_enabled();
+ }
+ 
+ static BOOL is_dualsense_mono_endpoint_name(const WCHAR *name)
+@@ -2029,6 +2049,58 @@
+     return CONTAINING_RECORD(iface, MMDevice, IMMDevice_iface);
+ }
+ 
++static BOOL is_sony_four_channel_audio_format(const WAVEFORMATEX *format)
++{
++    const WAVEFORMATEXTENSIBLE *extensible = (const WAVEFORMATEXTENSIBLE *)format;
++
++    return format && format->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
++            format->cbSize >= sizeof(*extensible) - sizeof(*format) &&
++            format->nChannels == 4 && format->nSamplesPerSec == 48000 &&
++            format->wBitsPerSample == 32 &&
++            IsEqualGUID(&extensible->SubFormat, &KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
++}
++
++BOOL auto_select_sony_audio_mode(IMMDevice *iface, AUDCLNT_SHAREMODE mode,
++        const WAVEFORMATEX *format, unsigned int *probe_count)
++{
++    MMDevice *device = impl_from_IMMDevice(iface);
++    BOOL selected;
++    HANDLE event;
++
++    if (mode != AUDCLNT_SHAREMODE_SHARED || !is_dualsense_mono_endpoint(device))
++        return FALSE;
++
++    selected = InterlockedCompareExchange(&sony_windows_audio_mode, 0, 0) ||
++            sony_windows_audio_mode_event_enabled();
++
++    /* A capability sweep is how Windows-style Sony audio clients discover the
++     * four-channel endpoint. Direct mono/stereo speaker clients never perform
++     * enough probes to leave the default hotplug path. */
++    if (!selected && !is_sony_four_channel_audio_format(format) &&
++            ++*probe_count < SONY_AUDIO_CAPABILITY_PROBE_THRESHOLD)
++        return FALSE;
++
++    if (!selected && !InterlockedCompareExchange(&sony_windows_audio_mode, 1, 0))
++    {
++        event = CreateEventW(NULL, TRUE, TRUE, SONY_WINDOWS_AUDIO_MODE_EVENT);
++        if (!event)
++            WARN("Failed to publish automatic Windows Sony audio mode, error %lu.\n", GetLastError());
++        else
++            sony_windows_audio_mode_event = event;
++        TRACE("Selected Windows Sony audio mode after %u format probes.\n", *probe_count);
++    }
++
++    EnterCriticalSection(&device_list_cs);
++    if (device->hide_from_collection)
++    {
++        TRACE("Restoring auto-detected Sony endpoint %s to endpoint collections.\n",
++                debugstr_guid(&device->devguid));
++        device->hide_from_collection = FALSE;
++    }
++    LeaveCriticalSection(&device_list_cs);
++    return TRUE;
++}
++
+ static BOOL MMDevCol_device_visible(IMMDevice *iface)
+ {
+     return !should_hide_from_endpoint_collection(impl_from_IMMDevice(iface));
+--- a/dlls/mmdevapi/client.c
++++ b/dlls/mmdevapi/client.c
+@@ -902,6 +902,7 @@
+     struct audio_client *This = impl_from_IAudioClient3(iface);
+     struct is_format_supported_params params;
+     BOOL fake_exclusive = FALSE;
++    BOOL sony_windows_audio_mode;
+     HRESULT hr;
+ 
+     TRACE("(%p)->(%x, %p, %p)\n", This, mode, fmt, out);
+@@ -914,6 +915,9 @@
+ 
+     dump_fmt(fmt);
+ 
++    sony_windows_audio_mode = auto_select_sony_audio_mode(This->parent, mode, fmt,
++            &This->sony_format_probe_count);
++
+     if (mode == AUDCLNT_SHAREMODE_EXCLUSIVE && device_fake_exclusive()) {
+         mode = AUDCLNT_SHAREMODE_SHARED;
+         fake_exclusive = TRUE;
+@@ -929,6 +933,7 @@
+         params.flow    = This->dataflow;
+         params.share   = mode;
+         params.fmt_in  = fmt;
++        params.sony_windows_audio_mode = sony_windows_audio_mode;
+ 
+         wine_unix_call(is_format_supported, &params);
+ 
+--- a/dlls/mmdevapi/mmdevapi_private.h
++++ b/dlls/mmdevapi/mmdevapi_private.h
+@@ -82,6 +82,7 @@
+ 
+     struct list entry;
+     char *device_name;
++    unsigned int sony_format_probe_count;
+ };
+ 
+ extern HRESULT MMDevEnum_Create(REFIID riid, void **ppv);
+@@ -131,6 +132,8 @@
+ extern BOOL get_device_name_from_guid( const GUID *guid, char **name, EDataFlow *flow );
+ extern HRESULT load_devices_from_reg(void);
+ extern HRESULT load_driver_devices(EDataFlow flow);
++extern BOOL auto_select_sony_audio_mode(IMMDevice *device, AUDCLNT_SHAREMODE mode,
++        const WAVEFORMATEX *format, unsigned int *probe_count);
+ 
+ extern void main_loop_stop(void);
+ extern void stop_update_thread(void);
+--- a/dlls/mmdevapi/unixlib.h
++++ b/dlls/mmdevapi/unixlib.h
+@@ -146,6 +146,7 @@
+     AUDCLNT_SHAREMODE share;
+     const WAVEFORMATEX *fmt_in;
+     HRESULT result;
++    BOOL sony_windows_audio_mode;
+ };
+ 
+ struct get_loopback_capture_device_params
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -183,6 +183,7 @@
+ static pthread_cond_t g_phys_cond = PTHREAD_COND_INITIALIZER;
+ static unsigned int g_haptic_hotplug_generation;
+ static unsigned int g_dualsense_endpoint_generation;
++static LONG g_sony_windows_audio_mode;
+ static unsigned int g_dualsense_mono_speaker_add_generation;
+ static char *g_dualsense_mono_preferred_sink;
+ static unsigned int g_phys_event_mask;
+@@ -1321,14 +1322,16 @@
+ {
+     const char *env = getenv("PROTON_SONY_WINDOWS_DEVICE_NAMES");
+ 
+-    return env && env[0] == '1' && !env[1];
++    return (env && env[0] == '1' && !env[1]) ||
++            InterlockedCompareExchange(&g_sony_windows_audio_mode, 0, 0);
+ }
+ 
+ static BOOL use_pipewire_dualsense_haptic_target(void)
+ {
+     const char *env = getenv("PROTON_DUALSENSE_HAPTICS_PREFER_NON_EVENT");
+ 
+-    return env && env[0] == '1' && !env[1];
++    return (env && env[0] == '1' && !env[1]) ||
++            InterlockedCompareExchange(&g_sony_windows_audio_mode, 0, 0);
+ }
+ 
+ static char *make_pipewire_dualsense_haptic_path(const char *target)
+@@ -4656,6 +4659,10 @@
+ {
+     struct is_format_supported_params *params = args;
+ 
++    if (params->sony_windows_audio_mode &&
++            !InterlockedExchange(&g_sony_windows_audio_mode, 1))
++        TRACE("Selected automatically detected Windows Sony audio mode.\n");
++
+     /* This driver does not support exclusive mode. */
+     if (params->share == AUDCLNT_SHAREMODE_EXCLUSIVE) {
+         WARN("Exclusive mode requested but winepulse.drv does not support exclusive mode.\n");
+@@ -4765,6 +4772,7 @@
+         if (!pulse_device_matches(dev, params->device))
+             continue;
+ 
++        apply_windows_sony_audio_format(dev);
+         *params->fmt = dev->fmt;
+         g_phys_unlock();
+         params->result = S_OK;
+@@ -5333,6 +5341,7 @@
+         AUDCLNT_SHAREMODE share;
+         PTR32 fmt_in;
+         HRESULT result;
++        BOOL sony_windows_audio_mode;
+     } *params32 = args;
+     struct is_format_supported_params params =
+     {
+@@ -5340,6 +5349,7 @@
+         .flow = params32->flow,
+         .share = params32->share,
+         .fmt_in = ULongToPtr(params32->fmt_in),
++        .sony_windows_audio_mode = params32->sony_windows_audio_mode,
+     };
+     pulse_is_format_supported(&params);
+     params32->result = params.result;
+--- a/dlls/sechost/service.c
++++ b/dlls/sechost/service.c
+@@ -2141,8 +2141,17 @@
+ static BOOL use_sony_usb_parent_container_fallback(void)
+ {
+     const char *env = getenv("PROTON_KEEP_SONY_AUDIO_ENDPOINT_VISIBLE");
++    HANDLE event;
++    BOOL enabled;
+ 
+-    return env && env[0] == '1' && !env[1];
++    if (env && env[0] == '1' && !env[1])
++        return TRUE;
++
++    if (!(event = OpenEventW(SYNCHRONIZE, FALSE, L"__wine_sony_windows_audio_mode")))
++        return FALSE;
++    enabled = WaitForSingleObject(event, 0) == WAIT_OBJECT_0;
++    CloseHandle(event);
++    return enabled;
+ }
+ 
+ static const GUID null_guid;
+--- a/dlls/winebus.sys/main.c
++++ b/dlls/winebus.sys/main.c
+@@ -298,11 +298,6 @@
+ static BOOL use_windows_sony_controller_names(void)
+ {
+-    static const WCHAR name[] = L"PROTON_SONY_WINDOWS_DEVICE_NAMES";
+-    WCHAR value[2];
+-    SIZE_T len;
+-
+-    return !RtlQueryEnvironmentVariable(NULL, name, ARRAY_SIZE(name) - 1,
+-            value, ARRAY_SIZE(value) - 1, &len) && len == 1 && value[0] == '1';
++    return TRUE;
+ }
+ 
+ static WCHAR *get_device_text(DEVICE_OBJECT *device)
+
+-- 
+2.55.0

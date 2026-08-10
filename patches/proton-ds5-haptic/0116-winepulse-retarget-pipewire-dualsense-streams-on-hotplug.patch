@@ -1,0 +1,283 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Thu, 6 Aug 2026 19:15:00 -0600
+Subject: [PATCH] winepulse: Retarget PipeWire DualSense streams on hotplug
+
+The opt-in Windows Sony audio layout turns controller speaker and haptic
+clients into four-channel streams routed through the hidden PipeWire parent.
+Unlike the public mono stream, these raw streams were not registered for
+hotplug retargeting. Once their controller disappeared, the stream remained
+permanently invalid even after Wine published a replacement controller.
+
+Track only live PipeWire-backed streams. When a newly connected Sony endpoint
+publishes its hidden parent, close and forget the old PCM, replace its target,
+drop samples queued while no controller was present, and open the new node.
+If PipeWire has not finished publishing that node, retry the new target from
+the normal write path. Never retry the path cleared by a disconnect.
+
+This lets games retain their Windows audio client while swapping between
+DualSense, DualSense Edge, and DualShock controllers without preserving any
+disconnected physical device.
+---
+ dlls/winepulse.drv/pulse.c | 138 ++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 126 insertions(+), 12 deletions(-)
+
+diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -85,6 +85,7 @@ struct pulse_period
+ 
+ static struct list active_periods = LIST_INIT(active_periods);
+ static struct list dualsense_mono_streams = LIST_INIT(dualsense_mono_streams);
++static struct list dualsense_haptic_streams = LIST_INIT(dualsense_haptic_streams);
+ 
+ struct pulse_stream
+ {
+@@ -126,13 +127,13 @@ struct pulse_stream
+ 
+     struct list packet_free_head;
+     struct list dualsense_mono_entry;
+-    struct list dualsense_pulse_haptic_entry;
++    struct list dualsense_haptic_entry;
+     struct list packet_filled_head;
+     struct list period_entry;
+     struct pulse_period *period;
+     unsigned int dualsense_mono_hotplug_generation;
+     BOOL dualsense_mono_registered;
+-    BOOL dualsense_pulse_haptic_registered;
++    BOOL dualsense_haptic_registered;
+ };
+ 
+ static void pulse_write(struct pulse_stream *stream);
+@@ -588,6 +589,7 @@ again:
+ static BOOL pulse_refresh_devices(EDataFlow flow);
+ static BOOL is_dualsense_speaker_sink(const PhysDevice *dev);
+ static void pulse_retarget_dualsense_mono_streams(const char *preferred);
++static void pulse_retarget_dualsense_haptic_streams(const char *target);
+ 
+ /* for winepulse, this function can be called in a separate thread from other functions. */
+ /* this function cannot be called from multiple threads at the same time however. */
+@@ -611,6 +613,7 @@ static NTSTATUS pulse_get_endpoint_ids(void *args)
+     PhysDevice *dev, *dev_next;
+     BOOL delta = params->delta;
+     char *dualsense_mono_target = NULL;
++    char *dualsense_haptic_target = NULL;
+ 
+     TRACE("flow %d, delta %d\n", (int)params->flow, (int)params->delta);
+ 
+@@ -743,6 +746,16 @@ static NTSTATUS pulse_get_endpoint_ids(void *args)
+                     dualsense_mono_target = target;
+                 }
+             }
++            if (params->flow == eRender && dev->raw_haptic_target)
++            {
++                char *target = strdup(dev->raw_haptic_target);
++
++                if (target)
++                {
++                    free(dualsense_haptic_target);
++                    dualsense_haptic_target = target;
++                }
++            }
+             list_remove(&dev->entry);
+             list_add_tail(list, &dev->entry);
+         }
+@@ -782,6 +795,16 @@ static NTSTATUS pulse_get_endpoint_ids(void *args)
+                     dualsense_mono_target = target;
+                 }
+             }
++            if (params->flow == eRender && dev->raw_haptic_target)
++            {
++                char *target = strdup(dev->raw_haptic_target);
++
++                if (target)
++                {
++                    free(dualsense_haptic_target);
++                    dualsense_haptic_target = target;
++                }
++            }
+             list_remove(&dev->entry);
+             list_add_tail(list, &dev->entry);
+         }
+@@ -790,12 +813,16 @@ static NTSTATUS pulse_get_endpoint_ids(void *args)
+ done:
+     g_phys_unlock();
+ 
+-    if (dualsense_mono_target)
++    if (dualsense_mono_target || dualsense_haptic_target)
+     {
+         pulse_lock();
+-        pulse_retarget_dualsense_mono_streams(dualsense_mono_target);
++        if (dualsense_mono_target)
++            pulse_retarget_dualsense_mono_streams(dualsense_mono_target);
++        if (dualsense_haptic_target)
++            pulse_retarget_dualsense_haptic_streams(dualsense_haptic_target);
+         pulse_unlock();
+         free(dualsense_mono_target);
++        free(dualsense_haptic_target);
+     }
+ 
+     if (needed > params->size) {
+@@ -892,6 +919,9 @@ static BOOL pulse_stream_valid(struct pulse_stream *stream)
+     if (stream->dualsense_mono_registered)
+         return TRUE;
+ 
++    if (!stream->stream && stream->dualsense_haptic_registered)
++        return stream->dataflow == eRender;
++
+     if (!stream->stream)
+         return stream->dataflow == eRender && stream->haptic_pcm && stream->haptic_alsa_path
+                 && stream->haptic_alsa_path[0];
+@@ -1280,6 +1310,28 @@ static BOOL use_pipewire_dualsense_haptic_target(void)
+     return env && env[0] == '1' && !env[1];
+ }
+ 
++static char *make_pipewire_dualsense_haptic_path(const char *target)
++{
++    static const char prefix[] = "pipewire:NODE=";
++    char *path;
++    size_t len;
++
++    if (!target || !target[0])
++        return NULL;
++
++    len = strlen(target) + sizeof(prefix);
++    if ((path = malloc(len)))
++        snprintf(path, len, "%s%s", prefix, target);
++    return path;
++}
++
++static BOOL is_pipewire_dualsense_haptic_path(const char *path)
++{
++    static const char prefix[] = "pipewire:NODE=";
++
++    return path && !strncmp(path, prefix, sizeof(prefix) - 1);
++}
++
+ static void apply_windows_sony_audio_format(PhysDevice *dev)
+ {
+     WAVEFORMATEX *wfx = &dev->fmt.Format;
+@@ -2974,6 +3026,53 @@ static void pulse_haptic_drop_held(struct pulse_stream *stream)
+     stream->held_bytes = 0;
+ }
+ 
++static HRESULT pulse_retarget_dualsense_haptic_stream(struct pulse_stream *stream, const char *target)
++{
++    char *path;
++    HRESULT hr;
++
++    if (!stream->dualsense_haptic_registered)
++        return S_FALSE;
++    if (!(path = make_pipewire_dualsense_haptic_path(target)))
++        return E_OUTOFMEMORY;
++
++    TRACE("Retargeting Sony controller haptic stream %p from %s to %s.\n",
++            stream, debugstr_a(stream->haptic_alsa_path), debugstr_a(path));
++    if (stream->haptic_pcm)
++    {
++        snd_pcm_drop(stream->haptic_pcm);
++        snd_pcm_close(stream->haptic_pcm);
++        stream->haptic_pcm = NULL;
++    }
++    free(stream->haptic_alsa_path);
++    stream->haptic_alsa_path = path;
++    stream->haptic_reconnect_time = 0;
++    stream->haptic_path_check_time = 0;
++    pulse_haptic_drop_held(stream);
++
++    if (FAILED(hr = pulse_haptic_stream_connect(stream, stream->haptic_alsa_path)))
++    {
++        stream->haptic_reconnect_time = pa_rtclock_now() + 250000;
++        WARN("Failed to retarget Sony controller haptic stream %p to %s: %#x.\n",
++                stream, debugstr_a(stream->haptic_alsa_path), (unsigned int)hr);
++        return hr;
++    }
++
++    stream->just_underran = TRUE;
++    stream->timeline_start_period_time = 0;
++    stream->timeline_start_stream_time = 0;
++    return S_OK;
++}
++
++static void pulse_retarget_dualsense_haptic_streams(const char *target)
++{
++    struct pulse_stream *stream, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE(stream, next, &dualsense_haptic_streams,
++            struct pulse_stream, dualsense_haptic_entry)
++        pulse_retarget_dualsense_haptic_stream(stream, target);
++}
++
+ static void pulse_haptic_invalidate(struct pulse_stream *stream, const char *reason)
+ {
+     TRACE("Invalidating DualSense haptic PCM after %s.\n", reason);
+@@ -2996,6 +3095,19 @@ static BOOL pulse_haptic_refresh_path(struct pulse_stream *stream)
+ {
+     if (!stream->haptic_pcm)
+     {
++        pa_usec_t now;
++
++        if (stream->dualsense_haptic_registered && stream->haptic_alsa_path &&
++                stream->haptic_alsa_path[0])
++        {
++            now = pa_rtclock_now();
++            if (now >= stream->haptic_reconnect_time)
++            {
++                if (SUCCEEDED(pulse_haptic_stream_connect(stream, stream->haptic_alsa_path)))
++                    return TRUE;
++                stream->haptic_reconnect_time = now + 250000;
++            }
++        }
+         TRACE("DualSense haptic stream has no open raw PCM.\n");
+         return FALSE;
+     }
+@@ -3148,7 +3260,7 @@ static NTSTATUS pulse_create_stream(void *args)
+ 
+     stream->dataflow = params->flow;
+     list_init(&stream->dualsense_mono_entry);
+-    list_init(&stream->dualsense_pulse_haptic_entry);
++    list_init(&stream->dualsense_haptic_entry);
+     for (i = 0; i < ARRAY_SIZE(stream->vol); ++i)
+         stream->vol[i] = 1.f;
+ 
+@@ -3176,10 +3288,7 @@ static NTSTATUS pulse_create_stream(void *args)
+         stream->map.map[3] = PA_CHANNEL_POSITION_AUX3;
+         if (use_pipewire_dualsense_haptic_target() && haptic_target)
+         {
+-            size_t path_len = strlen(haptic_target) + sizeof("pipewire:NODE=");
+-
+-            if ((haptic_alsa_path = malloc(path_len)))
+-                snprintf(haptic_alsa_path, path_len, "pipewire:NODE=%s", haptic_target);
++            haptic_alsa_path = make_pipewire_dualsense_haptic_path(haptic_target);
+             TRACE("Routing DualSense stream from %s through ALSA PipeWire target %s.\n",
+                     params->device, haptic_alsa_path ? haptic_alsa_path : haptic_target);
+         }
+@@ -3314,6 +3423,11 @@ static NTSTATUS pulse_create_stream(void *args)
+             list_add_tail(&dualsense_mono_streams, &stream->dualsense_mono_entry);
+             stream->dualsense_mono_registered = TRUE;
+         }
++        if (SUCCEEDED(hr) && is_pipewire_dualsense_haptic_path(stream->haptic_alsa_path))
++        {
++            list_add_tail(&dualsense_haptic_streams, &stream->dualsense_haptic_entry);
++            stream->dualsense_haptic_registered = TRUE;
++        }
+     }
+ 
+     *params->channel_count = stream->ss.channels;
+@@ -4000,10 +4114,10 @@ static NTSTATUS pulse_release_stream(void *args)
+         list_remove(&stream->dualsense_mono_entry);
+         stream->dualsense_mono_registered = FALSE;
+     }
+-    if (stream->dualsense_pulse_haptic_registered)
++    if (stream->dualsense_haptic_registered)
+     {
+-        list_remove(&stream->dualsense_pulse_haptic_entry);
+-        stream->dualsense_pulse_haptic_registered = FALSE;
++        list_remove(&stream->dualsense_haptic_entry);
++        stream->dualsense_haptic_registered = FALSE;
+     }
+     if (stream->stream)
+     {
+-- 
+2.50.1
+

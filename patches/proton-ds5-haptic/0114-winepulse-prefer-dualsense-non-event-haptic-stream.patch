@@ -1,0 +1,164 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Thu, 6 Aug 2026 13:00:00 -0600
+Subject: [PATCH] winepulse: Route paired DualSense streams through ALSA PipeWire
+
+Assassin's Creed games create paired four-channel, 48 kHz float clients
+for the DualSense endpoint. One carries controller speaker effects while
+the other carries haptic samples.
+
+PipeWire's default DualSense profile exposes a mono speaker loopback but
+keeps the physical four-channel PCM open through a hidden split parent.
+Trying to suspend the mono child and take the PCM through raw ALSA therefore
+still returns EBUSY, especially while the game has the controller microphone
+active. Falling back to the mono child loses both channel layouts.
+
+Wine already records the hidden parent from api.alsa.split.name. Fix
+short-circuit evaluation that prevented this target from being retrieved when
+the endpoint name itself identified a Sony controller. For the opt-in
+Assassin's Creed path, open that parent through GE-Proton's bundled PipeWire
+PCM plugin. Build a local ALSA configuration for this stream so normal ALSA
+and Pulse routing remain unchanged. This keeps PipeWire as the hardware owner
+while preserving all four channels, which the public mono Pulse sink cannot
+do.
+
+Leave the existing raw ALSA route unchanged for other games.
+---
+ dlls/winepulse.drv/pulse.c | 98 +++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 91 insertions(+), 7 deletions(-)
+
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -1273,6 +1273,13 @@
+     return env && env[0] == '1' && !env[1];
+ }
+ 
++static BOOL use_pipewire_dualsense_haptic_target(void)
++{
++    const char *env = getenv("PROTON_DUALSENSE_HAPTICS_PREFER_NON_EVENT");
++
++    return env && env[0] == '1' && !env[1];
++}
++
+ static void apply_windows_sony_audio_format(PhysDevice *dev)
+ {
+     WAVEFORMATEX *wfx = &dev->fmt.Format;
+@@ -2796,6 +2803,66 @@
+     return err >= 0;
+ }
+ 
++static int alsa_config_add_compound(snd_config_t *parent, const char *name, snd_config_t **node)
++{
++    int err;
++
++    if ((err = snd_config_make_compound(node, name, 0)) < 0)
++        return err;
++    if ((err = snd_config_add(parent, *node)) < 0)
++    {
++        snd_config_delete(*node);
++        *node = NULL;
++    }
++    return err;
++}
++
++static int alsa_config_add_string(snd_config_t *parent, const char *name, const char *value)
++{
++    snd_config_t *node;
++    int err;
++
++    if ((err = snd_config_imake_string(&node, name, value)) < 0)
++        return err;
++    if ((err = snd_config_add(parent, node)) < 0)
++        snd_config_delete(node);
++    return err;
++}
++
++static int open_dualsense_haptic_pcm(snd_pcm_t **pcm, const char *alsa_path)
++{
++    static const char pipewire_prefix[] = "pipewire:NODE=";
++    snd_config_t *config = NULL, *pcm_types, *pipewire_type, *pcms, *dualsense;
++    const char *plugin, *node;
++    int err;
++
++    if (strncmp(alsa_path, pipewire_prefix, sizeof(pipewire_prefix) - 1))
++        return snd_pcm_open(pcm, alsa_path, SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK);
++
++    node = alsa_path + sizeof(pipewire_prefix) - 1;
++    plugin = getenv("PROTON_PIPEWIRE_ALSA_PLUGIN");
++    if (!plugin || !plugin[0] || !node[0])
++        return -ENOENT;
++
++    if ((err = snd_config_top(&config)) < 0 ||
++            (err = alsa_config_add_compound(config, "pcm_type", &pcm_types)) < 0 ||
++            (err = alsa_config_add_compound(pcm_types, "pipewire", &pipewire_type)) < 0 ||
++            (err = alsa_config_add_string(pipewire_type, "lib", plugin)) < 0 ||
++            (err = alsa_config_add_compound(config, "pcm", &pcms)) < 0 ||
++            (err = alsa_config_add_compound(pcms, "ge_dualsense", &dualsense)) < 0 ||
++            (err = alsa_config_add_string(dualsense, "type", "pipewire")) < 0 ||
++            (err = alsa_config_add_string(dualsense, "playback_node", node)) < 0)
++        goto done;
++
++    err = snd_pcm_open_lconf(pcm, "ge_dualsense", SND_PCM_STREAM_PLAYBACK,
++            SND_PCM_NONBLOCK, config);
++
++done:
++    if (config)
++        snd_config_delete(config);
++    return err;
++}
++
+ static HRESULT pulse_haptic_stream_connect(struct pulse_stream *stream, const char *alsa_path)
+ {
+     snd_pcm_hw_params_t *hw_params;
+@@ -2811,7 +2878,7 @@
+     stream->attr.maxlength = stream->bufsize_frames * pa_frame_size(&stream->ss);
+     stream->attr.prebuf = 0;
+ 
+-    if ((err = snd_pcm_open(&stream->haptic_pcm, alsa_path, SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK)) < 0)
++    if ((err = open_dualsense_haptic_pcm(&stream->haptic_pcm, alsa_path)) < 0)
+     {
+         WARN("Unable to open DualSense haptic PCM \"%s\": %d (%s)\n", alsa_path, err, snd_strerror(err));
+         return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
+@@ -3081,6 +3148,11 @@
+     haptic_candidate = is_dualsense_haptic_format(stream)
+             && (string_contains_dualsense_name(params->device)
+                     || (haptic_target = get_dualsense_haptic_target(params->device, stream)));
++    /* A Sony endpoint name satisfies the first side of the expression above,
++     * so retrieve its hidden PipeWire parent separately instead of losing it
++     * to short-circuit evaluation. */
++    if (haptic_candidate && !haptic_target)
++        haptic_target = get_dualsense_haptic_target(params->device, stream);
+     dualsense_mono_candidate = !haptic_candidate && pulse_stream_dualsense_mono_format(stream)
+             && string_contains_dualsense_name(params->device);
+     if (haptic_candidate)
+@@ -3089,12 +3161,24 @@
+         stream->map.map[1] = PA_CHANNEL_POSITION_AUX1;
+         stream->map.map[2] = PA_CHANNEL_POSITION_AUX2;
+         stream->map.map[3] = PA_CHANNEL_POSITION_AUX3;
+-        haptic_alsa_path = get_dualsense_haptic_alsa_path(params->device, stream);
+-        if (!haptic_alsa_path)
+-            haptic_alsa_path = find_dualsense_haptic_alsa_path();
+-        TRACE("Routing DualSense haptic stream from %s through %s%s.\n",
+-                params->device, haptic_alsa_path ? "raw ALSA PCM " : "Pulse device ",
+-                haptic_alsa_path ? haptic_alsa_path : params->device);
++        if (use_pipewire_dualsense_haptic_target() && haptic_target)
++        {
++            size_t path_len = strlen(haptic_target) + sizeof("pipewire:NODE=");
++
++            if ((haptic_alsa_path = malloc(path_len)))
++                snprintf(haptic_alsa_path, path_len, "pipewire:NODE=%s", haptic_target);
++            TRACE("Routing DualSense stream from %s through ALSA PipeWire target %s.\n",
++                    params->device, haptic_alsa_path ? haptic_alsa_path : haptic_target);
++        }
++        else
++        {
++            haptic_alsa_path = get_dualsense_haptic_alsa_path(params->device, stream);
++            if (!haptic_alsa_path)
++                haptic_alsa_path = find_dualsense_haptic_alsa_path();
++            TRACE("Routing DualSense haptic stream from %s through %s%s.\n",
++                    params->device, haptic_alsa_path ? "raw ALSA PCM " : "Pulse device ",
++                    haptic_alsa_path ? haptic_alsa_path : params->device);
++        }
+     }
+ 
+     stream->def_period = params->period;

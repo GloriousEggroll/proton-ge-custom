@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Sun, 9 Aug 2026 19:15:00 -0600
+Subject: [PATCH] setupapi: Wait for Sony speaker before enumerating HID
+
+The Sony HID arrival notification is held until mmdevapi has finished
+publishing the matching controller speaker, but applications can bypass that
+notification ordering by polling SetupAPI. Spider-Man does this during
+controller replacement and sees the new HID interface several hundred
+milliseconds before its speaker endpoint exists. It consequently classifies
+the replacement controller without audio support and never activates the
+speaker after publication.
+
+When SetupAPI enumerates either the USB audio HID interface or device instance
+for a DualShock 4, DualSense, or DualSense Edge, check for the per-container
+ready event already created by sechost. If the event exists, wait for endpoint
+publication before exposing the device. A missing event means no hotplug is
+pending, and removal wakes the event, so normal enumeration and disconnect do
+not acquire persistent state or a retry loop.
+---
+ dlls/setupapi/devinst.c | 69 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 69 insertions(+)
+
+diff --git a/dlls/setupapi/devinst.c b/dlls/setupapi/devinst.c
+--- a/dlls/setupapi/devinst.c
++++ b/dlls/setupapi/devinst.c
+@@ -2064,6 +2064,72 @@ static BOOL enable_mhwilds_usb_audio(void)
+     return env && env[0] == '1' && !env[1];
+ }
+ 
++static BOOL string_containsi(const WCHAR *string, const WCHAR *needle)
++{
++    size_t len = wcslen(needle);
++
++    for (; *string; ++string)
++        if (!wcsnicmp(string, needle, len)) return TRUE;
++
++    return FALSE;
++}
++
++static BOOL is_sony_usb_audio_hid(const WCHAR *instance)
++{
++    if (wcsnicmp(instance, L"HID\\", 4) ||
++            !string_containsi(instance, L"VID_054C") ||
++            !string_containsi(instance, L"MI_03"))
++        return FALSE;
++
++    return string_containsi(instance, L"PID_05C4") ||
++            string_containsi(instance, L"PID_09CC") ||
++            string_containsi(instance, L"PID_0CE6") ||
++            string_containsi(instance, L"PID_0DF2");
++}
++
++static void wait_for_sony_audio_endpoint(HKEY key, const WCHAR *instance)
++{
++    WCHAR container_string[40] = {0}, event_name[80];
++    DWORD size = sizeof(container_string), type, wait;
++    GUID container_id;
++    HANDLE event;
++
++    if (!is_sony_usb_audio_hid(instance) ||
++            RegQueryValueExW(key, L"ContainerId", NULL, &type,
++                    (BYTE *)container_string, &size) ||
++            type != REG_SZ || size < 38 * sizeof(WCHAR) ||
++            container_string[0] != '{' ||
++            container_string[37] != '}')
++        return;
++
++    container_string[37] = 0;
++    if (UuidFromStringW(&container_string[1], &container_id) != RPC_S_OK)
++        return;
++
++    swprintf(event_name, ARRAY_SIZE(event_name),
++            L"__wine_sony_audio_ready_%08x%04x%04x%02x%02x%02x%02x%02x%02x%02x%02x",
++            (unsigned int)container_id.Data1, (unsigned int)container_id.Data2,
++            (unsigned int)container_id.Data3, (unsigned int)container_id.Data4[0],
++            (unsigned int)container_id.Data4[1], (unsigned int)container_id.Data4[2],
++            (unsigned int)container_id.Data4[3], (unsigned int)container_id.Data4[4],
++            (unsigned int)container_id.Data4[5], (unsigned int)container_id.Data4[6],
++            (unsigned int)container_id.Data4[7]);
++
++    if (!(event = OpenEventW(SYNCHRONIZE, FALSE, event_name)))
++        return;
++
++    TRACE("Waiting for Sony speaker container %s before exposing HID interface.\n",
++            debugstr_guid(&container_id));
++    wait = WaitForSingleObject(event, 3000);
++    if (wait == WAIT_TIMEOUT)
++        WARN("Timed out waiting for Sony speaker container %s before HID enumeration.\n",
++                debugstr_guid(&container_id));
++    else if (wait == WAIT_FAILED)
++        WARN("Failed waiting for Sony speaker container %s, error %lu.\n",
++                debugstr_guid(&container_id), GetLastError());
++    CloseHandle(event);
++}
++
+ static void SETUPDI_AddDeviceInterfaces(struct device *device, HKEY key,
+     const GUID *guid, DWORD flags)
+ {
+@@ -2183,6 +2249,8 @@ static void SETUPDI_EnumerateMatchingInterfaces(HDEVINFO DeviceInfoSet,
+                         {
+                             WCHAR deviceClassStr[40];
+ 
++                            wait_for_sony_audio_endpoint(deviceKey, deviceInst);
++
+                             len = sizeof(deviceClassStr);
+                             l = RegQueryValueExW(deviceKey, L"ClassGUID", NULL,
+                                     &dataType, (BYTE *)deviceClassStr, &len);
+@@ -2416,6 +2484,7 @@ static void SETUPDI_EnumerateMatchingDeviceInstances(struct DeviceInfoSet *set,
+                                     (!(flags & DIGCF_PRESENT) ||
+                                      is_device_instance_linked(subKey, interfacesKey, id)))
+                             {
++                                wait_for_sony_audio_endpoint(subKey, id);
+                                 create_device(set, &deviceClass, id, FALSE);
+                             }
+ 
+-- 
+2.55.0

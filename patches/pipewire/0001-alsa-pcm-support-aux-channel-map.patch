@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Thu, 6 Aug 2026 18:30:00 -0600
+Subject: [PATCH] alsa-pcm: Support auxiliary channels and exact node IDs
+
+DualSense haptic endpoints use a four-channel raw PCM whose PipeWire ports
+are AUX0 through AUX3. The generic ALSA plugin labels every four-channel
+client FL, FR, RL, and RR, which prevents the dedicated client from linking
+to those raw ports correctly.
+
+Add an opt-in ALSA configuration field which preserves all ordinary plugin
+behavior while allowing the GE-Proton DualSense stream to request the raw
+auxiliary positions.
+
+Also allow playback_node_id to select the exact target passed to
+pw_stream_connect(). Unlike an advisory node.target property, this does not
+leave each hotplug generation to session-manager target resolution. A global
+object ID identifies the exact hidden parent created for the current
+controller connection.
+---
+ pcm_pipewire.c | 37 +++++++++++++++++++++++++++++++++++--
+ 1 file changed, 35 insertions(+), 2 deletions(-)
+
+diff --git a/pcm_pipewire.c b/pcm_pipewire.c
+index 96456c7..a51962b 100644
+--- a/pcm_pipewire.c
++++ b/pcm_pipewire.c
+@@ -55,6 +55,8 @@ typedef struct {
+ 	unsigned int xrun_detected:1;
+ 	unsigned int hw_params_changed:1;
+ 	unsigned int negotiated:1;
++	unsigned int aux_channels:1;
++	uint32_t target_id;
+ 
+ 	snd_pcm_uframes_t hw_ptr;
+ 	snd_pcm_uframes_t boundary;
+@@ -568,7 +570,7 @@ static int snd_pcm_pipewire_prepare(snd_pcm_ioplug_t *io)
+ 				io->stream == SND_PCM_STREAM_PLAYBACK ?
+ 				PW_DIRECTION_OUTPUT :
+ 				PW_DIRECTION_INPUT,
+-				PW_ID_ANY,
++				pw->target_id,
+ 				PW_STREAM_FLAG_AUTOCONNECT |
+ 				PW_STREAM_FLAG_MAP_BUFFERS |
+ 				PW_STREAM_FLAG_RT_PROCESS,
+@@ -771,7 +773,15 @@ static int snd_pcm_pipewire_hw_params(snd_pcm_ioplug_t * io,
+ 	case SPA_MEDIA_SUBTYPE_raw:
+ 		pw->requested.info.raw.channels = io->channels;
+ 		pw->requested.info.raw.rate = io->rate;
+-		set_default_channels(io->channels, pw->requested.info.raw.position);
++		if (pw->aux_channels && io->channels == 4) {
++			pw->requested.info.raw.position[0] = SPA_AUDIO_CHANNEL_AUX0;
++			pw->requested.info.raw.position[1] = SPA_AUDIO_CHANNEL_AUX1;
++			pw->requested.info.raw.position[2] = SPA_AUDIO_CHANNEL_AUX2;
++			pw->requested.info.raw.position[3] = SPA_AUDIO_CHANNEL_AUX3;
++		} else {
++			set_default_channels(io->channels,
++					pw->requested.info.raw.position);
++		}
+ 		fmt_str = spa_type_audio_format_to_short_name(pw->requested.info.raw.format);
+ 		pw->format = pw->requested;
+ 		break;
+@@ -1265,6 +1275,15 @@ static int snd_pcm_pipewire_open(snd_pcm_t **pcmp,
+ 	if (!pw)
+ 		return -ENOMEM;
+ 
++	str = pw_properties_get(props, "alsa.aux-channels");
++	pw->aux_channels = str && spa_atob(str);
++	pw_properties_set(props, "alsa.aux-channels", NULL);
++	pw->target_id = PW_ID_ANY;
++	str = pw_properties_get(props, "alsa.target-id");
++	if (str)
++		spa_atou32(str, &pw->target_id, 0);
++	pw_properties_set(props, "alsa.target-id", NULL);
++
+ 	pw->props = props;
+ 	pw->fd = -1;
+ 	pw->io.poll_fd = -1;
+@@ -1435,6 +1454,20 @@ SND_PCM_PLUGIN_DEFINE_FUNC(pipewire)
+ 					pw_properties_set(props, PW_KEY_TARGET_OBJECT, str);
+ 			continue;
+ 		}
++		if (spa_streq(id, "playback_node_id")) {
++			if (stream == SND_PCM_STREAM_PLAYBACK &&
++			    snd_config_get_string(n, &str) == 0)
++				if (str != NULL && !spa_streq(str, "-1"))
++					pw_properties_set(props, "alsa.target-id", str);
++			continue;
++		}
++		if (spa_streq(id, "aux_channels")) {
++			int enabled = snd_config_get_bool(n);
++
++			if (enabled > 0)
++				pw_properties_set(props, "alsa.aux-channels", "true");
++			continue;
++		}
+ 		if (spa_streq(id, "capture_node")) {
+ 			if (stream == SND_PCM_STREAM_CAPTURE &&
+ 			    snd_config_get_string(n, &str) == 0)
+-- 
+2.50.1

@@ -1,0 +1,170 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Wed, 5 Aug 2026 16:30:00 -0600
+Subject: [PATCH] mmdevapi,winepulse: Retire stale Sony audio endpoints
+
+Sony capture and raw-haptic endpoints were assigned a process-local
+generation number every time PulseAudio refreshed its device list.  An
+unchanged controller therefore appeared to be a new MMDevice after every
+refresh, leaving hundreds of stale SWD AudioEndpoint records in long-lived
+prefixes.  The existing cleanup only recognized speaker names, so it never
+removed the generated microphone records.
+
+Derive non-speaker Sony endpoint IDs from the USB connection container ID.
+The ID remains stable while a controller is connected and changes naturally
+when udev reports a genuinely new connection.  Expand stale PnP cleanup to
+recognize all supported Sony controller endpoints by their encoded USB
+vendor/product container ID, with friendly-name matching for old records.
+Keep records belonging to the currently connected container while removing
+records left by earlier connections.
+
+This prevents stale endpoint enumeration from racing controller speaker
+publication and randomly requiring a second physical replug before games
+route their controller effect stream.
+---
+ dlls/mmdevapi/devenum.c     | 53 +++++++++++++++++++++++++++++++++++---------
+ dlls/winepulse.drv/pulse.c | 14 +++++++-----
+ 2 files changed, 51 insertions(+), 16 deletions(-)
+
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -1091,13 +1091,24 @@ static void remove_dualsense_media_devices(void)
+ static BOOL is_dualsense_audioendpoint_name(const WCHAR *name)
+ {
+     return is_dualsense_mono_endpoint_name(name) ||
+-            (name && (wcsstr(name, L"Wireless Controller Speaker") ||
++            (name && (wcsstr(name, L"DualSense") ||
++            wcsstr(name, L"DualShock") ||
++            wcsstr(name, L"Wireless Controller Speaker") ||
+             wcsstr(name, L"DualShock 4 Wireless Controller Speaker") ||
+             wcsstr(name, L"DualSense Wireless Controller Speaker") ||
+             wcsstr(name, L"DualSense Edge Wireless Controller Speaker")));
+ }
+ 
+-static void remove_dualsense_audioendpoint_devices(void)
++static BOOL is_dualsense_audioendpoint_container(const GUID *container_id)
++{
++    WORD vendor = LOWORD(container_id->Data1);
++    WORD product = HIWORD(container_id->Data1);
++
++    return vendor == 0x054c && (product == 0x05c4 || product == 0x09cc ||
++            product == 0x0ce6 || product == 0x0df2);
++}
++
++static void remove_dualsense_audioendpoint_devices(const GUID *keep_container_id)
+ {
+     static const GUID AudioEndpoint_ClassGUID = { 0xc166523c, 0xfe0c, 0x4a94, { 0xa5, 0x86, 0xf1, 0xa8, 0x0c, 0xfb, 0xbf, 0x3e } };
+     HDEVINFO device_set;
+@@ -1110,7 +1121,9 @@ static void remove_dualsense_audioendpoint_devices(void)
+ 
+     for (;;)
+     {
+-        WCHAR friendly_name[256];
++        WCHAR container_id_string[39], friendly_name[256], instance_id[256];
++        GUID container_id;
++        BOOL keep = FALSE, sony = FALSE;
+ 
+         memset(&device_info_data, 0, sizeof(device_info_data));
+         device_info_data.cbSize = sizeof(device_info_data);
+@@ -1118,15 +1131,32 @@ static void remove_dualsense_audioendpoint_devices(void)
+         if (!SetupDiEnumDeviceInfo(device_set, index, &device_info_data))
+             break;
+ 
+-        if (SetupDiGetDeviceRegistryPropertyW(device_set, &device_info_data, SPDRP_FRIENDLYNAME, NULL,
+-                (BYTE *)friendly_name, sizeof(friendly_name), NULL) &&
+-                is_dualsense_audioendpoint_name(friendly_name))
++        friendly_name[0] = 0;
++        instance_id[0] = 0;
++        SetupDiGetDeviceRegistryPropertyW(device_set, &device_info_data, SPDRP_FRIENDLYNAME, NULL,
++                (BYTE *)friendly_name, sizeof(friendly_name), NULL);
++        SetupDiGetDeviceInstanceIdW(device_set, &device_info_data, instance_id,
++                ARRAY_SIZE(instance_id), NULL);
++
++        if (SetupDiGetDeviceRegistryPropertyW(device_set, &device_info_data, SPDRP_BASE_CONTAINERID,
++                NULL, (BYTE *)container_id_string, sizeof(container_id_string), NULL) &&
++                SUCCEEDED(CLSIDFromString(container_id_string, &container_id)) &&
++                is_dualsense_audioendpoint_container(&container_id))
++        {
++            sony = TRUE;
++            keep = keep_container_id && IsEqualGUID(keep_container_id, &container_id);
++        }
++        else if (is_dualsense_audioendpoint_name(friendly_name))
++            sony = TRUE;
++
++        if (sony && !keep)
+         {
+-            TRACE("Removing stale DualSense AudioEndpoint device %s.\n", debugstr_w(friendly_name));
++            TRACE("Removing stale Sony AudioEndpoint device %s (%s).\n",
++                    debugstr_w(friendly_name), debugstr_w(instance_id));
+             if (SetupDiRemoveDevice(device_set, &device_info_data))
+                 continue;
+-            WARN("Failed to remove stale DualSense AudioEndpoint device %s: 0x%lu.\n",
+-                    debugstr_w(friendly_name), GetLastError());
++            WARN("Failed to remove stale Sony AudioEndpoint device %s (%s): 0x%lu.\n",
++                    debugstr_w(friendly_name), debugstr_w(instance_id), GetLastError());
+         }
+ 
+         index++;
+@@ -1188,7 +1218,8 @@ static void MMDevice_Register(const WCHAR *instguid, const WCHAR *friendly_name,
+ 
+         if (skip_audioendpoint && is_dualsense_device_path(device_path))
+         {
+-            remove_dualsense_audioendpoint_devices();
++            remove_dualsense_audioendpoint_devices(IsEqualGUID(container_id, &GUID_NULL) ?
++                    NULL : container_id);
+             skip_audioendpoint = FALSE;
+         }
+ 
+@@ -1790,7 +1821,7 @@ static DWORD WINAPI update_thread_proc(void *user)
+                                 debugstr_guid(id));
+                         if (dualsense_mono_endpoint)
+                         {
+-                            remove_dualsense_audioendpoint_devices();
++                            remove_dualsense_audioendpoint_devices(NULL);
+                             remove_dualsense_media_devices();
+                         }
+                         notify_endpoint_removed(dev->flow, id);
+diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -181,7 +181,6 @@ static struct list g_phys_audio_devices = LIST_INIT(g_phys_audio_devices);
+ static pthread_mutex_t g_phys_mutex;
+ static pthread_cond_t g_phys_cond = PTHREAD_COND_INITIALIZER;
+ static unsigned int g_haptic_hotplug_generation;
+-static unsigned int g_dualsense_endpoint_generation;
+ static unsigned int g_dualsense_mono_speaker_add_generation;
+ static char *g_dualsense_mono_preferred_sink;
+ static unsigned int g_phys_event_mask;
+@@ -1365,7 +1364,6 @@ static BOOL pulse_stream_dualsense_mono_format(const struct pulse_stream *stream
+ 
+ static BOOL pulse_set_endpoint_id(PhysDevice *dev)
+ {
+-    unsigned int generation;
+     size_t len;
+ 
+     if (is_dualsense_edge_speaker_sink(dev))
+@@ -1381,12 +1379,18 @@ static BOOL pulse_set_endpoint_id(PhysDevice *dev)
+             && strstr(dev->pulse_name, "Speaker__sink")))
+         return !!(dev->endpoint_id = strdup(dev->pulse_name));
+ 
+-    generation = ++g_dualsense_endpoint_generation;
+-    len = strlen(dev->pulse_name) + sizeof("#wine-dualsense-hotplug-") + 10;
++    len = strlen(dev->pulse_name) + sizeof("#wine-sony-hotplug-") + 36;
+     if (!(dev->endpoint_id = malloc(len)))
+         return FALSE;
+ 
+-    snprintf(dev->endpoint_id, len, "%s#wine-dualsense-hotplug-%u", dev->pulse_name, generation);
++    snprintf(dev->endpoint_id, len,
++            "%s#wine-sony-hotplug-%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
++            dev->pulse_name, (unsigned int)dev->container_id.Data1,
++            (unsigned int)dev->container_id.Data2, (unsigned int)dev->container_id.Data3,
++            (unsigned int)dev->container_id.Data4[0], (unsigned int)dev->container_id.Data4[1],
++            (unsigned int)dev->container_id.Data4[2], (unsigned int)dev->container_id.Data4[3],
++            (unsigned int)dev->container_id.Data4[4], (unsigned int)dev->container_id.Data4[5],
++            (unsigned int)dev->container_id.Data4[6], (unsigned int)dev->container_id.Data4[7]);
+     return TRUE;
+ }
+ 
+-- 
+2.55.0
