@@ -1,0 +1,262 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Sun, 9 Aug 2026 23:30:00 -0600
+Subject: [PATCH] xinput: Translate Sony fallback vibration to native rumble
+
+Sony controllers exposed through the opt-in hidraw-to-XInput bridge use their
+native output report descriptors, which do not advertise the Windows HID
+Haptics collections consumed by Wine's generic XInput vibration path. As a
+result XInputSetState succeeds without sending anything to the controller.
+
+Translate the conventional XInput large and small motor values to native
+DualShock 4, DualSense, and DualSense Edge output reports. Support both USB
+and Bluetooth transports, including Bluetooth sequence/control fields and
+Sony's seeded CRC32. Keep Bluetooth input report fixups active for the XInput
+bridge after output begins, since XInput continues consuming the translated
+basic input layout.
+
+This intentionally implements only conventional two-motor rumble. Native
+DualSense PCM haptics, adaptive triggers, and controller audio remain on the
+native HID/audio paths.
+---
+ dlls/xinput1_3/Makefile.in |   2 +-
+ dlls/xinput1_3/main.c      | 138 ++++++++++++++++++++++++++++++++++++++++++--
+ dlls/winebus.sys/main.c    |  12 ++++
+ 3 files changed, 145 insertions(+), 7 deletions(-)
+
+diff --git a/dlls/xinput1_3/Makefile.in b/dlls/xinput1_3/Makefile.in
+--- a/dlls/xinput1_3/Makefile.in
++++ b/dlls/xinput1_3/Makefile.in
+@@ -1,7 +1,7 @@
+ EXTRADEFS = -DXINPUT_VER=3
+ MODULE    = xinput1_3.dll
+ IMPORTLIB = xinput
+-IMPORTS   = hid setupapi advapi32 user32
++IMPORTS   = hid setupapi advapi32 user32 ntdll
+ 
+ SOURCES = \
+ 	main.c \
+diff --git a/dlls/xinput1_3/main.c b/dlls/xinput1_3/main.c
+--- a/dlls/xinput1_3/main.c
++++ b/dlls/xinput1_3/main.c
+@@ -49,6 +49,26 @@
+ /* Not defined in the headers, used only by XInputGetStateEx */
+ #define XINPUT_GAMEPAD_GUIDE 0x0400
+ 
++#define SONY_VENDOR_ID 0x054c
++#define SONY_DUALSHOCK4_PRODUCT_ID 0x05c4
++#define SONY_DUALSHOCK4_V2_PRODUCT_ID 0x09cc
++#define SONY_DUALSENSE_PRODUCT_ID 0x0ce6
++#define SONY_DUALSENSE_EDGE_PRODUCT_ID 0x0df2
++
++#define SONY_DUALSHOCK4_USB_REPORT_ID 0x05
++#define SONY_DUALSHOCK4_USB_REPORT_SIZE 32
++#define SONY_DUALSHOCK4_BT_REPORT_ID 0x11
++#define SONY_DUALSHOCK4_BT_REPORT_SIZE 78
++#define SONY_DUALSHOCK4_BT_HW_CONTROL 0xc4
++
++#define SONY_DUALSENSE_USB_REPORT_ID 0x02
++#define SONY_DUALSENSE_USB_REPORT_SIZE 63
++#define SONY_DUALSENSE_BT_REPORT_ID 0x31
++#define SONY_DUALSENSE_BT_REPORT_SIZE 78
++#define SONY_DUALSENSE_BT_TAG 0x10
++
++#define SONY_OUTPUT_CRC32_SEED 0xa2
++
+ WINE_DEFAULT_DEBUG_CHANNEL(xinput);
+ 
+ struct xinput_controller
+@@ -65,6 +85,8 @@
+         PHIDP_PREPARSED_DATA preparsed;
+         HIDP_CAPS caps;
+         BOOL is_sony_gamepad;
++        USHORT sony_product_id;
++        BYTE sony_output_seq;
+         HIDP_VALUE_CAPS lx_caps;
+         HIDP_VALUE_CAPS ly_caps;
+         HIDP_VALUE_CAPS lt_caps;
+@@ -102,7 +124,7 @@
+ static SRWLOCK state_lock = SRWLOCK_INIT;
+ static XINPUT_STATE current_state[XUSER_MAX_COUNT];
+ 
+-static BOOL is_sony_gamepad_path(const WCHAR *path);
++static USHORT sony_gamepad_product_id(const WCHAR *path);
+ 
+ static void set_current_state(UINT index, const XINPUT_STATE *state)
+ {
+@@ -262,6 +284,103 @@
+     return TRUE;
+ }
+ 
++static void sony_set_output_report_crc(BYTE *report, ULONG report_len)
++{
++    const BYTE seed = SONY_OUTPUT_CRC32_SEED;
++    DWORD crc;
++
++    crc = RtlComputeCrc32(0, &seed, sizeof(seed));
++    crc = RtlComputeCrc32(crc, report, report_len - sizeof(crc));
++    report[report_len - 4] = crc;
++    report[report_len - 3] = crc >> 8;
++    report[report_len - 2] = crc >> 16;
++    report[report_len - 1] = crc >> 24;
++}
++
++static DWORD sony_HID_set_state(struct xinput_controller *controller, XINPUT_VIBRATION *state)
++{
++    ULONG report_len = controller->hid.caps.OutputReportByteLength;
++    BYTE *report = (BYTE *)controller->hid.output_report_buf;
++    BOOL ret, update_left, update_right;
++    BYTE motor_left, motor_right;
++
++    update_left = controller->vibration.wLeftMotorSpeed != state->wLeftMotorSpeed;
++    update_right = controller->vibration.wRightMotorSpeed != state->wRightMotorSpeed;
++    controller->vibration = *state;
++
++    if (!controller->enabled || (!update_left && !update_right)) return ERROR_SUCCESS;
++
++    motor_left = state->wLeftMotorSpeed >> 8;
++    motor_right = state->wRightMotorSpeed >> 8;
++    memset(report, 0, report_len);
++
++    switch (controller->hid.sony_product_id)
++    {
++    case SONY_DUALSHOCK4_PRODUCT_ID:
++    case SONY_DUALSHOCK4_V2_PRODUCT_ID:
++        if (report_len == SONY_DUALSHOCK4_USB_REPORT_SIZE)
++        {
++            report[0] = SONY_DUALSHOCK4_USB_REPORT_ID;
++            report[1] = 0x01; /* motor update valid */
++            report[4] = motor_right;
++            report[5] = motor_left;
++        }
++        else if (report_len == SONY_DUALSHOCK4_BT_REPORT_SIZE)
++        {
++            report[0] = SONY_DUALSHOCK4_BT_REPORT_ID;
++            report[1] = SONY_DUALSHOCK4_BT_HW_CONTROL;
++            report[3] = 0x01; /* motor update valid */
++            report[6] = motor_right;
++            report[7] = motor_left;
++            sony_set_output_report_crc(report, report_len);
++        }
++        else
++        {
++            WARN("Unsupported DualShock 4 output report length %lu.\n", report_len);
++            return ERROR_SUCCESS;
++        }
++        break;
++
++    case SONY_DUALSENSE_PRODUCT_ID:
++    case SONY_DUALSENSE_EDGE_PRODUCT_ID:
++        if (report_len == SONY_DUALSENSE_USB_REPORT_SIZE)
++        {
++            report[0] = SONY_DUALSENSE_USB_REPORT_ID;
++            report[1] = 0x03; /* compatible vibration and haptics selection */
++            report[3] = motor_right;
++            report[4] = motor_left;
++            report[39] = 0x04; /* compatible vibration v2 */
++        }
++        else if (report_len == SONY_DUALSENSE_BT_REPORT_SIZE)
++        {
++            report[0] = SONY_DUALSENSE_BT_REPORT_ID;
++            report[1] = (controller->hid.sony_output_seq++ & 0x0f) << 4;
++            report[2] = SONY_DUALSENSE_BT_TAG;
++            report[3] = 0x03; /* compatible vibration and haptics selection */
++            report[5] = motor_right;
++            report[6] = motor_left;
++            report[41] = 0x04; /* compatible vibration v2 */
++            sony_set_output_report_crc(report, report_len);
++        }
++        else
++        {
++            WARN("Unsupported DualSense output report length %lu.\n", report_len);
++            return ERROR_SUCCESS;
++        }
++        break;
++
++    default:
++        return ERROR_SUCCESS;
++    }
++
++    ret = HidD_SetOutputReport(controller->device, report, report_len);
++    if (!ret) WARN("Failed to send Sony XInput rumble report, error %lu.\n", GetLastError());
++    else TRACE("Sent Sony XInput rumble report %#x/%lu, motors %u/%u.\n",
++               report[0], report_len, motor_left, motor_right);
++
++    return ERROR_SUCCESS;
++}
++
+ static DWORD HID_set_state(struct xinput_controller *controller, XINPUT_VIBRATION *state)
+ {
+     ULONG report_len = controller->hid.caps.OutputReportByteLength;
+@@ -272,6 +391,8 @@
+     NTSTATUS status;
+     BYTE report_id;
+ 
++    if (controller->hid.is_sony_gamepad) return sony_HID_set_state(controller, state);
++
+     if (!controller->hid.haptics_rumble_caps.UsagePage && !controller->hid.haptics_buzz_caps.UsagePage) return ERROR_SUCCESS;
+ 
+     update_rumble = (controller->vibration.wLeftMotorSpeed != state->wLeftMotorSpeed);
+@@ -367,7 +488,9 @@
+     XINPUT_STATE state = {0};
+ 
+     controller->hid.caps = *caps;
+-    controller->hid.is_sony_gamepad = is_sony_gamepad_path(device_path);
++    controller->hid.sony_product_id = sony_gamepad_product_id(device_path);
++    controller->hid.is_sony_gamepad = !!controller->hid.sony_product_id;
++    controller->hid.sony_output_seq = 0;
+     if (!(controller->hid.feature_report_buf = calloc(1, controller->hid.caps.FeatureReportByteLength))) goto failed;
+     if (!controller_check_caps(controller, device, preparsed)) goto failed;
+ 
+@@ -571,16 +694,19 @@
+     return min + MulDiv(tmp - caps->LogicalMin, max - min, caps->LogicalMax - caps->LogicalMin);
+ }
+ 
+-static BOOL is_sony_gamepad_path(const WCHAR *path)
++static USHORT sony_gamepad_product_id(const WCHAR *path)
+ {
+     UINT vid, pid;
+ 
+     if (swscanf(path, L"\\\\?\\HID#VID_%04x&PID_%04x", &vid, &pid) != 2 &&
+         swscanf(path, L"\\\\?\\hid#vid_%04x&pid_%04x", &vid, &pid) != 2)
+-        return FALSE;
++        return 0;
+ 
+-    if (vid != 0x054c) return FALSE;
+-    return pid == 0x05c4 || pid == 0x09cc || pid == 0x0ce6 || pid == 0x0df2;
++    if (vid != SONY_VENDOR_ID) return 0;
++    if (pid == SONY_DUALSHOCK4_PRODUCT_ID || pid == SONY_DUALSHOCK4_V2_PRODUCT_ID ||
++        pid == SONY_DUALSENSE_PRODUCT_ID || pid == SONY_DUALSENSE_EDGE_PRODUCT_ID)
++        return pid;
++    return 0;
+ }
+ 
+ /* read the controller state from the HID device, xinput_cs must be held */
+diff --git a/dlls/winebus.sys/main.c b/dlls/winebus.sys/main.c
+--- a/dlls/winebus.sys/main.c
++++ b/dlls/winebus.sys/main.c
+@@ -1628,10 +1628,22 @@
+     return STATUS_NOT_IMPLEMENTED;
+ }
+ 
++static BOOL sony_hidraw_xinput_enabled(void)
++{
++    const char *env = getenv("PROTON_SONY_HIDRAW_XINPUT");
++
++    return env && env[0] == '1' && !env[1];
++}
++
+ static void hidraw_disable_report_fixups(DEVICE_OBJECT *device)
+ {
+     struct device_extension *ext = (struct device_extension *)device->DeviceExtension;
+ 
++    /* XInput consumes the translated basic input report even after sending a
++     * valid Bluetooth output report, which switches Sony controllers to their
++     * extended input report. */
++    if (sony_hidraw_xinput_enabled()) return;
++
+     /* FIXME: we may want to validate CRC at the end of the outbound HID reports,
+      * as controllers do not switch modes if it is incorrect.
+      */
+-- 
+2.55.0
