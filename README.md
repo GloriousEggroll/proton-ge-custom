@@ -511,6 +511,8 @@ If on a non-systemd system with an inadequate `ulimit -Hn`, adjusting limits is 
 
 Environment variable options:
 
+Disable Steam Input for the game before using the Sony controller compatibility options below. This allows Wine to use the physical controller's HIDRAW interface instead of Steam's virtual controller.
+
 | Compat config string  | Environment Variable           | Description  |
 | :-------------------- | :----------------------------- | :----------- |
 |                       | <tt>PROTON_LOG</tt>            | Convenience method for dumping a useful debug log to `$HOME/steam-$APPID.log`. For more thorough logging, use `user_settings.py`. |
@@ -525,6 +527,7 @@ Environment variable options:
 | <tt>nofsync</tt>      | <tt>PROTON_NO_FSYNC</tt>       | Do not use futex-based in-process synchronization primitives. (Automatically disabled on systems with no `FUTEX_WAIT_MULTIPLE` support.) |
 | <tt>nontsync</tt>      | <tt>PROTON_NO_NTSYNC</tt>       | Do not use the ntsync kernel module for in-process synchronization primitives. |
 | <tt>forcelgadd</tt>   | <tt>PROTON_FORCE_LARGE_ADDRESS_AWARE</tt> | Force Wine to enable the LARGE_ADDRESS_AWARE flag for all executables. |
+|                       | <tt>WINE_DISABLE_EXE_ASLR</tt> | Set to `1` to disable ASLR for executable images while leaving DLL relocation enabled. Use this for applications that require the main executable to remain at its preferred base address, such as some 32-bit applications that store data in otherwise unused code-pointer bits. |
 | <tt>heapdelayfree</tt>| <tt>PROTON_HEAP_DELAY_FREE</tt>| Delay freeing some memory, to work around application use-after-free bugs. |
 |                       | <tt>HOST_LC_ALL</tt>           | Set value to a locale to override all other system locale settings for a game.  This variable should be used instead of `LC_ALL`. |
 | <tt>enablenvapi</tt>  | <tt>PROTON_ENABLE_NVAPI</tt>   | Enable NVIDIA's NVAPI GPU support library. |
@@ -547,6 +550,9 @@ Environment variable options:
 | `dlsshud`            | `PROTON_DLSS_INDICATOR`        | Enable the DLSS overlay at the bottom left portion of the screen. This is exactly the same as `FSR4_WATERMARK=1`                                                                                                                                                                                                                                                                                                                      |
 | `xess`               | `PROTON_XESS_UPGRADE`          |                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `sdlinput`           | `PROTON_USE_SDL` or `PROTON_PREFER_SDL` | Uses SDL input instead of HIDRAW/Steam Input. |
+|                      | `PROTON_SONY_DUALSENSE_AS_DUALSHOCK4` | Set to `1` to expose a DualSense or DualSense Edge as a DualShock 4. Use this for older games that support DS4 correctly but have missing or broken DualSense mappings. This preserves the game's DS4 button mappings and icons while translating input, rumble, lightbar, and feature reports. |
+|                      | `PROTON_SONY_HIDRAW_XINPUT` | Set to `1` to translate a DualShock 4, DualSense, or DualSense Edge HIDRAW device to XInput, including conventional two-motor rumble. Use this when a game has missing or incorrect native Sony mappings. The controller mappings are corrected, but the game's displayed button icons may not change. |
+|                      | `PROTON_STEAMINPUT_XINPUT_FALLBACK` | Set to `1` to provide an XInput-backed replacement for the Steam Input interface required by some games. This allows controller support outside Steam and can work around unavailable Steam Input profile switching under Wine-Wayland. Combine it with `PROTON_SONY_HIDRAW_XINPUT=1` for Sony controllers; Xbox controllers can use the fallback directly. |
 | `wayland`            | `PROTON_USE_WAYLAND` or `PROTON_ENABLE_WAYLAND` | Enables the Wayland driver. |
 | `wow64`              | `PROTON_USE_WOW64`             | Enables wow64. |
 |                      | `WAYLANDDRV_PRIMARY_MONITOR`   | Specify primary monitor where the value is something like `eDP-1`. Requires the Wayland driver. |
