@@ -1,0 +1,134 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Tue, 11 Aug 2026 00:00:00 -0600
+Subject: [PATCH] ntdll: Allow native high-address syscalls with SUD
+
+Syscall User Dispatch only exempted the library containing the signal
+restorer. Native modules that are manually mapped outside of the dynamic
+loader, such as Easy Anti-Cheat's Linux module, can issue Linux syscalls
+from other addresses. Those calls were delivered as SIGSYS and incorrectly
+routed through Wine's NT syscall dispatcher.
+
+Restore the native address distinction used by Proton's previous seccomp
+filter. Allow syscalls from the high native module range while keeping the
+top-down PE reservation blocked. Dynamically loaded .so modules are covered
+by that range as well, so do not disable SUD globally when loading one. The
+old lazy disable could leave existing threads in different dispatch modes
+and retry a trapped NT syscall as a Linux syscall.
+
+---
+ dlls/ntdll/unix/loader.c        |  3 ---
+ dlls/ntdll/unix/signal_x86_64.c | 42 ++++++++++++++++------------------
+ dlls/ntdll/unix/unix_private.h  |  1 -
+ 3 files changed, 19 insertions(+), 27 deletions(-)
+
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -1048,9 +1048,6 @@ static NTSTATUS dlopen_dll( const char *so_name, UNICODE_STRING *nt_name, void *
+         dlclose( handle );
+         return STATUS_NO_MEMORY;
+     }
+-#ifdef __x86_64__
+-    signal_disable_syscall_dispatch();
+-#endif
+     *ret_module = module;
+     return STATUS_SUCCESS;
+ }
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -2828,15 +2828,6 @@ static void sigsys_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+ 
+     TRACE_(seh)("SIGSYS, rax %#lx, rip %#lx.\n", (long)RAX_sig(ucontext), (long)RIP_sig(ucontext));
+ 
+-#ifdef __linux__
+-    if (!syscall_dispatch_enabled)
+-    {
+-        prctl( PR_SET_SYSCALL_USER_DISPATCH, PR_SYS_DISPATCH_OFF, 0, 0, 0 );
+-        RIP_sig(ucontext) -= 2;  /* retry the syscall */
+-        return;
+-    }
+-#endif
+-
+     frame->rip = RIP_sig(ucontext) + 0xb;
+     frame->rcx = RIP_sig(ucontext);
+     frame->eflags = EFL_sig(ucontext);
+@@ -2947,15 +2938,6 @@ void signal_free_thread( TEB *teb )
+     if (teb->WowTebOffset && !fs32_sel) ldt_free_entry( thread_data->fs );
+ }
+ 
+-
+-/**********************************************************************
+- *		signal_disable_syscall_dispatch
+- */
+-void signal_disable_syscall_dispatch(void)
+-{
+-    if (InterlockedExchange( &syscall_dispatch_enabled, FALSE )) TRACE_(seh)( "disabled\n" );
+-}
+-
+ #ifdef __APPLE__
+ /**********************************************************************
+  *		mac_thread_gsbase
+@@ -2975,22 +2957,35 @@ static void *mac_thread_gsbase(void)
+ #endif
+ 
+ #ifdef __linux__
+-static uintptr_t libc_addr, libc_size;
++#define NATIVE_SYSCALL_ADDRESS_START 0x700000000000ull
++#define TOP_DOWN_SYSCALL_ADDRESS_START 0x7ffffe000000ull
++
++static uintptr_t syscall_dispatch_addr, syscall_dispatch_size;
+ 
+ static int libc_addr_cb( struct dl_phdr_info *info, size_t info_size, void *arg )
+ {
+     uintptr_t restorer_addr = (uintptr_t)arg;
+     uintptr_t size = 0;
+ 
+     for (unsigned int i = 0; i < info->dlpi_phnum; ++i)
+         size = max( size, info->dlpi_phdr[i].p_vaddr + info->dlpi_phdr[i].p_memsz );
+ 
+     if (restorer_addr < info->dlpi_addr || restorer_addr >= info->dlpi_addr + size)
+         return 0;
+ 
+-    libc_addr = info->dlpi_addr;
+-    libc_size = size;
+-    TRACE_(seh)( "found signal trampoline in %s\n", info->dlpi_name);
++    if (info->dlpi_addr < NATIVE_SYSCALL_ADDRESS_START ||
++        info->dlpi_addr + size > TOP_DOWN_SYSCALL_ADDRESS_START)
++    {
++        WARN_(seh)( "signal trampoline is outside the native syscall range\n" );
++        return 0;
++    }
++
++    /* Native modules, including manually mapped anti-cheat modules, can issue
++     * Linux syscalls without going through libc. Keep Wine's top-down PE
++     * reservation blocked while allowing the native address range. */
++    syscall_dispatch_addr = NATIVE_SYSCALL_ADDRESS_START;
++    syscall_dispatch_size = TOP_DOWN_SYSCALL_ADDRESS_START - NATIVE_SYSCALL_ADDRESS_START;
++    TRACE_(seh)( "found signal trampoline in %s\n", info->dlpi_name );
+     return 1;
+ }
+ #endif
+@@ -3105,7 +3100,8 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend,
+         alloc_fs_sel( fs32_sel >> 3, get_wow_teb( teb ));
+     }
+     if (syscall_dispatch_enabled && prctl( PR_SET_SYSCALL_USER_DISPATCH, PR_SYS_DISPATCH_ON,
+-                                           libc_addr, libc_size, &thread_data->syscall_dispatch ) < 0)
++                                           syscall_dispatch_addr, syscall_dispatch_size,
++                                           &thread_data->syscall_dispatch ) < 0)
+         WARN_(seh)( "could not enable syscall user dispatch\n" );
+ #elif defined (__FreeBSD__) || defined (__FreeBSD_kernel__)
+     amd64_set_gsbase( teb );
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -344,7 +344,6 @@ extern NTSTATUS signal_alloc_thread( TEB *teb );
+ extern void set_thread_teb( TEB *teb );
+ extern void signal_free_thread( TEB *teb );
+-extern void signal_disable_syscall_dispatch(void);
+ extern void signal_init_process(void);
+ extern void DECLSPEC_NORETURN signal_start_thread( PRTL_THREAD_START_ROUTINE entry, void *arg,
+                                                    BOOL suspend, TEB *teb );
+ extern SYSTEM_SERVICE_TABLE KeServiceDescriptorTable[4];
+-- 
+2.55.0
