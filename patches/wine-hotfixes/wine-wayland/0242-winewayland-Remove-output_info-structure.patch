@@ -1,0 +1,877 @@
+From 523a4a9769224123e3d2c2f76d087c43865530a8 Mon Sep 17 00:00:00 2001
+From: Etaash Mathamsetty
+ <45927311+Etaash-mathamsetty@users.noreply.github.com>
+Date: Tue, 28 Jul 2026 17:25:26 -0400
+Subject: [PATCH 242/268] winewayland: Remove output_info structure.
+
+This was holding us back from doing many things since we need the physical_x/y coordinates.
+---
+ dlls/winewayland.drv/display.c        | 243 ++++++++++++--------------
+ dlls/winewayland.drv/wayland.c        |  24 +--
+ dlls/winewayland.drv/wayland_output.c | 138 +++++++--------
+ dlls/winewayland.drv/waylanddrv.h     |  19 +-
+ 4 files changed, 195 insertions(+), 229 deletions(-)
+
+diff --git a/dlls/winewayland.drv/display.c b/dlls/winewayland.drv/display.c
+index de29e04c102..f52b4ed71f4 100644
+--- a/dlls/winewayland.drv/display.c
++++ b/dlls/winewayland.drv/display.c
+@@ -36,28 +36,30 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
+ 
+-static int output_info_cmp_primary_x_y(const void *va, const void *vb)
++static int wayland_output_cmp_primary_x_y(const void *va, const void *vb)
+ {
+-    const struct output_info *a = va;
+-    const struct output_info *b = vb;
+-    BOOL a_is_primary = a->x == 0 && a->y == 0;
+-    BOOL b_is_primary = b->x == 0 && b->y == 0;
++    const struct wayland_output * const *output_a = va;
++    const struct wayland_output * const *output_b = vb;
++    const struct wayland_output_state *a = &(*output_a)->current;
++    const struct wayland_output_state *b = &(*output_b)->current;
++    BOOL a_is_primary = a->physical_x == 0 && a->physical_y == 0;
++    BOOL b_is_primary = b->physical_x == 0 && b->physical_y == 0;
+ 
+     if (a_is_primary && !b_is_primary) return -1;
+     if (!a_is_primary && b_is_primary) return 1;
+-    if (a->x < b->x) return -1;
+-    if (a->x > b->x) return 1;
+-    if (a->y < b->y) return -1;
+-    if (a->y > b->y) return 1;
+-    return strcmp(a->output->name, b->output->name);
++    if (a->physical_x < b->physical_x) return -1;
++    if (a->physical_x > b->physical_x) return 1;
++    if (a->physical_y < b->physical_y) return -1;
++    if (a->physical_y > b->physical_y) return 1;
++    return strcmp(a->name, b->name);
+ }
+ 
+-static inline BOOL output_info_overlap(struct output_info *a, struct output_info *b)
++static inline BOOL wayland_output_overlap(struct wayland_output_state *a, struct wayland_output_state *b)
+ {
+-    return b->x < a->x + a->output->current_mode->width &&
+-           b->x + b->output->current_mode->width > a->x &&
+-           b->y < a->y + a->output->current_mode->height &&
+-           b->y + b->output->current_mode->height > a->y;
++    return b->physical_x < a->physical_x + a->current_mode->width &&
++           b->physical_x + b->current_mode->width > a->physical_x &&
++           b->physical_y < a->physical_y + a->current_mode->height &&
++           b->physical_y + b->current_mode->height > a->physical_y;
+ }
+ 
+ /* Map a point to one of the four quadrants of our 2d coordinate space:
+@@ -72,8 +74,8 @@ static inline int point_to_quadrant(int x, int y)
+ 
+ /* Decide which of two outputs to keep stationary in order
+  * to resolve an overlap. */
+-static struct output_info *output_info_get_overlap_anchor(struct output_info *a,
+-                                                          struct output_info *b)
++static struct wayland_output_state *wayland_output_get_overlap_anchor(struct wayland_output_state *a,
++                                                                      struct wayland_output_state *b)
+ {
+     /* Preferences for the direction of growth in each quadrant, with a
+      * lower value signifying a higher preference. */
+@@ -84,14 +86,14 @@ static struct output_info *output_info_get_overlap_anchor(struct output_info *a,
+         {2, 3, 0, 1}, /* quadrant 2 */
+         {3, 2, 1, 0}, /* quadrant 3 */
+     };
+-    int qa = point_to_quadrant(a->output->logical_x, a->output->logical_y);
+-    int qb = point_to_quadrant(b->output->logical_x, b->output->logical_y);
++    int qa = point_to_quadrant(a->logical_x, a->logical_y);
++    int qb = point_to_quadrant(b->logical_x, b->logical_y);
+     /* Direction of growth if a is the anchor. */
+-    int qab = point_to_quadrant(b->output->logical_x - a->output->logical_x,
+-                                b->output->logical_y - a->output->logical_y);
++    int qab = point_to_quadrant(b->logical_x - a->logical_x,
++                                b->logical_y - a->logical_y);
+     /* Direction of growth if b is the anchor. */
+-    int qba = point_to_quadrant(a->output->logical_x - b->output->logical_x,
+-                                a->output->logical_y - b->output->logical_y);
++    int qba = point_to_quadrant(a->logical_x - b->logical_x,
++                                a->logical_y - b->logical_y);
+ 
+     /* If the two output origins are in different quadrants, use the output
+      * in the lower valued quadrant as the anchor (so effectively outputs
+@@ -104,30 +106,32 @@ static struct output_info *output_info_get_overlap_anchor(struct output_info *a,
+     return (quadrant_prefs[qa][qab] < quadrant_prefs[qa][qba]) ? a : b;
+ }
+ 
+-static BOOL output_info_array_resolve_overlaps(struct wl_array *output_info_array)
++static BOOL wayland_output_array_resolve_overlaps(struct wl_array *output_info_array)
+ {
+-    struct output_info *a, *b;
++    struct wayland_output **a, **b;
+     BOOL found_overlap = FALSE;
+ 
+     wl_array_for_each(a, output_info_array)
+     {
++        if (!(*a)->current.current_mode) continue;
+         wl_array_for_each(b, output_info_array)
+         {
+-            struct output_info *anchor, *move;
++            struct wayland_output_state *anchor, *move;
+             BOOL x_use_end, y_use_end;
+             double rel_x, rel_y;
+ 
+             /* Break if we reach the same output in the inner loop, so that we
+              * don't process output pairs twice (since order doesn't matter for
+              * our algorithm.) */
++            if (!(*b)->current.current_mode) continue;
+             if (a == b) break;
+ 
+-            if (!output_info_overlap(a, b)) continue;
++            if (!wayland_output_overlap(&(*a)->current, &(*b)->current)) continue;
+             found_overlap = TRUE;
+ 
+             /* Decide which output to move to resolve the overlap. */
+-            anchor = output_info_get_overlap_anchor(a, b);
+-            move = anchor == a ? b : a;
++            anchor = wayland_output_get_overlap_anchor(&(*a)->current, &(*b)->current);
++            move = anchor == &(*a)->current ? &(*b)->current : &(*a)->current;
+ 
+             /* Move the selected output on the X axis to resolve the overlap,
+              * while maintaining the same relative positioning of the outputs as
+@@ -135,42 +139,43 @@ static BOOL output_info_array_resolve_overlaps(struct wl_array *output_info_arra
+              * of the moved output as the point to maintain the relative
+              * position of, depending on whether the anchor is before or after
+              * the moved output on the axis. */
+-            x_use_end = move->output->logical_x < anchor->output->logical_x;
+-            rel_x = (move->output->logical_x - anchor->output->logical_x +
+-                     (x_use_end ? move->output->logical_w : 0)) /
+-                    (double)anchor->output->logical_w;
+-            move->x = anchor->x + anchor->output->current_mode->width * rel_x -
+-                      (x_use_end ? move->output->current_mode->width : 0);
++            x_use_end = move->logical_x < anchor->logical_x;
++            rel_x = (move->logical_x - anchor->logical_x +
++                     (x_use_end ? move->logical_w : 0)) /
++                    (double)anchor->logical_w;
++            move->physical_x = anchor->physical_x + anchor->current_mode->width * rel_x -
++                               (x_use_end ? move->current_mode->width : 0);
+ 
+             /* Similarly for the Y axis. */
+-            y_use_end = move->output->logical_y < anchor->output->logical_y;
+-            rel_y = (move->output->logical_y - anchor->output->logical_y +
+-                     (y_use_end ? move->output->logical_h : 0)) /
+-                    (double)anchor->output->logical_h;
+-            move->y = anchor->y + anchor->output->current_mode->height * rel_y -
+-                      (y_use_end ? move->output->current_mode->height : 0);
++            y_use_end = move->logical_y < anchor->logical_y;
++            rel_y = (move->logical_y - anchor->logical_y +
++                     (y_use_end ? move->logical_h : 0)) /
++                    (double)anchor->logical_h;
++            move->physical_y = anchor->physical_y + anchor->current_mode->height * rel_y -
++                               (y_use_end ? move->current_mode->height : 0);
+         }
+     }
+ 
+     return found_overlap;
+ }
+ 
+-static void output_info_array_zero_primary(struct wl_array *output_info_array)
++static void wayland_output_array_zero_primary(struct wl_array *output_info_array)
+ {
+     const char *env = getenv("WAYLANDDRV_PRIMARY_MONITOR");
+     int x_offset = 0, y_offset = 0;
+-    struct output_info *info;
++    struct wayland_output **pos;
+     UINT64 max_score = 0;
+     int count = 0;
+ 
+     if (env)
+     {
+-        wl_array_for_each(info, output_info_array)
++        wl_array_for_each(pos, output_info_array)
+         {
+-            if (!strcmp(info->output->name, env))
++            if (!(*pos)->current.current_mode) continue;
++            if (!strcmp((*pos)->current.name, env))
+             {
+-                x_offset = info->x;
+-                y_offset = info->y;
++                x_offset = (*pos)->current.physical_x;
++                y_offset = (*pos)->current.physical_y;
+                 count++;
+             }
+         }
+@@ -185,61 +190,67 @@ static void output_info_array_zero_primary(struct wl_array *output_info_array)
+         {
+             ERR("Could not find output %s\n", debugstr_a(env));
+         }
++        else ERR("HACK: Using %s as primary output!\n", debugstr_a(env));
+     }
+     else
+     {
+         /* rank monitors by bandwidth */
+-        wl_array_for_each(info, output_info_array)
++        wl_array_for_each(pos, output_info_array)
+         {
+-            struct wayland_output_mode *mode = info->output->current_mode;
+-            UINT64 score = (UINT64)mode->height *
+-                        (UINT64)mode->width * ((UINT64)(mode->refresh + 500) / 1000)
+-                        - (INT64)(info->output->logical_x / 100)
+-                        - (INT64)(info->output->logical_y / 100)
+-                        + (UINT64)info->output->max_cll;
++            struct wayland_output_mode *mode = (*pos)->current.current_mode;
++            UINT64 score;
++
++            if (!mode) continue;
++
++            score = (UINT64)mode->height * (UINT64)mode->width *
++                    ((UINT64)(mode->refresh + 500) / 1000) -
++                    (INT64)((*pos)->current.logical_x / 100) -
++                    (INT64)((*pos)->current.logical_y / 100) +
++                    (UINT64)(*pos)->current.max_cll;
+ 
+             if (score > max_score)
+             {
+-                x_offset = info->x;
+-                y_offset = info->y;
++                x_offset = (*pos)->current.physical_x;
++                y_offset = (*pos)->current.physical_y;
+                 max_score = score;
+             }
+         }
+     }
+ 
+-    wl_array_for_each(info, output_info_array)
++    wl_array_for_each(pos, output_info_array)
+     {
+-        info->x -= x_offset;
+-        info->y -= y_offset;
++        (*pos)->current.physical_x -= x_offset;
++        (*pos)->current.physical_y -= y_offset;
+     }
+ }
+ 
+-static void output_info_array_arrange_physical_coords(struct wl_array *output_info_array)
++void wayland_output_array_arrange_physical_coords(void)
+ {
+-    struct output_info *info;
+-    size_t num_outputs = output_info_array->size / sizeof(struct output_info);
++    struct wl_array *output_array = &process_wayland.output_array;
++    struct wayland_output **output;
++    size_t num_outputs = output_array->size / sizeof(struct wayland_output *);
+     int steps = 0;
+ 
+     /* Set the initial physical pixel coordinates. */
+-    wl_array_for_each(info, output_info_array)
++    wl_array_for_each(output, output_array)
+     {
+-        info->x = info->output->logical_x;
+-        info->y = info->output->logical_y;
++        (*output)->current.physical_x = (*output)->current.logical_x;
++        (*output)->current.physical_y = (*output)->current.logical_y;
+     }
+ 
+     /* Try to iteratively resolve overlaps, but be defensive and set an upper
+      * iteration bound to ensure we avoid infinite loops. */
+-    while (output_info_array_resolve_overlaps(output_info_array) &&
++    while (wayland_output_array_resolve_overlaps(output_array) &&
+            ++steps < num_outputs)
+         continue;
+ 
+     /* places the primary output at 0,0 and offsets the other outputs accordingly */
+-    output_info_array_zero_primary(output_info_array);
++    wayland_output_array_zero_primary(output_array);
+ 
+     /* Now that we have our physical pixel coordinates, sort from physical left
+      * to right, but ensure the primary output is first. */
+-    qsort(output_info_array->data, num_outputs, sizeof(struct output_info),
+-          output_info_cmp_primary_x_y);
++    qsort(output_array->data, num_outputs, sizeof(struct wayland_output *),
++          wayland_output_cmp_primary_x_y);
+ }
+ 
+ static void wayland_add_device_gpu(const struct gdi_device_manager *device_manager,
+@@ -253,12 +264,12 @@ static void wayland_add_device_gpu(const struct gdi_device_manager *device_manag
+ }
+ 
+ static void wayland_add_device_source(const struct gdi_device_manager *device_manager,
+-                                       void *param, UINT state_flags, struct output_info *output_info)
++                                       void *param, UINT state_flags, struct wayland_output_state *output)
+ {
+     UINT dpi = NtUserGetSystemDpiForProcess( NULL );
+     TRACE("name=%s state_flags=0x%x\n",
+-          output_info->output->name, state_flags);
+-    device_manager->add_source(output_info->output->name, state_flags, dpi, param);
++          output->name, state_flags);
++    device_manager->add_source(output->name, state_flags, dpi, param);
+ }
+ 
+ /* borrowed from gamescope with permission */
+@@ -270,18 +281,18 @@ static uint8_t encode_max_luminance(float nits)
+     return ceilf((logf(nits / 50.0f) / logf(2.0f)) * 32.0f);
+ }
+ 
+-static UINT get_edid(struct output_info *output_info, unsigned char **edid)
++static UINT get_edid(struct wayland_output_state *output, unsigned char **edid)
+ {
+-    const struct wayland_primaries *primaries = &output_info->output->primaries;
+-    struct wayland_output_mode *mode = output_info->output->current_mode;
+-    const char *model = output_info->output->model;
++    const struct wayland_primaries *primaries = &output->primaries;
++    struct wayland_output_mode *mode = output->current_mode;
++    const char *model = output->model;
+     unsigned int edid_size = 128, extensions = 0;
+     unsigned char l[3] = {19, 1, 13}; /* SAM */
+     unsigned int i, mwidth, mheight;
+     unsigned char *data, *p, c;
+     char temp_model[13] = {0};
+ 
+-    if (output_info->output->supports_hdr)
++    if (output->supports_hdr)
+     {
+         edid_size += 128;
+         extensions++;
+@@ -292,8 +303,8 @@ static UINT get_edid(struct output_info *output_info, unsigned char **edid)
+ 
+     data = *edid;
+ 
+-    mwidth = output_info->output->physical_w;
+-    mheight = output_info->output->physical_h;
++    mwidth = output->physical_w;
++    mheight = output->physical_h;
+ 
+     if (mwidth == 0 || mheight == 0)
+     {
+@@ -381,7 +392,7 @@ static UINT get_edid(struct output_info *output_info, unsigned char **edid)
+ 
+     p = data;
+ 
+-    if (output_info->output->supports_hdr)
++    if (output->supports_hdr)
+     {
+         p += 128;
+ 
+@@ -398,8 +409,8 @@ static UINT get_edid(struct output_info *output_info, unsigned char **edid)
+ 
+         p[2] = 0x7; /* ST2084 | SDR | HDR */
+         p[3] = 1;
+-        p[4] = encode_max_luminance(output_info->output->max_cll);
+-        p[5] = encode_max_luminance(output_info->output->max_fall);
++        p[4] = encode_max_luminance(output->max_cll);
++        p[5] = encode_max_luminance(output->max_fall);
+         p[6] = 0; /* assume undefined, games often don't implement this properly */
+ 
+         /* reset p to beginning of the CTA block */
+@@ -415,21 +426,21 @@ static UINT get_edid(struct output_info *output_info, unsigned char **edid)
+ }
+ 
+ static void wayland_add_device_monitor(const struct gdi_device_manager *device_manager,
+-                                       void *param, struct output_info *output_info,
+-                                       struct output_info *primary)
++                                       void *param, struct wayland_output_state *output,
++                                       struct wayland_output_state *primary)
+ {
+     const char *env;
+     struct gdi_monitor monitor = {0};
+ 
+-    SetRect(&monitor.rc_monitor, output_info->x, output_info->y,
+-            output_info->x + output_info->output->current_mode->width,
+-            output_info->y + output_info->output->current_mode->height);
+-    OffsetRect(&monitor.rc_monitor, -primary->x, -primary->y);
++    SetRect(&monitor.rc_monitor, output->physical_x, output->physical_y,
++            output->physical_x + output->current_mode->width,
++            output->physical_y + output->current_mode->height);
++    OffsetRect(&monitor.rc_monitor, -primary->physical_x, -primary->physical_y);
+ 
+-    monitor.edid_len = get_edid(output_info, &monitor.edid);
++    monitor.edid_len = get_edid(output, &monitor.edid);
+     /* We don't have a direct way to get the work area in Wayland. */
+     monitor.rc_work = monitor.rc_monitor;
+-    monitor.hdr_enabled = output_info->output->supports_hdr;
++    monitor.hdr_enabled = output->supports_hdr;
+ 
+     if ((env = getenv("DXVK_HDR")) && *env == '1')
+         monitor.hdr_enabled = TRUE;
+@@ -437,7 +448,7 @@ static void wayland_add_device_monitor(const struct gdi_device_manager *device_m
+         monitor.hdr_enabled = FALSE;
+ 
+     TRACE("name=%s rc_monitor=rc_work=%s\n",
+-          output_info->output->name, wine_dbgstr_rect(&monitor.rc_monitor));
++          output->name, wine_dbgstr_rect(&monitor.rc_monitor));
+ 
+     device_manager->add_monitor(&monitor, param);
+     free(monitor.edid);
+@@ -457,22 +468,22 @@ static void populate_devmode(struct wayland_output_mode *output_mode, DEVMODEW *
+ }
+ 
+ static void wayland_add_device_modes(const struct gdi_device_manager *device_manager,
+-                                     void *param, struct output_info *output_info,
+-                                     struct output_info *primary)
++                                     void *param, struct wayland_output_state *output,
++                                     struct wayland_output_state *primary)
+ {
+     DEVMODEW *modes, current = {.dmSize = sizeof(current)};
+     struct wayland_output_mode *output_mode;
+     int modes_count = 0;
+ 
+-    if (!(modes = malloc(output_info->output->modes_count * sizeof(*modes))))
++    if (!(modes = malloc(output->modes_count * sizeof(*modes))))
+         return;
+ 
+-    populate_devmode(output_info->output->current_mode, &current);
++    populate_devmode(output->current_mode, &current);
+     current.dmFields |= DM_POSITION;
+-    current.dmPosition.x = output_info->x - primary->x;
+-    current.dmPosition.y = output_info->y - primary->y;
++    current.dmPosition.x = output->physical_x - primary->physical_x;
++    current.dmPosition.y = output->physical_y - primary->physical_y;
+ 
+-    RB_FOR_EACH_ENTRY(output_mode, &output_info->output->modes,
++    RB_FOR_EACH_ENTRY(output_mode, &output->modes,
+                       struct wayland_output_mode, entry)
+     {
+         DEVMODEW mode = {.dmSize = sizeof(mode)};
+@@ -484,50 +495,28 @@ static void wayland_add_device_modes(const struct gdi_device_manager *device_man
+     free(modes);
+ }
+ 
+-void output_info_array_update(void)
+-{
+-    struct output_info *output_info;
+-    struct wayland_output *output;
+-    struct wl_array *output_info_array = &process_wayland.output_info_array;
+-
+-    /* reset the output info array */
+-    wl_array_release(&process_wayland.output_info_array);
+-    wl_array_init(&process_wayland.output_info_array);
+-
+-    wl_list_for_each(output, &process_wayland.output_list, link)
+-    {
+-        if (!output->current.current_mode) continue;
+-        output_info = wl_array_add(output_info_array, sizeof(*output_info));
+-        if (output_info) output_info->output = &output->current;
+-        else ERR("Failed to allocate space for output_info\n");
+-    }
+-
+-    output_info_array_arrange_physical_coords(output_info_array);
+-}
+-
+ /***********************************************************************
+  *      UpdateDisplayDevices (WAYLAND.@)
+  */
+ UINT WAYLAND_UpdateDisplayDevices(const struct gdi_device_manager *device_manager, void *param)
+ {
+     DWORD state_flags = DISPLAY_DEVICE_ATTACHED_TO_DESKTOP | DISPLAY_DEVICE_PRIMARY_DEVICE;
+-    struct output_info *primary = NULL, *output_info;
++    struct wayland_output *primary = NULL, **pos;
+ 
+     TRACE("\n");
+ 
+     pthread_mutex_lock(&process_wayland.output_mutex);
+ 
+-    output_info_array_update();
+-
+     /* Populate GDI devices. */
+     wayland_add_device_gpu(device_manager, param);
+ 
+-    wl_array_for_each(output_info, &process_wayland.output_info_array)
++    wl_array_for_each(pos, &process_wayland.output_array)
+     {
+-        if (!primary) primary = output_info;
+-        wayland_add_device_source(device_manager, param, state_flags, output_info);
+-        wayland_add_device_monitor(device_manager, param, output_info, primary);
+-        wayland_add_device_modes(device_manager, param, output_info, primary);
++        if (!(*pos)->current.current_mode) continue;
++        if (!primary) primary = *pos;
++        wayland_add_device_source(device_manager, param, state_flags, &(*pos)->current);
++        wayland_add_device_monitor(device_manager, param, &(*pos)->current, &primary->current);
++        wayland_add_device_modes(device_manager, param, &(*pos)->current, &primary->current);
+         state_flags &= ~DISPLAY_DEVICE_PRIMARY_DEVICE;
+     }
+ 
+diff --git a/dlls/winewayland.drv/wayland.c b/dlls/winewayland.drv/wayland.c
+index 8295de6a669..28829b7150d 100644
+--- a/dlls/winewayland.drv/wayland.c
++++ b/dlls/winewayland.drv/wayland.c
+@@ -41,7 +41,6 @@ struct wayland process_wayland =
+                             &process_wayland.touch.touch_points },
+     .text_input.mutex = PTHREAD_MUTEX_INITIALIZER,
+     .data_device.mutex = PTHREAD_MUTEX_INITIALIZER,
+-    .output_list = {&process_wayland.output_list, &process_wayland.output_list},
+     .output_mutex = PTHREAD_MUTEX_INITIALIZER,
+ };
+ 
+@@ -164,15 +163,15 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
+     }
+     else if (strcmp(interface, "zxdg_output_manager_v1") == 0)
+     {
+-        struct wayland_output *output;
++        struct wayland_output **output;
+ 
+         process_wayland.zxdg_output_manager_v1 =
+             wl_registry_bind(registry, id, &zxdg_output_manager_v1_interface,
+                              version < 3 ? version : 3);
+ 
+         /* Add zxdg_output_v1 to existing outputs. */
+-        wl_list_for_each(output, &process_wayland.output_list, link)
+-            wayland_output_use_xdg_extension(output);
++        wl_array_for_each(output, &process_wayland.output_array)
++            wayland_output_use_xdg_extension(*output);
+     }
+     else if (strcmp(interface, "wl_compositor") == 0)
+     {
+@@ -300,7 +299,7 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
+     }
+     else if (strcmp(interface, "wp_color_manager_v1") == 0)
+     {
+-        struct wayland_output *output;
++        struct wayland_output **output;
+ 
+         process_wayland.wp_color_manager_v1 =
+             wl_registry_bind(registry, id, &wp_color_manager_v1_interface,
+@@ -308,8 +307,8 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
+         wp_color_manager_v1_add_listener(process_wayland.wp_color_manager_v1,
+                                          &wp_color_manager_listener, NULL);
+         /* Add image descriptions to existing outputs. */
+-        wl_list_for_each(output, &process_wayland.output_list, link)
+-            wayland_output_use_image_description(output);
++        wl_array_for_each(output, &process_wayland.output_array)
++            wayland_output_use_image_description(*output);
+     }
+     else if (strcmp(interface, "xdg_activation_v1") == 0)
+     {
+@@ -333,7 +332,7 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
+ static void registry_handle_global_remove(void *data, struct wl_registry *registry,
+                                           uint32_t id)
+ {
+-    struct wayland_output *output, *tmp;
++    struct wayland_output **output;
+     struct wayland_seat *seat;
+ 
+     TRACE("id=%u\n", id);
+@@ -343,15 +342,17 @@ static void registry_handle_global_remove(void *data, struct wl_registry *regist
+         wl_fixes_ack_global_remove(process_wayland.wl_fixes, registry, id);
+ #endif
+ 
+-    wl_list_for_each_safe(output, tmp, &process_wayland.output_list, link)
++    pthread_mutex_lock(&process_wayland.output_mutex);
++    wl_array_for_each(output, &process_wayland.output_array)
+     {
+-        if (output->global_id == id)
++        if ((*output)->global_id == id)
+         {
+-            TRACE("removing output->name=%s\n", output->current.name);
++            TRACE("removing output->name=%s\n", (*output)->current.name);
+             wayland_output_remove(output);
+             return;
+         }
+     }
++    pthread_mutex_unlock(&process_wayland.output_mutex);
+ 
+     seat = &process_wayland.seat;
+     if (seat->wl_seat && seat->global_id == id)
+@@ -417,6 +418,7 @@ BOOL wayland_process_init(void)
+ 
+     /* initialize win data mutex */
+     wayland_window_init();
++    wl_array_init(&process_wayland.output_array);
+ 
+     /* Populate registry */
+     wl_registry_add_listener(process_wayland.wl_registry, &registry_listener, NULL);
+diff --git a/dlls/winewayland.drv/wayland_output.c b/dlls/winewayland.drv/wayland_output.c
+index 87e4ad19851..26846b36644 100644
+--- a/dlls/winewayland.drv/wayland_output.c
++++ b/dlls/winewayland.drv/wayland_output.c
+@@ -43,8 +43,7 @@ static uint32_t next_output_id = 0;
+ #define WAYLAND_OUTPUT_CHANGED_PRIMARIES    0x20
+ #define WAYLAND_OUTPUT_CHANGED_FALL         0x40
+ #define WAYLAND_OUTPUT_CHANGED_CLL          0x80
+-#define WAYLAND_OUTPUT_CHANGED_REF_L        0x100
+-#define WAYLAND_OUTPUT_CHANGED_MAX_TARGET_L 0x200
++#define WAYLAND_OUTPUT_CHANGED_LUMINANCES   0x100
+ 
+ /**********************************************************************
+  *          Output handling
+@@ -206,18 +205,14 @@ static void wayland_output_done(struct wayland_output *output)
+         output->current.max_cll = output->pending.max_cll;
+     }
+ 
+-    if (output->pending_flags & WAYLAND_OUTPUT_CHANGED_MAX_TARGET_L)
+-    {
+-        output->current.max_target_lum = output->pending.max_target_lum;
+-    }
+-
+-    if (output->pending_flags & WAYLAND_OUTPUT_CHANGED_REF_L)
++    if (output->pending_flags & WAYLAND_OUTPUT_CHANGED_LUMINANCES)
+     {
++        output->current.max_lum = output->pending.max_lum;
+         output->current.ref_lum = output->pending.ref_lum;
+     }
+ 
+     output->current.supports_hdr = process_wayland.supports_win_scrgb &&
+-                                    (output->current.max_target_lum > output->current.ref_lum);
++                                    (output->current.max_lum > output->current.ref_lum);
+ 
+     output->pending_flags = 0;
+ 
+@@ -229,10 +224,7 @@ static void wayland_output_done(struct wayland_output *output)
+         output->current.logical_h = output->current.current_mode->height;
+     }
+ 
+-    /* update the process output info array since pUpdateDisplayDevices
+-     * is only called on desktop window process */
+-    output_info_array_update();
+-
++    wayland_output_array_arrange_physical_coords();
+     pthread_mutex_unlock(&process_wayland.output_mutex);
+ 
+     TRACE("name=%s logical=%d,%d+%dx%d hdr=%u\n",
+@@ -402,60 +394,38 @@ static void wayland_image_description_info_v1_luminance(void *data,
+ {
+     struct wayland_output *output = data;
+ 
+-    TRACE("reference luminance: %u\n", ref);
++    TRACE("ref_lum: %u max_lum: %u\n", ref, max);
+ 
+     output->pending.ref_lum = ref;
+-    output->pending_flags |= WAYLAND_OUTPUT_CHANGED_REF_L;
++    output->pending.max_lum = max;
++    output->pending_flags |= WAYLAND_OUTPUT_CHANGED_LUMINANCES;
+ }
+ 
+ static void wayland_image_description_info_v1_primaries(void *data,
+-                                                   struct wp_image_description_info_v1 *info,
+-                                                   int32_t r_x, int32_t r_y, int32_t g_x,
+-                                                   int32_t g_y, int32_t b_x, int32_t b_y,
+-                                                   int32_t w_x, int32_t w_y)
++                                            struct wp_image_description_info_v1 *info,
++                                            int32_t r_x, int32_t r_y, int32_t g_x,
++                                            int32_t g_y, int32_t b_x, int32_t b_y,
++                                            int32_t w_x, int32_t w_y)
+ {
+-    struct wayland_output *output = data;
+-
+-    if (!(output->pending_flags & WAYLAND_OUTPUT_CHANGED_PRIMARIES))
+-    {
+-#define COPY(name) output->pending.primaries.name = round((name * 1e-6) * 1024)
+-        COPY(r_x);
+-        COPY(r_y);
+-        COPY(g_x);
+-        COPY(g_y);
+-        COPY(b_x);
+-        COPY(b_y);
+-        COPY(w_x);
+-        COPY(w_y);
+-#undef COPY
+-
+-        TRACE("primaries: {%lf, %lf, %lf, %lf, %lf, %lf, %lf, %lf}\n",
+-            r_x * 1e-6, r_y * 1e-6, g_x * 1e-6, g_y * 1e-6,
+-            b_x * 1e-6, b_y * 1e-6, w_x * 1e-6, w_y * 1e-6);
+-
+-        output->pending_flags |= WAYLAND_OUTPUT_CHANGED_PRIMARIES;
+-    }
+ }
+ 
+ static void wayland_image_description_info_v1_target_primaries(void *data,
+-				 struct wp_image_description_info_v1 *info,
+-				 int32_t r_x, int32_t r_y,
+-				 int32_t g_x, int32_t g_y,
+-				 int32_t b_x, int32_t b_y,
+-				 int32_t w_x, int32_t w_y)
++                               	            struct wp_image_description_info_v1 *info,
++                                   	        int32_t r_x, int32_t r_y, int32_t g_x,
++                                            int32_t g_y, int32_t b_x, int32_t b_y,
++                                            int32_t w_x, int32_t w_y)
+ {
+     struct wayland_output *output = data;
++    struct wayland_primaries *primaries = &output->pending.primaries;
+ 
+-#define COPY(name) output->pending.primaries.name = round((name * 1e-6) * 1024)
+-    COPY(r_x);
+-    COPY(r_y);
+-    COPY(g_x);
+-    COPY(g_y);
+-    COPY(b_x);
+-    COPY(b_y);
+-    COPY(w_x);
+-    COPY(w_y);
+-#undef COPY
++    primaries->r_x = round((r_x * 1e-6) * 1024);
++    primaries->r_y = round((r_y * 1e-6) * 1024);
++    primaries->g_x = round((g_x * 1e-6) * 1024);
++    primaries->g_y = round((g_y * 1e-6) * 1024);
++    primaries->b_x = round((b_x * 1e-6) * 1024);
++    primaries->b_y = round((b_y * 1e-6) * 1024);
++    primaries->w_x = round((b_x * 1e-6) * 1024);
++    primaries->w_y = round((b_y * 1e-6) * 1024);
+ 
+     TRACE("primaries: {%lf, %lf, %lf, %lf, %lf, %lf, %lf, %lf}\n",
+             r_x * 1e-6, r_y * 1e-6, g_x * 1e-6, g_y * 1e-6,
+@@ -468,12 +438,6 @@ static void wayland_image_description_info_v1_target_luminance(void *data,
+                             struct wp_image_description_info_v1 *info,
+                             uint32_t min, uint32_t max)
+ {
+-    struct wayland_output *output = data;
+-
+-    TRACE("max target luminance: %u\n", max);
+-
+-    output->pending.max_target_lum = max;
+-    output->pending_flags |= WAYLAND_OUTPUT_CHANGED_MAX_TARGET_L;
+ }
+ 
+ static void wayland_image_description_info_v1_target_max_cll(void *data,
+@@ -619,7 +583,7 @@ void wayland_output_use_image_description(struct wayland_output *output)
+  */
+ BOOL wayland_output_create(uint32_t id, uint32_t version)
+ {
+-    struct wayland_output *output = calloc(1, sizeof(*output));
++    struct wayland_output **elem, *output = calloc(1, sizeof(*output));
+     int name_len;
+ 
+     if (!output)
+@@ -675,7 +639,13 @@ BOOL wayland_output_create(uint32_t id, uint32_t version)
+     output->ref = 1;
+ 
+     pthread_mutex_lock(&process_wayland.output_mutex);
+-    wl_list_insert(process_wayland.output_list.prev, &output->link);
++    if (!(elem = wl_array_add(&process_wayland.output_array, sizeof(struct wayland_output *))))
++    {
++        ERR("Failed to add output to output array!\n");
++        pthread_mutex_unlock(&process_wayland.output_mutex);
++        goto err;
++    }
++    *elem = output;
+     pthread_mutex_unlock(&process_wayland.output_mutex);
+ 
+     return TRUE;
+@@ -696,14 +666,26 @@ static void wayland_output_state_deinit(struct wayland_output_state *state)
+  *
+  *  Drops ref of wayland output from the output list, and updates display devices.
+  */
+-void wayland_output_remove(struct wayland_output *output)
++void wayland_output_remove(struct wayland_output **output)
+ {
++    struct wl_array *output_array = &process_wayland.output_array;
++    struct wayland_output **end, *temp;
++
+     pthread_mutex_lock(&process_wayland.output_mutex);
+-    wl_list_remove(&output->link);
+-    output_info_array_update();
++    if ((end = output_array->data) && output_array->size)
++    {
++        end += (output_array->size / sizeof(*output)) - 1;
++        /* swap current element and back element */
++        temp = *end;
++        *end = *output;
++        *output = temp;
++        /* then reduce the size of the array */
++        output_array->size -= sizeof(*output);
++    }
++    wayland_output_array_arrange_physical_coords();
+     pthread_mutex_unlock(&process_wayland.output_mutex);
+ 
+-    wayland_output_release(output);
++    wayland_output_release(*output);
+ 
+     maybe_init_display_devices();
+ }
+@@ -741,8 +723,7 @@ void wayland_output_release(struct wayland_output *output)
+  */
+ struct wayland_output *wayland_output_for_rect(const RECT *window_rect)
+ {
+-    struct wayland_output *best = NULL;
+-    struct output_info *output_info;
++    struct wayland_output *best = NULL, **output;
+     HMONITOR target = NtUserMonitorFromRect(window_rect, 0);
+ 
+     TRACE("window %s\n", wine_dbgstr_rect(window_rect));
+@@ -751,24 +732,25 @@ struct wayland_output *wayland_output_for_rect(const RECT *window_rect)
+ 
+     pthread_mutex_lock(&process_wayland.output_mutex);
+ 
+-    wl_array_for_each(output_info, &process_wayland.output_info_array)
++    wl_array_for_each(output, &process_wayland.output_array)
+     {
++        struct wayland_output_state *current = &(*output)->current;
+         RECT rect;
++
++        if (!current->current_mode) continue;
++
+         SetRect(&rect, 0, 0,
+-                output_info->output->current_mode->width,
+-                output_info->output->current_mode->height);
+-        OffsetRect(&rect, output_info->x, output_info->y);
++                current->current_mode->width,
++                current->current_mode->height);
++        OffsetRect(&rect, current->physical_x, current->physical_y);
+ 
+         TRACE("output %s: %s\n",
+-              debugstr_a(output_info->output->name),
++              debugstr_a(current->name),
+               wine_dbgstr_rect(&rect));
+ 
+         if (NtUserMonitorFromRect(&rect, 0) == target)
+         {
+-            best = CONTAINING_RECORD(output_info->output,
+-                                     struct wayland_output,
+-                                     current);
+-            wayland_output_add_ref(best);
++            wayland_output_add_ref((best = *output));
+             break;
+         }
+     }
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index 9f7501723bd..9733b2877ed 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -264,9 +264,8 @@ struct wayland
+     struct wayland_touch touch;
+     struct wayland_text_input text_input;
+     struct wayland_data_device data_device;
+-    struct wl_list output_list;
+-    struct wl_array output_info_array;
+-    /* Protects the output_list, output_info_array, and the wayland_output.current states. */
++    struct wl_array output_array;
++    /* Protects the output_array, and the wayland_output.current states. */
+     pthread_mutex_t output_mutex;
+     LONG input_serial;
+     BOOL supports_win_scrgb;
+@@ -304,11 +303,12 @@ struct wayland_output_state
+     char *model;
+     int logical_x, logical_y;
+     int logical_w, logical_h;
++    int physical_x, physical_y;
+     int physical_w, physical_h;
+     int transform;
+     uint32_t max_fall;
+     uint32_t max_cll;
+-    uint32_t max_target_lum;
++    uint32_t max_lum;
+     uint32_t ref_lum;
+     BOOL supports_hdr;
+ };
+@@ -327,12 +327,6 @@ struct wayland_output
+     struct wayland_output_state pending, current;
+ };
+ 
+-struct output_info
+-{
+-    int x, y;
+-    struct wayland_output_state *output;
+-};
+-
+ struct wayland_surface_config
+ {
+     RECT rect;
+@@ -436,12 +430,11 @@ BOOL wayland_process_init(void);
+ void wayland_output_add_ref(struct wayland_output *output);
+ BOOL wayland_output_create(uint32_t id, uint32_t version);
+ void wayland_output_release(struct wayland_output *output);
+-void wayland_output_remove(struct wayland_output *output);
++void wayland_output_remove(struct wayland_output **output);
+ void wayland_output_use_xdg_extension(struct wayland_output *output);
+ void wayland_output_use_image_description(struct wayland_output *output);
+ struct wayland_output *wayland_output_for_rect(const RECT *rect);
+-void output_info_array_update(void);
+-void wayland_color_manager_init(void);
++void wayland_output_array_arrange_physical_coords(void);
+ 
+ /**********************************************************************
+  *          Wayland surface
+-- 
+2.55.0
+

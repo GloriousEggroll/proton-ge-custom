@@ -119,6 +119,7 @@ apply_all_in_dir() {
     -W ntdll-ext4-case-folder \
     -W winex11-Window_Style \
     -W wininet-Cleanup \
+    -W wintrust-WTHelperGetProvCertFromChain \
     -W winex11-ime-check-thread-data \
     -W winex11-Fixed-scancodes \
     -W Staging
@@ -147,6 +148,7 @@ apply_all_in_dir() {
     # loader-KeyboardLayouts - already applied
     # ntdll-Syscall_Emulation - already applied
     # ntdll_reg_flush - already applied
+    # wintrust-WTHelperGetProvCertFromChain - already applied by the wine-wayland patchset
 
     # ntdll-Hide_Wine_Exports - applied manually
     # kernel32-Debugger - applied manually

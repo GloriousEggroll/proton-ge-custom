@@ -1,0 +1,109 @@
+From 8ff7b37cf3912a776d74d29bced47409c7c4616b Mon Sep 17 00:00:00 2001
+From: Alexandre Julliard <julliard@winehq.org>
+Date: Mon, 16 Mar 2026 13:28:30 +0100
+Subject: [PATCH 260/268] ntdll: Disable syscall dispatch when loading a .so
+ dll.
+
+---
+ dlls/ntdll/unix/loader.c        |  3 +++
+ dlls/ntdll/unix/signal_x86_64.c | 28 +++++++++++++++++++++++++---
+ dlls/ntdll/unix/unix_private.h  |  1 +
+ 3 files changed, 29 insertions(+), 3 deletions(-)
+
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index f67fa07d366..2ede756d2cb 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -1048,6 +1048,9 @@ static NTSTATUS dlopen_dll( const char *so_name, UNICODE_STRING *nt_name, void *
+         dlclose( handle );
+         return STATUS_NO_MEMORY;
+     }
++#ifdef __x86_64__
++    signal_disable_syscall_dispatch();
++#endif
+     *ret_module = module;
+     return STATUS_SUCCESS;
+ }
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index 7792f173d1a..421ffe78774 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -532,6 +532,7 @@ static inline struct amd64_thread_data *amd64_thread_data(void)
+ static unsigned int frame_size;
+ static unsigned int xstate_size = sizeof(XSAVE_AREA_HEADER);
+ static UINT64 xstate_extended_features;
++static LONG syscall_dispatch_enabled = TRUE;
+ 
+ #if defined(__linux__) || defined(__APPLE__)
+ static inline TEB *get_current_teb(void)
+@@ -2821,6 +2822,15 @@ static void sigsys_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+ 
+     TRACE_(seh)("SIGSYS, rax %#llx, rip %#llx.\n", RAX_sig(ucontext), RIP_sig(ucontext));
+ 
++#ifdef PR_SET_SYSCALL_USER_DISPATCH
++    if (!syscall_dispatch_enabled)
++    {
++        prctl( PR_SET_SYSCALL_USER_DISPATCH, PR_SYS_DISPATCH_OFF, 0, 0, 0 );
++        RIP_sig(ucontext) -= 2;  /* retry the syscall */
++        return;
++    }
++#endif
++
+     frame->rip = RIP_sig(ucontext) + 0xb;
+     frame->rcx = RIP_sig(ucontext);
+     frame->eflags = EFL_sig(ucontext);
+@@ -2931,6 +2941,15 @@ void signal_free_thread( TEB *teb )
+     if (teb->WowTebOffset && !fs32_sel) ldt_free_entry( thread_data->fs );
+ }
+ 
++
++/**********************************************************************
++ *		signal_disable_syscall_dispatch
++ */
++void signal_disable_syscall_dispatch(void)
++{
++    if (InterlockedExchange( &syscall_dispatch_enabled, FALSE )) TRACE_(seh)( "disabled\n" );
++}
++
+ #ifdef __APPLE__
+ /**********************************************************************
+  *		mac_thread_gsbase
+@@ -3006,8 +3025,11 @@ void signal_init_process(void)
+     }
+ 
+ #ifdef PR_SET_SYSCALL_USER_DISPATCH
+-    if (!dl_iterate_phdr( libc_addr_cb, NULL ))
++    if (syscall_dispatch_enabled && !dl_iterate_phdr( libc_addr_cb, NULL ))
++    {
+         WARN_(seh)( "could not find libc\n" );
++        syscall_dispatch_enabled = FALSE;
++    }
+ #endif
+ 
+     signal_alloc_thread( NtCurrentTeb() );
+@@ -3069,8 +3091,8 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend,
+         alloc_fs_sel( fs32_sel >> 3, get_wow_teb( teb ));
+     }
+ #ifdef PR_SET_SYSCALL_USER_DISPATCH
+-    if (libc_addr && prctl( PR_SET_SYSCALL_USER_DISPATCH, PR_SYS_DISPATCH_ON,
+-                            libc_addr, libc_size, &thread_data->syscall_dispatch ) < 0)
++    if (syscall_dispatch_enabled && prctl( PR_SET_SYSCALL_USER_DISPATCH, PR_SYS_DISPATCH_ON,
++                                           libc_addr, libc_size, &thread_data->syscall_dispatch ) < 0)
+         WARN_(seh)( "could not enable syscall user dispatch\n" );
+ #endif
+ #elif defined (__FreeBSD__) || defined (__FreeBSD_kernel__)
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index 2f649ca399e..c29a34f3cec 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -343,6 +343,7 @@ extern void signal_init_threading(void);
+ extern NTSTATUS signal_alloc_thread( TEB *teb );
+ extern void set_thread_teb( TEB *teb );
+ extern void signal_free_thread( TEB *teb );
++extern void signal_disable_syscall_dispatch(void);
+ extern void signal_init_process(void);
+ extern void DECLSPEC_NORETURN signal_start_thread( PRTL_THREAD_START_ROUTINE entry, void *arg,
+                                                    BOOL suspend, TEB *teb );
+-- 
+2.55.0
+

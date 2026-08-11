@@ -1,0 +1,93 @@
+From 5d6a8261ca55add27dfdae035d2d4e543a45bc56 Mon Sep 17 00:00:00 2001
+From: Elizabeth Figura <zfigura@codeweavers.com>
+Date: Sun, 2 Aug 2026 18:27:33 -0500
+Subject: [PATCH 267/268] ntdll: Search for the library containing sa_restorer.
+
+Instead of assuming it will be libc.so. glibc versions before 2.34 put the
+restorer in libpthread.
+
+Wine-Bug: https://bugs.winehq.org/show_bug.cgi?id=59726
+---
+ dlls/ntdll/unix/signal_x86_64.c | 46 +++++++++++++++++++--------------
+ 1 file changed, 27 insertions(+), 19 deletions(-)
+
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index 2c1af239aeb..b10aff2ed6c 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -2977,23 +2977,20 @@ static void *mac_thread_gsbase(void)
+ #ifdef __linux__
+ static uintptr_t libc_addr, libc_size;
+ 
+-static int libc_addr_cb( struct dl_phdr_info *info, size_t size, void *arg )
++static int libc_addr_cb( struct dl_phdr_info *info, size_t info_size, void *arg )
+ {
+-    const char *p;
++    uintptr_t restorer_addr = (uintptr_t)arg;
++    uintptr_t size = 0;
+ 
+-    if ((p = strrchr( info->dlpi_name, '/' )))
+-        ++p;
+-    else
+-        p = info->dlpi_name;
++    for (unsigned int i = 0; i < info->dlpi_phnum; ++i)
++        size = max( size, info->dlpi_phdr[i].p_vaddr + info->dlpi_phdr[i].p_memsz );
+ 
+-    if (strcmp( p, "libc.so.6" ))
++    if (restorer_addr < info->dlpi_addr || restorer_addr >= info->dlpi_addr + size)
+         return 0;
+ 
+     libc_addr = info->dlpi_addr;
+-    libc_size = 0;
+-    for (unsigned int i = 0; i < info->dlpi_phnum; ++i)
+-        libc_size = max( libc_size, info->dlpi_phdr[i].p_vaddr + info->dlpi_phdr[i].p_memsz );
+-
++    libc_size = size;
++    TRACE_(seh)( "found signal trampoline in %s\n", info->dlpi_name);
+     return 1;
+ }
+ #endif
+@@ -3030,14 +3027,6 @@ void signal_init_process(void)
+ #endif
+     }
+ 
+-#ifdef __linux__
+-    if (syscall_dispatch_enabled && !dl_iterate_phdr( libc_addr_cb, NULL ))
+-    {
+-        WARN_(seh)( "could not find libc\n" );
+-        syscall_dispatch_enabled = FALSE;
+-    }
+-#endif
+-
+     signal_alloc_thread( NtCurrentTeb() );
+ 
+     sig_act.sa_mask = server_block_set;
+@@ -3063,6 +3052,25 @@ void signal_init_process(void)
+     sig_act.sa_sigaction = sigsys_handler;
+     if (sigaction( SIGSYS, &sig_act, NULL ) == -1) goto error;
+ #endif
++
++#ifdef __linux__
++    if (syscall_dispatch_enabled)
++    {
++        struct sigaction act;
++
++        if (sigaction( SIGSYS, NULL, &act ) == -1)
++        {
++            WARN_(seh)( "failed to retrieve signal restorer trampoline\n" );
++            syscall_dispatch_enabled = FALSE;
++        }
++        else if (!dl_iterate_phdr( libc_addr_cb, act.sa_restorer ))
++        {
++            WARN_(seh)( "could not find library containing signal restorer trampoline\n" );
++            syscall_dispatch_enabled = FALSE;
++        }
++    }
++#endif
++
+     return;
+ 
+  error:
+-- 
+2.55.0
+

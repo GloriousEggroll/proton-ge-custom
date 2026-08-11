@@ -1,0 +1,331 @@
+From f188068ebc27623af04596d2cf782259ee140053 Mon Sep 17 00:00:00 2001
+From: Etaash Mathamsetty
+ <45927311+Etaash-mathamsetty@users.noreply.github.com>
+Date: Wed, 22 Jul 2026 21:42:31 -0400
+Subject: [PATCH 217/268] atiadlxx: Implement
+ ADL2_Display_SourceContentAttribute_Set.
+
+Through analysis of amd_ags_x64.dll
+---
+ dlls/atiadlxx/Makefile.in         |   3 +-
+ dlls/atiadlxx/atiadlxx.spec       |   4 +-
+ dlls/atiadlxx/atiadlxx_main.c     | 107 +++++++++++++++++++++
+ dlls/atiadlxx/dxvk_interfaces.idl | 151 ++++++++++++++++++++++++++++++
+ 4 files changed, 262 insertions(+), 3 deletions(-)
+ create mode 100644 dlls/atiadlxx/dxvk_interfaces.idl
+
+diff --git a/dlls/atiadlxx/Makefile.in b/dlls/atiadlxx/Makefile.in
+index 854aa57b125..1fd42b626bf 100644
+--- a/dlls/atiadlxx/Makefile.in
++++ b/dlls/atiadlxx/Makefile.in
+@@ -4,4 +4,5 @@ IMPORTS = user32 dxgi cfgmgr32
+ EXTRADLLFLAGS = -mno-cygwin -Wb,--prefer-native
+ 
+ SOURCES = \
+-	atiadlxx_main.c
++	atiadlxx_main.c \
++	dxvk_interfaces.idl \
+diff --git a/dlls/atiadlxx/atiadlxx.spec b/dlls/atiadlxx/atiadlxx.spec
+index 2b916b922c1..2ae884130cb 100644
+--- a/dlls/atiadlxx/atiadlxx.spec
++++ b/dlls/atiadlxx/atiadlxx.spec
+@@ -387,7 +387,7 @@
+ @ stub ADL2_Display_Size_Get
+ @ stub ADL2_Display_Size_Set
+ @ stub ADL2_Display_SourceContentAttribute_Get
+-@ stub ADL2_Display_SourceContentAttribute_Set
++@ cdecl ADL2_Display_SourceContentAttribute_Set(ptr long long ptr)
+ @ stub ADL2_Display_SplitDisplay_Caps
+ @ stub ADL2_Display_SplitDisplay_Get
+ @ stub ADL2_Display_SplitDisplay_RestoreDesktopConfiguration
+@@ -948,7 +948,7 @@
+ @ stub ADL_Display_Size_Get
+ @ stub ADL_Display_Size_Set
+ @ stub ADL_Display_SourceContentAttribute_Get
+-@ stub ADL_Display_SourceContentAttribute_Set
++@ cdecl ADL_Display_SourceContentAttribute_Set(long long ptr)
+ @ stub ADL_Display_SplitDisplay_Caps
+ @ stub ADL_Display_SplitDisplay_Get
+ @ stub ADL_Display_SplitDisplay_RestoreDesktopConfiguration
+diff --git a/dlls/atiadlxx/atiadlxx_main.c b/dlls/atiadlxx/atiadlxx_main.c
+index 4d732860414..21da1fae640 100644
+--- a/dlls/atiadlxx/atiadlxx_main.c
++++ b/dlls/atiadlxx/atiadlxx_main.c
+@@ -19,6 +19,8 @@
+ 
+ #include "dxgi1_6.h"
+ 
++#include "dxvk_interfaces.h"
++
+ #define MAX_GPUS 64
+ #define VENDOR_AMD 0x1002
+ 
+@@ -1214,3 +1216,108 @@ int CDECL ADL_Display_SLSMapIndex_Get(int adapter_index, int num_display_target,
+ 
+     return ADL2_Display_SLSMapIndex_Get(default_ctx, adapter_index, num_display_target, display_target, sls_index);
+ }
++
++/* undocumented structure */
++typedef struct
++{
++    UINT32 unk; /* 0x0: AGS sets this to 2 */
++    UINT32 tf; /* 0x4: transfer function ADL_TF_* */
++    UINT32 colorspace; /* 0x8: ADL_CS_* */
++    UINT32 reserved; /* 0xc: (padding) */
++    double chromaticityGreenX; /* 0x10 -> local_a8[4-5] (local_a8 is uint*) */
++    double chromaticityGreenY; /* 0x18 -> local_a8[6-7] */
++    double chromaticityBlueX; /* 0x20 -> local_a8[8-9] */
++    double chromaticityBlueY; /* 0x28 -> local_a8[10-0xb] */
++    double chromaticityRedX; /* 0x30 -> local_a8[0xc-0xd] */
++    double chromaticityRedY; /* 0x38 -> local_a8[0xe-0xf] */
++    double chromaticityWhiteX; /* 0x40 -> local_a8[0x10-0x11] */
++    double chromaticityWhiteY; /* 0x48 -> local_a8[0x12-0x13] */
++    double minLuminance; /* 0x50 -> local_a8[0x14-0x15] */
++    double maxLuminance; /* 0x58 -> local_a8[0x16-0x17] */
++    double maxContentLightLevel; /* 0x60 -> local_a8[0x18-0x19] */
++    double maxFrameAverageLightLevel; /* 0x68 -> local_a8[0x1a-0x1b] */
++    UINT32 disableLocalDimming; /* 0x70 -> local_a8[0x1c] */
++} ADLSourceContentAttributes;
++
++int CDECL ADL2_Display_SourceContentAttribute_Set(ADL_CONTEXT_HANDLE ptr, int adapter_index, int display_index,
++                                                  ADLSourceContentAttributes *attributes)
++{
++    HMODULE dxgi;
++    typeof(CreateDXGIFactory1) *pCreateDXGIFactory1;
++    DXGI_COLOR_SPACE_TYPE colorspace;
++    DXGI_HDR_METADATA_HDR10 metadata;
++    IDXGIVkInteropFactory1 *dxgi_interop = NULL;
++    IDXGIFactory1 *factory;
++    struct gpu *gpu;
++    int ret = ADL_OK;
++    TRACE("ctx %p adapter %d display %d attr %p\n", ptr, adapter_index, display_index, attributes);
++
++    if (adapter_index >= ptr->adapter_count) return ADL_ERR_INVALID_ADL_IDX;
++    gpu = ptr->adapters[adapter_index].gpu;
++    if (gpu->display_count >= display_index) return ADL_ERR_INVALID_ADL_IDX;
++
++    if (attributes->unk != 2)
++    {
++        FIXME("unk was not 2!\n");
++        return ADL_ERR;
++    }
++
++    if (!(dxgi = LoadLibraryW(L"dxgi.dll"))) return ADL_ERR;
++
++    if (!(pCreateDXGIFactory1 = (void *)GetProcAddress(dxgi, "CreateDXGIFactory1")))
++    {
++        ERR("Could not find CreateDXGIFactory1.\n");
++        return ADL_ERR;
++    }
++
++    if (FAILED(pCreateDXGIFactory1(&IID_IDXGIFactory1, (void**)&factory)))
++        return ADL_ERR;
++
++    if (FAILED(IDXGIFactory1_QueryInterface(factory, &IID_IDXGIVkInteropFactory1, (void**)&dxgi_interop)))
++    {
++        WARN("Failed to get IDXGIVkInteropFactory1.\n");
++        ret = ADL_ERR;
++        goto done;
++    }
++
++    /* we can only support a limited number of colorspace + tf combinations */
++    if (attributes->colorspace == ADL_CS_BT2020 && attributes->tf == ADL_TF_PQ2084)
++        colorspace = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
++    else if (attributes->colorspace == ADL_CS_scRGB_MS_REF && attributes->tf == ADL_TF_LINEAR_0_125)
++        colorspace = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
++    else
++    {
++        colorspace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
++        if (attributes->colorspace != ADL_CS_sRGB || attributes->tf != ADL_TF_sRGB)
++            FIXME("Unknown colorspace %u, tf %u\n", attributes->colorspace, attributes->tf);
++    }
++
++    metadata.RedPrimary[0] = attributes->chromaticityRedX * 50000;
++    metadata.RedPrimary[1] = attributes->chromaticityRedY * 50000;
++    metadata.GreenPrimary[0] = attributes->chromaticityGreenX * 50000;
++    metadata.GreenPrimary[1] = attributes->chromaticityGreenY * 50000;
++    metadata.BluePrimary[0] = attributes->chromaticityBlueX * 50000;
++    metadata.BluePrimary[1] = attributes->chromaticityBlueY * 50000;
++    metadata.WhitePoint[0] = attributes->chromaticityWhiteX * 50000;
++    metadata.WhitePoint[1] = attributes->chromaticityWhiteY * 50000;
++    metadata.MaxContentLightLevel = attributes->maxContentLightLevel;
++    metadata.MaxFrameAverageLightLevel = attributes->maxFrameAverageLightLevel;
++    metadata.MaxMasteringLuminance = attributes->maxLuminance;
++    metadata.MinMasteringLuminance = attributes->minLuminance / 0.0001f;
++
++    /* FIXME: we have no way of respecting the display index, but the AGS implementation has the same limitation */
++    if (FAILED(IDXGIVkInteropFactory1_SetGlobalHDRState(dxgi_interop, colorspace, &metadata)))
++        ret = ADL_ERR;
++
++done:
++    if (dxgi_interop) IDXGIVkInteropFactory1_Release(dxgi_interop);
++    IDXGIFactory1_Release(factory);
++    FreeLibrary(dxgi);
++    return ret;
++}
++
++int CDECL ADL_Display_SourceContentAttribute_Set(int adapter_index, int display_index,
++                                                 ADLSourceContentAttributes *attributes)
++{
++    return ADL2_Display_SourceContentAttribute_Set(default_ctx, adapter_index, display_index, attributes);
++}
+diff --git a/dlls/atiadlxx/dxvk_interfaces.idl b/dlls/atiadlxx/dxvk_interfaces.idl
+new file mode 100644
+index 00000000000..110cdb94896
+--- /dev/null
++++ b/dlls/atiadlxx/dxvk_interfaces.idl
+@@ -0,0 +1,151 @@
++/*
++ * Copyright 2023      Paul Gofman for CodeWeavers
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++import "d3d11.idl";
++import "dxgi1_6.idl";
++
++typedef struct VkInstance_T *VkInstance;
++typedef void (__stdcall *PFN_vkVoidFunction)(void);
++typedef PFN_vkVoidFunction (__stdcall *PFN_vkGetInstanceProcAddr)(VkInstance instance, const char* pName);
++
++typedef enum D3D11_VK_EXTENSION
++{
++    D3D11_VK_EXT_MULTI_DRAW_INDIRECT,
++    D3D11_VK_EXT_MULTI_DRAW_INDIRECT_COUNT,
++    D3D11_VK_EXT_DEPTH_BOUNDS,
++    D3D11_VK_EXT_BARRIER_CONTROL,
++    D3D11_VK_NVX_BINARY_IMPORT,
++    D3D11_VK_NVX_IMAGE_VIEW_HANDLE,
++} D3D11_VK_EXTENSION;
++
++typedef enum D3D11_VK_BARRIER_CONTROL
++{
++    D3D11_VK_BARRIER_CONTROL_IGNORE_WRITE_AFTER_WRITE = 0x1,
++    D3D11_VK_BARRIER_CONTROL_IGNORE_GRAPHICS_UAV = 0x2,
++} D3D11_VK_BARRIER_CONTROL;
++
++[
++    object,
++    uuid(bb8a4fb9-3935-4762-b44b-35189a26414a),
++    local,
++    pointer_default(unique)
++]
++interface ID3D11VkExtShader : IUnknown
++{
++    HRESULT GetSpirvCode([in, out] SIZE_T *code_size, [out] void *code);
++}
++
++[
++    object,
++    uuid(8a6e3c42-f74c-45b7-8265-a231b677ca17),
++    local,
++    pointer_default(unique)
++]
++interface ID3D11VkExtDevice : IUnknown
++{
++    BOOL GetExtensionSupport([in] D3D11_VK_EXTENSION extension);
++}
++
++[
++    object,
++    uuid(cfcf64ef-9586-46d0-bca4-97cf2ca61b06),
++    local,
++    pointer_default(unique)
++]
++interface ID3D11VkExtDevice1 : ID3D11VkExtDevice
++{
++    BOOL GetResourceHandleGPUVirtualAddressAndSizeNVX([in] void *object, [out] UINT64 *gpu_va_start,
++            [out] UINT64 *gpu_va_size);
++    BOOL CreateUnorderedAccessViewAndGetDriverHandleNVX([in] ID3D11Resource *resource,
++            [in] const D3D11_UNORDERED_ACCESS_VIEW_DESC *desc, [out] ID3D11UnorderedAccessView **uav,
++            UINT32 *driver_handle);
++    BOOL CreateShaderResourceViewAndGetDriverHandleNVX([in] ID3D11Resource *resource,
++            [in] const D3D11_SHADER_RESOURCE_VIEW_DESC* desc, [out] ID3D11ShaderResourceView **srv,
++            UINT32 *dirver_handle);
++    BOOL CreateSamplerStateAndGetDriverHandleNVX([in] const D3D11_SAMPLER_DESC *sample_desc,
++            [out] ID3D11SamplerState **sample_state, UINT32 *driver_handle);
++    BOOL CreateCubinComputeShaderWithNameNVX([in] const void *cubin, [in] UINT32 size, [in] UINT32 block_x,
++            [in] UINT32 block_y, [in] UINT32 block_z, [in] const char *shader_name, [out] IUnknown **shader);
++    BOOL GetCudaTextureObjectNVX([in] UINT32 srv_driver_hadnle, [in] UINT32 sample_driver_handle,
++            [out] UINT32 *cuda_texture_handle);
++}
++
++[
++    object,
++    uuid(fd0bca13-5cb6-4c3a-987e-4750de2ca791),
++    local,
++    pointer_default(unique)
++]
++interface ID3D11VkExtContext : IUnknown
++{
++    void MultiDrawIndirect([in] UINT draw_count, [in] ID3D11Buffer *buffer_for_args, [in] UINT byte_offset_for_args,
++            [in] UINT byte_stride_for_args);
++    void MultiDrawIndexedIndirect([in] UINT draw_count, [in] ID3D11Buffer *buffer_for_args,
++            [in] UINT byte_offset_for_args, [in] UINT byte_stride_for_args);
++    void MultiDrawIndirectCount([in] UINT max_draw_count, [in] ID3D11Buffer *buffer_for_count,
++            [in] UINT byte_offset_for_count, [in] ID3D11Buffer *buffer_for_args,
++            [in] UINT byte_offset_for_args, [in] UINT byte_stride_for_args);
++    void MultiDrawIndexedIndirectCount([in] UINT max_draw_count, [in] ID3D11Buffer *buffer_for_count,
++            [in] UINT byte_offset_for_count, [in] ID3D11Buffer *buffer_for_args,
++            [in] UINT byte_offset_for_args, [in] UINT byte_stride_for_args);
++    void SetDepthBoundsTest([in] BOOL enable, [in] FLOAT min_depth_bounds, [in] FLOAT max_depth_bounds);
++    void SetBarrierControl([in] UINT control_flags);
++}
++
++[
++    object,
++    uuid(874b09b2-ae0b-41d8-8476-5f3b7a0e879d),
++    local,
++    pointer_default(unique)
++]
++interface ID3D11VkExtContext1 : ID3D11VkExtContext
++{
++    BOOL LaunchCubinShaderNVX([in] IUnknown *shader,[in] UINT32 grid_x, [in] UINT32 grid_y, [in] UINT32 grid_z,
++            [in] const void *params, [in] UINT32 param_size, [in] void * const *read_resources,
++            [in] UINT32 read_resource_count, [in] void* const *write_resources, [in] UINT32 write_resources_count);
++}
++
++[
++    object,
++    uuid(4c5e1b0d-b0c8-4131-bfd8-9b2476f7f408),
++    local,
++    pointer_default(unique)
++]
++interface IDXGIVkInteropFactory : IUnknown
++{
++    void GetVulkanInstance(
++          [out] VkInstance *pInstance,
++          [out] PFN_vkGetInstanceProcAddr *ppfnVkGetInstanceProcAddr);
++}
++
++[
++    object,
++    uuid(2a289dbd-2d0a-4a51-89f7-f2adce465cd6),
++    local,
++    pointer_default(unique)
++]
++interface IDXGIVkInteropFactory1 : IDXGIVkInteropFactory
++{
++  HRESULT GetGlobalHDRState(
++          [out] DXGI_COLOR_SPACE_TYPE   *pOutColorSpace,
++          [out] DXGI_HDR_METADATA_HDR10 *ppOutMetadata) = 0;
++
++  HRESULT SetGlobalHDRState(
++          [in] DXGI_COLOR_SPACE_TYPE    ColorSpace,
++    [in] const DXGI_HDR_METADATA_HDR10 *pMetadata) = 0;
++}
+-- 
+2.55.0
+

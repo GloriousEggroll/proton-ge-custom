@@ -1,0 +1,194 @@
+From 10669345943915c16f2a6ec1ec53b8fe30e88f9b Mon Sep 17 00:00:00 2001
+From: Etaash Mathamsetty
+ <45927311+Etaash-mathamsetty@users.noreply.github.com>
+Date: Fri, 17 Jul 2026 03:13:31 -0400
+Subject: [PATCH 197/268] winewayland: Implement ActivateWindow.
+
+Finally we do this without hacks :)
+---
+ dlls/winewayland.drv/wayland_surface.c | 42 +++++++++++++++++---------
+ dlls/winewayland.drv/waylanddrv.h      |  4 ++-
+ dlls/winewayland.drv/waylanddrv_main.c | 15 +++++++++
+ dlls/winewayland.drv/window.c          | 21 ++++++++++++-
+ 4 files changed, 66 insertions(+), 16 deletions(-)
+
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 5b3a9983727..3ffa8150b98 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -1887,7 +1887,6 @@ static void xdg_activation_token_handle_done(void *user_data,
+     struct wayland_win_data *data;
+     struct wayland_surface *surface;
+ 
+-
+     if ((data = wayland_win_data_get(hwnd)))
+     {
+         if ((surface = data->wayland_surface))
+@@ -1895,32 +1894,47 @@ static void xdg_activation_token_handle_done(void *user_data,
+         wayland_win_data_release(data);
+     }
+ 
+-    xdg_activation_token_v1_destroy(xdg_activation_token_v1);
++    if (xdg_activation_token_v1) xdg_activation_token_v1_destroy(xdg_activation_token_v1);
+ }
+ 
+ const static struct xdg_activation_token_v1_listener xdg_activation_listener = {
+     xdg_activation_token_handle_done
+ };
+ 
+-void wayland_surface_activate(struct wayland_surface *surface)
++void wayland_surface_activate(struct wayland_surface *surface, BOOL activate)
+ {
++    struct wayland_seat *seat = &process_wayland.seat;
+     struct xdg_activation_token_v1 *token;
++    uint32_t serial = ReadAcquire(&process_wayland.input_serial);
+     assert(surface);
+ 
+-    if (process_wayland.xdg_activation_v1)
+-    {
+-        token = xdg_activation_v1_get_activation_token(process_wayland.xdg_activation_v1);
++    if (!process_wayland.xdg_activation_v1) return;
++    if (!wayland_surface_is_toplevel(surface)) return;
+ 
+-        if (!token)
+-        {
+-            ERR("Failed to create activation token!\n");
+-            return;
+-        }
++    /* fall back to the per process activation token */
++    if (!serial && activate && process_activate_token)
++    {
++        xdg_activation_token_handle_done(surface->hwnd, NULL, process_activate_token);
++        free(process_activate_token);
++        process_activate_token = NULL;
++        return;
++    }
+ 
+-        xdg_activation_token_v1_add_listener(token, &xdg_activation_listener, surface->hwnd);
+-        xdg_activation_token_v1_set_surface(token, surface->wl_surface);
+-        xdg_activation_token_v1_commit(token);
++    if (!(token = xdg_activation_v1_get_activation_token(process_wayland.xdg_activation_v1)))
++    {
++        ERR("Failed to create activation token!\n");
++        return;
+     }
++
++    pthread_mutex_lock(&seat->mutex);
++
++    xdg_activation_token_v1_add_listener(token, &xdg_activation_listener, surface->hwnd);
++    xdg_activation_token_v1_set_surface(token, surface->wl_surface);
++    if (process_name && activate) xdg_activation_token_v1_set_app_id(token, process_name);
++    if (activate) xdg_activation_token_v1_set_serial(token, serial, seat->wl_seat);
++    xdg_activation_token_v1_commit(token);
++
++    pthread_mutex_unlock(&seat->mutex);
+ }
+ 
+ static BOOL use_inhibit(void)
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index 0e2fb5577f8..a7c208bc33e 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -70,6 +70,7 @@ struct xkb_compose_table;
+  *          Globals
+  */
+ 
++extern char *process_activate_token;
+ extern char *process_name;
+ extern struct wayland process_wayland;
+ 
+@@ -471,7 +472,7 @@ void wayland_surface_set_title(struct wayland_surface *surface, LPCWSTR title);
+ void wayland_surface_assign_icon(struct wayland_surface *surface);
+ void wayland_surface_set_icon_buffer(struct wayland_surface *surface, UINT type, const ICONINFO *ii);
+ void wayland_surface_set_opacity(struct wayland_surface *surface, BYTE alpha, UINT flags);
+-void wayland_surface_activate(struct wayland_surface *surface);
++void wayland_surface_activate(struct wayland_surface *surface, BOOL serial);
+ void wayland_surface_shortcut_control(struct wayland_surface *surface, BOOL inhibit);
+ 
+ static inline BOOL wayland_surface_is_toplevel(struct wayland_surface *surface)
+@@ -602,6 +603,7 @@ RGNDATA *get_region_data(HRGN region);
+  *          USER driver functions
+  */
+ 
++void WAYLAND_ActivateWindow(HWND hwnd, HWND previous);
+ LRESULT WAYLAND_ClipboardWindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
+ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset);
+ LRESULT WAYLAND_DesktopWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
+diff --git a/dlls/winewayland.drv/waylanddrv_main.c b/dlls/winewayland.drv/waylanddrv_main.c
+index 4b379fdb340..9fe3e2f2265 100644
+--- a/dlls/winewayland.drv/waylanddrv_main.c
++++ b/dlls/winewayland.drv/waylanddrv_main.c
+@@ -35,9 +35,11 @@
+ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
+ 
+ char *process_name = NULL;
++char *process_activate_token = NULL;
+ 
+ static const struct user_driver_funcs waylanddrv_funcs =
+ {
++    .pActivateWindow = WAYLAND_ActivateWindow,
+     .pClipboardWindowProc = WAYLAND_ClipboardWindowProc,
+     .pClipCursor = WAYLAND_ClipCursor,
+     .pDesktopWindowProc = WAYLAND_DesktopWindowProc,
+@@ -94,6 +96,18 @@ static void wayland_init_process_name(void)
+     }
+ }
+ 
++static void wayland_init_activation_token(void)
++{
++    char *env;
++
++    if ((env = getenv("XDG_ACTIVATION_TOKEN")))
++        process_activate_token = strdup(env);
++    else if ((env = getenv("DESKTOP_STARTUP_ID")))
++        process_activate_token = strdup(env);
++
++    TRACE("activation token %s\n", debugstr_a(process_activate_token));
++}
++
+ static NTSTATUS waylanddrv_unix_init(void *arg)
+ {
+     /* Set the user driver functions now so that they are available during
+@@ -101,6 +115,7 @@ static NTSTATUS waylanddrv_unix_init(void *arg)
+     __wine_set_user_driver(&waylanddrv_funcs, WINE_GDI_DRIVER_VERSION);
+ 
+     wayland_init_process_name();
++    wayland_init_activation_token();
+ 
+     if (!wayland_process_init()) goto err;
+ 
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index 238091087ec..77f507234d2 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -870,7 +870,26 @@ void WAYLAND_FlashWindowEx(FLASHWINFO *info)
+     if ((data = wayland_win_data_get(info->hwnd)))
+     {
+         if (data->wayland_surface && info->dwFlags)
+-            wayland_surface_activate(data->wayland_surface);
++            wayland_surface_activate(data->wayland_surface, FALSE);
++        wayland_win_data_release(data);
++    }
++}
++
++/***********************************************************************
++ *           WAYLAND_ActivateWindow
++ */
++void WAYLAND_ActivateWindow(HWND hwnd, HWND previous)
++{
++    struct wayland_win_data *data;
++
++    TRACE("hwnd=%p previous=%p\n", hwnd, previous);
++
++    if (hwnd == previous) return;
++
++    if ((data = wayland_win_data_get(hwnd)))
++    {
++        if (data->wayland_surface)
++            wayland_surface_activate(data->wayland_surface, TRUE);
+         wayland_win_data_release(data);
+     }
+ }
+-- 
+2.55.0
+
