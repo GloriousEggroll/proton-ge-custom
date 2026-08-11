@@ -156,7 +156,7 @@ echo "Fetching release for your arch..."
 
 case "$(uname -m)" in
     aarch64|arm64) tarball_pattern='\-aarch64\.tar\.gz$' ;;
-    x86_64)        tarball_pattern='GE-Proton[0-9]+-[0-9]+\.tar\.gz$' ;;
+    x86_64)        tarball_pattern='\-x86_64\.tar\.gz$' ;;
     *)
         echo "Error: Unsupported architecture: $(uname -m)." >&2
         echo "GE-Proton is only available for x86_64 and aarch64." >&2
@@ -314,7 +314,7 @@ echo "Fetching release for your arch..."
 
 case "$(uname -m)" in
     aarch64|arm64) tarball_pattern='-aarch64\.tar\.gz$' ;;
-    x86_64)        tarball_pattern='GE-Proton[0-9]+-[0-9]+\.tar\.gz$' ;;
+    x86_64)        tarball_pattern='\-x86_64\.tar\.gz$' ;;
     *)
         echo "Error: Unsupported architecture: $(uname -m)." >&2
         echo "GE-Proton is only available for x86_64 and aarch64." >&2
