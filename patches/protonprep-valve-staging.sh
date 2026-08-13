@@ -308,6 +308,9 @@ apply_all_in_dir() {
     echo "WINE: -FSR- fullscreen hack fsr patch"
     apply_patch "../patches/proton/0001-fshack-Implement-AMD-FSR-upscaler-for-fullscreen-hac.patch"
 
+    echo "WINE: Implement NtGdiDdDDIQueryAdapterInfo cases required for some games"
+    apply_patch "../patches/proton/0001-win32u-Implement-NtGdiDdDDIQueryAdapterInfo-cases.patch"
+
     echo "WINE: -Nvidia Reflex- Support VK_NV_low_latency2"
     apply_patch "../patches/proton/83-nv_low_latency_wine.patch"
 
