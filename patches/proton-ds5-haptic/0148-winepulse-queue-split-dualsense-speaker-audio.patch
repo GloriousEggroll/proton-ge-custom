@@ -1,0 +1,237 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Wed, 12 Aug 2026 21:30:00 -0600
+Subject: [PATCH] winepulse: Queue split DualSense speaker audio
+
+The private controller-speaker stream previously truncated every application
+buffer to Pulse's immediately writable size. A full or partially full server
+queue therefore discarded BB audio permanently, while the raw actuator stream
+and public WASAPI timeline continued normally.
+
+Keep a bounded local speaker queue and drain it both after each render release
+and from Pulse's write callback. Retain at most 250 ms so a stalled endpoint
+cannot replay stale effects. Connect this private stream at normal gain rather
+than inheriting any stale per-stream restore volume. Also trace the actual
+post-mix channel-1 peak, pending bytes, and dropped bytes once per second; this
+distinguishes a silent Wwise mastering voice from downstream Pulse or HID
+routing failures.
+
+This remains restricted to streams created by PROTON_DUALSENSE_SPLIT_AUDIO and
+does not change the independently paced main game or raw haptic paths.
+---
+ dlls/winepulse.drv/pulse.c | 137 +++++++++++++++++++++++++++++++++-----
+ 1 file changed, 119 insertions(+), 18 deletions(-)
+
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -118,7 +118,9 @@ struct pulse_stream
+     int16_t *haptic_buffer;
+     SIZE_T haptic_buffer_frames;
+     BYTE *speaker_buffer;
+-    SIZE_T speaker_buffer_bytes;
++    SIZE_T speaker_buffer_bytes, speaker_buffer_held, speaker_dropped_bytes;
++    float speaker_peak;
++    pa_usec_t speaker_trace_time;
+     unsigned int haptic_channel_peak[4];
+     pa_usec_t haptic_channel_trace_time;
+     pa_usec_t haptic_reconnect_time;
+@@ -2484,8 +2486,52 @@ static BOOL pulse_split_speaker_ready(const struct pulse_stream *stream)
+     return stream->speaker_stream && pa_stream_get_state(stream->speaker_stream) == PA_STREAM_READY;
+ }
+ 
++static void pulse_split_speaker_drain(struct pulse_stream *stream)
++{
++    SIZE_T bytes, sample_size, writable;
++
++    if (!pulse_split_speaker_ready(stream) || !stream->speaker_buffer_held)
++        return;
++
++    sample_size = pa_sample_size_of_format(stream->ss.format);
++    writable = pa_stream_writable_size(stream->speaker_stream);
++    if (!sample_size || writable == (SIZE_T)-1)
++        return;
++
++    bytes = min(stream->speaker_buffer_held, writable);
++    bytes -= bytes % sample_size;
++    if (!bytes)
++        return;
++
++    if (pa_stream_write(stream->speaker_stream, stream->speaker_buffer, bytes,
++            NULL, 0, PA_SEEK_RELATIVE) < 0)
++    {
++        WARN("Failed to write queued split DualSense speaker audio: %d.\n",
++                pa_context_errno(pulse_ctx));
++        return;
++    }
++
++    stream->speaker_buffer_held -= bytes;
++    if (stream->speaker_buffer_held)
++        memmove(stream->speaker_buffer, stream->speaker_buffer + bytes,
++                stream->speaker_buffer_held);
++}
++
++static void pulse_split_speaker_write_callback(pa_stream *s, size_t bytes, void *user)
++{
++    struct pulse_stream *stream = user;
++
++    if (stream && s == stream->speaker_stream && bytes)
++        pulse_split_speaker_drain(stream);
++}
++
+ static void pulse_split_speaker_disconnect(struct pulse_stream *stream)
+ {
++    stream->speaker_buffer_held = 0;
++    stream->speaker_dropped_bytes = 0;
++    stream->speaker_peak = 0.0f;
++    stream->speaker_trace_time = 0;
++
+     if (!stream->speaker_stream)
+         return;
+ 
+@@ -2503,5 +2549,6 @@ static HRESULT pulse_split_speaker_connect(struct pulse_stream *stream, const ch
+     pa_sample_spec ss = stream->ss;
+     pa_channel_map map;
++    pa_cvolume volume;
+     pa_buffer_attr attr;
+     UINT32 source_frame_size, speaker_frame_size, period_frames;
+     char name[64];
+@@ -2536,5 +2581,8 @@ static HRESULT pulse_split_speaker_connect(struct pulse_stream *stream, const ch
+ 
+     pa_stream_set_state_callback(stream->speaker_stream, pulse_split_speaker_state, stream);
++    pa_stream_set_write_callback(stream->speaker_stream,
++            pulse_split_speaker_write_callback, stream);
+-    ret = pa_stream_connect_playback(stream->speaker_stream, pulse_name, &attr, flags, NULL, NULL);
++    pa_cvolume_set(&volume, ss.channels, PA_VOLUME_NORM);
++    ret = pa_stream_connect_playback(stream->speaker_stream, pulse_name, &attr, flags, &volume, NULL);
+     if (ret < 0)
+         goto failed;
+@@ -3357,41 +3406,98 @@ static void pulse_haptic_trace_channels(struct pulse_stream *stream, const int16
+ 
+ static void pulse_split_speaker_write(struct pulse_stream *stream, const BYTE *src, UINT32 frames)
+ {
+-    SIZE_T sample_size, bytes, writable;
++    SIZE_T sample_size, bytes, max_queue, required, source_offset = 0;
++    pa_usec_t now;
+     UINT32 frame;
+ 
+     if (!pulse_split_speaker_ready(stream))
+         return;
+ 
+     sample_size = pa_sample_size_of_format(stream->ss.format);
+-    writable = pa_stream_writable_size(stream->speaker_stream);
+-    if (!sample_size || writable == (SIZE_T)-1)
++    if (!sample_size || stream->ss.channels < 2)
+         return;
+ 
+-    frames = min(frames, writable / sample_size);
+     bytes = (SIZE_T)frames * sample_size;
+     if (!bytes)
+         return;
+ 
+-    if (bytes > stream->speaker_buffer_bytes)
++    pulse_split_speaker_drain(stream);
++
++    /* Keep at most 250 ms locally. If the server stops consuming, retain
++     * current effects rather than replaying stale controller audio later. */
++    max_queue = max((SIZE_T)stream->ss.rate * sample_size / 4,
++            (SIZE_T)stream->period_bytes / stream->ss.channels * 3);
++    if (bytes > max_queue)
++    {
++        source_offset = bytes - max_queue;
++        source_offset -= source_offset % sample_size;
++        stream->speaker_dropped_bytes += source_offset;
++        bytes -= source_offset;
++        frames = bytes / sample_size;
++    }
++
++    if (stream->speaker_buffer_held + bytes > max_queue)
+     {
+-        BYTE *buffer = realloc(stream->speaker_buffer, bytes);
++        SIZE_T drop = min(stream->speaker_buffer_held,
++                stream->speaker_buffer_held + bytes - max_queue);
++
++        drop -= drop % sample_size;
++        stream->speaker_buffer_held -= drop;
++        stream->speaker_dropped_bytes += drop;
++        if (stream->speaker_buffer_held)
++            memmove(stream->speaker_buffer, stream->speaker_buffer + drop,
++                    stream->speaker_buffer_held);
++    }
++
++    required = stream->speaker_buffer_held + bytes;
++    if (required > stream->speaker_buffer_bytes)
++    {
++        SIZE_T capacity = max(required, min(max_queue,
++                max(stream->speaker_buffer_bytes * 2, (SIZE_T)4096)));
++        BYTE *buffer = realloc(stream->speaker_buffer, capacity);
+ 
+         if (!buffer)
+             return;
+         stream->speaker_buffer = buffer;
+-        stream->speaker_buffer_bytes = bytes;
++        stream->speaker_buffer_bytes = capacity;
+     }
+ 
+     /* The DualSense UCM speaker split is hardware channel 1. Preserve that
+      * Windows endpoint layout instead of applying a software downmix. */
+     for (frame = 0; frame < frames; ++frame)
+-        memcpy(stream->speaker_buffer + frame * sample_size,
+-                src + (frame * stream->ss.channels + 1) * sample_size, sample_size);
++    {
++        const BYTE *sample = src + source_offset * stream->ss.channels +
++                (frame * stream->ss.channels + 1) * sample_size;
+ 
+-    if (pa_stream_write(stream->speaker_stream, stream->speaker_buffer, bytes,
+-            NULL, 0, PA_SEEK_RELATIVE) < 0)
+-        WARN("Failed to write split DualSense speaker audio: %d.\n", pa_context_errno(pulse_ctx));
++        memcpy(stream->speaker_buffer + stream->speaker_buffer_held +
++                frame * sample_size, sample, sample_size);
++        if (TRACE_ON(pulse) && stream->ss.format == PA_SAMPLE_FLOAT32LE)
++        {
++            float value;
++
++            memcpy(&value, sample, sizeof(value));
++            if (value < 0.0f) value = -value;
++            if (value > stream->speaker_peak) stream->speaker_peak = value;
++        }
++    }
++    stream->speaker_buffer_held += bytes;
++
++    pulse_split_speaker_drain(stream);
++
++    if (!TRACE_ON(pulse))
++        return;
++    now = pa_rtclock_now();
++    if (!stream->speaker_trace_time)
++        stream->speaker_trace_time = now + 1000000;
++    else if (now >= stream->speaker_trace_time)
++    {
++        TRACE("%p split speaker peak %.9g, pending %zu bytes, dropped %zu bytes, corked %d.\n",
++                stream, stream->speaker_peak, (size_t)stream->speaker_buffer_held,
++                (size_t)stream->speaker_dropped_bytes, pa_stream_is_corked(stream->speaker_stream));
++        stream->speaker_peak = 0.0f;
++        stream->speaker_dropped_bytes = 0;
++        stream->speaker_trace_time = now + 1000000;
++    }
+ }
+ 
+ static void pulse_haptic_write(struct pulse_stream *stream)
+@@ -4623,7 +4728,7 @@ static NTSTATUS pulse_reset(void *args)
+     {
+         /* If there is still data in the render buffer it needs to be removed from the server */
+         int success = 0;
+-        if (stream->held_bytes && pulse_stream_haptic(stream))
++        if ((stream->held_bytes || stream->speaker_buffer_held) && pulse_stream_haptic(stream))
+         {
+             if (stream->haptic_pcm)
+             {
+@@ -4647,6 +4752,7 @@ static NTSTATUS pulse_reset(void *args)
+             stream->clock_lastpos = stream->clock_written = 0;
+             stream->pa_offs_bytes = stream->lcl_offs_bytes = 0;
+             stream->held_bytes = stream->pa_held_bytes = 0;
++            stream->speaker_buffer_held = 0;
+         }
+     }
+     else
+-- 
+2.55.0

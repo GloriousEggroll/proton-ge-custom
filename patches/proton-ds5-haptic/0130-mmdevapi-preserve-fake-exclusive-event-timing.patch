@@ -1,0 +1,115 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Tue, 11 Aug 2026 12:30:00 -0600
+Subject: [PATCH] mmdevapi: Preserve timing for emulated exclusive streams
+
+PROTON_MMDEV_FAKE_EXCLUSIVE previously changed the share mode before stream
+initialization. This also selected shared-mode timing, expanding an exclusive
+event-driven stream from one requested period to a three-period buffer.
+
+Death Stranding Director's Cut requests the complete exclusive buffer after
+each event. Signaling that translated stream once per shared period can leave
+only part of the expanded buffer writable, causing GetBuffer() to fail and the
+game to report an audio access violation.
+
+Keep exclusive validation and timing at the Windows API boundary, while still
+passing shared mode to the backend. Permit event-driven initialization for the
+emulated stream and retain its requested duration-equals-period buffer. The
+Pulse backend therefore receives a shared stream it can implement, but the
+application observes the exclusive event and buffer cadence it requested.
+
+---
+ dlls/mmdevapi/client.c | 29 ++++++++++++++++++-----------
+ 1 file changed, 18 insertions(+), 11 deletions(-)
+
+--- a/dlls/mmdevapi/client.c
++++ b/dlls/mmdevapi/client.c
+@@ -142,7 +142,7 @@
+ static HRESULT adjust_timing(struct audio_client *client, const BOOLEAN force_def_period,
+                              REFERENCE_TIME *duration, REFERENCE_TIME *period,
+                              const AUDCLNT_SHAREMODE mode, const DWORD flags,
+-                             const WAVEFORMATEX *fmt)
++                             const WAVEFORMATEX *fmt, const BOOL fake_exclusive)
+ {
+     REFERENCE_TIME def_period, min_period;
+     HRESULT hr;
+@@ -163,7 +163,7 @@
+             *duration = 3 * *period;
+     } else {
+         const WAVEFORMATEXTENSIBLE *fmtex = (WAVEFORMATEXTENSIBLE *)fmt;
+-        if (fmtex->Format.wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
++        if (!fake_exclusive && fmtex->Format.wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+            (fmtex->dwChannelMask == 0 || fmtex->dwChannelMask & SPEAKER_RESERVED))
+             return AUDCLNT_E_UNSUPPORTED_FORMAT;
+         else {
+@@ -177,9 +177,10 @@
+                 if (*duration != *period)
+                     return AUDCLNT_E_BUFDURATION_PERIOD_NOT_EQUAL;
+ 
+-                FIXME("EXCLUSIVE mode with EVENTCALLBACK\n");
+-
+-                return AUDCLNT_E_DEVICE_IN_USE;
++                if (!fake_exclusive) {
++                    FIXME("EXCLUSIVE mode with EVENTCALLBACK\n");
++                    return AUDCLNT_E_DEVICE_IN_USE;
++                }
+             } else if (*duration < 8 * *period)
+                 *duration = 8 * *period; /* May grow above 2s. */
+         }
+@@ -503,6 +504,7 @@
+                            const WAVEFORMATEX *fmt, const GUID *sessionguid)
+ {
+     struct create_stream_params params;
++    BOOL fake_exclusive;
+     UINT32 i, channel_count;
+     stream_handle stream;
+     WCHAR *name;
+@@ -516,6 +518,8 @@
+     if (mode != AUDCLNT_SHAREMODE_SHARED && mode != AUDCLNT_SHAREMODE_EXCLUSIVE)
+         return E_INVALIDARG;
+ 
++    fake_exclusive = mode == AUDCLNT_SHAREMODE_EXCLUSIVE && device_fake_exclusive();
++
+     if (flags & ~(AUDCLNT_STREAMFLAGS_CROSSPROCESS |
+                   AUDCLNT_STREAMFLAGS_LOOPBACK |
+                   AUDCLNT_STREAMFLAGS_EVENTCALLBACK |
+@@ -532,7 +536,7 @@
+     if (flags & AUDCLNT_STREAMFLAGS_CROSSPROCESS)
+         FIXME("Cross-process sessions not supported\n");
+ 
+-    hr = validate_wfx(fmt, mode);
++    hr = validate_wfx(fmt, fake_exclusive ? AUDCLNT_SHAREMODE_SHARED : mode);
+ 
+     if (hr == S_FALSE)
+         hr = AUDCLNT_E_UNSUPPORTED_FORMAT;
+@@ -583,7 +587,8 @@
+         client->dataflow = eCapture;
+     }
+ 
+-    if (FAILED(params.result = adjust_timing(client, force_def_period, &duration, &period, mode, flags, fmt))) {
++    if (FAILED(params.result = adjust_timing(client, force_def_period, &duration, &period,
++            mode, flags, fmt, fake_exclusive))) {
+         sessions_unlock();
+         return params.result;
+     }
+@@ -591,7 +596,7 @@
+     params.name = name   = get_application_name();
+     params.device        = client->device_name;
+     params.flow          = client->dataflow;
+-    params.share         = mode;
++    params.share         = fake_exclusive ? AUDCLNT_SHAREMODE_SHARED : mode;
+     params.flags         = flags;
+     params.duration      = duration;
+     params.period        = period;
+@@ -827,9 +832,6 @@
+                                                wine_dbgstr_longlong(period), fmt,
+                                                debugstr_guid(sessionguid));
+ 
+-    if (mode == AUDCLNT_SHAREMODE_EXCLUSIVE && device_fake_exclusive())
+-        mode = AUDCLNT_SHAREMODE_SHARED;
+-
+     return stream_init(This, TRUE, mode, flags, duration, period, fmt, sessionguid);
+ }
+ 
+-- 
+2.55.0

@@ -1,0 +1,184 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Tue, 11 Aug 2026 20:45:00 -0600
+Subject: [PATCH] mmdevapi: Gate Death Stranding controller effects on its
+ active output
+
+Forcing sGetFootSoundToControllerSpeaker to return true before Wwise has
+created its controller-speaker secondary output causes an access violation
+during startup. The game already has an sGetControllerSpeakerEnable callback
+which returns true only while that output is valid.
+
+Locate both registered callbacks and redirect the environmental-effects
+callback to the game's own output-state callback. Keep strict signatures for
+both functions so the hook fails closed after an incompatible game update.
+---
+ dlls/mmdevapi/main.c | 115 +++++++++++++++++++++++++++----------------
+ 1 file changed, 73 insertions(+), 42 deletions(-)
+
+--- a/dlls/mmdevapi/main.c
++++ b/dlls/mmdevapi/main.c
+@@ -125,14 +125,22 @@
+ 
+ static BOOL enable_death_stranding_controller_effects(void)
+ {
+-    static const char callback_name[] = "Wwise::sGetFootSoundToControllerSpeaker";
++    static const char *const callback_names[] =
++    {
++        "Wwise::sGetFootSoundToControllerSpeaker",
++        "Wwise::sGetControllerSpeakerEnable",
++    };
+     HMODULE module = GetModuleHandleW(NULL);
+-    BYTE *base = (BYTE *)module, *name = NULL, *reference = NULL, *callback;
++    BYTE *base = (BYTE *)module;
++    BYTE *names[ARRAY_SIZE(callback_names)] = {0};
++    BYTE *references[ARRAY_SIZE(callback_names)] = {0};
++    BYTE *callbacks[ARRAY_SIZE(callback_names)] = {0};
+     IMAGE_NT_HEADERS *nt;
+     IMAGE_SECTION_HEADER *section;
+     DWORD old_protect;
+     WCHAR value[2];
+-    unsigned int i;
++    INT32 jump_offset;
++    unsigned int i, k;
+ 
+     if (GetEnvironmentVariableW(L"PROTON_DEATH_STRANDING_CONTROLLER_EFFECTS", value, ARRAY_SIZE(value)) != 1
+             || value[0] != '1')
+@@ -140,69 +148,92 @@
+     if (!(nt = RtlImageNtHeader(module))) return FALSE;
+ 
+     section = IMAGE_FIRST_SECTION(nt);
+-    for (i = 0; i < nt->FileHeader.NumberOfSections && !name; ++i)
++    for (k = 0; k < ARRAY_SIZE(callback_names); ++k)
+     {
+-        BYTE *start = base + section[i].VirtualAddress;
+-        SIZE_T size = section[i].Misc.VirtualSize;
+-        SIZE_T j;
++        SIZE_T name_size = strlen(callback_names[k]) + 1;
+ 
+-        if (section[i].Characteristics & IMAGE_SCN_MEM_EXECUTE || size < sizeof(callback_name)) continue;
+-        for (j = 0; j <= size - sizeof(callback_name); ++j)
++        for (i = 0; i < nt->FileHeader.NumberOfSections && !names[k]; ++i)
+         {
+-            if (!memcmp(start + j, callback_name, sizeof(callback_name)))
++            BYTE *start = base + section[i].VirtualAddress;
++            SIZE_T size = section[i].Misc.VirtualSize;
++            SIZE_T j;
++
++            if (section[i].Characteristics & IMAGE_SCN_MEM_EXECUTE || size < name_size) continue;
++            for (j = 0; j <= size - name_size; ++j)
+             {
+-                name = start + j;
+-                break;
++                if (!memcmp(start + j, callback_names[k], name_size))
++                {
++                    names[k] = start + j;
++                    break;
++                }
+             }
+         }
++        if (!names[k]) return FALSE;
+     }
+-    if (!name) return FALSE;
+ 
+-    for (i = 0; i < nt->FileHeader.NumberOfSections && !reference; ++i)
++    for (k = 0; k < ARRAY_SIZE(callback_names); ++k)
+     {
+-        BYTE *start = base + section[i].VirtualAddress;
+-        SIZE_T size = section[i].Misc.VirtualSize;
+-        SIZE_T j;
+-
+-        if (!(section[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) || size < 7) continue;
+-        for (j = 0; j <= size - 7; ++j)
++        for (i = 0; i < nt->FileHeader.NumberOfSections && !references[k]; ++i)
+         {
+-            BYTE *p = start + j;
+-            INT32 displacement;
++            BYTE *start = base + section[i].VirtualAddress;
++            SIZE_T size = section[i].Misc.VirtualSize;
++            SIZE_T j;
+ 
+-            if (p[0] != 0x4c || p[1] != 0x8d || p[2] != 0x05) continue;
+-            memcpy(&displacement, p + 3, sizeof(displacement));
+-            if (p + 7 + displacement == name)
++            if (!(section[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) || size < 7) continue;
++            for (j = 0; j <= size - 7; ++j)
+             {
+-                reference = p;
+-                break;
++                BYTE *p = start + j;
++                INT32 displacement;
++
++                if (p[0] != 0x4c || p[1] != 0x8d || p[2] != 0x05) continue;
++                memcpy(&displacement, p + 3, sizeof(displacement));
++                if (p + 7 + displacement == names[k])
++                {
++                    references[k] = p;
++                    break;
++                }
+             }
+         }
++        if (!references[k]) return FALSE;
+     }
+-    if (!reference) return FALSE;
+ 
+-    for (callback = reference; callback >= reference - 32; --callback)
++    for (k = 0; k < ARRAY_SIZE(callback_names); ++k)
+     {
+-        INT32 displacement;
+-        BYTE *target;
++        BYTE *p;
+ 
+-        if (callback[0] != 0x48 || callback[1] != 0x8d || callback[2] != 0x05) continue;
+-        memcpy(&displacement, callback + 3, sizeof(displacement));
+-        target = callback + 7 + displacement;
+-        if (target < base || target + 3 > base + nt->OptionalHeader.SizeOfImage) continue;
+-        if (target[0] != 0x32 || target[1] != 0xc0 || target[2] != 0xc3) continue;
+-
+-        if (!VirtualProtect(target, 3, PAGE_EXECUTE_READWRITE, &old_protect)) return FALSE;
+-        target[0] = 0xb0;
+-        target[1] = 0x01;
+-        target[2] = 0xc3;
+-        FlushInstructionCache(GetCurrentProcess(), target, 3);
+-        VirtualProtect(target, 3, old_protect, &old_protect);
+-        TRACE("Enabled Death Stranding controller-speaker environmental effects callback at %p.\n", target);
+-        return TRUE;
++        for (p = references[k]; p >= references[k] - 32; --p)
++        {
++            INT32 displacement;
++            BYTE *target;
++
++            if (p[0] != 0x48 || p[1] != 0x8d || p[2] != 0x05) continue;
++            memcpy(&displacement, p + 3, sizeof(displacement));
++            target = p + 7 + displacement;
++            if (target < base || target + 11 > base + nt->OptionalHeader.SizeOfImage) continue;
++            callbacks[k] = target;
++            break;
++        }
++        if (!callbacks[k]) return FALSE;
+     }
+ 
+-    return FALSE;
++    if (callbacks[0][0] != 0x32 || callbacks[0][1] != 0xc0 || callbacks[0][2] != 0xc3
++            || callbacks[0][3] != 0xcc || callbacks[0][4] != 0xcc)
++        return FALSE;
++    if (callbacks[1][0] != 0x83 || callbacks[1][1] != 0x3d || callbacks[1][6] != 0xff
++            || callbacks[1][7] != 0x0f || callbacks[1][8] != 0x95 || callbacks[1][9] != 0xc0
++            || callbacks[1][10] != 0xc3)
++        return FALSE;
++
++    jump_offset = (INT32)(callbacks[1] - callbacks[0] - 5);
++    if (callbacks[0] + 5 + jump_offset != callbacks[1]) return FALSE;
++    if (!VirtualProtect(callbacks[0], 5, PAGE_EXECUTE_READWRITE, &old_protect)) return FALSE;
++    callbacks[0][0] = 0xe9;
++    memcpy(callbacks[0] + 1, &jump_offset, sizeof(jump_offset));
++    FlushInstructionCache(GetCurrentProcess(), callbacks[0], 5);
++    VirtualProtect(callbacks[0], 5, old_protect, &old_protect);
++    TRACE("Gated Death Stranding controller-speaker environmental effects callback %p on active output %p.\n",
++            callbacks[0], callbacks[1]);
++    return TRUE;
+ }
+ 
+ static BOOL WINAPI init_driver(INIT_ONCE *once, void *param, void **context)
+-- 
+2.55.0

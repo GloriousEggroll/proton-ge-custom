@@ -1,0 +1,320 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Wed, 12 Aug 2026 19:35:00 -0600
+Subject: [PATCH] mmdevapi: Fix Death Stranding output-device transitions
+
+Death Stranding stores requested and active Wwise output hashes separately.
+When changing between two concrete devices, its replacement branch constructs
+the new output with the old active hash and then marks the requested hash as
+active. Every selection consequently targets the preceding device.
+
+Strictly identify that transition routine through its relationship to the
+validated output selector and both RIP-relative references to the requested
+hash. Replace its same-sized argument setup so R8 carries the requested hash
+while preserving the zeroed Wwise arguments.
+
+Also intercept the UI's two selected-hash stores before its settings
+transaction. A register-, vector-, and flags-preserving thunk performs the
+original store and updates Wwise immediately. Retain the settings-entry hook
+for controller endpoints discovered after saved settings were loaded.
+---
+
+--- a/dlls/mmdevapi/main.c
++++ b/dlls/mmdevapi/main.c
+@@ -44,6 +44,7 @@
+ #include "mmddk.h"
+ 
+ #include "mmdevapi_private.h"
++#include "wine/asm.h"
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(mmdevapi);
+@@ -59,27 +60,123 @@
+ 
+ static death_stranding_output_selector_t death_stranding_output_selector;
+ static LONG death_stranding_pending_output_id = -1;
++static void **death_stranding_audio_system;
+ 
+-static BOOL WINAPI death_stranding_select_controller_output(DWORD output_id)
++BOOL WINAPI death_stranding_select_controller_output(DWORD output_id)
+ {
++    BOOL ret;
++
++    ret = death_stranding_output_selector(output_id);
++    TRACE("Death Stranding stored requested output %#lx through its settings path: %d.\n",
++            output_id, ret);
++    return ret;
++}
++
++void * WINAPI death_stranding_prepare_controller_output(void *settings, BYTE setting)
++{
++    DWORD *selected_output = (DWORD *)((BYTE *)settings + 0xdc);
++    DWORD output_id;
+     LONG hash;
+     BOOL ret;
+ 
+-    hash = InterlockedExchange(&death_stranding_pending_output_id, -1);
+-    if (hash != -1 && (DWORD)hash != output_id)
++    if (setting == 0x7b || setting == 0x7c || setting == 0xff)
+     {
+-        TRACE("Death Stranding is priming controller output %#lx before requested output %#lx.\n",
+-                hash, output_id);
+-        ret = death_stranding_output_selector(hash);
++        hash = InterlockedExchange(&death_stranding_pending_output_id, -1);
++        output_id = hash == -1 ? *selected_output : hash;
++        ret = death_stranding_output_selector(output_id);
++        if (ret && hash != -1)
++            *selected_output = output_id;
++
++        TRACE("Death Stranding preselected output %#lx before applying setting %#x: %d.\n",
++                output_id, setting, ret);
+         if (!ret)
+-            WARN("Death Stranding rejected controller output %#lx; preserving requested output %#lx.\n",
+-                    hash, output_id);
++            WARN("Death Stranding rejected output %#lx before its audio settings transaction.\n",
++                    output_id);
+     }
+ 
+-    TRACE("Death Stranding is selecting requested output %#lx through its settings path.\n", output_id);
+-    return death_stranding_output_selector(output_id);
++    return *death_stranding_audio_system;
+ }
+ 
++#ifdef __x86_64__
++extern void death_stranding_prepare_controller_output_thunk(void);
++__ASM_GLOBAL_FUNC( death_stranding_prepare_controller_output_thunk,
++                   "subq $0xb8,%rsp\n\t"
++                   __ASM_CFI(".cfi_adjust_cfa_offset 0xb8\n\t")
++                   "movq %rax,0x20(%rsp)\n\t"
++                   "movq %rcx,0x28(%rsp)\n\t"
++                   "movq %rdx,0x30(%rsp)\n\t"
++                   "movq %r9,0x38(%rsp)\n\t"
++                   "movq %r10,0x40(%rsp)\n\t"
++                   "movq %r11,0x48(%rsp)\n\t"
++                   "movdqu %xmm0,0x50(%rsp)\n\t"
++                   "movdqu %xmm1,0x60(%rsp)\n\t"
++                   "movdqu %xmm2,0x70(%rsp)\n\t"
++                   "movdqu %xmm3,0x80(%rsp)\n\t"
++                   "movdqu %xmm4,0x90(%rsp)\n\t"
++                   "movdqu %xmm5,0xa0(%rsp)\n\t"
++                   "call " __ASM_NAME("death_stranding_prepare_controller_output") "\n\t"
++                   "movq %rax,%r8\n\t"
++                   "movdqu 0x50(%rsp),%xmm0\n\t"
++                   "movdqu 0x60(%rsp),%xmm1\n\t"
++                   "movdqu 0x70(%rsp),%xmm2\n\t"
++                   "movdqu 0x80(%rsp),%xmm3\n\t"
++                   "movdqu 0x90(%rsp),%xmm4\n\t"
++                   "movdqu 0xa0(%rsp),%xmm5\n\t"
++                   "movq 0x20(%rsp),%rax\n\t"
++                   "movq 0x28(%rsp),%rcx\n\t"
++                   "movq 0x30(%rsp),%rdx\n\t"
++                   "movq 0x38(%rsp),%r9\n\t"
++                   "movq 0x40(%rsp),%r10\n\t"
++                   "movq 0x48(%rsp),%r11\n\t"
++                   "addq $0xb8,%rsp\n\t"
++                   __ASM_CFI(".cfi_adjust_cfa_offset -0xb8\n\t")
++                   "ret" )
++
++extern void death_stranding_store_controller_output_thunk(void);
++__ASM_GLOBAL_FUNC( death_stranding_store_controller_output_thunk,
++                   "movl %edx,0xdc(%rbx)\n\t"
++                   "pushfq\n\t"
++                   __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
++                   "subq $0xc0,%rsp\n\t"
++                   __ASM_CFI(".cfi_adjust_cfa_offset 0xc0\n\t")
++                   "movq %rax,0x20(%rsp)\n\t"
++                   "movq %rcx,0x28(%rsp)\n\t"
++                   "movq %rdx,0x30(%rsp)\n\t"
++                   "movq %r8,0x38(%rsp)\n\t"
++                   "movq %r9,0x40(%rsp)\n\t"
++                   "movq %r10,0x48(%rsp)\n\t"
++                   "movq %r11,0x50(%rsp)\n\t"
++                   "movdqu %xmm0,0x60(%rsp)\n\t"
++                   "movdqu %xmm1,0x70(%rsp)\n\t"
++                   "movdqu %xmm2,0x80(%rsp)\n\t"
++                   "movdqu %xmm3,0x90(%rsp)\n\t"
++                   "movdqu %xmm4,0xa0(%rsp)\n\t"
++                   "movdqu %xmm5,0xb0(%rsp)\n\t"
++                   "movl %edx,%ecx\n\t"
++                   "call " __ASM_NAME("death_stranding_select_controller_output") "\n\t"
++                   "movdqu 0x60(%rsp),%xmm0\n\t"
++                   "movdqu 0x70(%rsp),%xmm1\n\t"
++                   "movdqu 0x80(%rsp),%xmm2\n\t"
++                   "movdqu 0x90(%rsp),%xmm3\n\t"
++                   "movdqu 0xa0(%rsp),%xmm4\n\t"
++                   "movdqu 0xb0(%rsp),%xmm5\n\t"
++                   "movq 0x20(%rsp),%rax\n\t"
++                   "movq 0x28(%rsp),%rcx\n\t"
++                   "movq 0x30(%rsp),%rdx\n\t"
++                   "movq 0x38(%rsp),%r8\n\t"
++                   "movq 0x40(%rsp),%r9\n\t"
++                   "movq 0x48(%rsp),%r10\n\t"
++                   "movq 0x50(%rsp),%r11\n\t"
++                   "addq $0xc0,%rsp\n\t"
++                   __ASM_CFI(".cfi_adjust_cfa_offset -0xc0\n\t")
++                   "popfq\n\t"
++                   __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
++                   "ret" )
++#else
++#define death_stranding_prepare_controller_output_thunk death_stranding_prepare_controller_output
++#define death_stranding_store_controller_output_thunk death_stranding_select_controller_output
++#endif
++
+ static const char *get_priority_string(int prio)
+ {
+     switch(prio){
+@@ -162,7 +259,27 @@
+     BYTE *callbacks[ARRAY_SIZE(callback_names)] = {0};
+     IMAGE_NT_HEADERS *nt;
+     IMAGE_SECTION_HEADER *section;
+-    BYTE *output_selector = NULL, *selector_call = NULL;
++    static const BYTE settings_prefix[] =
++    {
++        0x48, 0x8b, 0xc4, 0x53, 0x57, 0x48, 0x83, 0xec, 0x78, 0x4c, 0x8b, 0x05,
++    };
++    static const BYTE settings_suffix[] =
++    {
++        0x0f, 0xb6, 0xfa, 0x48, 0x8b, 0xd9, 0x4d, 0x85, 0xc0,
++    };
++    static const BYTE output_switch_old[] =
++    {
++        0x45, 0x33, 0xc9,                         /* xor r9d, r9d */
++        0xc7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00, /* mov [rsp+0x20], 0 */
++    };
++    static const BYTE output_switch_new[] =
++    {
++        0x45, 0x33, 0xc9,                         /* xor r9d, r9d */
++        0x44, 0x8b, 0xc3,                         /* mov r8d, ebx */
++        0x44, 0x89, 0x4c, 0x24, 0x20,             /* mov [rsp+0x20], r9d */
++    };
++    BYTE *output_selector = NULL, *selector_call = NULL, *settings_apply;
++    BYTE *ui_settings_call = NULL, *output_stores[2], *output_switch, *requested_output;
+     DWORD old_protect;
+     WCHAR value[2];
+     INT32 jump_offset;
+@@ -287,10 +404,97 @@
+     }
+     if (!selector_call) return FALSE;
+ 
++    if (output_selector + 0xdaeb > base + nt->OptionalHeader.SizeOfImage ||
++            output_selector[0xaf] != 0x89 || output_selector[0xb0] != 0x1d)
++        return FALSE;
++
++    output_switch = output_selector + 0xda40;
++    if (memcmp(output_switch, "\x48\x83\xec\x58\x48\x8b\x05", 7) ||
++            output_switch[0x2c] != 0x44 || output_switch[0x2d] != 0x8b ||
++            output_switch[0x2e] != 0x05 || output_switch[0x33] != 0x8b ||
++            output_switch[0x34] != 0x1d ||
++            memcmp(output_switch + 0xa0, output_switch_old, sizeof(output_switch_old)))
++        return FALSE;
++
++    memcpy(&jump_offset, output_selector + 0xb1, sizeof(jump_offset));
++    requested_output = output_selector + 0xb5 + jump_offset;
++    memcpy(&jump_offset, output_switch + 0x35, sizeof(jump_offset));
++    if (output_switch + 0x39 + jump_offset != requested_output)
++        return FALSE;
++
++    if ((SIZE_T)(selector_call - base) < 0x579) return FALSE;
++    settings_apply = selector_call - 0x579;
++    if (settings_apply + 25 > base + nt->OptionalHeader.SizeOfImage ||
++            memcmp(settings_apply, settings_prefix, ARRAY_SIZE(settings_prefix)) ||
++            memcmp(settings_apply + 16, settings_suffix, ARRAY_SIZE(settings_suffix)))
++        return FALSE;
++
++    memcpy(&jump_offset, settings_apply + 12, sizeof(jump_offset));
++    death_stranding_audio_system = (void **)(settings_apply + 16 + jump_offset);
++    if ((BYTE *)death_stranding_audio_system < base ||
++            (BYTE *)(death_stranding_audio_system + 1) > base + nt->OptionalHeader.SizeOfImage)
++        return FALSE;
++
++    for (i = 0; i < nt->FileHeader.NumberOfSections && !ui_settings_call; ++i)
++    {
++        BYTE *start = base + section[i].VirtualAddress;
++        SIZE_T size = section[i].Misc.VirtualSize;
++        SIZE_T j;
++
++        if (!(section[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) || size < 22) continue;
++        for (j = 0; j <= size - 22; ++j)
++        {
++            BYTE *p = start + j;
++            INT32 displacement;
++
++            if (p[0] != 0x41 || p[1] != 0x0f || p[2] != 0xb6 || p[3] != 0xd6 ||
++                    p[4] != 0x48 || p[5] != 0x8b || p[6] != 0xcb || p[7] != 0xe8 ||
++                    p[12] != 0x80 || p[13] != 0x7f || p[14] != 0x30 || p[15] != 0x06 ||
++                    p[16] != 0x74 || p[18] != 0x41 || p[19] != 0x80 ||
++                    p[20] != 0xfe || p[21] != 0x21)
++                continue;
++
++            memcpy(&displacement, p + 8, sizeof(displacement));
++            if (p + 12 + displacement == settings_apply)
++                ui_settings_call = p + 7;
++        }
++    }
++    if (!ui_settings_call || (SIZE_T)(ui_settings_call - base) < 0x6b) return FALSE;
++
++    output_stores[0] = ui_settings_call - 0x6b;
++    output_stores[1] = ui_settings_call - 0x5e;
++    if (memcmp(output_stores[0] - 4, "\x8b\x54\xc8\x08\x89\x93\xdc\x00\x00\x00\xeb\x32", 12) ||
++            memcmp(output_stores[1] - 5, "\xba\xff\xff\xff\xff\x89\x93\xdc\x00\x00\x00\xeb\x25", 13))
++        return FALSE;
++
++    death_stranding_output_selector = (death_stranding_output_selector_t)output_selector;
++    relative_offset = (BYTE *)death_stranding_prepare_controller_output_thunk - (settings_apply + 14);
++    jump_offset = (INT32)relative_offset;
++    if ((INT_PTR)jump_offset != relative_offset) return FALSE;
++    if (!VirtualProtect(settings_apply + 9, 7, PAGE_EXECUTE_READWRITE, &old_protect))
++        return FALSE;
++    settings_apply[9] = 0xe8;
++    memcpy(settings_apply + 10, &jump_offset, sizeof(jump_offset));
++    settings_apply[14] = settings_apply[15] = 0x90;
++    FlushInstructionCache(GetCurrentProcess(), settings_apply + 9, 7);
++    VirtualProtect(settings_apply + 9, 7, old_protect, &old_protect);
++
++    for (i = 0; i < ARRAY_SIZE(output_stores); ++i)
++    {
++        relative_offset = (BYTE *)death_stranding_store_controller_output_thunk - (output_stores[i] + 5);
++        jump_offset = (INT32)relative_offset;
++        if ((INT_PTR)jump_offset != relative_offset) return FALSE;
++        if (!VirtualProtect(output_stores[i], 6, PAGE_EXECUTE_READWRITE, &old_protect)) return FALSE;
++        output_stores[i][0] = 0xe8;
++        memcpy(output_stores[i] + 1, &jump_offset, sizeof(jump_offset));
++        output_stores[i][5] = 0x90;
++        FlushInstructionCache(GetCurrentProcess(), output_stores[i], 6);
++        VirtualProtect(output_stores[i], 6, old_protect, &old_protect);
++    }
++
+     relative_offset = (BYTE *)death_stranding_select_controller_output - (selector_call + 5);
+     jump_offset = (INT32)relative_offset;
+     if ((INT_PTR)jump_offset != relative_offset) return FALSE;
+-    death_stranding_output_selector = (death_stranding_output_selector_t)output_selector;
+     if (!VirtualProtect(selector_call, 5, PAGE_EXECUTE_READWRITE, &old_protect)) return FALSE;
+     selector_call[0] = 0xe8;
+     memcpy(selector_call + 1, &jump_offset, sizeof(jump_offset));
+@@ -311,9 +515,20 @@
+     else
+         WARN("Could not enable Death Stranding's native BB controller-speaker capability.\n");
+ 
+-    TRACE("Left unsupported Death Stranding environmental speaker callback %p disabled and "
+-            "redirected its settings output selector call %p through %p.\n",
+-            callbacks[0], selector_call, (void *)death_stranding_select_controller_output);
++    if (!VirtualProtect(output_switch + 0xa0, sizeof(output_switch_old),
++            PAGE_EXECUTE_READWRITE, &old_protect))
++        return FALSE;
++    memcpy(output_switch + 0xa0, output_switch_new, sizeof(output_switch_new));
++    FlushInstructionCache(GetCurrentProcess(), output_switch + 0xa0, sizeof(output_switch_new));
++    VirtualProtect(output_switch + 0xa0, sizeof(output_switch_old), old_protect, &old_protect);
++
++    TRACE("Left unsupported Death Stranding environmental speaker callback %p disabled, "
++            "pre-applied output selection through %p and UI stores %p/%p, "
++            "redirected its final selector call %p through %p, and corrected its Wwise "
++            "output transition at %p.\n",
++            callbacks[0], (void *)death_stranding_prepare_controller_output_thunk,
++            output_stores[0], output_stores[1], selector_call,
++            (void *)death_stranding_select_controller_output, output_switch + 0xa0);
+     return TRUE;
+ }
+
+-- 
+2.55.0
+

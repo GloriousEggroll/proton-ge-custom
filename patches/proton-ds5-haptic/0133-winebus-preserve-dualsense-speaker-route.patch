@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Tue, 11 Aug 2026 14:20:00 -0600
+Subject: [PATCH] winebus: Preserve DualSense speaker route for raw audio
+
+Games continue sending USB output reports for adaptive triggers, LEDs, and
+compatibility rumble after Wine initializes the controller. An audio-control
+field in a later report can replace the initial internal-speaker route while
+the raw four-channel PCM remains open, leaving actuator haptics working but
+silencing the speaker channels.
+
+When the non-event raw haptic path is selected, preserve the documented
+internal-speaker route, unmuted state, volume, and pre-gain on every native
+DualSense USB output report. Preserve unrelated microphone control bits.
+
+--- a/dlls/winebus.sys/main.c
++++ b/dlls/winebus.sys/main.c
+@@ -678,6 +678,44 @@ static void hidraw_enable_dualsense_usb_haptics(DEVICE_OBJECT *device)
+         WARN("Failed to enable DualSense USB haptics mode on device %p: %#lx\n", device, io.Status);
+ }
+ 
++static void hidraw_preserve_dualsense_usb_speaker_route(struct device_extension *ext,
++        HID_XFER_PACKET *packet)
++{
++    const char *raw_haptics = getenv("PROTON_DUALSENSE_HAPTICS_PREFER_NON_EVENT");
++    BYTE *report = packet->reportBuffer;
++
++    if (!raw_haptics || raw_haptics[0] != '1' || raw_haptics[1])
++        return;
++    if (!ext->desc.is_hidraw || ext->desc.bus_type == BUS_TYPE_BLUETOOTH)
++        return;
++    if (!is_dualsense_gamepad(ext->desc.vid, ext->desc.pid))
++        return;
++    if (packet->reportId != DUALSENSE_OUTPUT_REPORT_USB ||
++            packet->reportBufferLen < DUALSENSE_OUTPUT_REPORT_USB_SIZE ||
++            report[0] != DUALSENSE_OUTPUT_REPORT_USB)
++        return;
++
++    /* Games continue to submit trigger, lightbar, and compatibility-rumble
++     * reports after the raw PCM stream starts. Preserve the speaker routing
++     * fields in every such report so one of them cannot mute the internal
++     * speaker while channels 2 and 3 continue driving the actuators. */
++    report[DUALSENSE_OUTPUT_VALID_FLAG0_OFFSET] |=
++            DUALSENSE_OUTPUT_VALID_FLAG0_SPEAKER_VOLUME_ENABLE |
++            DUALSENSE_OUTPUT_VALID_FLAG0_AUDIO_CONTROL_ENABLE;
++    report[DUALSENSE_OUTPUT_VALID_FLAG1_OFFSET] |=
++            DUALSENSE_OUTPUT_VALID_FLAG1_POWER_SAVE_CONTROL_ENABLE |
++            DUALSENSE_OUTPUT_VALID_FLAG1_AUDIO_CONTROL2_ENABLE;
++    report[DUALSENSE_OUTPUT_SPEAKER_VOLUME_OFFSET] = 0x64;
++    report[DUALSENSE_OUTPUT_AUDIO_CONTROL_OFFSET] =
++            (report[DUALSENSE_OUTPUT_AUDIO_CONTROL_OFFSET] & ~DUALSENSE_OUTPUT_AUDIO_OUTPUT_PATH_MASK) |
++            DUALSENSE_OUTPUT_AUDIO_SYSTEM_INTERNAL_SPEAKER;
++    report[DUALSENSE_OUTPUT_POWER_SAVE_CONTROL_OFFSET] &=
++            ~DUALSENSE_OUTPUT_POWER_SAVE_SPEAKER_MUTE;
++    report[DUALSENSE_OUTPUT_AUDIO_CONTROL2_OFFSET] =
++            (report[DUALSENSE_OUTPUT_AUDIO_CONTROL2_OFFSET] & ~DUALSENSE_OUTPUT_SPEAKER_GAIN_MASK) |
++            DUALSENSE_OUTPUT_SPEAKER_GAIN;
++}
++
+ #ifdef __ASM_USE_FASTCALL_WRAPPER
+ extern void * WINAPI wrap_fastcall_func1(void *func, const void *a);
+ __ASM_STDCALL_FUNC(wrap_fastcall_func1, 8,
+@@ -2297,6 +2335,7 @@ static NTSTATUS WINAPI hid_internal_dispatch(DEVICE_OBJECT *device, IRP *irp)
+                 packet = &fixed_packet;
+             else if (hidraw_fixup_dualsense_usb_output_report(ext, packet, &fixed_packet, fixed_report))
+                 packet = &fixed_packet;
++            hidraw_preserve_dualsense_usb_speaker_route(ext, packet);
+             unix_device_set_output_report(device, packet, &irp->IoStatus);
+             if (!irp->IoStatus.Status) hidraw_disable_report_fixups(device);
+             break;
+-- 
+2.55.0

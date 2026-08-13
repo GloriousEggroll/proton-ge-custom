@@ -1,0 +1,177 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Thu, 13 Aug 2026 01:05:00 -0600
+Subject: [PATCH] winepulse: Select DualSense speaker after raw PCM open
+
+Death Stranding's split speaker stream can reach the correct PulseAudio sink
+with nonzero samples while the physical controller speaker remains silent.
+The same stream becomes audible after sending the controller's USB internal
+speaker routing report, which shows that PCM delivery is not the missing part.
+
+The initial winebus routing report is too early: opening the raw four-channel
+PCM path can reset the controller's hardware audio route afterwards. Reapply
+the exact 63-byte report proven to enable the speaker immediately after ALSA
+has prepared each raw DualSense PCM. Reassert it once more just before the
+first nonzero split-speaker samples, since an idle controller may change its
+audio power state between stream creation and the first BB effect. These
+lifecycle points also naturally run again after controller hotplug.
+
+Limit the behavior to Death Stranding's opt-in controller-effects mode and to
+USB DualSense / DualSense Edge hidraw devices. Keep diagnostics on the pulse
+channel so the existing game log reports whether the hidraw write succeeded.
+
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -29,11 +29,18 @@
+ #include <stdlib.h>
+ #include <stdint.h>
+ #include <errno.h>
++#include <fcntl.h>
+ #include <pthread.h>
++#include <stdio.h>
+ #include <time.h>
+ #include <math.h>
+ #include <poll.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
+ 
++#ifdef HAVE_LINUX_HIDRAW_H
++# include <linux/hidraw.h>
++#endif
+ #include <alsa/asoundlib.h>
+ #include <pulse/pulseaudio.h>
+ 
+@@ -142,6 +149,7 @@
+     unsigned int dualsense_mono_hotplug_generation;
+     BOOL dualsense_mono_registered;
+     BOOL dualsense_haptic_registered;
++    BOOL speaker_route_selected;
+ };
+ 
+ static void pulse_write(struct pulse_stream *stream);
+@@ -2531,6 +2539,7 @@
+     stream->speaker_dropped_bytes = 0;
+     stream->speaker_peak = 0.0f;
+     stream->speaker_trace_time = 0;
++    stream->speaker_route_selected = FALSE;
+ 
+     if (!stream->speaker_stream)
+         return;
+@@ -3123,6 +3132,75 @@
+     return err;
+ }
+ 
++static BOOL pulse_select_dualsense_usb_speaker(void)
++{
++#ifdef HAVE_LINUX_HIDRAW_H
++    static const BYTE report[63] =
++    {
++        [0] = 0x02, /* USB output report. */
++        [1] = 0xa0, /* Speaker volume and audio routing are valid. */
++        [2] = 0x80, /* Speaker pre-gain is valid. */
++        [6] = 0x64, /* Speaker volume. */
++        [8] = 0x30, /* Route audio to the internal speaker. */
++        [38] = 0x02, /* Speaker pre-gain. */
++    };
++    const char *enabled = getenv("PROTON_DEATH_STRANDING_CONTROLLER_EFFECTS");
++    struct hidraw_devinfo info;
++    char path[32];
++    ssize_t written;
++    unsigned int i;
++    BOOL found = FALSE, selected = FALSE;
++    int fd;
++
++    if (!enabled || enabled[0] != '1' || enabled[1])
++        return FALSE;
++
++    for (i = 0; i < 64; ++i)
++    {
++        snprintf(path, sizeof(path), "/dev/hidraw%u", i);
++        if ((fd = open(path, O_RDWR)) == -1)
++        {
++            if (errno != ENOENT && errno != ENODEV)
++                WARN("Unable to open %s while selecting the DualSense USB speaker: %d (%s).\n",
++                        path, errno, strerror(errno));
++            continue;
++        }
++
++        fcntl(fd, F_SETFD, FD_CLOEXEC);
++        memset(&info, 0, sizeof(info));
++        if (ioctl(fd, HIDIOCGRAWINFO, &info) == -1 || info.bustype != 0x03 ||
++                info.vendor != 0x054c || (info.product != 0x0ce6 && info.product != 0x0df2))
++        {
++            close(fd);
++            continue;
++        }
++
++        found = TRUE;
++        written = write(fd, report, sizeof(report));
++        if (written == sizeof(report))
++        {
++            TRACE("Selected the USB internal speaker on Sony controller %04x:%04x at %s.\n",
++                    (unsigned int)(unsigned short)info.vendor,
++                    (unsigned int)(unsigned short)info.product, path);
++            selected = TRUE;
++        }
++        else
++            WARN("Failed to select the USB internal speaker on Sony controller %04x:%04x at %s: "
++                    "wrote %ld of %u bytes, errno %d (%s).\n",
++                    (unsigned int)(unsigned short)info.vendor,
++                    (unsigned int)(unsigned short)info.product, path,
++                    (long)written, (unsigned int)sizeof(report), errno, strerror(errno));
++        close(fd);
++    }
++
++    if (!found)
++        WARN("No writable USB DualSense hidraw device was found while selecting the internal speaker.\n");
++    return selected;
++#else
++    return FALSE;
++#endif
++}
++
+ static HRESULT pulse_haptic_stream_connect(struct pulse_stream *stream, const char *alsa_path)
+ {
+     snd_pcm_hw_params_t *hw_params;
+@@ -3200,6 +3278,7 @@
+     free(sw_params);
+     TRACE("Opened DualSense haptic PCM \"%s\" at %u Hz, %u channels.\n", alsa_path, rate, stream->ss.channels);
+     stream->haptic_hotplug_generation = g_haptic_hotplug_generation;
++    pulse_select_dualsense_usb_speaker();
+     return S_OK;
+ 
+ failed:
+@@ -3408,6 +3487,7 @@
+ static void pulse_split_speaker_write(struct pulse_stream *stream, const BYTE *src, UINT32 frames)
+ {
+     SIZE_T sample_size, bytes, max_queue, required, source_offset = 0;
++    BOOL has_signal = FALSE;
+     pa_usec_t now;
+     UINT32 frame;
+ 
+@@ -3469,9 +3549,13 @@
+     {
+         const BYTE *sample = src + source_offset * stream->ss.channels +
+                 (frame * stream->ss.channels + 1) * sample_size;
++        SIZE_T byte;
+ 
+         memcpy(stream->speaker_buffer + stream->speaker_buffer_held +
+                 frame * sample_size, sample, sample_size);
++        if (!stream->speaker_route_selected)
++            for (byte = 0; byte < sample_size; ++byte)
++                has_signal |= sample[byte] != 0;
+         if (TRACE_ON(pulse) && stream->ss.format == PA_SAMPLE_FLOAT32LE)
+         {
+             float value;
+@@ -3483,6 +3567,9 @@
+     }
+     stream->speaker_buffer_held += bytes;
+ 
++    if (!stream->speaker_route_selected && has_signal)
++        stream->speaker_route_selected = pulse_select_dualsense_usb_speaker();
++
+     pulse_split_speaker_drain(stream);
+ 
+     if (!TRACE_ON(pulse))
+-- 
+2.55.0

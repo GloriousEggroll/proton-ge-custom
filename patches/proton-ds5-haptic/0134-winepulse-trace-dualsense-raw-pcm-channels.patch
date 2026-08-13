@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Tue, 11 Aug 2026 14:21:00 -0600
+Subject: [PATCH] winepulse: Trace DualSense raw PCM channel activity
+
+The raw four-channel DualSense stream contains conventional audio on channels
+0 and 1 and actuator audio on channels 2 and 3. Add a throttled trace of each
+channel's peak amplitude so +pulse logs can distinguish missing game data from
+a controller speaker-routing failure without dumping the audio itself.
+
+The scan is compiled into the trace path and therefore has no per-sample cost
+unless pulse tracing is enabled.
+
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -115,6 +115,8 @@ struct pulse_stream
+     BYTE *local_buffer, *tmp_buffer, *peek_buffer;
+     int16_t *haptic_buffer;
+     SIZE_T haptic_buffer_frames;
++    unsigned int haptic_channel_peak[4];
++    pa_usec_t haptic_channel_trace_time;
+     pa_usec_t haptic_reconnect_time;
+     pa_usec_t haptic_path_check_time;
+     unsigned int haptic_hotplug_generation;
+@@ -3191,6 +3193,43 @@ static void pulse_haptic_advance(struct pulse_stream *stream, UINT32 frames, UINT
+     stream->held_bytes -= min(stream->held_bytes, bytes);
+ }
+ 
++static void pulse_haptic_trace_channels(struct pulse_stream *stream, const int16_t *samples,
++        UINT32 frames)
++{
++    pa_usec_t now;
++    UINT32 frame, channel;
++
++    if (!TRACE_ON(pulse))
++        return;
++
++    for (frame = 0; frame < frames; ++frame)
++    {
++        for (channel = 0; channel < ARRAY_SIZE(stream->haptic_channel_peak); ++channel)
++        {
++            int value = samples[frame * stream->ss.channels + channel];
++            unsigned int amplitude = value < 0 ? -value : value;
++
++            stream->haptic_channel_peak[channel] =
++                    max(stream->haptic_channel_peak[channel], amplitude);
++        }
++    }
++
++    now = pa_rtclock_now();
++    if (!stream->haptic_channel_trace_time)
++    {
++        stream->haptic_channel_trace_time = now + 1000000;
++        return;
++    }
++    if (now < stream->haptic_channel_trace_time)
++        return;
++
++    TRACE("DualSense raw PCM channel peaks: %u, %u, %u, %u.\n",
++            stream->haptic_channel_peak[0], stream->haptic_channel_peak[1],
++            stream->haptic_channel_peak[2], stream->haptic_channel_peak[3]);
++    memset(stream->haptic_channel_peak, 0, sizeof(stream->haptic_channel_peak));
++    stream->haptic_channel_trace_time = now + 1000000;
++}
++
+ static void pulse_haptic_write(struct pulse_stream *stream)
+ {
+     snd_pcm_state_t state;
+@@ -3269,6 +3307,8 @@ static void pulse_haptic_write(struct pulse_stream *stream)
+     else
+         write_data = src;
+ 
++    pulse_haptic_trace_channels(stream, write_data, frames);
++
+     written = snd_pcm_writei(stream->haptic_pcm, write_data, frames);
+     if (written < 0)
+     {
+-- 
+2.55.0
