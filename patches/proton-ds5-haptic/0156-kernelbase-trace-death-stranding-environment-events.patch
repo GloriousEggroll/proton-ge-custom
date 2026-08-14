@@ -1,0 +1,245 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Thu, 13 Aug 2026 19:30:00 -0600
+Subject: [PATCH] kernelbase: Trace Death Stranding environmental Wwise events
+
+The controller-speaker state and matching global RTPC are both accepted by
+Wwise, but the environmental source remains entirely silent while the haptic
+channels remain active. Trace the game's common PostEvent submission path to
+determine whether environmental events are absent or associated with the
+wrong Wwise game object.
+
+Resolve the common implementation through the uniquely matched simple
+PostEvent wrapper, validate both functions byte-for-byte, and install a preserving
+trampoline. Forward all fourteen arguments unchanged. Log each distinct event
+once and retain additional bounded logging for IDs extracted from the water
+stream sound graphs so later events cannot be hidden by a full trace table.
+
+--- a/dlls/kernelbase/main.c
++++ b/dlls/kernelbase/main.c
+@@ -56,6 +56,10 @@
+         ULONGLONG game_object, ULONG transition_duration, ULONG fade_curve,
+         ULONG bypass_interpolation, ULONG unknown);
+ typedef ULONG (WINAPI *death_stranding_set_state_t)(ULONG group, ULONG state);
++typedef ULONG (WINAPI *death_stranding_post_event_t)(ULONG id, void *game_object,
++        ULONG_PTR arg3, ULONG_PTR arg4, ULONG_PTR arg5, ULONG_PTR arg6,
++        ULONG_PTR arg7, ULONG_PTR arg8, ULONG_PTR arg9, ULONG_PTR arg10,
++        ULONG_PTR arg11, ULONG_PTR arg12, ULONG_PTR arg13, ULONG_PTR arg14);
+ 
+ struct death_stranding_rtpc_trace_entry
+ {
+@@ -63,9 +67,17 @@
+     LONG calls;
+ };
+ 
++struct death_stranding_event_trace_entry
++{
++    LONG id;
++    LONG calls;
++};
++
+ static death_stranding_set_rtpc_value_t death_stranding_set_rtpc_value_original;
+ static death_stranding_set_state_t death_stranding_set_state_original;
++static death_stranding_post_event_t death_stranding_post_event_original;
+ static struct death_stranding_rtpc_trace_entry death_stranding_rtpc_trace_entries[256];
++static struct death_stranding_event_trace_entry death_stranding_event_trace_entries[2048];
+ static LONGLONG death_stranding_state_trace_entries[512];
+ static LONG death_stranding_controller_state_initialized;
+ 
+@@ -141,6 +153,93 @@
+     return result;
+ }
+ 
++static ULONG WINAPI death_stranding_trace_post_event(ULONG id, void *game_object,
++        ULONG_PTR arg3, ULONG_PTR arg4, ULONG_PTR arg5, ULONG_PTR arg6,
++        ULONG_PTR arg7, ULONG_PTR arg8, ULONG_PTR arg9, ULONG_PTR arg10,
++        ULONG_PTR arg11, ULONG_PTR arg12, ULONG_PTR arg13, ULONG_PTR arg14)
++{
++    static const ULONG environment_event_ids[] =
++    {
++        0xc5c64b7f, 0x1ef78956, 0x9c541536, 0xb8b66b56,
++        0x5b58a574, 0x7941a8b8, 0x1f85777b, 0x51c0962c,
++        0x9952b771, 0x84f685eb, 0xc6564efe, 0x029c58ff,
++    };
++    static LONG environment_event_calls[ARRAY_SIZE(environment_event_ids)];
++    ULONG result;
++    unsigned int i;
++
++    result = death_stranding_post_event_original(id, game_object, arg3, arg4,
++            arg5, arg6, arg7, arg8, arg9, arg10, arg11, arg12, arg13, arg14);
++
++    for (i = 0; i < ARRAY_SIZE(environment_event_ids); ++i)
++    {
++        LONG calls;
++
++        if (id != environment_event_ids[i]) continue;
++        calls = InterlockedIncrement(&environment_event_calls[i]);
++        if (calls <= 16)
++            WARN("Death Stranding posted candidate environment event %#lx on Wwise object %p "
++                    "(result %#lx, flags %#Ix/%#Ix, call %ld).\n",
++                    id, game_object, result, arg3, arg4, calls);
++        return result;
++    }
++
++    if (id)
++    {
++        LONG key = id;
++
++        for (i = 0; i < ARRAY_SIZE(death_stranding_event_trace_entries); ++i)
++        {
++            LONG entry_id = InterlockedCompareExchange(
++                    &death_stranding_event_trace_entries[i].id, key, 0);
++
++            if (entry_id && entry_id != key) continue;
++            if (InterlockedIncrement(&death_stranding_event_trace_entries[i].calls) == 1)
++                WARN("Death Stranding posted new Wwise event %#lx on object %p "
++                        "(result %#lx, flags %#Ix/%#Ix).\n",
++                        id, game_object, result, arg3, arg4);
++            break;
++        }
++    }
++    return result;
++}
++
++static BYTE *death_stranding_find_code_pattern(BYTE *base, IMAGE_NT_HEADERS *nt,
++        const BYTE *pattern, SIZE_T pattern_size, const char *description)
++{
++    IMAGE_SECTION_HEADER *section = IMAGE_FIRST_SECTION(nt);
++    BYTE *match = NULL;
++    unsigned int i, count = 0;
++
++    for (i = 0; i < nt->FileHeader.NumberOfSections; ++i)
++    {
++        BYTE *start;
++        SIZE_T size, j;
++
++        if (!(section[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) ||
++                section[i].VirtualAddress >= nt->OptionalHeader.SizeOfImage)
++            continue;
++        start = base + section[i].VirtualAddress;
++        size = min(section[i].Misc.VirtualSize,
++                nt->OptionalHeader.SizeOfImage - section[i].VirtualAddress);
++        if (size < pattern_size) continue;
++
++        for (j = 0; j <= size - pattern_size; ++j)
++        {
++            if (memcmp(start + j, pattern, pattern_size)) continue;
++            match = start + j;
++            ++count;
++        }
++    }
++
++    if (count != 1)
++    {
++        WARN("Found %u copies of Death Stranding %s signature.\n", count, description);
++        return NULL;
++    }
++    return match;
++}
++
+ static BYTE *death_stranding_find_registration_callback(BYTE *base, IMAGE_NT_HEADERS *nt,
+         const char *registration_name, BYTE **callback_load_out)
+ {
+@@ -370,13 +469,35 @@
+         0x48, 0x89, 0x6c, 0x24, 0x10,
+         0x48, 0x89, 0x74, 0x24, 0x18,
+     };
++    static const BYTE simple_post_event_pattern[] =
++    {
++        0x48, 0x83, 0xec, 0x78, 0x33, 0xc0,
++        0x48, 0x89, 0x44, 0x24, 0x68,
++        0x89, 0x44, 0x24, 0x60,
++        0x48, 0x89, 0x44, 0x24, 0x58,
++        0x48, 0x89, 0x44, 0x24, 0x50,
++        0x48, 0x89, 0x44, 0x24, 0x48,
++        0xc7, 0x44, 0x24, 0x40, 0x04, 0x00, 0x00, 0x00,
++        0x89, 0x44, 0x24, 0x38,
++        0x89, 0x44, 0x24, 0x30,
++        0x0f, 0xb6, 0x84, 0x24, 0xa8, 0x00, 0x00, 0x00,
++        0x88, 0x44, 0x24, 0x28,
++        0x0f, 0xb6, 0x84, 0x24, 0xa0, 0x00, 0x00, 0x00,
++        0x88, 0x44, 0x24, 0x20,
++        0xe8,
++    };
++    static const BYTE post_event_pattern[] =
++    {
++        0x40, 0x55, 0x56, 0x41, 0x54, 0x41, 0x55, 0x41,
++        0x56, 0x41, 0x57, 0x48, 0x83, 0xec, 0x68,
++    };
+     static const char environment_name[] = "Wwise::sGetFootSoundToControllerSpeaker";
+     static const char set_global_rtpc_name[] = "WwiseGameObject::sSetGlobalRTPCExport";
+     static const char set_state_name[] = "WwiseGameObject::sSetStateExport";
+     HMODULE module = NtCurrentTeb()->Peb->ImageBaseAddress;
+     BYTE *base = (BYTE *)module;
+     BYTE *environment_callback, *set_global_rtpc_callback, *set_rtpc_wrapper_callback;
+-    BYTE *set_rtpc_value_callback;
++    BYTE *set_rtpc_value_callback, *simple_post_event_callback, *post_event_callback;
+     BYTE *set_state_callback, *set_state_load = NULL;
+     IMAGE_NT_HEADERS *nt;
+     LONG displacement;
+@@ -392,8 +513,11 @@
+             set_global_rtpc_name, NULL);
+     set_state_callback = death_stranding_find_registration_callback(base, nt,
+             set_state_name, &set_state_load);
++    simple_post_event_callback = death_stranding_find_code_pattern(base, nt,
++            simple_post_event_pattern, sizeof(simple_post_event_pattern),
++            "Wwise simple PostEvent callback");
+     if (!environment_callback || !set_global_rtpc_callback || !set_state_callback ||
+-            !set_state_load)
++            !set_state_load || !simple_post_event_callback)
+         return;
+ 
+     if (environment_callback < base || environment_callback + 12 > base + nt->OptionalHeader.SizeOfImage ||
+@@ -456,6 +580,29 @@
+                 set_state_callback);
+         return;
+     }
++    if (simple_post_event_callback < base ||
++            simple_post_event_callback + sizeof(simple_post_event_pattern) + sizeof(displacement) >
++            base + nt->OptionalHeader.SizeOfImage ||
++            memcmp(simple_post_event_callback, simple_post_event_pattern,
++            sizeof(simple_post_event_pattern)))
++    {
++        WARN("Death Stranding Wwise simple PostEvent callback %p has an unknown layout.\n",
++                simple_post_event_callback);
++        return;
++    }
++    memcpy(&displacement, simple_post_event_callback + sizeof(simple_post_event_pattern),
++            sizeof(displacement));
++    post_event_callback = simple_post_event_callback + sizeof(simple_post_event_pattern) +
++            sizeof(displacement) + displacement;
++    if (post_event_callback < base ||
++            post_event_callback + sizeof(post_event_pattern) >
++            base + nt->OptionalHeader.SizeOfImage ||
++            memcmp(post_event_callback, post_event_pattern, sizeof(post_event_pattern)))
++    {
++        WARN("Death Stranding Wwise PostEvent submission function %p has an unknown layout.\n",
++                post_event_callback);
++        return;
++    }
+     death_stranding_set_state_original = (death_stranding_set_state_t)set_state_callback;
+ 
+     if (!death_stranding_install_absolute_jump(environment_callback,
+@@ -464,13 +611,18 @@
+             (const void *)death_stranding_trace_set_rtpc_value,
+             sizeof(set_rtpc_value_pattern),
+             (void **)&death_stranding_set_rtpc_value_original) ||
++            !death_stranding_install_trampoline(post_event_callback,
++            (const void *)death_stranding_trace_post_event,
++            sizeof(post_event_pattern),
++            (void **)&death_stranding_post_event_original) ||
+             !death_stranding_redirect_registration_callback(set_state_load,
+             (const void *)death_stranding_trace_set_state))
+         return;
+ 
+     TRACE("Tracing Death Stranding environmental callback %p, Wwise RTPC submission %p, "
+-            "and Wwise state callback %p.\n",
+-            environment_callback, set_rtpc_value_callback, set_state_callback);
++            "Wwise state callback %p, and Wwise PostEvent submission %p.\n",
++            environment_callback, set_rtpc_value_callback, set_state_callback,
++            post_event_callback);
+ }
+ 
+ static void enable_death_stranding_environment_audio(void)
+-- 
+2.51.0

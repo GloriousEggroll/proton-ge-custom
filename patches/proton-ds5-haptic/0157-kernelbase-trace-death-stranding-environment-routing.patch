@@ -1,0 +1,283 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Thu, 13 Aug 2026 20:15:00 -0600
+Subject: [PATCH] kernelbase: Trace Death Stranding environmental Wwise routing
+
+Death Stranding posts its environmental water events successfully, but those
+events route through the normal environmental bus and the controller stream
+remains silent. Trace Wwise's object aux sends, object output-bus volumes, and
+output-device volumes to identify where the controller-speaker route is
+disabled.
+
+Record every object's initial route and retain bounded follow-up samples for
+objects which post candidate environmental events. The hooks forward all
+arguments unchanged and do not alter game behavior.
+
+--- a/dlls/kernelbase/main.c
++++ b/dlls/kernelbase/main.c
+@@ -61,6 +61,19 @@
+         ULONG_PTR arg7, ULONG_PTR arg8, ULONG_PTR arg9, ULONG_PTR arg10,
+         ULONG_PTR arg11, ULONG_PTR arg12, ULONG_PTR arg13, ULONG_PTR arg14);
+ 
++struct death_stranding_aux_send_value
++{
++    ULONGLONG listener;
++    ULONG bus;
++    float volume;
++};
++
++typedef ULONG (WINAPI *death_stranding_set_aux_sends_t)(ULONGLONG game_object,
++        struct death_stranding_aux_send_value *values, ULONG count);
++typedef ULONG (WINAPI *death_stranding_set_output_bus_volume_t)(ULONGLONG emitter,
++        ULONGLONG listener, float volume);
++typedef ULONG (WINAPI *death_stranding_set_output_volume_t)(ULONGLONG output, float volume);
++
+ struct death_stranding_rtpc_trace_entry
+ {
+     LONG id;
+@@ -73,11 +86,30 @@
+     LONG calls;
+ };
+ 
++struct death_stranding_routing_trace_entry
++{
++    LONGLONG game_object;
++    LONG aux_calls;
++    LONG output_calls;
++};
++
++struct death_stranding_output_trace_entry
++{
++    LONGLONG output;
++    LONG calls;
++};
++
+ static death_stranding_set_rtpc_value_t death_stranding_set_rtpc_value_original;
+ static death_stranding_set_state_t death_stranding_set_state_original;
+ static death_stranding_post_event_t death_stranding_post_event_original;
++static death_stranding_set_aux_sends_t death_stranding_set_aux_sends_original;
++static death_stranding_set_output_bus_volume_t death_stranding_set_output_bus_volume_original;
++static death_stranding_set_output_volume_t death_stranding_set_output_volume_original;
+ static struct death_stranding_rtpc_trace_entry death_stranding_rtpc_trace_entries[256];
+ static struct death_stranding_event_trace_entry death_stranding_event_trace_entries[2048];
++static struct death_stranding_routing_trace_entry death_stranding_routing_trace_entries[4096];
++static struct death_stranding_output_trace_entry death_stranding_output_trace_entries[64];
++static LONGLONG death_stranding_environment_objects[64];
+ static LONGLONG death_stranding_state_trace_entries[512];
+ static LONG death_stranding_controller_state_initialized;
+ 
+@@ -174,8 +206,16 @@
+     for (i = 0; i < ARRAY_SIZE(environment_event_ids); ++i)
+     {
+         LONG calls;
++        unsigned int j;
+ 
+         if (id != environment_event_ids[i]) continue;
++        for (j = 0; j < ARRAY_SIZE(death_stranding_environment_objects); ++j)
++        {
++            LONGLONG object = InterlockedCompareExchange64(
++                    &death_stranding_environment_objects[j], (ULONG_PTR)game_object, 0);
++
++            if (!object || object == (ULONG_PTR)game_object) break;
++        }
+         calls = InterlockedIncrement(&environment_event_calls[i]);
+         if (calls <= 16)
+             WARN("Death Stranding posted candidate environment event %#lx on Wwise object %p "
+@@ -204,6 +244,111 @@
+     return result;
+ }
+ 
++static BOOL death_stranding_is_environment_object(ULONGLONG game_object)
++{
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(death_stranding_environment_objects); ++i)
++    {
++        LONGLONG object = InterlockedCompareExchange64(
++                &death_stranding_environment_objects[i], 0, 0);
++
++        if (object == game_object) return TRUE;
++        if (!object) return FALSE;
++    }
++    return FALSE;
++}
++
++static struct death_stranding_routing_trace_entry *death_stranding_get_routing_entry(
++        ULONGLONG game_object)
++{
++    unsigned int i;
++
++    if (!game_object) return NULL;
++    for (i = 0; i < ARRAY_SIZE(death_stranding_routing_trace_entries); ++i)
++    {
++        struct death_stranding_routing_trace_entry *entry =
++                &death_stranding_routing_trace_entries[i];
++        LONGLONG object = InterlockedCompareExchange64(
++                &entry->game_object, game_object, 0);
++
++        if (!object || object == game_object) return entry;
++    }
++    return NULL;
++}
++
++static ULONG WINAPI death_stranding_trace_set_aux_sends(ULONGLONG game_object,
++        struct death_stranding_aux_send_value *values, ULONG count)
++{
++    struct death_stranding_routing_trace_entry *entry;
++    ULONG result, i, calls = 0;
++    BOOL environment_object;
++
++    result = death_stranding_set_aux_sends_original(game_object, values, count);
++    entry = death_stranding_get_routing_entry(game_object);
++    environment_object = death_stranding_is_environment_object(game_object);
++    if (entry) calls = InterlockedIncrement(&entry->aux_calls);
++    if (calls == 1 || (environment_object && calls <= 32))
++    {
++        WARN("Death Stranding set %lu Wwise aux sends on object %#I64x "
++                "(result %#lx, call %lu, environment %u).\n",
++                count, game_object, result, calls, environment_object);
++        for (i = 0; values && i < count && i < 8; ++i)
++        {
++            ULONG volume_bits;
++
++            memcpy(&volume_bits, &values[i].volume, sizeof(volume_bits));
++            WARN("Death Stranding aux send %lu: listener %#I64x, bus %#lx, "
++                    "volume bits %#lx.\n", i, values[i].listener,
++                    values[i].bus, volume_bits);
++        }
++    }
++    return result;
++}
++
++static ULONG WINAPI death_stranding_trace_set_output_bus_volume(ULONGLONG emitter,
++        ULONGLONG listener, float volume)
++{
++    struct death_stranding_routing_trace_entry *entry;
++    ULONG result, volume_bits, calls = 0;
++    BOOL environment_object;
++
++    result = death_stranding_set_output_bus_volume_original(emitter, listener, volume);
++    entry = death_stranding_get_routing_entry(emitter);
++    environment_object = death_stranding_is_environment_object(emitter);
++    if (entry) calls = InterlockedIncrement(&entry->output_calls);
++    if (calls == 1 || (environment_object && calls <= 32))
++    {
++        memcpy(&volume_bits, &volume, sizeof(volume_bits));
++        WARN("Death Stranding set Wwise output-bus volume on object %#I64x to listener "
++                "%#I64x, volume bits %#lx (result %#lx, call %lu, environment %u).\n",
++                emitter, listener, volume_bits, result, calls, environment_object);
++    }
++    return result;
++}
++
++static ULONG WINAPI death_stranding_trace_set_output_volume(ULONGLONG output, float volume)
++{
++    ULONG result, volume_bits;
++    unsigned int i;
++
++    result = death_stranding_set_output_volume_original(output, volume);
++    memcpy(&volume_bits, &volume, sizeof(volume_bits));
++    for (i = 0; i < ARRAY_SIZE(death_stranding_output_trace_entries); ++i)
++    {
++        struct death_stranding_output_trace_entry *entry =
++                &death_stranding_output_trace_entries[i];
++        LONGLONG output_id = InterlockedCompareExchange64(&entry->output, output, 0);
++
++        if (output_id && output_id != output) continue;
++        if (InterlockedIncrement(&entry->calls) <= 16)
++            WARN("Death Stranding set Wwise output %#I64x volume bits %#lx "
++                    "(result %#lx).\n", output, volume_bits, result);
++        break;
++    }
++    return result;
++}
++
+ static BYTE *death_stranding_find_code_pattern(BYTE *base, IMAGE_NT_HEADERS *nt,
+         const BYTE *pattern, SIZE_T pattern_size, const char *description)
+ {
+@@ -491,6 +636,24 @@
+         0x40, 0x55, 0x56, 0x41, 0x54, 0x41, 0x55, 0x41,
+         0x56, 0x41, 0x57, 0x48, 0x83, 0xec, 0x68,
+     };
++    static const BYTE set_aux_sends_pattern[] =
++    {
++        0x48, 0x89, 0x5c, 0x24, 0x10,
++        0x48, 0x89, 0x6c, 0x24, 0x18,
++        0x57, 0x48, 0x83, 0xec, 0x30, 0x45, 0x33, 0xd2,
++    };
++    static const BYTE set_output_bus_volume_pattern[] =
++    {
++        0x48, 0x89, 0x5c, 0x24, 0x08,
++        0x57, 0x48, 0x83, 0xec, 0x30,
++        0x0f, 0x29, 0x74, 0x24, 0x20, 0x48, 0x8b, 0xda,
++    };
++    static const BYTE set_output_volume_pattern[] =
++    {
++        0x40, 0x53, 0x48, 0x83, 0xec, 0x30,
++        0x0f, 0x29, 0x74, 0x24, 0x20,
++        0x48, 0x8b, 0xd9, 0x0f, 0x28, 0xf1,
++    };
+     static const char environment_name[] = "Wwise::sGetFootSoundToControllerSpeaker";
+     static const char set_global_rtpc_name[] = "WwiseGameObject::sSetGlobalRTPCExport";
+     static const char set_state_name[] = "WwiseGameObject::sSetStateExport";
+@@ -498,6 +661,7 @@
+     BYTE *base = (BYTE *)module;
+     BYTE *environment_callback, *set_global_rtpc_callback, *set_rtpc_wrapper_callback;
+     BYTE *set_rtpc_value_callback, *simple_post_event_callback, *post_event_callback;
++    BYTE *set_aux_sends_callback, *set_output_bus_volume_callback, *set_output_volume_callback;
+     BYTE *set_state_callback, *set_state_load = NULL;
+     IMAGE_NT_HEADERS *nt;
+     LONG displacement;
+@@ -516,8 +680,18 @@
+     simple_post_event_callback = death_stranding_find_code_pattern(base, nt,
+             simple_post_event_pattern, sizeof(simple_post_event_pattern),
+             "Wwise simple PostEvent callback");
++    set_aux_sends_callback = death_stranding_find_code_pattern(base, nt,
++            set_aux_sends_pattern, sizeof(set_aux_sends_pattern),
++            "Wwise SetGameObjectAuxSendValues function");
++    set_output_bus_volume_callback = death_stranding_find_code_pattern(base, nt,
++            set_output_bus_volume_pattern, sizeof(set_output_bus_volume_pattern),
++            "Wwise SetGameObjectOutputBusVolume function");
++    set_output_volume_callback = death_stranding_find_code_pattern(base, nt,
++            set_output_volume_pattern, sizeof(set_output_volume_pattern),
++            "Wwise SetOutputVolume function");
+     if (!environment_callback || !set_global_rtpc_callback || !set_state_callback ||
+-            !set_state_load || !simple_post_event_callback)
++            !set_state_load || !simple_post_event_callback || !set_aux_sends_callback ||
++            !set_output_bus_volume_callback || !set_output_volume_callback)
+         return;
+ 
+     if (environment_callback < base || environment_callback + 12 > base + nt->OptionalHeader.SizeOfImage ||
+@@ -615,14 +789,28 @@
+             (const void *)death_stranding_trace_post_event,
+             sizeof(post_event_pattern),
+             (void **)&death_stranding_post_event_original) ||
++            !death_stranding_install_trampoline(set_aux_sends_callback,
++            (const void *)death_stranding_trace_set_aux_sends,
++            sizeof(set_aux_sends_pattern),
++            (void **)&death_stranding_set_aux_sends_original) ||
++            !death_stranding_install_trampoline(set_output_bus_volume_callback,
++            (const void *)death_stranding_trace_set_output_bus_volume,
++            sizeof(set_output_bus_volume_pattern),
++            (void **)&death_stranding_set_output_bus_volume_original) ||
++            !death_stranding_install_trampoline(set_output_volume_callback,
++            (const void *)death_stranding_trace_set_output_volume,
++            sizeof(set_output_volume_pattern),
++            (void **)&death_stranding_set_output_volume_original) ||
+             !death_stranding_redirect_registration_callback(set_state_load,
+             (const void *)death_stranding_trace_set_state))
+         return;
+ 
+     TRACE("Tracing Death Stranding environmental callback %p, Wwise RTPC submission %p, "
+-            "Wwise state callback %p, and Wwise PostEvent submission %p.\n",
++            "Wwise state callback %p, Wwise PostEvent submission %p, aux sends %p, "
++            "output-bus volume %p, and output volume %p.\n",
+             environment_callback, set_rtpc_value_callback, set_state_callback,
+-            post_event_callback);
++            post_event_callback, set_aux_sends_callback,
++            set_output_bus_volume_callback, set_output_volume_callback);
+ }
+ 
+ static void enable_death_stranding_environment_audio(void)
+-- 
+2.51.0

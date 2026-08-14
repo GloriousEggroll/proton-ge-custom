@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Thu, 13 Aug 2026 21:25:00 -0600
+Subject: [PATCH] kernelbase: Route Death Stranding footsteps to controller
+
+Death Stranding creates its DS_Sub_Output successfully and the Wwise banks
+provide dedicated sam_fs aux buses for stone, snow, and water. The PC game
+nevertheless submits only its normal environmental send, leaving footsteps on
+the main output even when the controller output is available.
+
+Remember the authored controller bus for observed Sam footstep and movement
+events, then append it to the object's existing aux sends. The PC init bank
+leaves the common sam_fs parent at -96 dB, so also send the object through the
+dry controller-speaker aux bus under the same DS_Sub_Output. This follows the
+output device selected for BB audio without hard-coding an MMDevice endpoint.
+Keep the normal send unchanged so the game's standard-output fallback remains
+available. The bank does not contain a distinct grass aux bus, so use the
+texturally similar sam_fs_snow_thick layer for grass and tall-grass events.
+
+--- a/dlls/kernelbase/main.c
++++ b/dlls/kernelbase/main.c
+@@ -93,6 +93,7 @@
+ struct death_stranding_routing_trace_entry
+ {
+     LONGLONG game_object;
++    LONG controller_bus;
+     LONG aux_calls;
+     LONG output_calls;
+ };
+@@ -195,6 +196,51 @@
+     return result;
+ }
+ 
++static ULONG death_stranding_controller_bus_for_event(ULONG id)
++{
++    switch (id)
++    {
++        /* Stone and gravel footstep events use sam_fs_stone_debris. */
++        case 0x3ca60f68: case 0x8af12b8f:
++        case 0x3ca60f6b: case 0x8af12b8c:
++        case 0x3ca60f6d: case 0x8af12b8a:
++        case 0x39a60a91: case 0x89f12a1a:
++        case 0x36a3c762: case 0x10f43d75:
++            return 0x31a8bcd4;
++
++        /* Grass reuses the textured sam_fs_snow_thick controller layer. */
++        case 0x39a60a95: case 0x89f12a1e:
++        case 0x44a61bc2: case 0x82f11f15:
++        case 0xf2a69342: case 0x4da0fc9e:
++        case 0x311fc17b: case 0x5e7d0c92: case 0xfa90dbab:
++            return 0x746a8010;
++
++        /* Water footstep and movement events use sam_fs_water. */
++        case 0x39a60a97: case 0x0a2bfefe:
++        case 0xb82046fc: case 0xfb1b3b60: case 0x5aef2d94:
++            return 0x8065800c;
++    }
++    return 0;
++}
++
++static void death_stranding_set_controller_bus(ULONGLONG game_object, ULONG bus)
++{
++    unsigned int i;
++
++    if (!game_object || !bus) return;
++    for (i = 0; i < ARRAY_SIZE(death_stranding_routing_trace_entries); ++i)
++    {
++        struct death_stranding_routing_trace_entry *entry =
++                &death_stranding_routing_trace_entries[i];
++        LONGLONG object = InterlockedCompareExchange64(
++                &entry->game_object, game_object, 0);
++
++        if (object && object != game_object) continue;
++        InterlockedExchange(&entry->controller_bus, bus);
++        return;
++    }
++}
++
+ static ULONG WINAPI death_stranding_trace_post_event(ULONG id, void *game_object,
+         ULONG_PTR arg3, ULONG_PTR arg4, ULONG_PTR arg5, ULONG_PTR arg6,
+         ULONG_PTR arg7, ULONG_PTR arg8, ULONG_PTR arg9, ULONG_PTR arg10,
+@@ -207,9 +253,12 @@
+         0x9952b771, 0x84f685eb, 0xc6564efe, 0x029c58ff,
+     };
+     static LONG environment_event_calls[ARRAY_SIZE(environment_event_ids)];
+-    ULONG result;
++    ULONG controller_bus, result;
+     unsigned int i;
+ 
++    controller_bus = death_stranding_controller_bus_for_event(id);
++    if (controller_bus)
++        death_stranding_set_controller_bus((ULONG_PTR)game_object, controller_bus);
+     result = death_stranding_post_event_original(id, game_object, arg3, arg4,
+             arg5, arg6, arg7, arg8, arg9, arg10, arg11, arg12, arg13, arg14);
+ 
+@@ -290,27 +339,55 @@
+ static ULONG WINAPI death_stranding_trace_set_aux_sends(ULONGLONG game_object,
+         struct death_stranding_aux_send_value *values, ULONG count)
+ {
++    static const ULONG controller_speaker_bus = 0x5db4f0ba;
++    struct death_stranding_aux_send_value routed_values[10];
++    struct death_stranding_aux_send_value *submitted_values = values;
+     struct death_stranding_routing_trace_entry *entry;
+-    ULONG result, i, calls = 0;
++    ULONG buses[2], result, i, j, calls = 0, controller_bus = 0, submitted_count = count;
+     BOOL environment_object;
+ 
+-    result = death_stranding_set_aux_sends_original(game_object, values, count);
+     entry = death_stranding_get_routing_entry(game_object);
++    if (entry)
++        controller_bus = InterlockedCompareExchange(&entry->controller_bus, 0, 0);
++    if (controller_bus && count + ARRAY_SIZE(buses) <= ARRAY_SIZE(routed_values) &&
++            (!count || values))
++    {
++        if (count) memcpy(routed_values, values, count * sizeof(*values));
++        submitted_values = routed_values;
++        buses[0] = controller_bus;
++        buses[1] = controller_speaker_bus;
++
++        for (j = 0; j < ARRAY_SIZE(buses); ++j)
++        {
++            for (i = 0; i < submitted_count; ++i)
++                if (routed_values[i].bus == buses[j]) break;
++            if (i != submitted_count) continue;
++
++            routed_values[submitted_count].listener = count ? values[0].listener : 0;
++            routed_values[submitted_count].bus = buses[j];
++            routed_values[submitted_count].volume = 1.0f;
++            ++submitted_count;
++        }
++    }
++    result = death_stranding_set_aux_sends_original(game_object,
++            submitted_values, submitted_count);
+     environment_object = death_stranding_is_environment_object(game_object);
+     if (entry) calls = InterlockedIncrement(&entry->aux_calls);
+     if (calls == 1 || (environment_object && calls <= 32))
+     {
+         WARN("Death Stranding set %lu Wwise aux sends on object %#I64x "
+-                "(result %#lx, call %lu, environment %u).\n",
+-                count, game_object, result, calls, environment_object);
+-        for (i = 0; values && i < count && i < 8; ++i)
++                "(result %#lx, call %lu, environment %u, material bus %#lx, "
++                "speaker bus %#lx).\n",
++                submitted_count, game_object, result, calls, environment_object,
++                controller_bus, controller_bus ? controller_speaker_bus : 0);
++        for (i = 0; submitted_values && i < submitted_count && i < 8; ++i)
+         {
+             ULONG volume_bits;
+ 
+-            memcpy(&volume_bits, &values[i].volume, sizeof(volume_bits));
++            memcpy(&volume_bits, &submitted_values[i].volume, sizeof(volume_bits));
+             WARN("Death Stranding aux send %lu: listener %#I64x, bus %#lx, "
+-                    "volume bits %#lx.\n", i, values[i].listener,
+-                    values[i].bus, volume_bits);
++                    "volume bits %#lx.\n", i, submitted_values[i].listener,
++                    submitted_values[i].bus, volume_bits);
+         }
+     }
+     return result;

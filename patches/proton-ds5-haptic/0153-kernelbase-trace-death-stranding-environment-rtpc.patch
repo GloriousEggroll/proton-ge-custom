@@ -1,0 +1,466 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Thu, 13 Aug 2026 15:30:00 -0600
+Subject: [PATCH] kernelbase: Trace Death Stranding controller environment RTPC
+
+Death Stranding's secondary four-channel stream remains silent after its
+environmental controller-speaker capability is enabled. Instrument its
+game-local capability callback plus its global Wwise RTPC and state
+registrations to determine which system value still suppresses the
+environmental speaker path.
+
+Replace only the already redirected true-return stub, resolve the shared Wwise
+RTPC submission function through the exact SetGlobalRTPC registration and its
+forwarding wrapper, and install a preserving trampoline before game
+initialization. This observes both game-object and system-global RTPC calls.
+Preserve every original call, record float values as raw bits, bound repeated
+RTPC logging per ID, and retain each distinct state pair without letting a
+high-frequency state exhaust the trace. Teach the later mmdevapi scanner to
+recognize the diagnostic true-return trampoline.
+
+--- a/dlls/kernelbase/main.c
++++ b/dlls/kernelbase/main.c
+@@ -52,6 +52,406 @@ static BOOL death_stranding_controller_effects_enabled(void)
+             value.Length == sizeof(WCHAR) && buffer[0] == '1';
+ }
+ 
++typedef ULONG (WINAPI *death_stranding_set_rtpc_value_t)(ULONG id, float value,
++        ULONGLONG game_object, ULONG transition_duration, ULONG fade_curve,
++        ULONG bypass_interpolation, ULONG unknown);
++typedef ULONG (WINAPI *death_stranding_set_state_t)(ULONG group, ULONG state);
++
++struct death_stranding_rtpc_trace_entry
++{
++    LONG id;
++    LONG calls;
++};
++
++static death_stranding_set_rtpc_value_t death_stranding_set_rtpc_value_original;
++static death_stranding_set_state_t death_stranding_set_state_original;
++static struct death_stranding_rtpc_trace_entry death_stranding_rtpc_trace_entries[256];
++static LONGLONG death_stranding_state_trace_entries[512];
++
++static BOOL WINAPI death_stranding_environment_output_enabled(void)
++{
++    static LONG logged;
++
++    if (!InterlockedExchange(&logged, TRUE))
++        WARN("Death Stranding evaluated its environmental controller-speaker capability; "
++                "returning true.\n");
++    return TRUE;
++}
++
++static ULONG WINAPI death_stranding_trace_set_rtpc_value(ULONG id, float value,
++        ULONGLONG game_object, ULONG transition_duration, ULONG fade_curve,
++        ULONG bypass_interpolation, ULONG unknown)
++{
++    ULONG value_bits;
++    LONG key = id;
++    unsigned int i;
++
++    memcpy(&value_bits, &value, sizeof(value_bits));
++    for (i = 0; i < ARRAY_SIZE(death_stranding_rtpc_trace_entries); ++i)
++    {
++        LONG entry_id = InterlockedCompareExchange(
++                &death_stranding_rtpc_trace_entries[i].id, key, 0);
++
++        if (entry_id && entry_id != key) continue;
++        if (InterlockedIncrement(&death_stranding_rtpc_trace_entries[i].calls) <= 4)
++            WARN("Death Stranding set global RTPC %#lx to float bits %#lx.\n",
++                    id, value_bits);
++        break;
++    }
++    return death_stranding_set_rtpc_value_original(id, value, game_object,
++            transition_duration, fade_curve, bypass_interpolation, unknown);
++}
++
++static ULONG WINAPI death_stranding_trace_set_state(ULONG group, ULONG state)
++{
++    LONGLONG pair = ((ULONGLONG)group << 32) | state;
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(death_stranding_state_trace_entries); ++i)
++    {
++        LONGLONG entry = InterlockedCompareExchange64(
++                &death_stranding_state_trace_entries[i], pair, 0);
++
++        if (entry == pair) break;
++        if (entry) continue;
++        WARN("Death Stranding set new Wwise state pair %#lx -> %#lx.\n", group, state);
++        break;
++    }
++    return death_stranding_set_state_original(group, state);
++}
++
++static BYTE *death_stranding_find_registration_callback(BYTE *base, IMAGE_NT_HEADERS *nt,
++        const char *registration_name, BYTE **callback_load_out)
++{
++    static const BYTE registration_tail[] =
++    {
++        0xc7, 0x44, 0x24, 0x28, 0x03, 0x00, 0x00, 0x00,
++    };
++    IMAGE_SECTION_HEADER *section = IMAGE_FIRST_SECTION(nt);
++    BYTE *name = NULL, *reference = NULL, *callback_load;
++    unsigned int i, name_count = 0, reference_count = 0;
++    SIZE_T registration_name_size = strlen(registration_name) + 1;
++    LONG displacement;
++
++    for (i = 0; i < nt->FileHeader.NumberOfSections; ++i)
++    {
++        BYTE *start;
++        SIZE_T size, j;
++
++        if ((section[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) ||
++                section[i].VirtualAddress >= nt->OptionalHeader.SizeOfImage)
++            continue;
++        start = base + section[i].VirtualAddress;
++        size = min(section[i].Misc.VirtualSize,
++                nt->OptionalHeader.SizeOfImage - section[i].VirtualAddress);
++        if (size < registration_name_size) continue;
++        for (j = 0; j <= size - registration_name_size; ++j)
++        {
++            if (memcmp(start + j, registration_name, registration_name_size)) continue;
++            name = start + j;
++            ++name_count;
++        }
++    }
++
++    if (name_count != 1)
++    {
++        WARN("Found %u copies of Death Stranding registration %s.\n",
++                name_count, registration_name);
++        return NULL;
++    }
++
++    for (i = 0; i < nt->FileHeader.NumberOfSections; ++i)
++    {
++        BYTE *start;
++        SIZE_T size, j;
++
++        if (!(section[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) ||
++                section[i].VirtualAddress >= nt->OptionalHeader.SizeOfImage)
++            continue;
++        start = base + section[i].VirtualAddress;
++        size = min(section[i].Misc.VirtualSize,
++                nt->OptionalHeader.SizeOfImage - section[i].VirtualAddress);
++        if (size < 7) continue;
++        for (j = 0; j <= size - 7; ++j)
++        {
++            BYTE *p = start + j;
++
++            if (p[0] != 0x4c || p[1] != 0x8d || p[2] != 0x05) continue;
++            memcpy(&displacement, p + 3, sizeof(displacement));
++            if (p + 7 + displacement != name) continue;
++            reference = p;
++            ++reference_count;
++        }
++    }
++
++    if (reference_count != 1 || reference < base + 15)
++    {
++        WARN("Found %u references to Death Stranding registration %s.\n",
++                reference_count, registration_name);
++        return NULL;
++    }
++
++    callback_load = reference - 15;
++    if (callback_load[0] != 0x48 || callback_load[1] != 0x8d || callback_load[2] != 0x05 ||
++            memcmp(callback_load + 7, registration_tail, sizeof(registration_tail)))
++    {
++        WARN("Death Stranding registration %s has an unknown layout.\n", registration_name);
++        return NULL;
++    }
++
++    memcpy(&displacement, callback_load + 3, sizeof(displacement));
++    if (callback_load_out) *callback_load_out = callback_load;
++    return callback_load + 7 + displacement;
++}
++
++static BOOL death_stranding_redirect_registration_callback(BYTE *callback_load,
++        const void *target)
++{
++    INT_PTR relative_offset = (INT_PTR)target - (INT_PTR)(callback_load + 7);
++    LONG displacement = relative_offset;
++    void *protect_base = callback_load + 3;
++    SIZE_T protect_size = sizeof(displacement);
++    ULONG old_protect;
++    NTSTATUS status;
++
++    if ((INT_PTR)displacement != relative_offset)
++    {
++        WARN("Death Stranding diagnostic callback is outside relative-call range.\n");
++        return FALSE;
++    }
++    if ((status = NtProtectVirtualMemory(NtCurrentProcess(), &protect_base, &protect_size,
++            PAGE_EXECUTE_READWRITE, &old_protect)))
++    {
++        WARN("Could not make Death Stranding registration %p writable, status %#lx.\n",
++                callback_load, status);
++        return FALSE;
++    }
++
++    memcpy(callback_load + 3, &displacement, sizeof(displacement));
++    NtFlushInstructionCache(NtCurrentProcess(), callback_load, 7);
++
++    protect_base = callback_load + 3;
++    protect_size = sizeof(displacement);
++    if ((status = NtProtectVirtualMemory(NtCurrentProcess(), &protect_base, &protect_size,
++            old_protect, &old_protect)))
++        WARN("Could not restore Death Stranding registration %p protection, status %#lx.\n",
++                callback_load, status);
++    return TRUE;
++}
++
++static BOOL death_stranding_install_absolute_jump(BYTE *address, const void *target)
++{
++    BYTE jump[] = {0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xe0};
++    void *protect_base = address;
++    SIZE_T protect_size = sizeof(jump);
++    ULONG old_protect;
++    NTSTATUS status;
++
++    memcpy(jump + 2, &target, sizeof(target));
++    if ((status = NtProtectVirtualMemory(NtCurrentProcess(), &protect_base, &protect_size,
++            PAGE_EXECUTE_READWRITE, &old_protect)))
++    {
++        WARN("Could not make Death Stranding callback %p writable, status %#lx.\n",
++                address, status);
++        return FALSE;
++    }
++
++    memcpy(address, jump, sizeof(jump));
++    NtFlushInstructionCache(NtCurrentProcess(), address, sizeof(jump));
++
++    protect_base = address;
++    protect_size = sizeof(jump);
++    if ((status = NtProtectVirtualMemory(NtCurrentProcess(), &protect_base, &protect_size,
++            old_protect, &old_protect)))
++        WARN("Could not restore Death Stranding callback %p protection, status %#lx.\n",
++                address, status);
++    return TRUE;
++}
++
++static BOOL death_stranding_install_trampoline(BYTE *address, const void *target,
++        SIZE_T copied_size, void **original)
++{
++    BYTE jump[] =
++    {
++        0xff, 0x25, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    };
++    BYTE *trampoline = NULL;
++    const void *resume = address + copied_size;
++    SIZE_T trampoline_size = copied_size + sizeof(jump);
++    void *protect_base;
++    SIZE_T protect_size;
++    ULONG old_protect;
++    NTSTATUS status;
++
++    if (copied_size < sizeof(jump)) return FALSE;
++    if ((status = NtAllocateVirtualMemory(NtCurrentProcess(), (void **)&trampoline, 0,
++            &trampoline_size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE)))
++    {
++        WARN("Could not allocate Death Stranding diagnostic trampoline, status %#lx.\n", status);
++        return FALSE;
++    }
++
++    memcpy(trampoline, address, copied_size);
++    memcpy(jump + 6, &resume, sizeof(resume));
++    memcpy(trampoline + copied_size, jump, sizeof(jump));
++    NtFlushInstructionCache(NtCurrentProcess(), trampoline, copied_size + sizeof(jump));
++
++    memcpy(jump + 6, &target, sizeof(target));
++    protect_base = address;
++    protect_size = copied_size;
++    if ((status = NtProtectVirtualMemory(NtCurrentProcess(), &protect_base, &protect_size,
++            PAGE_EXECUTE_READWRITE, &old_protect)))
++    {
++        WARN("Could not make Death Stranding Wwise function %p writable, status %#lx.\n",
++                address, status);
++        return FALSE;
++    }
++
++    memcpy(address, jump, sizeof(jump));
++    memset(address + sizeof(jump), 0x90, copied_size - sizeof(jump));
++    NtFlushInstructionCache(NtCurrentProcess(), address, copied_size);
++
++    protect_base = address;
++    protect_size = copied_size;
++    if ((status = NtProtectVirtualMemory(NtCurrentProcess(), &protect_base, &protect_size,
++            old_protect, &old_protect)))
++        WARN("Could not restore Death Stranding Wwise function protection, status %#lx.\n",
++                status);
++
++    *original = trampoline;
++    return TRUE;
++}
++
++static void trace_death_stranding_environment_audio(void)
++{
++    static const BYTE set_global_rtpc_pattern[] =
++    {
++        0x48, 0x83, 0xec, 0x38, 0x45, 0x33, 0xc9, 0xc6,
++        0x44, 0x24, 0x28, 0x00, 0xc7, 0x44, 0x24, 0x20,
++        0x04, 0x00, 0x00, 0x00, 0x4d, 0x8d, 0x41, 0xff,
++        0xe8,
++    };
++    static const BYTE set_rtpc_wrapper_pattern[] =
++    {
++        0x48, 0x83, 0xec, 0x48,
++        0x0f, 0xb6, 0x44, 0x24, 0x78,
++        0x88, 0x44, 0x24, 0x30,
++        0x8b, 0x44, 0x24, 0x70,
++        0x89, 0x44, 0x24, 0x28,
++        0x44, 0x89, 0x4c, 0x24, 0x20,
++        0x45, 0x33, 0xc9,
++        0xe8,
++    };
++    static const BYTE set_rtpc_value_pattern[] =
++    {
++        0x48, 0x89, 0x5c, 0x24, 0x08,
++        0x48, 0x89, 0x6c, 0x24, 0x10,
++        0x48, 0x89, 0x74, 0x24, 0x18,
++    };
++    static const char environment_name[] = "Wwise::sGetFootSoundToControllerSpeaker";
++    static const char set_global_rtpc_name[] = "WwiseGameObject::sSetGlobalRTPCExport";
++    static const char set_state_name[] = "WwiseGameObject::sSetStateExport";
++    HMODULE module = NtCurrentTeb()->Peb->ImageBaseAddress;
++    BYTE *base = (BYTE *)module;
++    BYTE *environment_callback, *set_global_rtpc_callback, *set_rtpc_wrapper_callback;
++    BYTE *set_rtpc_value_callback;
++    BYTE *set_state_callback, *set_state_load = NULL;
++    IMAGE_NT_HEADERS *nt;
++    LONG displacement;
++    unsigned int i;
++
++    if (!death_stranding_controller_effects_enabled() || !(nt = RtlImageNtHeader(module)) ||
++            nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
++        return;
++
++    environment_callback = death_stranding_find_registration_callback(base, nt,
++            environment_name, NULL);
++    set_global_rtpc_callback = death_stranding_find_registration_callback(base, nt,
++            set_global_rtpc_name, NULL);
++    set_state_callback = death_stranding_find_registration_callback(base, nt,
++            set_state_name, &set_state_load);
++    if (!environment_callback || !set_global_rtpc_callback || !set_state_callback ||
++            !set_state_load)
++        return;
++
++    if (environment_callback < base || environment_callback + 12 > base + nt->OptionalHeader.SizeOfImage ||
++            environment_callback[0] != 0xb0 || environment_callback[1] != 0x01 ||
++            environment_callback[2] != 0xc3)
++    {
++        WARN("Death Stranding environmental callback %p cannot be traced safely.\n",
++                environment_callback);
++        return;
++    }
++    for (i = 3; i < 12; ++i)
++    {
++        if (environment_callback[i] == 0xcc) continue;
++        WARN("Death Stranding environmental callback %p has no trampoline space.\n",
++                environment_callback);
++        return;
++    }
++
++    if (set_global_rtpc_callback < base ||
++            set_global_rtpc_callback + sizeof(set_global_rtpc_pattern) + sizeof(displacement) >
++            base + nt->OptionalHeader.SizeOfImage ||
++            memcmp(set_global_rtpc_callback, set_global_rtpc_pattern,
++            sizeof(set_global_rtpc_pattern)))
++    {
++        WARN("Death Stranding Wwise global RTPC callback %p has an unknown layout.\n",
++                set_global_rtpc_callback);
++        return;
++    }
++    memcpy(&displacement, set_global_rtpc_callback + sizeof(set_global_rtpc_pattern),
++            sizeof(displacement));
++    set_rtpc_wrapper_callback = set_global_rtpc_callback + sizeof(set_global_rtpc_pattern) +
++            sizeof(displacement) + displacement;
++    if (set_rtpc_wrapper_callback < base ||
++            set_rtpc_wrapper_callback + sizeof(set_rtpc_wrapper_pattern) + sizeof(displacement) >
++            base + nt->OptionalHeader.SizeOfImage ||
++            memcmp(set_rtpc_wrapper_callback, set_rtpc_wrapper_pattern,
++            sizeof(set_rtpc_wrapper_pattern)))
++    {
++        WARN("Death Stranding Wwise RTPC wrapper %p has an unknown layout.\n",
++                set_rtpc_wrapper_callback);
++        return;
++    }
++    memcpy(&displacement, set_rtpc_wrapper_callback + sizeof(set_rtpc_wrapper_pattern),
++            sizeof(displacement));
++    set_rtpc_value_callback = set_rtpc_wrapper_callback + sizeof(set_rtpc_wrapper_pattern) +
++            sizeof(displacement) + displacement;
++    if (set_rtpc_value_callback < base ||
++            set_rtpc_value_callback + sizeof(set_rtpc_value_pattern) >
++            base + nt->OptionalHeader.SizeOfImage ||
++            memcmp(set_rtpc_value_callback, set_rtpc_value_pattern,
++            sizeof(set_rtpc_value_pattern)))
++    {
++        WARN("Death Stranding Wwise RTPC submission function %p has an unknown layout.\n",
++                set_rtpc_value_callback);
++        return;
++    }
++    if (set_state_callback < base || set_state_callback >= base + nt->OptionalHeader.SizeOfImage)
++    {
++        WARN("Death Stranding Wwise state callback %p is outside the executable.\n",
++                set_state_callback);
++        return;
++    }
++    death_stranding_set_state_original = (death_stranding_set_state_t)set_state_callback;
++
++    if (!death_stranding_install_absolute_jump(environment_callback,
++            (const void *)death_stranding_environment_output_enabled) ||
++            !death_stranding_install_trampoline(set_rtpc_value_callback,
++            (const void *)death_stranding_trace_set_rtpc_value,
++            sizeof(set_rtpc_value_pattern),
++            (void **)&death_stranding_set_rtpc_value_original) ||
++            !death_stranding_redirect_registration_callback(set_state_load,
++            (const void *)death_stranding_trace_set_state))
++        return;
++
++    TRACE("Tracing Death Stranding environmental callback %p, Wwise RTPC submission %p, "
++            "and Wwise state callback %p.\n",
++            environment_callback, set_rtpc_value_callback, set_state_callback);
++}
++
+ static void enable_death_stranding_environment_audio(void)
+ {
+     static const char setting_name[] = "Wwise::sGetFootSoundToControllerSpeaker";
+@@ -207,6 +581,10 @@ static void enable_death_stranding_environment_audio(void)
+ static void enable_death_stranding_environment_audio(void)
+ {
+ }
++
++static void trace_death_stranding_environment_audio(void)
++{
++}
+ #endif
+ 
+ /***********************************************************************
+@@ -223,6 +597,7 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, LPVOID reserved )
+         init_startup_info( NtCurrentTeb()->Peb->ProcessParameters );
+         init_console();
+         enable_death_stranding_environment_audio();
++        trace_death_stranding_environment_audio();
+     }
+     return TRUE;
+ }
+--- a/dlls/mmdevapi/main.c
++++ b/dlls/mmdevapi/main.c
+@@ -508,8 +508,11 @@ static BOOL enable_death_stranding_controller_effects(void)
+         if (!callbacks[k]) return FALSE;
+     }
+ 
+-    environment_registered_early = callbacks[0][0] == 0xb0 && callbacks[0][1] == 0x01 &&
+-            callbacks[0][2] == 0xc3 && callbacks[0][3] == 0xcc && callbacks[0][4] == 0xcc;
++    environment_registered_early =
++            (callbacks[0][0] == 0xb0 && callbacks[0][1] == 0x01 &&
++             callbacks[0][2] == 0xc3 && callbacks[0][3] == 0xcc && callbacks[0][4] == 0xcc) ||
++            (callbacks[0][0] == 0x48 && callbacks[0][1] == 0xb8 &&
++             callbacks[0][10] == 0xff && callbacks[0][11] == 0xe0);
+     if (!environment_registered_early &&
+             (callbacks[0][0] != 0x32 || callbacks[0][1] != 0xc0 || callbacks[0][2] != 0xc3 ||
+              callbacks[0][3] != 0xcc || callbacks[0][4] != 0xcc))
+-- 
+2.50.1
