@@ -87,6 +87,9 @@ apply_all_in_dir() {
     echo "WINE: -CUSTOM- ETAASH WINE-WAYLAND+ PATCHES"
    apply_all_in_dir "../patches/wine-hotfixes/wine-wayland/"
 
+    echo "WINE: -CUSTOM- ETAASH WINE-WAYLAND+ FIXUPS"
+    apply_all_in_dir "../patches/wine-hotfixes/em-fixups/"
+
 ### END EM-10/WINE-WAYLAND PATCH SECTION ###
 
 ### (2-3) WINE STAGING APPLY SECTION ###
@@ -298,9 +301,6 @@ apply_all_in_dir() {
 
 
 ### (2-7) PROTON-GE ADDITIONAL CUSTOM PATCHES ###
-
-    echo "WINE: -CUSTOM- Hide Steam desktop virtual controllers on winewayland"
-    apply_patch "../patches/proton/winewayland-ignore-steam-desktop-virtual-controller.patch"
 
     echo "WINE: Add an env variable to override channel count in winealsa"
     apply_patch "../patches/proton/winealsa-override-channel-count.patch"
