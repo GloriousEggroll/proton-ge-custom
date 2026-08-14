@@ -1,0 +1,248 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Fri, 14 Aug 2026 16:00:00 -0600
+Subject: [PATCH] lsteamclient: Probe native controllers during init
+
+Steam's 28de:11ff virtual HID is not guaranteed to be openable through Wine's
+XInput path even while native Steam Input is active. Steam's own
+GetConnectedControllers call is authoritative in that case.
+
+Probe the native controller list immediately after ISteamInput::Init, before a
+game registers its action handles. Once Steam reports a native controller,
+keep native ownership for the lifetime of the process so a temporary device
+disconnect cannot activate the fallback. Also observe every normal controller
+enumeration so Steam Input can take ownership when a controller is connected
+after launch.
+
+With Steam Input disabled the native count remains zero, so the standalone
+XInput fallback and its dynamic DS4/DS5/Xbox profile selection remain active.
+---
+
+diff --git a/lsteamclient/gen_wrapper.py b/lsteamclient/gen_wrapper.py
+--- a/lsteamclient/gen_wrapper.py
++++ b/lsteamclient/gen_wrapper.py
+@@ -1180,9 +1180,12 @@ def handle_method_c(klass, method, winclassname, out):
+     is_steaminput = klass.full_name.startswith("ISteamInput_SteamInput")
+     session_config_method = None
++    connected_controllers_method = None
+ 
+     if is_steaminput and method.name == "Init":
+         session_config_method = next((candidate for candidate in klass.methods
+                 if candidate.name == "GetSessionInputConfigurationSettings"), None)
++        connected_controllers_method = next((candidate for candidate in klass.methods
++                if candidate.name == "GetConnectedControllers"), None)
+ 
+     ret = "*" if returns_record else ""
+     ret = f'{declspec(method.result_type, ret, "w_")} '
+@@ -1212,6 +1215,14 @@ def handle_method_c(klass, method, winclassname, out):
+         out(u'        .u_iface = _this->u_iface,\n')
+         out(u'    };\n')
+ 
++    if connected_controllers_method:
++        out(u'    uint64_t native_handles[16] = {0};\n')
++        out(f'    struct {connected_controllers_method.full_name}_params controller_params =\n')
++        out(u'    {\n')
++        out(u'        .u_iface = _this->u_iface,\n')
++        out(u'        .handlesOut = native_handles,\n')
++        out(u'    };\n')
++
+     out(u'    TRACE("%p\\n", _this);\n')
+ 
+     # Some games pass pointers to the data in PE modules which have no access. Access violation is handled
+@@ -1247,10 +1258,14 @@ def handle_method_c(klass, method, winclassname, out):
+     if is_steaminput:
+         if method.name == "Init":
+-            if session_config_method:
++            if connected_controllers_method:
+                 out(u'    if (steaminput_xinput_fallback_configured())\n')
+                 out(u'    {\n')
+-                out(f'        STEAMCLIENT_CALL( {session_config_method.full_name}, &config_params );\n')
+-                out(u'        steaminput_xinput_set_native_configuration( config_params._ret );\n')
++                out(f'        STEAMCLIENT_CALL( {connected_controllers_method.full_name}, &controller_params );\n')
++                if session_config_method:
++                    out(f'        STEAMCLIENT_CALL( {session_config_method.full_name}, &config_params );\n')
++                    out(u'        steaminput_xinput_set_native_configuration( config_params._ret, controller_params._ret );\n')
++                else:
++                    out(u'        steaminput_xinput_set_native_configuration( 0, controller_params._ret );\n')
+                 out(u'        if (steaminput_xinput_fallback_active()) params._ret = TRUE;\n')
+                 out(u'    }\n')
+             else:
+diff --git a/lsteamclient/steam_input_manual.c b/lsteamclient/steam_input_manual.c
+--- a/lsteamclient/steam_input_manual.c
++++ b/lsteamclient/steam_input_manual.c
+@@ -190,6 +190,7 @@ enum steaminput_xinput_fallback_mode
+ };
+ 
+ static LONG steaminput_xinput_fallback_mode;
++static LONG steaminput_native_session_seen;
+ 
+ int steaminput_xinput_fallback_configured(void)
+ {
+@@ -254,16 +255,31 @@ static BOOL steaminput_xinput_native_virtual_present(void)
+ 
+ static void steaminput_xinput_refresh_mode(const char *reason)
+ {
+-    if (!steaminput_xinput_fallback_configured() || steaminput_xinput_native_virtual_present())
++    BOOL native_virtual_present;
++
++    if (!steaminput_xinput_fallback_configured() ||
++            InterlockedCompareExchange(&steaminput_native_session_seen, 0, 0))
++    {
+         steaminput_xinput_set_fallback_mode(STEAMINPUT_FALLBACK_NATIVE, reason);
++        return;
++    }
++
++    native_virtual_present = steaminput_xinput_native_virtual_present();
++    if (native_virtual_present)
++        InterlockedExchange(&steaminput_native_session_seen, TRUE);
++
++    if (native_virtual_present)
++        steaminput_xinput_set_fallback_mode(STEAMINPUT_FALLBACK_NATIVE, reason);
+     else
+         steaminput_xinput_set_fallback_mode(STEAMINPUT_FALLBACK_XINPUT, reason);
+ }
+ 
+-void steaminput_xinput_set_native_configuration(uint16_t native_configuration)
++void steaminput_xinput_set_native_configuration(uint16_t native_configuration, int32_t native_count)
+ {
+-    TRACE("native Steam Input configuration mask %#x.\n", native_configuration);
+-    steaminput_xinput_refresh_mode("live Steam virtual controller probe");
++    TRACE("native Steam Input configuration mask %#x, controllers %d.\n",
++            native_configuration, native_count);
++    if (native_count > 0) InterlockedExchange(&steaminput_native_session_seen, TRUE);
++    steaminput_xinput_refresh_mode("native Steam controller probe");
+ }
+ 
+ static WORD steaminput_xinput_sony_product_id(unsigned int index)
+@@ -381,6 +397,7 @@ int32_t steaminput006_xinput_get_connected_controllers(int32_t native_count, uin
+ 
+     if (!steaminput_xinput_fallback_configured() || !handles) return native_count;
+ 
++    if (native_count > 0) InterlockedExchange(&steaminput_native_session_seen, TRUE);
+     steaminput_xinput_refresh_mode("controller enumeration");
+     if (InterlockedCompareExchange(&steaminput_xinput_fallback_mode, 0, 0) ==
+             STEAMINPUT_FALLBACK_NATIVE)
+diff --git a/lsteamclient/steamclient_private.h b/lsteamclient/steamclient_private.h
+--- a/lsteamclient/steamclient_private.h
++++ b/lsteamclient/steamclient_private.h
+@@ -49,7 +49,7 @@ void init_rtti( char *base );
+ 
+ int steaminput_xinput_fallback_configured(void);
+ int steaminput_xinput_fallback_active(void);
+-void steaminput_xinput_set_native_configuration( uint16_t native_configuration );
++void steaminput_xinput_set_native_configuration( uint16_t native_configuration, int32_t native_count );
+ uint16_t steaminput_xinput_get_session_configuration( uint16_t native_configuration );
+ int32_t steaminput006_xinput_get_connected_controllers( int32_t native_count, uint64_t *handles );
+ uint64_t steaminput006_xinput_register_action_set( uint64_t native_handle, const char *name );
+diff --git a/lsteamclient/winISteamInput.c b/lsteamclient/winISteamInput.c
+--- a/lsteamclient/winISteamInput.c
++++ b/lsteamclient/winISteamInput.c
+@@ -45,9 +45,20 @@ int8_t __thiscall winISteamInput_SteamInput001_Init(struct w_iface *_this)
+     {
+         .u_iface = _this->u_iface,
+     };
++    uint64_t native_handles[16] = {0};
++    struct ISteamInput_SteamInput001_GetConnectedControllers_params controller_params =
++    {
++        .u_iface = _this->u_iface,
++        .handlesOut = native_handles,
++    };
+     TRACE("%p\n", _this);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput001_Init, &params );
+-    if (steaminput_xinput_fallback_configured()) params._ret = TRUE;
++    if (steaminput_xinput_fallback_configured())
++    {
++        STEAMCLIENT_CALL( ISteamInput_SteamInput001_GetConnectedControllers, &controller_params );
++        steaminput_xinput_set_native_configuration( 0, controller_params._ret );
++        if (steaminput_xinput_fallback_active()) params._ret = TRUE;
++    }
+     return params._ret;
+ }
+ 
+@@ -566,9 +577,20 @@ int8_t __thiscall winISteamInput_SteamInput002_Init(struct w_iface *_this)
+     {
+         .u_iface = _this->u_iface,
+     };
++    uint64_t native_handles[16] = {0};
++    struct ISteamInput_SteamInput002_GetConnectedControllers_params controller_params =
++    {
++        .u_iface = _this->u_iface,
++        .handlesOut = native_handles,
++    };
+     TRACE("%p\n", _this);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput002_Init, &params );
+-    if (steaminput_xinput_fallback_configured()) params._ret = TRUE;
++    if (steaminput_xinput_fallback_configured())
++    {
++        STEAMCLIENT_CALL( ISteamInput_SteamInput002_GetConnectedControllers, &controller_params );
++        steaminput_xinput_set_native_configuration( 0, controller_params._ret );
++        if (steaminput_xinput_fallback_active()) params._ret = TRUE;
++    }
+     return params._ret;
+ }
+ 
+@@ -1104,12 +1126,19 @@ int8_t __thiscall winISteamInput_SteamInput005_Init(struct w_iface *_this, int8_
+     {
+         .u_iface = _this->u_iface,
+     };
++    uint64_t native_handles[16] = {0};
++    struct ISteamInput_SteamInput005_GetConnectedControllers_params controller_params =
++    {
++        .u_iface = _this->u_iface,
++        .handlesOut = native_handles,
++    };
+     TRACE("%p\n", _this);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput005_Init, &params );
+     if (steaminput_xinput_fallback_configured())
+     {
++        STEAMCLIENT_CALL( ISteamInput_SteamInput005_GetConnectedControllers, &controller_params );
+         STEAMCLIENT_CALL( ISteamInput_SteamInput005_GetSessionInputConfigurationSettings, &config_params );
+-        steaminput_xinput_set_native_configuration( config_params._ret );
++        steaminput_xinput_set_native_configuration( config_params._ret, controller_params._ret );
+         if (steaminput_xinput_fallback_active()) params._ret = TRUE;
+     }
+     return params._ret;
+@@ -1794,12 +1823,19 @@ int8_t __thiscall winISteamInput_SteamInput006_Init(struct w_iface *_this, int8_
+     {
+         .u_iface = _this->u_iface,
+     };
++    uint64_t native_handles[16] = {0};
++    struct ISteamInput_SteamInput006_GetConnectedControllers_params controller_params =
++    {
++        .u_iface = _this->u_iface,
++        .handlesOut = native_handles,
++    };
+     TRACE("%p\n", _this);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput006_Init, &params );
+     if (steaminput_xinput_fallback_configured())
+     {
++        STEAMCLIENT_CALL( ISteamInput_SteamInput006_GetConnectedControllers, &controller_params );
+         STEAMCLIENT_CALL( ISteamInput_SteamInput006_GetSessionInputConfigurationSettings, &config_params );
+-        steaminput_xinput_set_native_configuration( config_params._ret );
++        steaminput_xinput_set_native_configuration( config_params._ret, controller_params._ret );
+         if (steaminput_xinput_fallback_active()) params._ret = TRUE;
+     }
+     return params._ret;
+@@ -2487,12 +2523,19 @@ int8_t __thiscall winISteamInput_SteamInput007_Init(struct w_iface *_this, int8_
+     {
+         .u_iface = _this->u_iface,
+     };
++    uint64_t native_handles[16] = {0};
++    struct ISteamInput_SteamInput007_GetConnectedControllers_params controller_params =
++    {
++        .u_iface = _this->u_iface,
++        .handlesOut = native_handles,
++    };
+     TRACE("%p\n", _this);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput007_Init, &params );
+     if (steaminput_xinput_fallback_configured())
+     {
++        STEAMCLIENT_CALL( ISteamInput_SteamInput007_GetConnectedControllers, &controller_params );
+         STEAMCLIENT_CALL( ISteamInput_SteamInput007_GetSessionInputConfigurationSettings, &config_params );
+-        steaminput_xinput_set_native_configuration( config_params._ret );
++        steaminput_xinput_set_native_configuration( config_params._ret, controller_params._ret );
+         if (steaminput_xinput_fallback_active()) params._ret = TRUE;
+     }
+     return params._ret;
+-- 
+2.55.0

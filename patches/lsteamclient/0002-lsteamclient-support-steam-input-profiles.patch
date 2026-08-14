@@ -1,0 +1,715 @@
+diff --git a/lsteamclient/gen_wrapper.py b/lsteamclient/gen_wrapper.py
+--- a/lsteamclient/gen_wrapper.py
++++ b/lsteamclient/gen_wrapper.py
+@@ -1210,7 +1210,7 @@ def handle_method_c(klass, method, winclassname, out):
+         if pretouch is not None:
+             out(pretouch.format(p.spelling))
+ 
+-    steaminput006_hooks = {
++    steaminput_hooks = {
+         "GetDigitalActionData":
+             "    if (steaminput006_xinput_get_digital_action_data( _ret, inputHandle, digitalActionHandle )) return _ret;\n",
+         "GetAnalogActionData":
+@@ -1227,13 +1227,18 @@ def handle_method_c(klass, method, winclassname, out):
+         "GetGamepadIndexForController":
+             "    if (steaminput006_xinput_get_gamepad_index_for_controller( &params._ret, ulinputHandle )) return params._ret;\n",
+     }
+-    if klass.full_name == "ISteamInput_SteamInput006" and method.name in steaminput006_hooks:
+-        out(steaminput006_hooks[method.name])
++    is_steaminput = klass.full_name.startswith("ISteamInput_SteamInput")
++    if is_steaminput and method.name in steaminput_hooks:
++        out(steaminput_hooks[method.name])
+ 
+     out(f'    STEAMCLIENT_CALL( {method.full_name}, &params );\n')
+-    if klass.full_name == "ISteamInput_SteamInput006":
+-        if method.name == "GetConnectedControllers":
++    if is_steaminput:
++        if method.name == "Init":
++            out(u'    if (steaminput_xinput_fallback_enabled()) params._ret = TRUE;\n')
++        elif method.name == "GetConnectedControllers":
+             out(u'    params._ret = steaminput006_xinput_get_connected_controllers( params._ret, handlesOut );\n')
++        elif method.name == "GetActionSetHandle":
++            out(u'    params._ret = steaminput006_xinput_register_action_set( params._ret, pszActionSetName );\n')
+         elif method.name == "GetDigitalActionHandle":
+             out(u'    params._ret = steaminput006_xinput_register_digital_action( params._ret, pszActionName );\n')
+         elif method.name == "GetAnalogActionHandle":
+diff --git a/lsteamclient/steam_input_manual.c b/lsteamclient/steam_input_manual.c
+--- a/lsteamclient/steam_input_manual.c
++++ b/lsteamclient/steam_input_manual.c
+@@ -8,6 +8,7 @@
+ WINE_DEFAULT_DEBUG_CHANNEL(steamclient);
+ 
+ #define XINPUT_STEAM_HANDLE_BASE UINT64_C(0x474558494e500100)
++#define XINPUT_ACTION_SET_BASE UINT64_C(0x4745585345540000)
+ #define XINPUT_DIGITAL_ACTION_BASE UINT64_C(0x4745584449470000)
+ #define XINPUT_ANALOG_ACTION_BASE UINT64_C(0x474558414e410000)
+ 
+@@ -20,12 +21,23 @@ enum steam_input_source_mode
+ enum steam_input_type
+ {
+     STEAM_INPUT_TYPE_XBOX_ONE = 3,
++    STEAM_INPUT_TYPE_PS4 = 5,
++    STEAM_INPUT_TYPE_PS5 = 13,
++};
++
++enum xinput_digital_source
++{
++    XINPUT_DIGITAL_BUTTON,
++    XINPUT_DIGITAL_LEFT_TRIGGER,
++    XINPUT_DIGITAL_RIGHT_TRIGGER,
++    XINPUT_DIGITAL_UNAVAILABLE,
+ };
+ 
+ struct xinput_digital_action
+ {
+     const char *name;
+     uint64_t handle;
++    enum xinput_digital_source source;
+     WORD buttons;
+ };
+ 
+@@ -43,24 +55,81 @@ struct xinput_analog_action
+     } source;
+ };
+ 
+-/* Monster Hunter Wilds uses these action names from its Xbox One action manifest. */
++#define DIGITAL_BUTTON(name, button) {name, 0, XINPUT_DIGITAL_BUTTON, button}
++#define DIGITAL_TRIGGER(name, trigger) {name, 0, trigger, 0}
++#define DIGITAL_UNAVAILABLE(name) {name, 0, XINPUT_DIGITAL_UNAVAILABLE, 0}
++
++/* Action aliases used by the supported Steam Input manifests. */
+ static struct xinput_digital_action xinput_digital_actions[] =
+ {
+-    {"LUp",         0, XINPUT_GAMEPAD_DPAD_UP},
+-    {"LDown",       0, XINPUT_GAMEPAD_DPAD_DOWN},
+-    {"LLeft",       0, XINPUT_GAMEPAD_DPAD_LEFT},
+-    {"LRight",      0, XINPUT_GAMEPAD_DPAD_RIGHT},
+-    {"RUp",         0, XINPUT_GAMEPAD_Y},
+-    {"RDown",       0, XINPUT_GAMEPAD_A},
+-    {"RLeft",       0, XINPUT_GAMEPAD_X},
+-    {"RRight",      0, XINPUT_GAMEPAD_B},
+-    {"CLeft",       0, XINPUT_GAMEPAD_BACK},
+-    {"CRight",      0, XINPUT_GAMEPAD_START},
+-    {"CCenter",     0, 0},
+-    {"LStickPush",  0, XINPUT_GAMEPAD_LEFT_THUMB},
+-    {"RStickPush",  0, XINPUT_GAMEPAD_RIGHT_THUMB},
+-    {"LTrigTop",    0, XINPUT_GAMEPAD_LEFT_SHOULDER},
+-    {"RTrigTop",    0, XINPUT_GAMEPAD_RIGHT_SHOULDER},
++    /* Monster Hunter Wilds. */
++    DIGITAL_BUTTON("LUp", XINPUT_GAMEPAD_DPAD_UP),
++    DIGITAL_BUTTON("LDown", XINPUT_GAMEPAD_DPAD_DOWN),
++    DIGITAL_BUTTON("LLeft", XINPUT_GAMEPAD_DPAD_LEFT),
++    DIGITAL_BUTTON("LRight", XINPUT_GAMEPAD_DPAD_RIGHT),
++    DIGITAL_BUTTON("RUp", XINPUT_GAMEPAD_Y),
++    DIGITAL_BUTTON("RDown", XINPUT_GAMEPAD_A),
++    DIGITAL_BUTTON("RLeft", XINPUT_GAMEPAD_X),
++    DIGITAL_BUTTON("RRight", XINPUT_GAMEPAD_B),
++    DIGITAL_BUTTON("CLeft", XINPUT_GAMEPAD_BACK),
++    DIGITAL_BUTTON("CRight", XINPUT_GAMEPAD_START),
++    DIGITAL_UNAVAILABLE("CCenter"),
++    DIGITAL_BUTTON("LStickPush", XINPUT_GAMEPAD_LEFT_THUMB),
++    DIGITAL_BUTTON("RStickPush", XINPUT_GAMEPAD_RIGHT_THUMB),
++    DIGITAL_BUTTON("LTrigTop", XINPUT_GAMEPAD_LEFT_SHOULDER),
++    DIGITAL_BUTTON("RTrigTop", XINPUT_GAMEPAD_RIGHT_SHOULDER),
++
++    /* Horizon Zero Dawn. */
++    DIGITAL_BUTTON("button_a", XINPUT_GAMEPAD_A),
++    DIGITAL_BUTTON("button_b", XINPUT_GAMEPAD_B),
++    DIGITAL_BUTTON("button_x", XINPUT_GAMEPAD_X),
++    DIGITAL_BUTTON("button_y", XINPUT_GAMEPAD_Y),
++    DIGITAL_BUTTON("button_touchpad", XINPUT_GAMEPAD_BACK),
++    DIGITAL_BUTTON("button_start", XINPUT_GAMEPAD_START),
++    DIGITAL_BUTTON("dpad_up", XINPUT_GAMEPAD_DPAD_UP),
++    DIGITAL_BUTTON("dpad_down", XINPUT_GAMEPAD_DPAD_DOWN),
++    DIGITAL_BUTTON("dpad_left", XINPUT_GAMEPAD_DPAD_LEFT),
++    DIGITAL_BUTTON("dpad_right", XINPUT_GAMEPAD_DPAD_RIGHT),
++    DIGITAL_BUTTON("left_bumper", XINPUT_GAMEPAD_LEFT_SHOULDER),
++    DIGITAL_BUTTON("right_bumper", XINPUT_GAMEPAD_RIGHT_SHOULDER),
++    DIGITAL_BUTTON("left_stick_click", XINPUT_GAMEPAD_LEFT_THUMB),
++    DIGITAL_BUTTON("right_stick_click", XINPUT_GAMEPAD_RIGHT_THUMB),
++    DIGITAL_UNAVAILABLE("left_back_panel"),
++    DIGITAL_UNAVAILABLE("right_back_panel"),
++
++    /* God of War Ragnarok. */
++    DIGITAL_BUTTON("evade", XINPUT_GAMEPAD_A),
++    DIGITAL_BUTTON("useworld", XINPUT_GAMEPAD_B),
++    DIGITAL_BUTTON("companioninteract", XINPUT_GAMEPAD_X),
++    DIGITAL_BUTTON("axerecall", XINPUT_GAMEPAD_Y),
++    DIGITAL_TRIGGER("aim", XINPUT_DIGITAL_LEFT_TRIGGER),
++    DIGITAL_TRIGGER("heavyattack", XINPUT_DIGITAL_RIGHT_TRIGGER),
++    DIGITAL_BUTTON("defend", XINPUT_GAMEPAD_LEFT_SHOULDER),
++    DIGITAL_BUTTON("lightattack", XINPUT_GAMEPAD_RIGHT_SHOULDER),
++    DIGITAL_BUTTON("sprint", XINPUT_GAMEPAD_LEFT_THUMB),
++    DIGITAL_BUTTON("togglelockon", XINPUT_GAMEPAD_RIGHT_THUMB),
++    DIGITAL_BUTTON("companionammo", XINPUT_GAMEPAD_DPAD_UP),
++    DIGITAL_BUTTON("tertiaryweapontoggle", XINPUT_GAMEPAD_DPAD_DOWN),
++    DIGITAL_BUTTON("primaryweapontoggle", XINPUT_GAMEPAD_DPAD_RIGHT),
++    DIGITAL_BUTTON("secondaryweapontoggle", XINPUT_GAMEPAD_DPAD_LEFT),
++    DIGITAL_BUTTON("pausemenu", XINPUT_GAMEPAD_START),
++    DIGITAL_BUTTON("weaponmenu", XINPUT_GAMEPAD_BACK),
++    DIGITAL_BUTTON("SELECT", XINPUT_GAMEPAD_A),
++    DIGITAL_BUTTON("Cancel", XINPUT_GAMEPAD_B),
++    DIGITAL_BUTTON("MenuX", XINPUT_GAMEPAD_X),
++    DIGITAL_BUTTON("MenuY", XINPUT_GAMEPAD_Y),
++    DIGITAL_TRIGGER("MenuPrevScreen", XINPUT_DIGITAL_LEFT_TRIGGER),
++    DIGITAL_TRIGGER("MenuNextScreen", XINPUT_DIGITAL_RIGHT_TRIGGER),
++    DIGITAL_BUTTON("MenuPrevOption", XINPUT_GAMEPAD_LEFT_SHOULDER),
++    DIGITAL_BUTTON("MenuNextOption", XINPUT_GAMEPAD_RIGHT_SHOULDER),
++    DIGITAL_BUTTON("MenuLclick", XINPUT_GAMEPAD_LEFT_THUMB),
++    DIGITAL_BUTTON("MenuRclick", XINPUT_GAMEPAD_RIGHT_THUMB),
++    DIGITAL_BUTTON("MenuUp", XINPUT_GAMEPAD_DPAD_UP),
++    DIGITAL_BUTTON("MenuDown", XINPUT_GAMEPAD_DPAD_DOWN),
++    DIGITAL_BUTTON("MenuRight", XINPUT_GAMEPAD_DPAD_RIGHT),
++    DIGITAL_BUTTON("MenuLeft", XINPUT_GAMEPAD_DPAD_LEFT),
++    DIGITAL_BUTTON("MenuCharacter", XINPUT_GAMEPAD_BACK),
++    DIGITAL_BUTTON("MenuExit", XINPUT_GAMEPAD_START),
+ };
+ 
+ static struct xinput_analog_action xinput_analog_actions[] =
+@@ -70,15 +139,46 @@ static struct xinput_analog_action xinput_analog_actions[] =
+     {"TouchPad", 0, XINPUT_ANALOG_UNAVAILABLE},
+     {"AnalogL",  0, XINPUT_ANALOG_LEFT_TRIGGER},
+     {"AnalogR",  0, XINPUT_ANALOG_RIGHT_TRIGGER},
++    {"left_trigger",  0, XINPUT_ANALOG_LEFT_TRIGGER},
++    {"right_trigger", 0, XINPUT_ANALOG_RIGHT_TRIGGER},
++    {"left_stick",    0, XINPUT_ANALOG_LEFT_STICK},
++    {"right_stick",   0, XINPUT_ANALOG_RIGHT_STICK},
++    {"Move",          0, XINPUT_ANALOG_LEFT_STICK},
++    {"Camera",         0, XINPUT_ANALOG_RIGHT_STICK},
++};
++
++static struct
++{
++    const char *name;
++    uint64_t handle;
++} xinput_action_sets[] =
++{
++    {"GamepadSetting", 0},
++    {"GameControls", 0},
++    {"MenuControls", 0},
+ };
+ 
+-static BOOL steaminput_xinput_fallback_enabled(void)
++static BOOL env_enabled(const char *name)
+ {
+-    const char *env = getenv("PROTON_STEAMINPUT_XINPUT_FALLBACK");
++    const char *env = getenv(name);
+ 
+     return env && env[0] == '1' && !env[1];
+ }
+ 
++int steaminput_xinput_fallback_enabled(void)
++{
++    return env_enabled("PROTON_STEAMINPUT_FALLBACK") ||
++            env_enabled("PROTON_STEAMINPUT_XINPUT_FALLBACK");
++}
++
++static uint32_t steaminput_xinput_fallback_type(void)
++{
++    if (env_enabled("PROTON_STEAMINPUT_LAYOUT_DS5")) return STEAM_INPUT_TYPE_PS5;
++    if (env_enabled("PROTON_STEAMINPUT_LAYOUT_DS4")) return STEAM_INPUT_TYPE_PS4;
++    if (env_enabled("PROTON_STEAMINPUT_LAYOUT_XBOX")) return STEAM_INPUT_TYPE_XBOX_ONE;
++    return STEAM_INPUT_TYPE_XBOX_ONE;
++}
++
+ static uint64_t xinput_steam_handle(unsigned int index)
+ {
+     return XINPUT_STEAM_HANDLE_BASE + index;
+@@ -123,6 +223,24 @@ int32_t steaminput006_xinput_get_connected_controllers(int32_t native_count, uin
+     return (int32_t)count;
+ }
+ 
++uint64_t steaminput006_xinput_register_action_set(uint64_t native_handle, const char *name)
++{
++    unsigned int i;
++
++    if (!steaminput_xinput_fallback_enabled() || !name) return native_handle;
++
++    for (i = 0; i < ARRAY_SIZE(xinput_action_sets); ++i)
++    {
++        if (strcmp(name, xinput_action_sets[i].name)) continue;
++        if (native_handle) xinput_action_sets[i].handle = native_handle;
++        else if (!xinput_action_sets[i].handle)
++            xinput_action_sets[i].handle = XINPUT_ACTION_SET_BASE + i;
++        return xinput_action_sets[i].handle;
++    }
++
++    return native_handle;
++}
++
+ uint64_t steaminput006_xinput_register_digital_action(uint64_t native_handle, const char *name)
+ {
+     unsigned int i;
+@@ -158,8 +276,27 @@ int steaminput006_xinput_get_digital_action_data(InputDigitalActionData_t *data,
+     for (i = 0; i < ARRAY_SIZE(xinput_digital_actions); ++i)
+     {
+         if (xinput_digital_actions[i].handle != action_handle) continue;
+-        data->bState = !!(state.Gamepad.wButtons & xinput_digital_actions[i].buttons);
+-        data->bActive = !!xinput_digital_actions[i].buttons;
++
++        switch (xinput_digital_actions[i].source)
++        {
++            case XINPUT_DIGITAL_BUTTON:
++                data->bState = !!(state.Gamepad.wButtons & xinput_digital_actions[i].buttons);
++                data->bActive = TRUE;
++                break;
++
++            case XINPUT_DIGITAL_LEFT_TRIGGER:
++                data->bState = state.Gamepad.bLeftTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD;
++                data->bActive = TRUE;
++                break;
++
++            case XINPUT_DIGITAL_RIGHT_TRIGGER:
++                data->bState = state.Gamepad.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD;
++                data->bActive = TRUE;
++                break;
++
++            case XINPUT_DIGITAL_UNAVAILABLE:
++                break;
++        }
+         break;
+     }
+ 
+@@ -276,7 +413,7 @@ int steaminput006_xinput_get_input_type(uint32_t *type, uint64_t input_handle)
+     if (!steaminput_xinput_fallback_enabled() || xinput_index_from_steam_handle(input_handle) < 0)
+         return FALSE;
+ 
+-    *type = STEAM_INPUT_TYPE_XBOX_ONE;
++    *type = steaminput_xinput_fallback_type();
+     return TRUE;
+ }
+ 
+diff --git a/lsteamclient/steamclient_private.h b/lsteamclient/steamclient_private.h
+--- a/lsteamclient/steamclient_private.h
++++ b/lsteamclient/steamclient_private.h
+@@ -47,7 +47,9 @@ void init_rtti( char *base );
+ 
+ #include "steamclient_generated.h"
+ 
++int steaminput_xinput_fallback_enabled(void);
+ int32_t steaminput006_xinput_get_connected_controllers( int32_t native_count, uint64_t *handles );
++uint64_t steaminput006_xinput_register_action_set( uint64_t native_handle, const char *name );
+ uint64_t steaminput006_xinput_register_digital_action( uint64_t native_handle, const char *name );
+ int steaminput006_xinput_get_digital_action_data( InputDigitalActionData_t *data,
+         uint64_t input_handle, uint64_t action_handle );
+diff --git a/lsteamclient/winISteamInput.c b/lsteamclient/winISteamInput.c
+--- a/lsteamclient/winISteamInput.c
++++ b/lsteamclient/winISteamInput.c
+@@ -47,6 +47,7 @@ int8_t __thiscall winISteamInput_SteamInput001_Init(struct w_iface *_this)
+     };
+     TRACE("%p\n", _this);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput001_Init, &params );
++    if (steaminput_xinput_fallback_enabled()) params._ret = TRUE;
+     return params._ret;
+ }
+ 
+@@ -80,6 +81,7 @@ int32_t __thiscall winISteamInput_SteamInput001_GetConnectedControllers(struct w
+     };
+     TRACE("%p\n", _this);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput001_GetConnectedControllers, &params );
++    params._ret = steaminput006_xinput_get_connected_controllers( params._ret, handlesOut );
+     return params._ret;
+ }
+ 
+@@ -93,6 +95,7 @@ uint64_t __thiscall winISteamInput_SteamInput001_GetActionSetHandle(struct w_ifa
+     TRACE("%p\n", _this);
+     IsBadStringPtrA(pszActionSetName, -1);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput001_GetActionSetHandle, &params );
++    params._ret = steaminput006_xinput_register_action_set( params._ret, pszActionSetName );
+     return params._ret;
+ }
+ 
+@@ -178,6 +181,7 @@ uint64_t __thiscall winISteamInput_SteamInput001_GetDigitalActionHandle(struct w
+     TRACE("%p\n", _this);
+     IsBadStringPtrA(pszActionName, -1);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput001_GetDigitalActionHandle, &params );
++    params._ret = steaminput006_xinput_register_digital_action( params._ret, pszActionName );
+     return params._ret;
+ }
+ 
+@@ -191,6 +195,7 @@ InputDigitalActionData_t * __thiscall winISteamInput_SteamInput001_GetDigitalAct
+         .digitalActionHandle = digitalActionHandle,
+     };
+     TRACE("%p\n", _this);
++    if (steaminput006_xinput_get_digital_action_data( _ret, inputHandle, digitalActionHandle )) return _ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput001_GetDigitalActionData, &params );
+     return params._ret;
+ }
+@@ -220,6 +225,7 @@ uint64_t __thiscall winISteamInput_SteamInput001_GetAnalogActionHandle(struct w_
+     TRACE("%p\n", _this);
+     IsBadStringPtrA(pszActionName, -1);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput001_GetAnalogActionHandle, &params );
++    params._ret = steaminput006_xinput_register_analog_action( params._ret, pszActionName );
+     return params._ret;
+ }
+ 
+@@ -233,6 +239,7 @@ InputAnalogActionData_t * __thiscall winISteamInput_SteamInput001_GetAnalogActio
+         .analogActionHandle = analogActionHandle,
+     };
+     TRACE("%p\n", _this);
++    if (steaminput006_xinput_get_analog_action_data( _ret, inputHandle, analogActionHandle )) return _ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput001_GetAnalogActionData, &params );
+     return params._ret;
+ }
+@@ -285,6 +292,7 @@ InputMotionData_t * __thiscall winISteamInput_SteamInput001_GetMotionData(struct
+         .inputHandle = inputHandle,
+     };
+     TRACE("%p\n", _this);
++    if (steaminput006_xinput_get_motion_data( _ret, inputHandle )) return _ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput001_GetMotionData, &params );
+     return params._ret;
+ }
+@@ -299,6 +307,7 @@ void __thiscall winISteamInput_SteamInput001_TriggerVibration(struct w_iface *_th
+         .usRightSpeed = usRightSpeed,
+     };
+     TRACE("%p\n", _this);
++    if (steaminput006_xinput_trigger_vibration( inputHandle, usLeftSpeed, usRightSpeed )) return;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput001_TriggerVibration, &params );
+ }
+ 
+@@ -366,6 +375,7 @@ uint32_t __thiscall winISteamInput_SteamInput001_GetInputTypeForHandle(struct w_
+         .inputHandle = inputHandle,
+     };
+     TRACE("%p\n", _this);
++    if (steaminput006_xinput_get_input_type( &params._ret, inputHandle )) return params._ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput001_GetInputTypeForHandle, &params );
+     return params._ret;
+ }
+@@ -379,6 +389,7 @@ uint64_t __thiscall winISteamInput_SteamInput001_GetControllerForGamepadIndex(st
+     };
+     TRACE("%p\n", _this);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput001_GetControllerForGamepadIndex, &params );
++    if (!params._ret) steaminput006_xinput_get_controller_for_gamepad_index( &params._ret, nIndex );
+     return params._ret;
+ }
+ 
+@@ -390,6 +401,7 @@ int32_t __thiscall winISteamInput_SteamInput001_GetGamepadIndexForController(str
+         .ulinputHandle = ulinputHandle,
+     };
+     TRACE("%p\n", _this);
++    if (steaminput006_xinput_get_gamepad_index_for_controller( &params._ret, ulinputHandle )) return params._ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput001_GetGamepadIndexForController, &params );
+     return params._ret;
+ }
+@@ -555,6 +567,7 @@ int8_t __thiscall winISteamInput_SteamInput002_Init(struct w_iface *_this)
+     };
+     TRACE("%p\n", _this);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput002_Init, &params );
++    if (steaminput_xinput_fallback_enabled()) params._ret = TRUE;
+     return params._ret;
+ }
+ 
+@@ -588,6 +601,7 @@ int32_t __thiscall winISteamInput_SteamInput002_GetConnectedControllers(struct w
+     };
+     TRACE("%p\n", _this);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput002_GetConnectedControllers, &params );
++    params._ret = steaminput006_xinput_get_connected_controllers( params._ret, handlesOut );
+     return params._ret;
+ }
+ 
+@@ -601,6 +615,7 @@ uint64_t __thiscall winISteamInput_SteamInput002_GetActionSetHandle(struct w_ifa
+     TRACE("%p\n", _this);
+     IsBadStringPtrA(pszActionSetName, -1);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput002_GetActionSetHandle, &params );
++    params._ret = steaminput006_xinput_register_action_set( params._ret, pszActionSetName );
+     return params._ret;
+ }
+ 
+@@ -686,6 +701,7 @@ uint64_t __thiscall winISteamInput_SteamInput002_GetDigitalActionHandle(struct w
+     TRACE("%p\n", _this);
+     IsBadStringPtrA(pszActionName, -1);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput002_GetDigitalActionHandle, &params );
++    params._ret = steaminput006_xinput_register_digital_action( params._ret, pszActionName );
+     return params._ret;
+ }
+ 
+@@ -699,6 +715,7 @@ InputDigitalActionData_t * __thiscall winISteamInput_SteamInput002_GetDigitalAct
+         .digitalActionHandle = digitalActionHandle,
+     };
+     TRACE("%p\n", _this);
++    if (steaminput006_xinput_get_digital_action_data( _ret, inputHandle, digitalActionHandle )) return _ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput002_GetDigitalActionData, &params );
+     return params._ret;
+ }
+@@ -728,6 +745,7 @@ uint64_t __thiscall winISteamInput_SteamInput002_GetAnalogActionHandle(struct w_
+     TRACE("%p\n", _this);
+     IsBadStringPtrA(pszActionName, -1);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput002_GetAnalogActionHandle, &params );
++    params._ret = steaminput006_xinput_register_analog_action( params._ret, pszActionName );
+     return params._ret;
+ }
+ 
+@@ -741,6 +759,7 @@ InputAnalogActionData_t * __thiscall winISteamInput_SteamInput002_GetAnalogActio
+         .analogActionHandle = analogActionHandle,
+     };
+     TRACE("%p\n", _this);
++    if (steaminput006_xinput_get_analog_action_data( _ret, inputHandle, analogActionHandle )) return _ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput002_GetAnalogActionData, &params );
+     return params._ret;
+ }
+@@ -793,6 +812,7 @@ InputMotionData_t * __thiscall winISteamInput_SteamInput002_GetMotionData(struct
+         .inputHandle = inputHandle,
+     };
+     TRACE("%p\n", _this);
++    if (steaminput006_xinput_get_motion_data( _ret, inputHandle )) return _ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput002_GetMotionData, &params );
+     return params._ret;
+ }
+@@ -807,6 +827,7 @@ void __thiscall winISteamInput_SteamInput002_TriggerVibration(struct w_iface *_th
+         .usRightSpeed = usRightSpeed,
+     };
+     TRACE("%p\n", _this);
++    if (steaminput006_xinput_trigger_vibration( inputHandle, usLeftSpeed, usRightSpeed )) return;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput002_TriggerVibration, &params );
+ }
+ 
+@@ -874,6 +895,7 @@ uint32_t __thiscall winISteamInput_SteamInput002_GetInputTypeForHandle(struct w_
+         .inputHandle = inputHandle,
+     };
+     TRACE("%p\n", _this);
++    if (steaminput006_xinput_get_input_type( &params._ret, inputHandle )) return params._ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput002_GetInputTypeForHandle, &params );
+     return params._ret;
+ }
+@@ -887,6 +909,7 @@ uint64_t __thiscall winISteamInput_SteamInput002_GetControllerForGamepadIndex(st
+     };
+     TRACE("%p\n", _this);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput002_GetControllerForGamepadIndex, &params );
++    if (!params._ret) steaminput006_xinput_get_controller_for_gamepad_index( &params._ret, nIndex );
+     return params._ret;
+ }
+ 
+@@ -898,6 +921,7 @@ int32_t __thiscall winISteamInput_SteamInput002_GetGamepadIndexForController(str
+         .ulinputHandle = ulinputHandle,
+     };
+     TRACE("%p\n", _this);
++    if (steaminput006_xinput_get_gamepad_index_for_controller( &params._ret, ulinputHandle )) return params._ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput002_GetGamepadIndexForController, &params );
+     return params._ret;
+ }
+@@ -1076,6 +1100,7 @@ int8_t __thiscall winISteamInput_SteamInput005_Init(struct w_iface *_this)
+     };
+     TRACE("%p\n", _this);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput005_Init, &params );
++    if (steaminput_xinput_fallback_enabled()) params._ret = TRUE;
+     return params._ret;
+ }
+ 
+@@ -1147,6 +1172,7 @@ int32_t __thiscall winISteamInput_SteamInput005_GetConnectedControllers(struct w
+     };
+     TRACE("%p\n", _this);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput005_GetConnectedControllers, &params );
++    params._ret = steaminput006_xinput_get_connected_controllers( params._ret, handlesOut );
+     return params._ret;
+ }
+ 
+@@ -1181,6 +1207,7 @@ uint64_t __thiscall winISteamInput_SteamInput005_GetActionSetHandle(struct w_ifa
+     TRACE("%p\n", _this);
+     IsBadStringPtrA(pszActionSetName, -1);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput005_GetActionSetHandle, &params );
++    params._ret = steaminput006_xinput_register_action_set( params._ret, pszActionSetName );
+     return params._ret;
+ }
+ 
+@@ -1266,6 +1293,7 @@ uint64_t __thiscall winISteamInput_SteamInput005_GetDigitalActionHandle(struct w
+     TRACE("%p\n", _this);
+     IsBadStringPtrA(pszActionName, -1);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput005_GetDigitalActionHandle, &params );
++    params._ret = steaminput006_xinput_register_digital_action( params._ret, pszActionName );
+     return params._ret;
+ }
+ 
+@@ -1279,6 +1307,7 @@ InputDigitalActionData_t * __thiscall winISteamInput_SteamInput005_GetDigitalAct
+         .digitalActionHandle = digitalActionHandle,
+     };
+     TRACE("%p\n", _this);
++    if (steaminput006_xinput_get_digital_action_data( _ret, inputHandle, digitalActionHandle )) return _ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput005_GetDigitalActionData, &params );
+     return params._ret;
+ }
+@@ -1320,6 +1349,7 @@ uint64_t __thiscall winISteamInput_SteamInput005_GetAnalogActionHandle(struct w_
+     TRACE("%p\n", _this);
+     IsBadStringPtrA(pszActionName, -1);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput005_GetAnalogActionHandle, &params );
++    params._ret = steaminput006_xinput_register_analog_action( params._ret, pszActionName );
+     return params._ret;
+ }
+ 
+@@ -1333,6 +1363,7 @@ InputAnalogActionData_t * __thiscall winISteamInput_SteamInput005_GetAnalogActio
+         .analogActionHandle = analogActionHandle,
+     };
+     TRACE("%p\n", _this);
++    if (steaminput006_xinput_get_analog_action_data( _ret, inputHandle, analogActionHandle )) return _ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput005_GetAnalogActionData, &params );
+     return params._ret;
+ }
+@@ -1397,6 +1428,7 @@ InputMotionData_t * __thiscall winISteamInput_SteamInput005_GetMotionData(struct
+         .inputHandle = inputHandle,
+     };
+     TRACE("%p\n", _this);
++    if (steaminput006_xinput_get_motion_data( _ret, inputHandle )) return _ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput005_GetMotionData, &params );
+     return params._ret;
+ }
+@@ -1411,6 +1443,7 @@ void __thiscall winISteamInput_SteamInput005_TriggerVibration(struct w_iface *_th
+         .usRightSpeed = usRightSpeed,
+     };
+     TRACE("%p\n", _this);
++    if (steaminput006_xinput_trigger_vibration( inputHandle, usLeftSpeed, usRightSpeed )) return;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput005_TriggerVibration, &params );
+ }
+ 
+@@ -1426,6 +1459,8 @@ void __thiscall winISteamInput_SteamInput005_TriggerVibrationExtended(struct w_i
+         .usRightTriggerSpeed = usRightTriggerSpeed,
+     };
+     TRACE("%p\n", _this);
++    if (steaminput006_xinput_trigger_vibration_extended( inputHandle, usLeftSpeed, usRightSpeed,
++            usLeftTriggerSpeed, usRightTriggerSpeed )) return;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput005_TriggerVibrationExtended, &params );
+ }
+ 
+@@ -1509,6 +1544,7 @@ uint32_t __thiscall winISteamInput_SteamInput005_GetInputTypeForHandle(struct w_
+         .inputHandle = inputHandle,
+     };
+     TRACE("%p\n", _this);
++    if (steaminput006_xinput_get_input_type( &params._ret, inputHandle )) return params._ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput005_GetInputTypeForHandle, &params );
+     return params._ret;
+ }
+@@ -1522,6 +1558,7 @@ uint64_t __thiscall winISteamInput_SteamInput005_GetControllerForGamepadIndex(st
+     };
+     TRACE("%p\n", _this);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput005_GetControllerForGamepadIndex, &params );
++    if (!params._ret) steaminput006_xinput_get_controller_for_gamepad_index( &params._ret, nIndex );
+     return params._ret;
+ }
+ 
+@@ -1533,6 +1570,7 @@ int32_t __thiscall winISteamInput_SteamInput005_GetGamepadIndexForController(str
+         .ulinputHandle = ulinputHandle,
+     };
+     TRACE("%p\n", _this);
++    if (steaminput006_xinput_get_gamepad_index_for_controller( &params._ret, ulinputHandle )) return params._ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput005_GetGamepadIndexForController, &params );
+     return params._ret;
+ }
+@@ -1735,6 +1773,7 @@ int8_t __thiscall winISteamInput_SteamInput006_Init(struct w_iface *_this)
+     };
+     TRACE("%p\n", _this);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput006_Init, &params );
++    if (steaminput_xinput_fallback_enabled()) params._ret = TRUE;
+     return params._ret;
+ }
+ 
+@@ -1841,6 +1880,7 @@ uint64_t __thiscall winISteamInput_SteamInput006_GetActionSetHandle(struct w_ifa
+     TRACE("%p\n", _this);
+     IsBadStringPtrA(pszActionSetName, -1);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput006_GetActionSetHandle, &params );
++    params._ret = steaminput006_xinput_register_action_set( params._ret, pszActionSetName );
+     return params._ret;
+ }
+ 
+@@ -2419,6 +2459,7 @@ int8_t __thiscall winISteamInput_SteamInput007_Init(struct w_iface *_this)
+     };
+     TRACE("%p\n", _this);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput007_Init, &params );
++    if (steaminput_xinput_fallback_enabled()) params._ret = TRUE;
+     return params._ret;
+ }
+ 
+@@ -2490,6 +2531,7 @@ int32_t __thiscall winISteamInput_SteamInput007_GetConnectedControllers(struct w
+     };
+     TRACE("%p\n", _this);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput007_GetConnectedControllers, &params );
++    params._ret = steaminput006_xinput_get_connected_controllers( params._ret, handlesOut );
+     return params._ret;
+ }
+ 
+@@ -2524,6 +2566,7 @@ uint64_t __thiscall winISteamInput_SteamInput007_GetActionSetHandle(struct w_ifa
+     TRACE("%p\n", _this);
+     IsBadStringPtrA(pszActionSetName, -1);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput007_GetActionSetHandle, &params );
++    params._ret = steaminput006_xinput_register_action_set( params._ret, pszActionSetName );
+     return params._ret;
+ }
+ 
+@@ -2609,6 +2652,7 @@ uint64_t __thiscall winISteamInput_SteamInput007_GetDigitalActionHandle(struct w
+     TRACE("%p\n", _this);
+     IsBadStringPtrA(pszActionName, -1);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput007_GetDigitalActionHandle, &params );
++    params._ret = steaminput006_xinput_register_digital_action( params._ret, pszActionName );
+     return params._ret;
+ }
+ 
+@@ -2622,6 +2666,7 @@ InputDigitalActionData_t * __thiscall winISteamInput_SteamInput007_GetDigitalAct
+         .digitalActionHandle = digitalActionHandle,
+     };
+     TRACE("%p\n", _this);
++    if (steaminput006_xinput_get_digital_action_data( _ret, inputHandle, digitalActionHandle )) return _ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput007_GetDigitalActionData, &params );
+     return params._ret;
+ }
+@@ -2663,6 +2708,7 @@ uint64_t __thiscall winISteamInput_SteamInput007_GetAnalogActionHandle(struct w_
+     TRACE("%p\n", _this);
+     IsBadStringPtrA(pszActionName, -1);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput007_GetAnalogActionHandle, &params );
++    params._ret = steaminput006_xinput_register_analog_action( params._ret, pszActionName );
+     return params._ret;
+ }
+ 
+@@ -2676,6 +2722,7 @@ InputAnalogActionData_t * __thiscall winISteamInput_SteamInput007_GetAnalogActio
+         .analogActionHandle = analogActionHandle,
+     };
+     TRACE("%p\n", _this);
++    if (steaminput006_xinput_get_analog_action_data( _ret, inputHandle, analogActionHandle )) return _ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput007_GetAnalogActionData, &params );
+     return params._ret;
+ }
+@@ -2740,6 +2787,7 @@ InputMotionData_t * __thiscall winISteamInput_SteamInput007_GetMotionData(struct
+         .inputHandle = inputHandle,
+     };
+     TRACE("%p\n", _this);
++    if (steaminput006_xinput_get_motion_data( _ret, inputHandle )) return _ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput007_GetMotionData, &params );
+     return params._ret;
+ }
+@@ -2754,6 +2802,7 @@ void __thiscall winISteamInput_SteamInput007_TriggerVibration(struct w_iface *_th
+         .usRightSpeed = usRightSpeed,
+     };
+     TRACE("%p\n", _this);
++    if (steaminput006_xinput_trigger_vibration( inputHandle, usLeftSpeed, usRightSpeed )) return;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput007_TriggerVibration, &params );
+ }
+ 
+@@ -2769,6 +2818,8 @@ void __thiscall winISteamInput_SteamInput007_TriggerVibrationExtended(struct w_i
+         .usRightTriggerSpeed = usRightTriggerSpeed,
+     };
+     TRACE("%p\n", _this);
++    if (steaminput006_xinput_trigger_vibration_extended( inputHandle, usLeftSpeed, usRightSpeed,
++            usLeftTriggerSpeed, usRightTriggerSpeed )) return;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput007_TriggerVibrationExtended, &params );
+ }
+ 
+@@ -2852,6 +2903,7 @@ uint32_t __thiscall winISteamInput_SteamInput007_GetInputTypeForHandle(struct w_
+         .inputHandle = inputHandle,
+     };
+     TRACE("%p\n", _this);
++    if (steaminput006_xinput_get_input_type( &params._ret, inputHandle )) return params._ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput007_GetInputTypeForHandle, &params );
+     return params._ret;
+ }
+@@ -2865,6 +2917,7 @@ uint64_t __thiscall winISteamInput_SteamInput007_GetControllerForGamepadIndex(st
+     };
+     TRACE("%p\n", _this);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput007_GetControllerForGamepadIndex, &params );
++    if (!params._ret) steaminput006_xinput_get_controller_for_gamepad_index( &params._ret, nIndex );
+     return params._ret;
+ }
+ 
+@@ -2876,6 +2929,7 @@ int32_t __thiscall winISteamInput_SteamInput007_GetGamepadIndexForController(str
+         .ulinputHandle = ulinputHandle,
+     };
+     TRACE("%p\n", _this);
++    if (steaminput006_xinput_get_gamepad_index_for_controller( &params._ret, ulinputHandle )) return params._ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput007_GetGamepadIndexForController, &params );
+     return params._ret;
+ }

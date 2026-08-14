@@ -1,0 +1,166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Fri, 14 Aug 2026 15:00:00 -0600
+Subject: [PATCH] lsteamclient: Detect native Steam Input by virtual device
+
+GetSessionInputConfigurationSettings reports the controller families enabled
+for an application, not whether the user enabled Steam Input for the current
+launch. Consequently its bitmask can remain nonzero with the per-game Steam
+Input toggle disabled, incorrectly suppressing the standalone fallback and
+leaving games on their ordinary Xbox path.
+
+Use the live 28de:11ff Steam virtual gamepad as the native-ownership signal
+instead. Refresh the decision when Steam Input initializes, when the session
+configuration is queried, and whenever controllers are enumerated. If the
+virtual gamepad is absent, synthesize the configured fallback even when the
+application's opt-in bitmask is nonzero; if it is present, leave Steam's native
+handles and mappings authoritative.
+
+This also lets fallback layout detection inspect the real converted XInput
+slot, so DualSense and DualSense Edge devices select the PS5 profile rather
+than inheriting an Xbox profile from the stale configuration mask.
+---
+ lsteamclient/steam_input_manual.c | 66 ++++++++++++++++++++++---------
+ 1 file changed, 38 insertions(+), 28 deletions(-)
+
+diff --git a/lsteamclient/steam_input_manual.c b/lsteamclient/steam_input_manual.c
+--- a/lsteamclient/steam_input_manual.c
++++ b/lsteamclient/steam_input_manual.c
+@@ -20,6 +20,8 @@
+ #define SONY_DUALSHOCK4_ADAPTER_PRODUCT_ID 0x0ba0
+ #define SONY_DUALSENSE_PRODUCT_ID 0x0ce6
+ #define SONY_DUALSENSE_EDGE_PRODUCT_ID 0x0df2
++#define STEAM_VIRTUAL_GAMEPAD_VENDOR_ID 0x28de
++#define STEAM_VIRTUAL_GAMEPAD_PRODUCT_ID 0x11ff
+ 
+ enum steam_input_source_mode
+ {
+@@ -188,7 +190,6 @@ enum steaminput_xinput_fallback_mode
+ };
+ 
+ static LONG steaminput_xinput_fallback_mode;
+-static LONG steaminput_native_configuration_known;
+ 
+ int steaminput_xinput_fallback_configured(void)
+ {
+@@ -213,30 +214,59 @@ static void steaminput_xinput_set_fallback_mode(enum steaminput_xinput_fallback_
+                 (unsigned int)mode, reason);
+ }
+ 
+-void steaminput_xinput_set_native_configuration(uint16_t native_configuration)
+-{
+-    InterlockedExchange(&steaminput_native_configuration_known, TRUE);
+-    if (native_configuration || !steaminput_xinput_fallback_configured())
+-        steaminput_xinput_set_fallback_mode(STEAMINPUT_FALLBACK_NATIVE,
+-                "native session configuration enabled");
+-    else
+-        steaminput_xinput_set_fallback_mode(STEAMINPUT_FALLBACK_XINPUT,
+-                "native session configuration disabled");
+-}
+-
+ typedef DWORD (WINAPI *xinput_get_sony_product_id_func)(DWORD index, WORD *product_id);
++typedef DWORD (WINAPI *xinput_get_device_vid_pid_func)(DWORD index, WORD *vendor_id, WORD *product_id);
+ 
+ static xinput_get_sony_product_id_func xinput_get_sony_product_id;
++static xinput_get_device_vid_pid_func xinput_get_device_vid_pid;
+ 
+ static BOOL CALLBACK init_xinput_get_sony_product_id(INIT_ONCE *once, void *param, void **context)
+ {
+     HMODULE module = GetModuleHandleW(L"xinput1_3.dll");
+ 
+     if (module)
++    {
+         xinput_get_sony_product_id = (void *)GetProcAddress(module, "__wine_XInputGetSonyProductId");
++        xinput_get_device_vid_pid = (void *)GetProcAddress(module, "__wine_XInputGetDeviceVidPid");
++    }
+     return TRUE;
+ }
+ 
++static BOOL steaminput_xinput_native_virtual_present(void)
++{
++    static INIT_ONCE init_once = INIT_ONCE_STATIC_INIT;
++    unsigned int index;
++
++    InitOnceExecuteOnce(&init_once, init_xinput_get_sony_product_id, NULL, NULL);
++    if (!xinput_get_device_vid_pid) return FALSE;
++
++    for (index = 0; index < XUSER_MAX_COUNT; ++index)
++    {
++        WORD vendor_id = 0, product_id = 0;
++
++        if (xinput_get_device_vid_pid(index, &vendor_id, &product_id) != ERROR_SUCCESS) continue;
++        if (vendor_id == STEAM_VIRTUAL_GAMEPAD_VENDOR_ID &&
++                product_id == STEAM_VIRTUAL_GAMEPAD_PRODUCT_ID)
++            return TRUE;
++    }
++
++    return FALSE;
++}
++
++static void steaminput_xinput_refresh_mode(const char *reason)
++{
++    if (!steaminput_xinput_fallback_configured() || steaminput_xinput_native_virtual_present())
++        steaminput_xinput_set_fallback_mode(STEAMINPUT_FALLBACK_NATIVE, reason);
++    else
++        steaminput_xinput_set_fallback_mode(STEAMINPUT_FALLBACK_XINPUT, reason);
++}
++
++void steaminput_xinput_set_native_configuration(uint16_t native_configuration)
++{
++    TRACE("native Steam Input configuration mask %#x.\n", native_configuration);
++    steaminput_xinput_refresh_mode("live Steam virtual controller probe");
++}
++
+ static WORD steaminput_xinput_sony_product_id(unsigned int index)
+ {
+     static INIT_ONCE init_once = INIT_ONCE_STATIC_INIT;
+@@ -276,9 +315,8 @@ uint16_t steaminput_xinput_get_session_configuration(uint16_t native_configurati
+ 
+     if (!steaminput_xinput_fallback_configured()) return native_configuration;
+ 
+-    steaminput_xinput_set_native_configuration(native_configuration);
+-    if (native_configuration || !steaminput_xinput_fallback_active())
+-        return native_configuration;
++    steaminput_xinput_refresh_mode("session configuration query");
++    if (!steaminput_xinput_fallback_active()) return native_configuration;
+ 
+     for (index = 0; index < XUSER_MAX_COUNT; ++index)
+     {
+@@ -352,19 +390,11 @@ int32_t steaminput006_xinput_get_connected_controllers(int32_t native_count, uin
+ 
+     if (!steaminput_xinput_fallback_configured() || !handles) return native_count;
+ 
++    steaminput_xinput_refresh_mode("controller enumeration");
+     if (InterlockedCompareExchange(&steaminput_xinput_fallback_mode, 0, 0) ==
+             STEAMINPUT_FALLBACK_NATIVE)
+         return native_count;
+ 
+-    /* Interfaces before SteamInput005 have no session configuration query. */
+-    if (!InterlockedCompareExchange(&steaminput_native_configuration_known, 0, 0) &&
+-            native_count > 0)
+-    {
+-        steaminput_xinput_set_fallback_mode(STEAMINPUT_FALLBACK_NATIVE,
+-                "native controller enumeration succeeded");
+-        return native_count;
+-    }
+-
+     for (index = 0; index < XUSER_MAX_COUNT; ++index)
+     {
+         if (XInputGetState(index, &state) != ERROR_SUCCESS) continue;
+@@ -372,14 +403,6 @@ int32_t steaminput006_xinput_get_connected_controllers(int32_t native_count, uin
+         mask |= 1u << index;
+     }
+ 
+-    if (!InterlockedCompareExchange(&steaminput_native_configuration_known, 0, 0) && count &&
+-            InterlockedCompareExchange(&steaminput_xinput_fallback_mode, 0, 0) ==
+-            STEAMINPUT_FALLBACK_UNKNOWN)
+-        steaminput_xinput_set_fallback_mode(STEAMINPUT_FALLBACK_XINPUT,
+-                "native controller enumeration empty");
+-
+-    if (!steaminput_xinput_fallback_active()) return native_count;
+-
+     if (mask != previous_mask || memcmp(current_types, previous_types, sizeof(current_types)))
+     {
+         TRACE("Steam Input XInput fallback replacing %d native controllers with mask %#x, "
+-- 
+2.55.0
