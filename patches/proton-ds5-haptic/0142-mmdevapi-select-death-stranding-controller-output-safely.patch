@@ -1,0 +1,255 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Tue, 11 Aug 2026 23:59:00 -0600
+Subject: [PATCH] mmdevapi: Select Death Stranding controller output safely
+
+Death Stranding Director's Cut stores its selected Wwise secondary output as
+the lowercase FNV-1 hash of the Windows endpoint ID. Cache the visible Sony
+controller endpoint when MMDevAPI creates it, then select that hash immediately
+before the game's requested output in its native settings transaction. This
+avoids detached calls and direct writes into game state.
+
+The PC port does not commit the BB secondary output until a subsequent output
+selection. A single substituted call therefore leaves the controller stream
+alive but silent, while forcing the controller as the primary output confuses
+the game's visible device selection. Priming the controller and then preserving
+the requested primary output reproduces the game's working two-selection
+sequence in one transaction.
+
+The PC implementation of sGetFootSoundToControllerSpeaker is a hard-coded
+false stub. Enabling it enters an incomplete Wwise environmental-speaker path
+and crashes shortly afterward. Keep that callback disabled. Its signature and
+the adjacent controller-speaker callback are used only as a strict executable
+version guard before intercepting the native output selector.
+
+Initial synchronous endpoint enumeration must not be replayed as a hotplug.
+Death Stranding responds to that duplicate add notification by rebuilding live
+XAudio engines. Pass the startup/hotplug distinction explicitly because Pulse
+marks both successful request types as delta-capable. Real hotplug and all
+other titles retain the existing notification path.
+---
+
+--- a/dlls/mmdevapi/main.c
++++ b/dlls/mmdevapi/main.c
+@@ -55,6 +55,31 @@
+ 
+ const WCHAR drv_keyW[] = L"Software\\Wine\\Drivers";
+ 
++typedef BOOL (WINAPI *death_stranding_output_selector_t)(DWORD output_id);
++
++static death_stranding_output_selector_t death_stranding_output_selector;
++static LONG death_stranding_pending_output_id = -1;
++
++static BOOL WINAPI death_stranding_select_controller_output(DWORD output_id)
++{
++    LONG hash;
++    BOOL ret;
++
++    hash = InterlockedExchange(&death_stranding_pending_output_id, -1);
++    if (hash != -1 && (DWORD)hash != output_id)
++    {
++        TRACE("Death Stranding is priming controller output %#lx before requested output %#lx.\n",
++                hash, output_id);
++        ret = death_stranding_output_selector(hash);
++        if (!ret)
++            WARN("Death Stranding rejected controller output %#lx; preserving requested output %#lx.\n",
++                    hash, output_id);
++    }
++
++    TRACE("Death Stranding is selecting requested output %#lx through its settings path.\n", output_id);
++    return death_stranding_output_selector(output_id);
++}
++
+ static const char *get_priority_string(int prio)
+ {
+     switch(prio){
+@@ -137,9 +160,11 @@
+     BYTE *callbacks[ARRAY_SIZE(callback_names)] = {0};
+     IMAGE_NT_HEADERS *nt;
+     IMAGE_SECTION_HEADER *section;
++    BYTE *output_selector = NULL, *selector_call = NULL;
+     DWORD old_protect;
+     WCHAR value[2];
+     INT32 jump_offset;
++    INT_PTR relative_offset;
+     unsigned int i, k;
+ 
+     if (GetEnvironmentVariableW(L"PROTON_DEATH_STRANDING_CONTROLLER_EFFECTS", value, ARRAY_SIZE(value)) != 1
+@@ -224,18 +249,90 @@
+             || callbacks[1][10] != 0xc3)
+         return FALSE;
+ 
+-    jump_offset = (INT32)(callbacks[1] - callbacks[0] - 5);
+-    if (callbacks[0] + 5 + jump_offset != callbacks[1]) return FALSE;
+-    if (!VirtualProtect(callbacks[0], 5, PAGE_EXECUTE_READWRITE, &old_protect)) return FALSE;
+-    callbacks[0][0] = 0xe9;
+-    memcpy(callbacks[0] + 1, &jump_offset, sizeof(jump_offset));
+-    FlushInstructionCache(GetCurrentProcess(), callbacks[0], 5);
+-    VirtualProtect(callbacks[0], 5, old_protect, &old_protect);
+-    TRACE("Gated Death Stranding controller-speaker environmental effects callback %p on active output %p.\n",
+-            callbacks[0], callbacks[1]);
++    for (i = 0; i < nt->FileHeader.NumberOfSections && !selector_call; ++i)
++    {
++        BYTE *start = base + section[i].VirtualAddress;
++        SIZE_T size = section[i].Misc.VirtualSize;
++        SIZE_T j;
++
++        if (!(section[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) || size < 24) continue;
++        for (j = 0; j <= size - 24; ++j)
++        {
++            BYTE *p = start + j;
++            INT32 displacement;
++            BYTE *target;
++
++            if (p[0] != 0x8b || p[1] != 0x8b || p[2] != 0xdc ||
++                    p[3] != 0x00 || p[4] != 0x00 || p[5] != 0x00 ||
++                    p[6] != 0xc5 || p[7] != 0xf8 || p[8] != 0x77 || p[9] != 0xe8 ||
++                    p[14] != 0xc5 || p[15] != 0xf8 || p[16] != 0x77 ||
++                    p[17] != 0x48 || p[18] != 0x83 || p[19] != 0xc4 || p[20] != 0x78 ||
++                    p[21] != 0x5f || p[22] != 0x5b || p[23] != 0xc3)
++                continue;
++
++            memcpy(&displacement, p + 10, sizeof(displacement));
++            target = p + 14 + displacement;
++            if (target < base || target + 10 > base + nt->OptionalHeader.SizeOfImage ||
++                    target[0] != 0x48 || target[1] != 0x89 || target[2] != 0x5c ||
++                    target[3] != 0x24 || target[4] != 0x10 || target[5] != 0x56 ||
++                    target[6] != 0x48 || target[7] != 0x83 || target[8] != 0xec || target[9] != 0x40)
++                continue;
++
++            selector_call = p + 9;
++            output_selector = target;
++            break;
++        }
++    }
++    if (!selector_call) return FALSE;
++
++    relative_offset = (BYTE *)death_stranding_select_controller_output - (selector_call + 5);
++    jump_offset = (INT32)relative_offset;
++    if ((INT_PTR)jump_offset != relative_offset) return FALSE;
++    death_stranding_output_selector = (death_stranding_output_selector_t)output_selector;
++    if (!VirtualProtect(selector_call, 5, PAGE_EXECUTE_READWRITE, &old_protect)) return FALSE;
++    selector_call[0] = 0xe8;
++    memcpy(selector_call + 1, &jump_offset, sizeof(jump_offset));
++    FlushInstructionCache(GetCurrentProcess(), selector_call, 5);
++    VirtualProtect(selector_call, 5, old_protect, &old_protect);
++
++    TRACE("Left unsupported Death Stranding environmental speaker callback %p disabled and "
++            "redirected its settings output selector call %p through %p.\n", callbacks[0],
++            selector_call, (void *)death_stranding_select_controller_output);
+     return TRUE;
+ }
+ 
++void death_stranding_controller_endpoint_seen(const WCHAR *id)
++{
++    const WCHAR *p;
++    DWORD hash = 0x811c9dc5;
++    if (!death_stranding_output_selector || !id) return;
++
++    for (p = id; *p; ++p)
++    {
++        WCHAR ch = *p;
++
++        if (ch >= 'A' && ch <= 'Z') ch += 'a' - 'A';
++        if (ch > 0x7f)
++        {
++            WARN("Cannot select non-ASCII Death Stranding controller endpoint %s.\n", wine_dbgstr_w(id));
++            return;
++        }
++        hash *= 0x01000193;
++        hash ^= ch;
++    }
++
++    if (hash == ~0u || (DWORD)InterlockedExchange(&death_stranding_pending_output_id, hash) == hash)
++        return;
++
++    TRACE("Queued Death Stranding controller endpoint %s (Wwise device %#lx) for its settings path.\n",
++            wine_dbgstr_w(id), hash);
++}
++
++BOOL death_stranding_controller_output_hook_active(void)
++{
++    return death_stranding_output_selector != NULL;
++}
++
+ static BOOL WINAPI init_driver(INIT_ONCE *once, void *param, void **context)
+ {
+     static WCHAR default_list[] = L"pulse,alsa,oss,coreaudio";
+@@ -246,7 +343,7 @@ static BOOL WINAPI init_driver(INIT_ONCE *once, void *param, void **context)
+ 
+     if (GetEnvironmentVariableW(L"PROTON_DEATH_STRANDING_CONTROLLER_EFFECTS", reg_list, ARRAY_SIZE(reg_list))
+             && !enable_death_stranding_controller_effects())
+-        WARN("Could not enable Death Stranding controller-speaker environmental effects.\n");
++        WARN("Could not configure Death Stranding's native controller-audio output.\n");
+ 
+     if(RegOpenKeyW(HKEY_CURRENT_USER, drv_keyW, &key) == ERROR_SUCCESS){
+         DWORD size = sizeof(reg_list);
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -1830,7 +1830,7 @@
+ static LONG dualsense_mono_activation_serial;
+ static enum dualsense_mono_model dualsense_mono_render_add_model;
+ 
+-static void add_endpoints_from_params(struct get_endpoint_ids_params *params)
++static void add_endpoints_from_params(struct get_endpoint_ids_params *params, BOOL hotplug)
+ {
+     UINT i;
+ 
+@@ -1843,8 +1843,24 @@
+         device = MMDevice_Create(name, &guid, params->flow, DEVICE_STATE_ACTIVE, params->default_idx == i);
+         if (device && params->flow == eRender && is_dualsense_mono_endpoint(device))
+         {
+-            dualsense_mono_render_add_model = dualsense_mono_endpoint_model(device);
+-            InterlockedExchange(&dualsense_mono_render_add_pending, 1);
++            const GUID *id = &device->devguid;
++            WCHAR devid[56];
++
++            if (should_prioritize_dualsense_mono_endpoint(device) &&
++                    !should_hide_from_endpoint_collection(device))
++            {
++                swprintf(devid, ARRAY_SIZE(devid), devid_formatW,
++                        device->flow, id->Data1, id->Data2, id->Data3,
++                        id->Data4[0], id->Data4[1], id->Data4[2], id->Data4[3],
++                        id->Data4[4], id->Data4[5], id->Data4[6], id->Data4[7]);
++                death_stranding_controller_endpoint_seen(devid);
++            }
++
++            if (hotplug || !death_stranding_controller_output_hook_active())
++            {
++                dualsense_mono_render_add_model = dualsense_mono_endpoint_model(device);
++                InterlockedExchange(&dualsense_mono_render_add_pending, 1);
++            }
+         }
+     }
+ }
+@@ -1985,7 +2001,7 @@
+         }
+ 
+         /* add devices only after removing devices */
+-        add_endpoints_from_params(&params);
++        add_endpoints_from_params(&params, TRUE);
+ 
+         if (params.flow == eRender)
+         {
+@@ -2087,7 +2103,7 @@
+ 
+     if (params.delta)
+         need_update_thread = TRUE;
+-    add_endpoints_from_params(&params);
++    add_endpoints_from_params(&params, FALSE);
+ 
+ end:
+     free(params.endpoints);
+--- a/dlls/mmdevapi/mmdevapi_private.h
++++ b/dlls/mmdevapi/mmdevapi_private.h
+@@ -134,6 +134,8 @@
+ extern HRESULT load_driver_devices(EDataFlow flow);
+ extern BOOL auto_select_sony_audio_mode(IMMDevice *device, AUDCLNT_SHAREMODE mode,
+         const WAVEFORMATEX *format, unsigned int *probe_count);
++extern void death_stranding_controller_endpoint_seen(const WCHAR *id);
++extern BOOL death_stranding_controller_output_hook_active(void);
+ 
+ extern void main_loop_stop(void);
+ extern void stop_update_thread(void);
+-- 
+2.55.0

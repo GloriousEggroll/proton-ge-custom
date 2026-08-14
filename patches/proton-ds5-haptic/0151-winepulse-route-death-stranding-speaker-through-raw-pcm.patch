@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Thu, 13 Aug 2026 01:25:00 -0600
+Subject: [PATCH] winepulse: Route Death Stranding speaker through raw PCM
+
+Death Stranding supplies controller speaker audio in hardware channel AUX1 of
+the same four-channel endpoint that carries DualSense haptics. The separate
+PulseAudio mono stream reaches the correct public sink and accepts nonzero
+samples, but PipeWire does not reliably deliver that second stream while Wine
+also has the raw four-channel PCM open on the same hardware node.
+
+For Death Stranding's opt-in controller-effects mode, keep AUX1 in the raw
+four-channel PCM instead. Clear only AUX0, preserving AUX1 speaker samples and
+AUX2/AUX3 haptics. Do not create or feed the redundant private mono stream in
+this mode. Reassert the USB internal-speaker route immediately before the
+first nonzero AUX1 samples reach the raw PCM.
+
+Keep the existing split-Pulse route unchanged for every other title.
+
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -1364,6 +1364,13 @@ static BOOL use_dualsense_split_audio(void)
+     return env && env[0] == '1' && !env[1];
+ }
+ 
++static BOOL use_death_stranding_controller_effects(void)
++{
++    const char *env = getenv("PROTON_DEATH_STRANDING_CONTROLLER_EFFECTS");
++
++    return env && env[0] == '1' && !env[1];
++}
++
+ static char *make_pipewire_dualsense_haptic_path(const char *target)
+ {
+     static const char prefix[] = "pipewire:NODE=";
+@@ -3144,7 +3151,6 @@ static BOOL pulse_select_dualsense_usb_speaker(void)
+         [8] = 0x30, /* Route audio to the internal speaker. */
+         [38] = 0x02, /* Speaker pre-gain. */
+     };
+-    const char *enabled = getenv("PROTON_DEATH_STRANDING_CONTROLLER_EFFECTS");
+     struct hidraw_devinfo info;
+     char path[32];
+     ssize_t written;
+@@ -3152,7 +3158,7 @@ static BOOL pulse_select_dualsense_usb_speaker(void)
+     BOOL found = FALSE, selected = FALSE;
+     int fd;
+ 
+-    if (!enabled || enabled[0] != '1' || enabled[1])
++    if (!use_death_stranding_controller_effects())
+         return FALSE;
+ 
+     for (i = 0; i < 64; ++i)
+@@ -3597,7 +3603,7 @@ static void pulse_haptic_write(struct pulse_stream *stream)
+     UINT32 frames, contiguous_frames, i, c;
+     const BYTE *src;
+     const void *write_data;
+-    BOOL split_speaker;
++    BOOL raw_speaker, split_speaker;
+     int err;
+ 
+     if (!pulse_stream_haptic(stream) || !held_frames)
+@@ -3645,6 +3651,7 @@ static void pulse_haptic_write(struct pulse_stream *stream)
+         return;
+     src = stream->local_buffer + stream->pa_offs_bytes;
+     split_speaker = use_dualsense_split_audio() && pulse_split_speaker_ready(stream);
++    raw_speaker = use_death_stranding_controller_effects() && stream->ss.channels >= 2;
+     if (stream->ss.format == PA_SAMPLE_FLOAT32LE)
+     {
+         const float *float_src = (const float *)src;
+@@ -3666,7 +3673,7 @@ static void pulse_haptic_write(struct pulse_stream *stream)
+                         float_to_s16(float_src[i * stream->ss.channels + c]);
+         write_data = stream->haptic_buffer;
+     }
+-    else if (split_speaker)
++    else if (split_speaker || raw_speaker)
+     {
+         if (frames > stream->haptic_buffer_frames)
+         {
+@@ -3685,12 +3692,22 @@ static void pulse_haptic_write(struct pulse_stream *stream)
+     else
+         write_data = src;
+ 
+-    if (split_speaker)
++    if (split_speaker || raw_speaker)
+     {
+         int16_t *samples = stream->haptic_buffer;
++        BOOL has_speaker_signal = FALSE;
+ 
+         for (i = 0; i < frames; ++i)
+-            samples[i * stream->ss.channels] = samples[i * stream->ss.channels + 1] = 0;
++        {
++            samples[i * stream->ss.channels] = 0;
++            if (raw_speaker)
++                has_speaker_signal |= samples[i * stream->ss.channels + 1] != 0;
++            else
++                samples[i * stream->ss.channels + 1] = 0;
++        }
++
++        if (raw_speaker && has_speaker_signal && !stream->speaker_route_selected)
++            stream->speaker_route_selected = pulse_select_dualsense_usb_speaker();
+     }
+ 
+     pulse_haptic_trace_channels(stream, write_data, frames);
+@@ -3799,7 +3816,8 @@ static NTSTATUS pulse_create_stream(void *args)
+             WARN("No PipeWire parent was found for the DualSense haptic stream from %s.\n",
+                     params->device);
+ 
+-        if (use_dualsense_split_audio() && stream->ss.format == PA_SAMPLE_FLOAT32LE)
++        if (use_dualsense_split_audio() && !use_death_stranding_controller_effects() &&
++                stream->ss.format == PA_SAMPLE_FLOAT32LE)
+             split_speaker = get_dualsense_speaker_sink(params->device, TRUE);
+     }
+ 
+@@ -3913,7 +3931,8 @@ static NTSTATUS pulse_create_stream(void *args)
+             }
+         }
+         stream->device = strdup(connect_device);
+-        if (haptic_candidate && use_dualsense_split_audio() && haptic_alsa_path &&
++        if (haptic_candidate && use_dualsense_split_audio() &&
++                !use_death_stranding_controller_effects() && haptic_alsa_path &&
+                 stream->ss.format == PA_SAMPLE_FLOAT32LE)
+         {
+             if (!split_speaker)
+-- 
+2.50.1

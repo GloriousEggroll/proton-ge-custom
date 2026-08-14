@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Wed, 12 Aug 2026 17:00:00 -0600
+Subject: [PATCH] winepulse: Pace split DualSense streams from the logical ring
+
+Do not expose the private Pulse speaker stream's queue depth as the public
+WASAPI stream padding. The two queues advance independently, and coupling them
+causes Wwise's controller mastering voice to intermittently gate the game's
+main mastering voice.
+
+Instead, let raw actuator writes advance only their own ALSA cursor for split
+streams. Retain application-visible frames in Wine's logical render ring and
+retire one period from that ring on each audio timer tick. This preserves the
+normal three-period WASAPI cadence, feeds the private speaker stream at real
+time, and leaves the main game output isolated.
+---
+ dlls/winepulse.drv/pulse.c | 25 +++++++------------------
+ 1 file changed, 7 insertions(+), 18 deletions(-)
+
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -3309,9 +3309,12 @@ static void pulse_haptic_advance(struct pulse_stream *stream, UINT32 frames, UINT
+ 
+     stream->pa_offs_bytes += bytes;
+     stream->pa_offs_bytes %= stream->real_bufsize_bytes;
+-    stream->lcl_offs_bytes += bytes;
+-    stream->lcl_offs_bytes %= stream->real_bufsize_bytes;
+     stream->pa_held_bytes -= min(stream->pa_held_bytes, bytes);
++    if (pulse_split_speaker_ready(stream))
++        return;
++
++    stream->lcl_offs_bytes += bytes;
++    stream->lcl_offs_bytes %= stream->real_bufsize_bytes;
+     stream->held_bytes -= min(stream->held_bytes, bytes);
+ }
+ 
+@@ -4307,12 +4310,12 @@ static void pa_streams_timer_cb(pa_mainloop_api *api, pa_time_event *e, const str
+             {
+                 pulse_write(stream);
+ 
+-                if (!pulse_stream_haptic(stream))
++                if (!pulse_stream_haptic(stream) || pulse_split_speaker_ready(stream))
+                 {
+-                    /* regardless of what PA does, advance one period */
++                    /* Pace normal Pulse and split speaker streams by one logical period. */
+                     adv_bytes = min(stream->period_bytes, stream->held_bytes);
+                     stream->lcl_offs_bytes += adv_bytes;
+                     stream->lcl_offs_bytes %= stream->real_bufsize_bytes;
+                     stream->held_bytes -= adv_bytes;
+                 }
+             }
+@@ -4690,17 +4693,3 @@ static UINT32 pulse_render_padding(struct pulse_stream *stream)
+ {
+-    if (pulse_split_speaker_ready(stream))
+-    {
+-        const pa_buffer_attr *attr = pa_stream_get_buffer_attr(stream->speaker_stream);
+-        SIZE_T sample_size = pa_sample_size_of_format(stream->ss.format);
+-        SIZE_T writable = pa_stream_writable_size(stream->speaker_stream);
+-
+-        /* Raw actuator PCM is consumed immediately and therefore normally
+-         * reports no padding. A hybrid speaker+haptic stream must instead be
+-         * paced by the public speaker queue, or the client renders several
+-         * periods per tick and most of its speaker audio gets dropped. */
+-        if (attr && sample_size && writable != (SIZE_T)-1)
+-            return (attr->tlength > writable ? attr->tlength - writable : 0) / sample_size;
+-    }
+-
+     return stream->held_bytes / pa_frame_size(&stream->ss);
+ }
+-- 
+2.55.0

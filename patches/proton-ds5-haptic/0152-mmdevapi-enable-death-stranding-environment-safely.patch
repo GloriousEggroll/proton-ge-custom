@@ -1,0 +1,463 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Thu, 13 Aug 2026 03:00:00 -0600
+Subject: [PATCH] kernelbase, mmdevapi: Enable Death Stranding environmental
+ audio safely
+
+Death Stranding registers sGetFootSoundToControllerSpeaker with a tiny
+function that always returns false. The linker folds that function together
+with many unrelated false-returning callbacks, so replacing its body enables
+unrelated dormant systems and causes startup access violations.
+
+Changing the live GraphWwiseGroup callback later from mmdevapi is also too
+late: Wwise evaluates and caches this capability during game startup before
+mmdevapi is loaded.
+
+When the existing Death Stranding controller-effects option is enabled,
+locate the exact setting registration from kernelbase's process-attach path
+and redirect only its callback pointer before the game begins initialization.
+Use a verified in-game true-return function so the callback remains a valid
+game code target. Keep the mmdevapi live-table replacement as a fallback for
+builds whose registration was not patched early, and recognize the early
+callback without replacing it.
+
+--- a/dlls/kernelbase/main.c
++++ b/dlls/kernelbase/main.c
+@@ -37,6 +37,178 @@
+ 
+ BOOL is_wow64 = FALSE;
+ 
++#ifdef __x86_64__
++static BOOL death_stranding_controller_effects_enabled(void)
++{
++    static const WCHAR nameW[] = L"PROTON_DEATH_STRANDING_CONTROLLER_EFFECTS";
++    WCHAR buffer[2];
++    UNICODE_STRING name, value;
++
++    RtlInitUnicodeString( &name, nameW );
++    value.Buffer = buffer;
++    value.Length = 0;
++    value.MaximumLength = sizeof(buffer);
++    return !RtlQueryEnvironmentVariable_U( NULL, &name, &value ) &&
++            value.Length == sizeof(WCHAR) && buffer[0] == '1';
++}
++
++static void enable_death_stranding_environment_audio(void)
++{
++    static const char setting_name[] = "Wwise::sGetFootSoundToControllerSpeaker";
++    static const BYTE registration_tail[] =
++    {
++        0xc7, 0x44, 0x24, 0x28, 0x03, 0x00, 0x00, 0x00,
++    };
++    static const BYTE true_stub_pattern[] =
++    {
++        0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
++        0xb0, 0x01, 0xc3, 0xcc,
++    };
++    HMODULE module = NtCurrentTeb()->Peb->ImageBaseAddress;
++    BYTE *base = (BYTE *)module;
++    BYTE *name = NULL, *reference = NULL, *callback_load, *callback, *true_callback = NULL;
++    IMAGE_NT_HEADERS *nt;
++    IMAGE_SECTION_HEADER *section;
++    unsigned int i, name_count = 0, reference_count = 0, true_callback_count = 0;
++    INT_PTR relative_offset;
++    LONG displacement;
++    void *protect_base;
++    SIZE_T protect_size;
++    ULONG old_protect;
++    NTSTATUS status;
++
++    if (!death_stranding_controller_effects_enabled() || !(nt = RtlImageNtHeader( module )) ||
++            nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
++        return;
++
++    section = IMAGE_FIRST_SECTION( nt );
++    for (i = 0; i < nt->FileHeader.NumberOfSections; ++i)
++    {
++        BYTE *start;
++        SIZE_T size, j;
++
++        if (section[i].VirtualAddress >= nt->OptionalHeader.SizeOfImage) continue;
++        start = base + section[i].VirtualAddress;
++        size = min( section[i].Misc.VirtualSize,
++                nt->OptionalHeader.SizeOfImage - section[i].VirtualAddress );
++
++        if (!(section[i].Characteristics & IMAGE_SCN_MEM_EXECUTE))
++        {
++            if (size < sizeof(setting_name)) continue;
++            for (j = 0; j <= size - sizeof(setting_name); ++j)
++            {
++                if (memcmp( start + j, setting_name, sizeof(setting_name) )) continue;
++                name = start + j;
++                ++name_count;
++            }
++            continue;
++        }
++
++        if (size >= sizeof(true_stub_pattern))
++        {
++            for (j = 0; j <= size - sizeof(true_stub_pattern); ++j)
++            {
++                if (memcmp( start + j, true_stub_pattern, sizeof(true_stub_pattern) )) continue;
++                true_callback = start + j + 8;
++                ++true_callback_count;
++            }
++        }
++    }
++
++    if (name_count != 1 || true_callback_count != 1)
++    {
++        WARN( "Death Stranding environmental-audio signatures are ambiguous "
++                "(name %u, true callback %u).\n", name_count, true_callback_count );
++        return;
++    }
++
++    for (i = 0; i < nt->FileHeader.NumberOfSections; ++i)
++    {
++        BYTE *start;
++        SIZE_T size, j;
++
++        if (!(section[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) ||
++                section[i].VirtualAddress >= nt->OptionalHeader.SizeOfImage)
++            continue;
++        start = base + section[i].VirtualAddress;
++        size = min( section[i].Misc.VirtualSize,
++                nt->OptionalHeader.SizeOfImage - section[i].VirtualAddress );
++        if (size < 7) continue;
++
++        for (j = 0; j <= size - 7; ++j)
++        {
++            BYTE *p = start + j;
++
++            if (p[0] != 0x4c || p[1] != 0x8d || p[2] != 0x05) continue;
++            memcpy( &displacement, p + 3, sizeof(displacement) );
++            if (p + 7 + displacement != name) continue;
++            reference = p;
++            ++reference_count;
++        }
++    }
++
++    if (reference_count != 1 || reference < base + 15)
++    {
++        WARN( "Found %u Death Stranding environmental registration references.\n",
++                reference_count );
++        return;
++    }
++
++    callback_load = reference - 15;
++    if (callback_load[0] != 0x48 || callback_load[1] != 0x8d || callback_load[2] != 0x05 ||
++            memcmp( callback_load + 7, registration_tail, sizeof(registration_tail) ))
++    {
++        WARN( "Death Stranding environmental registration has an unknown layout.\n" );
++        return;
++    }
++
++    memcpy( &displacement, callback_load + 3, sizeof(displacement) );
++    callback = callback_load + 7 + displacement;
++    if (callback < base || callback + 5 > base + nt->OptionalHeader.SizeOfImage ||
++            memcmp( callback, "\x32\xc0\xc3\xcc\xcc", 5 ))
++    {
++        WARN( "Death Stranding environmental registration has an unknown callback %p.\n", callback );
++        return;
++    }
++
++    relative_offset = true_callback - (callback_load + 7);
++    displacement = relative_offset;
++    if ((INT_PTR)displacement != relative_offset)
++    {
++        WARN( "Death Stranding environmental callback is outside relative-call range.\n" );
++        return;
++    }
++
++    protect_base = callback_load + 3;
++    protect_size = sizeof(displacement);
++    if ((status = NtProtectVirtualMemory( NtCurrentProcess(), &protect_base, &protect_size,
++            PAGE_EXECUTE_READWRITE, &old_protect )))
++    {
++        WARN( "Could not make Death Stranding environmental registration writable, status %#lx.\n",
++                status );
++        return;
++    }
++
++    memcpy( callback_load + 3, &displacement, sizeof(displacement) );
++    NtFlushInstructionCache( NtCurrentProcess(), callback_load, 7 );
++
++    protect_base = callback_load + 3;
++    protect_size = sizeof(displacement);
++    if ((status = NtProtectVirtualMemory( NtCurrentProcess(), &protect_base, &protect_size,
++            old_protect, &old_protect )))
++        WARN( "Could not restore Death Stranding environmental registration protection, status %#lx.\n",
++                status );
++
++    TRACE( "Redirected Death Stranding environmental registration %p from shared false callback "
++            "%p to in-game true callback %p before game initialization.\n",
++            callback_load, callback, true_callback );
++}
++#else
++static void enable_death_stranding_environment_audio(void)
++{
++}
++#endif
++
+ /***********************************************************************
+  *           DllMain
+  */
+@@ -50,6 +222,7 @@
+         init_locale( hinst );
+         init_startup_info( NtCurrentTeb()->Peb->ProcessParameters );
+         init_console();
++        enable_death_stranding_environment_audio();
+     }
+     return TRUE;
+ }
+--- a/dlls/mmdevapi/main.c
++++ b/dlls/mmdevapi/main.c
+@@ -46,6 +46,7 @@
+ #include "mmdevapi_private.h"
+ #include "wine/asm.h"
+ #include "wine/debug.h"
++#include "wine/exception.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(mmdevapi);
+ 
+@@ -61,6 +62,148 @@
+ static death_stranding_output_selector_t death_stranding_output_selector;
+ static LONG death_stranding_pending_output_id = -1;
+ static void **death_stranding_audio_system;
++static BYTE *death_stranding_environment_name;
++static void *death_stranding_environment_original_callback;
++static LONG death_stranding_environment_callback_updated;
++static LONG death_stranding_environment_scan_in_progress;
++
++static BOOL WINAPI death_stranding_environment_output_enabled(void)
++{
++    static LONG logged;
++
++    if (!InterlockedExchange(&logged, TRUE))
++        TRACE("Death Stranding requested environmental controller-speaker audio.\n");
++    return TRUE;
++}
++
++static BOOL death_stranding_readable_range(const void *address, SIZE_T size)
++{
++    MEMORY_BASIC_INFORMATION info;
++    const BYTE *start = address;
++    const BYTE *region;
++    SIZE_T offset;
++
++    if (!address || !size || !VirtualQuery(address, &info, sizeof(info)) ||
++            info.State != MEM_COMMIT || (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
++        return FALSE;
++
++    region = info.BaseAddress;
++    if (start < region) return FALSE;
++    offset = start - region;
++    return offset <= info.RegionSize && size <= info.RegionSize - offset;
++}
++
++static BOOL death_stranding_writable_protection(DWORD protect)
++{
++    switch (protect & 0xff)
++    {
++        case PAGE_READWRITE:
++        case PAGE_WRITECOPY:
++        case PAGE_EXECUTE_READWRITE:
++        case PAGE_EXECUTE_WRITECOPY:
++            return TRUE;
++        default:
++            return FALSE;
++    }
++}
++
++static BYTE *death_stranding_find_environment_entry(void)
++{
++    static const SIZE_T active_callback_offsets[] = {0x28, 0x68};
++    SYSTEM_INFO system_info;
++    BYTE *address, *limit, *found = NULL;
++
++    GetSystemInfo(&system_info);
++    address = system_info.lpMinimumApplicationAddress;
++    limit = system_info.lpMaximumApplicationAddress;
++
++    while (address < limit)
++    {
++        MEMORY_BASIC_INFORMATION info;
++        BYTE *start, *end, *next, *p;
++
++        if (!VirtualQuery(address, &info, sizeof(info))) break;
++        start = info.BaseAddress;
++        if (info.RegionSize > (SIZE_T)(limit - start)) next = limit;
++        else next = start + info.RegionSize;
++
++        if (info.State == MEM_COMMIT && !(info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
++                death_stranding_writable_protection(info.Protect) &&
++                info.RegionSize >= 0xe8)
++        {
++            end = next;
++            p = (BYTE *)(((UINT_PTR)start + sizeof(void *) - 1) & ~(sizeof(void *) - 1));
++            __TRY
++            {
++                for (; p + sizeof(void *) <= end; p += sizeof(void *))
++                {
++                    void *value;
++                    BYTE *entry;
++                    unsigned int i;
++
++                    memcpy(&value, p, sizeof(value));
++                    if (value != death_stranding_environment_name ||
++                            p < start + 0x18)
++                        continue;
++
++                    entry = p - 0x18;
++                    if (!death_stranding_readable_range(entry, 0xe8)) continue;
++                    for (i = 0; i < ARRAY_SIZE(active_callback_offsets); ++i)
++                    {
++                        memcpy(&value, entry + active_callback_offsets[i], sizeof(value));
++                        if (value != death_stranding_environment_original_callback &&
++                                value != (void *)death_stranding_environment_output_enabled)
++                            break;
++                    }
++                    if (i == ARRAY_SIZE(active_callback_offsets))
++                    {
++                        found = entry;
++                        break;
++                    }
++                }
++            }
++            __EXCEPT_PAGE_FAULT
++            {
++                found = NULL;
++            }
++            __ENDTRY
++
++            if (found) return found;
++        }
++
++        if (next <= address) break;
++        address = next;
++    }
++    return NULL;
++}
++
++static BOOL death_stranding_update_environment_callback(void)
++{
++    static const SIZE_T callback_offsets[] = {0x28, 0x68, 0xa8};
++    BYTE *entry;
++    unsigned int i;
++
++    if (InterlockedCompareExchange(&death_stranding_environment_callback_updated, 0, 0))
++        return TRUE;
++    if (!death_stranding_environment_name ||
++            !death_stranding_environment_original_callback ||
++            InterlockedExchange(&death_stranding_environment_scan_in_progress, TRUE))
++        return FALSE;
++
++    entry = death_stranding_find_environment_entry();
++    if (entry)
++    {
++        for (i = 0; i < ARRAY_SIZE(callback_offsets); ++i)
++            InterlockedCompareExchangePointer(
++                    (void * volatile *)(entry + callback_offsets[i]),
++                    (void *)death_stranding_environment_output_enabled,
++                    death_stranding_environment_original_callback);
++        InterlockedExchange(&death_stranding_environment_callback_updated, TRUE);
++        TRACE("Updated Death Stranding's live environmental callback entry at %p.\n", entry);
++    }
++    InterlockedExchange(&death_stranding_environment_scan_in_progress, FALSE);
++    return entry != NULL;
++}
+ 
+ BOOL WINAPI death_stranding_select_controller_output(DWORD output_id)
+ {
+@@ -79,6 +222,8 @@
+     LONG hash;
+     BOOL ret;
+ 
++    death_stranding_update_environment_callback();
++
+     if (setting == 0x7b || setting == 0x7c || setting == 0xff)
+     {
+         hash = InterlockedExchange(&death_stranding_pending_output_id, -1);
+@@ -256,6 +401,7 @@
+     BYTE *base = (BYTE *)module;
+     BYTE *names[ARRAY_SIZE(callback_names)] = {0};
+     BYTE *references[ARRAY_SIZE(callback_names)] = {0};
++    BYTE *callback_loads[ARRAY_SIZE(callback_names)] = {0};
+     BYTE *callbacks[ARRAY_SIZE(callback_names)] = {0};
+     IMAGE_NT_HEADERS *nt;
+     IMAGE_SECTION_HEADER *section;
+@@ -280,6 +426,7 @@
+     };
+     BYTE *output_selector = NULL, *selector_call = NULL, *settings_apply;
+     BYTE *ui_settings_call = NULL, *output_stores[2], *output_switch, *requested_output;
++    BOOL environment_registered_early = FALSE, registered_callback_updated = FALSE;
+     DWORD old_protect;
+     WCHAR value[2];
+     INT32 jump_offset;
+@@ -354,14 +501,18 @@
+             memcpy(&displacement, p + 3, sizeof(displacement));
+             target = p + 7 + displacement;
+             if (target < base || target + 11 > base + nt->OptionalHeader.SizeOfImage) continue;
++            callback_loads[k] = p;
+             callbacks[k] = target;
+             break;
+         }
+         if (!callbacks[k]) return FALSE;
+     }
+ 
+-    if (callbacks[0][0] != 0x32 || callbacks[0][1] != 0xc0 || callbacks[0][2] != 0xc3
+-            || callbacks[0][3] != 0xcc || callbacks[0][4] != 0xcc)
++    environment_registered_early = callbacks[0][0] == 0xb0 && callbacks[0][1] == 0x01 &&
++            callbacks[0][2] == 0xc3 && callbacks[0][3] == 0xcc && callbacks[0][4] == 0xcc;
++    if (!environment_registered_early &&
++            (callbacks[0][0] != 0x32 || callbacks[0][1] != 0xc0 || callbacks[0][2] != 0xc3 ||
++             callbacks[0][3] != 0xcc || callbacks[0][4] != 0xcc))
+         return FALSE;
+     if (callbacks[1][0] != 0x83 || callbacks[1][1] != 0x3d || callbacks[1][6] != 0xff
+             || callbacks[1][7] != 0x0f || callbacks[1][8] != 0x95 || callbacks[1][9] != 0xc0
+@@ -522,11 +673,31 @@
+     FlushInstructionCache(GetCurrentProcess(), output_switch + 0xa0, sizeof(output_switch_new));
+     VirtualProtect(output_switch + 0xa0, sizeof(output_switch_old), old_protect, &old_protect);
+ 
+-    TRACE("Left unsupported Death Stranding environmental speaker callback %p disabled, "
++    if (!environment_registered_early)
++    {
++        relative_offset = (BYTE *)death_stranding_environment_output_enabled - (callback_loads[0] + 7);
++        jump_offset = (INT32)relative_offset;
++        if ((INT_PTR)jump_offset != relative_offset) return FALSE;
++        if (!VirtualProtect(callback_loads[0] + 3, sizeof(jump_offset),
++                PAGE_EXECUTE_READWRITE, &old_protect))
++            return FALSE;
++        memcpy(callback_loads[0] + 3, &jump_offset, sizeof(jump_offset));
++        FlushInstructionCache(GetCurrentProcess(), callback_loads[0], 7);
++        VirtualProtect(callback_loads[0] + 3, sizeof(jump_offset), old_protect, &old_protect);
++
++        death_stranding_environment_name = names[0];
++        death_stranding_environment_original_callback = callbacks[0];
++        registered_callback_updated = death_stranding_update_environment_callback();
++    }
++
++    TRACE("Enabled Death Stranding environmental speaker registration %p using callback %p; "
++            "early registration enabled %d, existing runtime entry updated %d, "
+             "pre-applied output selection through %p and UI stores %p/%p, "
+             "redirected its final selector call %p through %p, and corrected its Wwise "
+             "output transition at %p.\n",
+-            callbacks[0], (void *)death_stranding_prepare_controller_output_thunk,
++            callback_loads[0], callbacks[0], environment_registered_early,
++            registered_callback_updated,
++            (void *)death_stranding_prepare_controller_output_thunk,
+             output_stores[0], output_stores[1], selector_call,
+             (void *)death_stranding_select_controller_output, output_switch + 0xa0);
+     return TRUE;
+@@ -536,6 +707,8 @@
+ {
+     const WCHAR *p;
+     DWORD hash = 0x811c9dc5;
++
++    death_stranding_update_environment_callback();
+     if (!death_stranding_output_selector || !id) return;
+ 
+     for (p = id; *p; ++p)
+-- 
+2.50.1
+

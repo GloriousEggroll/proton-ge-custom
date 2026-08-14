@@ -1,0 +1,386 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Wed, 12 Aug 2026 16:00:00 -0600
+Subject: [PATCH] winepulse: Split DualSense speaker output from raw haptics
+
+Death Stranding Director's Cut writes controller effects to a four-channel
+endpoint. Its float Wwise stream carries controller-speaker audio while a
+separate exclusive stream drives the actuators.
+
+Keep the actuator PCM on the raw four-channel path. For the float Wwise stream,
+create a private Pulse stream on the controller's public mono speaker sink and
+copy hardware channel 1, matching the Linux DualSense UCM speaker route. Feed
+that stream when the application releases each render buffer so raw ALSA
+availability cannot stall speaker playback. Pace the hybrid endpoint from the
+Pulse speaker queue rather than the immediately-consumed raw actuator PCM;
+otherwise XAudio renders multiple periods per tick and most speaker samples are
+dropped. Clear the speaker pair only from the float raw write to avoid duplicate
+playback. Leave the independent 16-bit haptic stream unchanged.
+
+The behavior remains restricted to PROTON_DUALSENSE_SPLIT_AUDIO, leaving the
+established Sony controller paths unchanged.
+---
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -93,6 +93,8 @@
+ 
+     char *device;
+     pa_stream *stream;
++    pa_stream *speaker_stream;
++    char *speaker_device;
+     snd_pcm_t *haptic_pcm;
+     char *haptic_alsa_path;
+     pa_sample_spec ss;
+@@ -115,6 +117,8 @@
+     BYTE *local_buffer, *tmp_buffer, *peek_buffer;
+     int16_t *haptic_buffer;
+     SIZE_T haptic_buffer_frames;
++    BYTE *speaker_buffer;
++    SIZE_T speaker_buffer_bytes;
+     unsigned int haptic_channel_peak[4];
+     pa_usec_t haptic_channel_trace_time;
+     pa_usec_t haptic_reconnect_time;
+@@ -884,6 +888,12 @@
+     pulse_broadcast();
+ }
+ 
++static void pulse_split_speaker_state(pa_stream *s, void *user)
++{
++    TRACE("%p: Split speaker stream state changed to %i\n", user, pa_stream_get_state(s));
++    pulse_broadcast();
++}
++
+ static void pulse_attr_update(pa_stream *s, void *user) {
+     struct pulse_stream *stream = user;
+     const pa_buffer_attr *attr = pa_stream_get_buffer_attr(s);
+@@ -2469,6 +2479,100 @@
+     return pulse_stream_connect_timeout(stream, pulse_name, NULL, period_bytes, 5000, FALSE);
+ }
+ 
++static BOOL pulse_split_speaker_ready(const struct pulse_stream *stream)
++{
++    return stream->speaker_stream && pa_stream_get_state(stream->speaker_stream) == PA_STREAM_READY;
++}
++
++static void pulse_split_speaker_disconnect(struct pulse_stream *stream)
++{
++    if (!stream->speaker_stream)
++        return;
++
++    if (PA_STREAM_IS_GOOD(pa_stream_get_state(stream->speaker_stream)))
++        pa_stream_disconnect(stream->speaker_stream);
++    pa_stream_unref(stream->speaker_stream);
++    stream->speaker_stream = NULL;
++}
++
++static HRESULT pulse_split_speaker_connect(struct pulse_stream *stream, const char *pulse_name)
++{
++    pa_stream_flags_t flags = PA_STREAM_START_CORKED | PA_STREAM_START_UNMUTED |
++            PA_STREAM_ADJUST_LATENCY | PA_STREAM_DONT_MOVE;
++    pa_sample_spec ss = stream->ss;
++    pa_channel_map map;
++    pa_buffer_attr attr;
++    UINT32 source_frame_size, speaker_frame_size, period_frames;
++    char name[64];
++    static LONG number;
++    char *device;
++    int ret;
++
++    if (!pulse_name || !pulse_name[0])
++        return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
++
++    source_frame_size = pa_frame_size(&stream->ss);
++    ss.channels = 1;
++    pa_channel_map_init_mono(&map);
++    speaker_frame_size = pa_frame_size(&ss);
++    if (!source_frame_size || !speaker_frame_size)
++        return AUDCLNT_E_UNSUPPORTED_FORMAT;
++
++    period_frames = stream->period_bytes / source_frame_size;
++    attr.minreq = attr.fragsize = period_frames * speaker_frame_size;
++    attr.tlength = attr.minreq * 3;
++    attr.maxlength = stream->bufsize_frames * speaker_frame_size;
++    attr.prebuf = 0;
++
++    if (!(device = strdup(pulse_name)))
++        return E_OUTOFMEMORY;
++
++    pulse_split_speaker_disconnect(stream);
++    snprintf(name, sizeof(name), "DualSense speaker #%d", InterlockedIncrement(&number));
++    if (!(stream->speaker_stream = pa_stream_new(pulse_ctx, name, &ss, &map)))
++    {
++        free(device);
++        return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
++    }
++
++    pa_stream_set_state_callback(stream->speaker_stream, pulse_split_speaker_state, stream);
++    ret = pa_stream_connect_playback(stream->speaker_stream, pulse_name, &attr, flags, NULL, NULL);
++    if (ret < 0)
++        goto failed;
++
++    while (pa_stream_get_state(stream->speaker_stream) == PA_STREAM_CREATING)
++    {
++        if (pulse_cond_timedwait_ms(5000) == ETIMEDOUT)
++            break;
++    }
++    if (!pulse_split_speaker_ready(stream))
++        goto failed;
++
++    free(stream->speaker_device);
++    stream->speaker_device = device;
++    TRACE("Connected split DualSense speaker stream %p to %s.\n",
++            stream, debugstr_a(stream->speaker_device));
++    return S_OK;
++
++failed:
++    WARN("Failed to connect split DualSense speaker stream to %s: %d.\n",
++            debugstr_a(pulse_name), pa_context_errno(pulse_ctx));
++    pulse_split_speaker_disconnect(stream);
++    free(device);
++    return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
++}
++
++static void pulse_split_speaker_set_corked(struct pulse_stream *stream, BOOL corked)
++{
++    pa_operation *op;
++
++    if (!pulse_split_speaker_ready(stream) || pa_stream_is_corked(stream->speaker_stream) == corked)
++        return;
++
++    if ((op = pa_stream_cork(stream->speaker_stream, corked, NULL, NULL)))
++        pa_operation_unref(op);
++}
++
+ static HRESULT get_device_period_helper(EDataFlow flow, const char *pulse_name, REFERENCE_TIME *def, REFERENCE_TIME *min)
+ {
+     struct list *list = (flow == eRender) ? &g_phys_speakers : &g_phys_sources;
+@@ -3248,6 +3352,45 @@
+     stream->haptic_channel_trace_time = now + 1000000;
+ }
+ 
++static void pulse_split_speaker_write(struct pulse_stream *stream, const BYTE *src, UINT32 frames)
++{
++    SIZE_T sample_size, bytes, writable;
++    UINT32 frame;
++
++    if (!pulse_split_speaker_ready(stream))
++        return;
++
++    sample_size = pa_sample_size_of_format(stream->ss.format);
++    writable = pa_stream_writable_size(stream->speaker_stream);
++    if (!sample_size || writable == (SIZE_T)-1)
++        return;
++
++    frames = min(frames, writable / sample_size);
++    bytes = (SIZE_T)frames * sample_size;
++    if (!bytes)
++        return;
++
++    if (bytes > stream->speaker_buffer_bytes)
++    {
++        BYTE *buffer = realloc(stream->speaker_buffer, bytes);
++
++        if (!buffer)
++            return;
++        stream->speaker_buffer = buffer;
++        stream->speaker_buffer_bytes = bytes;
++    }
++
++    /* The DualSense UCM speaker split is hardware channel 1. Preserve that
++     * Windows endpoint layout instead of applying a software downmix. */
++    for (frame = 0; frame < frames; ++frame)
++        memcpy(stream->speaker_buffer + frame * sample_size,
++                src + (frame * stream->ss.channels + 1) * sample_size, sample_size);
++
++    if (pa_stream_write(stream->speaker_stream, stream->speaker_buffer, bytes,
++            NULL, 0, PA_SEEK_RELATIVE) < 0)
++        WARN("Failed to write split DualSense speaker audio: %d.\n", pa_context_errno(pulse_ctx));
++}
++
+ static void pulse_haptic_write(struct pulse_stream *stream)
+ {
+     snd_pcm_state_t state;
+@@ -3257,6 +3400,7 @@
+     UINT32 frames, contiguous_frames, i, c;
+     const BYTE *src;
+     const void *write_data;
++    BOOL split_speaker;
+     int err;
+ 
+     if (!pulse_stream_haptic(stream) || !held_frames)
+@@ -3303,6 +3447,7 @@
+     if (!frames)
+         return;
+     src = stream->local_buffer + stream->pa_offs_bytes;
++    split_speaker = use_dualsense_split_audio() && pulse_split_speaker_ready(stream);
+     if (stream->ss.format == PA_SAMPLE_FLOAT32LE)
+     {
+         const float *float_src = (const float *)src;
+@@ -3324,9 +3469,33 @@
+                         float_to_s16(float_src[i * stream->ss.channels + c]);
+         write_data = stream->haptic_buffer;
+     }
++    else if (split_speaker)
++    {
++        if (frames > stream->haptic_buffer_frames)
++        {
++            int16_t *buffer = realloc(stream->haptic_buffer,
++                    frames * stream->ss.channels * sizeof(*buffer));
++
++            if (!buffer)
++                return;
++            stream->haptic_buffer = buffer;
++            stream->haptic_buffer_frames = frames;
++        }
++        memcpy(stream->haptic_buffer, src,
++                frames * stream->ss.channels * sizeof(*stream->haptic_buffer));
++        write_data = stream->haptic_buffer;
++    }
+     else
+         write_data = src;
+ 
++    if (split_speaker)
++    {
++        int16_t *samples = stream->haptic_buffer;
++
++        for (i = 0; i < frames; ++i)
++            samples[i * stream->ss.channels] = samples[i * stream->ss.channels + 1] = 0;
++    }
++
+     pulse_haptic_trace_channels(stream, write_data, frames);
+ 
+     written = snd_pcm_writei(stream->haptic_pcm, write_data, frames);
+@@ -3357,6 +3526,7 @@
+     unsigned int i, bufsize_bytes;
+     HRESULT hr;
+     char *name, *haptic_target = NULL, *haptic_alsa_path = NULL, *dualsense_speaker = NULL;
++    char *split_speaker = NULL;
+     char *resolved_device = NULL;
+     const char *connect_device;
+     BOOL haptic_candidate, dualsense_mono_candidate, dualsense_pulse_haptic_candidate = FALSE;
+@@ -3431,6 +3601,9 @@
+         else
+             WARN("No PipeWire parent was found for the DualSense haptic stream from %s.\n",
+                     params->device);
++
++        if (use_dualsense_split_audio() && stream->ss.format == PA_SAMPLE_FLOAT32LE)
++            split_speaker = get_dualsense_speaker_sink(params->device, TRUE);
+     }
+ 
+     stream->def_period = params->period;
+@@ -3543,6 +3716,16 @@
+             }
+         }
+         stream->device = strdup(connect_device);
++        if (haptic_candidate && use_dualsense_split_audio() && haptic_alsa_path &&
++                stream->ss.format == PA_SAMPLE_FLOAT32LE)
++        {
++            if (!split_speaker)
++                WARN("No public DualSense speaker sink was found for split stream %s.\n",
++                        debugstr_a(params->device));
++            else if (FAILED(pulse_split_speaker_connect(stream, split_speaker)))
++                WARN("Could not create split speaker stream for %s; retaining raw channel routing.\n",
++                        debugstr_a(split_speaker));
++        }
+         if (dualsense_pulse_haptic_candidate || dualsense_mono_candidate)
+             stream->haptic_hotplug_generation = g_haptic_hotplug_generation;
+         if (dualsense_mono_candidate)
+@@ -3573,12 +3756,16 @@
+         }
+         free(stream->device);
+         free(stream->haptic_alsa_path);
++        pulse_split_speaker_disconnect(stream);
++        free(stream->speaker_device);
++        free(stream->speaker_buffer);
+         free(stream);
+     }
+ 
+     free(haptic_target);
+     free(haptic_alsa_path);
+     free(dualsense_speaker);
++    free(split_speaker);
+     free(resolved_device);
+     pulse_unlock();
+     return STATUS_SUCCESS;
+@@ -4259,6 +4446,7 @@
+         }
+         pa_stream_unref(stream->stream);
+     }
++    pulse_split_speaker_disconnect(stream);
+     if (stream->haptic_pcm)
+     {
+         snd_pcm_drop(stream->haptic_pcm);
+@@ -4278,7 +4466,9 @@
+     }
+     free(stream->peek_buffer);
+     free(stream->haptic_buffer);
++    free(stream->speaker_buffer);
+     free(stream->device);
++    free(stream->speaker_device);
+     free(stream->haptic_alsa_path);
+     free(stream);
+     return STATUS_SUCCESS;
+@@ -4322,6 +4512,8 @@
+         }
+         else
+             params->result = AUDCLNT_E_DEVICE_INVALIDATED;
++        if (SUCCEEDED(params->result))
++            pulse_split_speaker_set_corked(stream, FALSE);
+     }
+     else
+     {
+@@ -4377,6 +4569,7 @@
+             snd_pcm_drop(stream->haptic_pcm);
+             snd_pcm_prepare(stream->haptic_pcm);
+         }
++        pulse_split_speaker_set_corked(stream, TRUE);
+     }
+     else if (stream->dataflow == eRender && pulse_stream_ready(stream))
+     {
+@@ -4434,6 +4627,13 @@
+                 snd_pcm_drop(stream->haptic_pcm);
+                 snd_pcm_prepare(stream->haptic_pcm);
+             }
++            if (pulse_split_speaker_ready(stream))
++            {
++                int speaker_success = 0;
++
++                wait_pa_operation_complete(pa_stream_flush(stream->speaker_stream,
++                        pulse_op_cb, &speaker_success));
++            }
+             success = 1;
+         }
+         else if (stream->held_bytes && pulse_stream_ready(stream))
+@@ -4490,3 +4690,17 @@ static UINT32 pulse_render_padding(struct pulse_stream *stream)
+ {
++    if (pulse_split_speaker_ready(stream))
++    {
++        const pa_buffer_attr *attr = pa_stream_get_buffer_attr(stream->speaker_stream);
++        SIZE_T sample_size = pa_sample_size_of_format(stream->ss.format);
++        SIZE_T writable = pa_stream_writable_size(stream->speaker_stream);
++
++        /* Raw actuator PCM is consumed immediately and therefore normally
++         * reports no padding. A hybrid speaker+haptic stream must instead be
++         * paced by the public speaker queue, or the client renders several
++         * periods per tick and most of its speaker audio gets dropped. */
++        if (attr && sample_size && writable != (SIZE_T)-1)
++            return (attr->tlength > writable ? attr->tlength - writable : 0) / sample_size;
++    }
++
+     return stream->held_bytes / pa_frame_size(&stream->ss);
+ }
+@@ -4616,6 +4830,12 @@
+     if (params->flags & AUDCLNT_BUFFERFLAGS_SILENT)
+         silence_buffer(stream->ss.format, buffer, written_bytes);
+ 
++    /* Keep controller-speaker delivery on the application's render cadence.
++     * The raw actuator PCM may temporarily report no writable frames, but it
++     * must not stall or burst the independent mono speaker stream. */
++    if (pulse_split_speaker_ready(stream))
++        pulse_split_speaker_write(stream, buffer, params->written_frames);
++
+     if (stream->locked < 0)
+         pulse_wrap_buffer(stream, buffer, written_bytes);
+ 
+-- 
+2.55.0

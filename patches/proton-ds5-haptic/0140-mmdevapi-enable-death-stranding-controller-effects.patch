@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Tue, 11 Aug 2026 20:20:00 -0600
+Subject: [PATCH] mmdevapi: Enable Death Stranding controller effects
+
+Death Stranding Director's Cut registers separate Wwise callbacks for the
+optional BB output and environmental controller-speaker effects. Its PC binary
+implements Wwise::sGetFootSoundToControllerSpeaker as an unconditional false,
+leaving channels 0 and 1 of the four-channel controller stream silent even when
+the speaker endpoint is available. Channels 2 and 3 continue to carry haptics.
+
+Under an internal title-specific option, locate that callback through its Wwise
+registration string and change its three-byte `xor al, al; ret` body to
+`mov al, 1; ret` in the loaded image. This enables water, grass, footsteps, and
+other environmental events independently of the optional BB output setting.
+The executable on disk is not modified, and a signature check makes the fix
+fail closed if a future game update changes the callback.
+---
+ dlls/mmdevapi/main.c | 86 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 86 insertions(+)
+
+--- a/dlls/mmdevapi/main.c
++++ b/dlls/mmdevapi/main.c
+@@ -123,6 +123,88 @@ fail:
+     return FALSE;
+ }
+ 
++static BOOL enable_death_stranding_controller_effects(void)
++{
++    static const char callback_name[] = "Wwise::sGetFootSoundToControllerSpeaker";
++    HMODULE module = GetModuleHandleW(NULL);
++    BYTE *base = (BYTE *)module, *name = NULL, *reference = NULL, *callback;
++    IMAGE_NT_HEADERS *nt;
++    IMAGE_SECTION_HEADER *section;
++    DWORD old_protect;
++    WCHAR value[2];
++    unsigned int i;
++
++    if (GetEnvironmentVariableW(L"PROTON_DEATH_STRANDING_CONTROLLER_EFFECTS", value, ARRAY_SIZE(value)) != 1
++            || value[0] != '1')
++        return FALSE;
++    if (!(nt = RtlImageNtHeader(module))) return FALSE;
++
++    section = IMAGE_FIRST_SECTION(nt);
++    for (i = 0; i < nt->FileHeader.NumberOfSections && !name; ++i)
++    {
++        BYTE *start = base + section[i].VirtualAddress;
++        SIZE_T size = section[i].Misc.VirtualSize;
++        SIZE_T j;
++
++        if (section[i].Characteristics & IMAGE_SCN_MEM_EXECUTE || size < sizeof(callback_name)) continue;
++        for (j = 0; j <= size - sizeof(callback_name); ++j)
++        {
++            if (!memcmp(start + j, callback_name, sizeof(callback_name)))
++            {
++                name = start + j;
++                break;
++            }
++        }
++    }
++    if (!name) return FALSE;
++
++    for (i = 0; i < nt->FileHeader.NumberOfSections && !reference; ++i)
++    {
++        BYTE *start = base + section[i].VirtualAddress;
++        SIZE_T size = section[i].Misc.VirtualSize;
++        SIZE_T j;
++
++        if (!(section[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) || size < 7) continue;
++        for (j = 0; j <= size - 7; ++j)
++        {
++            BYTE *p = start + j;
++            INT32 displacement;
++
++            if (p[0] != 0x4c || p[1] != 0x8d || p[2] != 0x05) continue;
++            memcpy(&displacement, p + 3, sizeof(displacement));
++            if (p + 7 + displacement == name)
++            {
++                reference = p;
++                break;
++            }
++        }
++    }
++    if (!reference) return FALSE;
++
++    for (callback = reference; callback >= reference - 32; --callback)
++    {
++        INT32 displacement;
++        BYTE *target;
++
++        if (callback[0] != 0x48 || callback[1] != 0x8d || callback[2] != 0x05) continue;
++        memcpy(&displacement, callback + 3, sizeof(displacement));
++        target = callback + 7 + displacement;
++        if (target < base || target + 3 > base + nt->OptionalHeader.SizeOfImage) continue;
++        if (target[0] != 0x32 || target[1] != 0xc0 || target[2] != 0xc3) continue;
++
++        if (!VirtualProtect(target, 3, PAGE_EXECUTE_READWRITE, &old_protect)) return FALSE;
++        target[0] = 0xb0;
++        target[1] = 0x01;
++        target[2] = 0xc3;
++        FlushInstructionCache(GetCurrentProcess(), target, 3);
++        VirtualProtect(target, 3, old_protect, &old_protect);
++        TRACE("Enabled Death Stranding controller-speaker environmental effects callback at %p.\n", target);
++        return TRUE;
++    }
++
++    return FALSE;
++}
++
+ static BOOL WINAPI init_driver(INIT_ONCE *once, void *param, void **context)
+ {
+     static WCHAR default_list[] = L"pulse,alsa,oss,coreaudio";
+@@ -130,6 +212,10 @@ static BOOL WINAPI init_driver(INIT_ONCE *once, void *param, void **context)
+     HKEY key;
+     WCHAR reg_list[256], *p, *next, *driver_list = default_list;
+ 
++    if (GetEnvironmentVariableW(L"PROTON_DEATH_STRANDING_CONTROLLER_EFFECTS", reg_list, ARRAY_SIZE(reg_list))
++            && !enable_death_stranding_controller_effects())
++        WARN("Could not enable Death Stranding controller-speaker environmental effects.\n");
++
+     if(RegOpenKeyW(HKEY_CURRENT_USER, drv_keyW, &key) == ERROR_SUCCESS){
+         DWORD size = sizeof(reg_list);
+ 
+-- 
+2.55.0

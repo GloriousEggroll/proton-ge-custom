@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Tue, 11 Aug 2026 12:45:00 -0600
+Subject: [PATCH] winepulse: Route S16 DualSense haptic streams
+
+Death Stranding Director's Cut opens the Windows Sony four-channel endpoint as
+48 kHz S16 PCM. The DualSense routing code only classified four-channel float
+streams as haptic data, so the game's valid S16 stream was sent to the ordinary
+controller speaker sink and never reached the haptic PCM.
+
+Recognize both Windows formats. The raw controller target already consumes S16
+samples, so write S16 application buffers directly and retain float-to-S16
+conversion for existing games.
+
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -1418,8 +1418,8 @@
+ 
+ static BOOL is_dualsense_haptic_format(const struct pulse_stream *stream)
+ {
+-    return stream->dataflow == eRender && stream->ss.format == PA_SAMPLE_FLOAT32LE
+-            && stream->ss.rate == 48000 && stream->ss.channels == 4;
++    return stream->dataflow == eRender && stream->ss.rate == 48000 && stream->ss.channels == 4 &&
++            (stream->ss.format == PA_SAMPLE_FLOAT32LE || stream->ss.format == PA_SAMPLE_S16LE);
+ }
+ 
+ static BOOL string_contains_dualsense_name(const char *name)
+@@ -3198,7 +3198,8 @@
+     UINT32 frame_size = pa_frame_size(&stream->ss);
+     UINT32 held_frames = stream->held_bytes / frame_size;
+     UINT32 frames, contiguous_frames, i, c;
+-    const float *src;
++    const BYTE *src;
++    const void *write_data;
+     int err;
+ 
+     if (!pulse_stream_haptic(stream) || !held_frames)
+@@ -3244,23 +3245,32 @@
+     frames = min(min((UINT32)avail, held_frames), contiguous_frames);
+     if (!frames)
+         return;
+-    src = (const float *)(stream->local_buffer + stream->pa_offs_bytes);
+-    if (frames > stream->haptic_buffer_frames)
++    src = stream->local_buffer + stream->pa_offs_bytes;
++    if (stream->ss.format == PA_SAMPLE_FLOAT32LE)
+     {
+-        int16_t *buffer = realloc(stream->haptic_buffer, frames * stream->ss.channels * sizeof(*buffer));
++        const float *float_src = (const float *)src;
+ 
+-        if (!buffer)
+-            return;
+-        stream->haptic_buffer = buffer;
+-        stream->haptic_buffer_frames = frames;
+-    }
++        if (frames > stream->haptic_buffer_frames)
++        {
++            int16_t *buffer = realloc(stream->haptic_buffer,
++                    frames * stream->ss.channels * sizeof(*buffer));
+ 
+-    for (i = 0; i < frames; ++i)
+-        for (c = 0; c < stream->ss.channels; ++c)
+-            stream->haptic_buffer[i * stream->ss.channels + c] =
+-                    float_to_s16(src[i * stream->ss.channels + c]);
++            if (!buffer)
++                return;
++            stream->haptic_buffer = buffer;
++            stream->haptic_buffer_frames = frames;
++        }
++
++        for (i = 0; i < frames; ++i)
++            for (c = 0; c < stream->ss.channels; ++c)
++                stream->haptic_buffer[i * stream->ss.channels + c] =
++                        float_to_s16(float_src[i * stream->ss.channels + c]);
++        write_data = stream->haptic_buffer;
++    }
++    else
++        write_data = src;
+ 
+-    written = snd_pcm_writei(stream->haptic_pcm, stream->haptic_buffer, frames);
++    written = snd_pcm_writei(stream->haptic_pcm, write_data, frames);
+     if (written < 0)
+     {
+         if ((err = snd_pcm_recover(stream->haptic_pcm, written, 1)) < 0)
+@@ -3269,7 +3279,7 @@
+             pulse_haptic_invalidate(stream, "write recovery failure");
+             return;
+         }
+-        written = snd_pcm_writei(stream->haptic_pcm, stream->haptic_buffer, frames);
++        written = snd_pcm_writei(stream->haptic_pcm, write_data, frames);
+         if (written < 0)
+         {
+             WARN("DualSense haptic PCM write failed after recover: %ld (%s)\n",
+-- 
+2.55.0
