@@ -1,0 +1,110 @@
+From e85ac9a80e13d0857bd62da9a150e2d4efc7ca55 Mon Sep 17 00:00:00 2001
+From: Etaash Mathamsetty
+ <45927311+Etaash-mathamsetty@users.noreply.github.com>
+Date: Wed, 12 Aug 2026 00:24:03 -0400
+Subject: [PATCH 272/273] HACK: ntdll: Forward syscalls to linux when EAC (EOS)
+ bootstrapper is present.
+
+---
+ dlls/kernelbase/process.c       |  8 +++++++
+ dlls/ntdll/unix/signal_x86_64.c | 37 +++++++++++++++++++++++++++++++++
+ 2 files changed, 45 insertions(+)
+
+diff --git a/dlls/kernelbase/process.c b/dlls/kernelbase/process.c
+index 6da31d7a8f9..fcc71c18d36 100644
+--- a/dlls/kernelbase/process.c
++++ b/dlls/kernelbase/process.c
+@@ -798,6 +798,9 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR
+             sync_env_var_to_unix( new_env, "UPLAY_ARGUMENTS" );
+             sync_env_var_to_unix( new_env, "UPC_GAME_STARTER_RUNNING" );
+ 
++            /* HACK: tell the sigsys handler that this is the EAC (EOS) dispatcher */
++            __wine_set_unix_env("PROTON_SYSCALL_HACK", "1");
++
+             p = app_name + wcslen( app_name );
+             while (p != app_name && *p != '/' && *p != '\\') --p;
+             if (p != app_name)
+@@ -950,6 +953,11 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR
+     }
+ 
+  done:
++
++    /* clean up the syscall hack env now that we are done using it */
++    if (product_name && !strcmp( product_name, "Easy Anti-Cheat Bootstrapper (EOS)" ))
++        __wine_set_unix_env("PROTON_SYSCALL_HACK", NULL);
++
+     RtlDestroyProcessParameters( params );
+     if (tidy_cmdline != cmd_line) HeapFree( GetProcessHeap(), 0, tidy_cmdline );
+     HeapFree( GetProcessHeap(), 0, product_name );
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index b10aff2ed6c..0ddcf9ff26b 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -2814,6 +2814,9 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+ 
+ 
+ #if defined(__APPLE__) || defined(__linux__)
++
++static BOOL use_eos_syscall_hack;
++
+ /**********************************************************************
+  *		sigsys_handler
+  *
+@@ -2835,6 +2838,33 @@ static void sigsys_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+         RIP_sig(ucontext) -= 2;  /* retry the syscall */
+         return;
+     }
++
++    /* HACK: The EOS version of easy anti cheat executes linux syscalls in a high address
++     * to evade the older seccomp based syscall emulation. It maps a page at
++     * 0x700100000000 and uses it to execute syscalls.
++     * The child process does more of the same but at different address.
++     * Detect this case and execute the linux syscall instead. */
++    if ((long)RIP_sig(ucontext) >= 0x700100000000 && use_eos_syscall_hack)
++    {
++        /* block syscall user dispatch, if it was already blocked we wont be in this handler */
++        __asm__ (
++            "movq %%gs:0x30,%%r13\n\t"
++            "movb $0, 0x340(%%r13)\n\t"
++            ::: "r13"
++        );
++
++        RAX_sig(ucontext) = syscall(RAX_sig(ucontext), RDI_sig(ucontext), RSI_sig(ucontext),
++                                    RDX_sig(ucontext), R10_sig(ucontext), R8_sig(ucontext),
++                                    R9_sig(ucontext));
++
++        /* restore syscall user dispatch state */
++        __asm__ (
++            "movq %%gs:0x30,%%r13\n\t"
++            "movb $1, 0x340(%%r13)\n\t"
++            ::: "r13"
++        );
++        return;
++    }
+ #endif
+ 
+     frame->rip = RIP_sig(ucontext) + 0xb;
+@@ -3056,6 +3086,7 @@ void signal_init_process(void)
+ #ifdef __linux__
+     if (syscall_dispatch_enabled)
+     {
++        const char *env;
+         struct sigaction act;
+ 
+         if (sigaction( SIGSYS, NULL, &act ) == -1)
+@@ -3068,6 +3099,12 @@ void signal_init_process(void)
+             WARN_(seh)( "could not find library containing signal restorer trampoline\n" );
+             syscall_dispatch_enabled = FALSE;
+         }
++        else
++        {
++            /* We don't unset the env since child processes also need to inherit the same syscall hack */
++            use_eos_syscall_hack = (env = getenv("PROTON_SYSCALL_HACK")) && !strcmp(env, "1");
++            if (use_eos_syscall_hack) ERR_(seh)("Using EAC bootstrapper (EOS) syscall workaround!\n");
++        }
+     }
+ #endif
+ 
+-- 
+2.55.0
+

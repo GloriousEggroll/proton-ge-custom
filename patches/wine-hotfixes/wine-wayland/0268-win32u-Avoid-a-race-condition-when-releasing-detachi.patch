@@ -1,0 +1,103 @@
+From 62044eeb16dd4e57675d34789a05f0bb62d14dbb Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?R=C3=A9mi=20Bernon?= <rbernon@codeweavers.com>
+Date: Wed, 8 Jul 2026 12:39:42 +0200
+Subject: [PATCH 268/273] win32u: Avoid a race condition when releasing /
+ detaching a client surface.
+
+The client_surfaces list doesn't own a reference, and temporarily taking
+one while detaching surfaces can race with another owner releasing its
+last reference, as client_surface_release only takes the surfaces_lock
+after decrementing the refcount.
+---
+ dlls/win32u/window.c | 59 +++++++++++++++++++-------------------------
+ 1 file changed, 26 insertions(+), 33 deletions(-)
+
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index f977f215715..2fdc344d315 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -274,32 +274,38 @@ void *free_user_handle( HANDLE handle, unsigned short type )
+ static pthread_mutex_t surfaces_lock = PTHREAD_MUTEX_INITIALIZER;
+ static struct list client_surfaces = LIST_INIT( client_surfaces );
+ 
++static void client_surface_detach_locked( struct client_surface *surface )
++{
++    if (!surface->hwnd) return;
++
++    list_remove( &surface->entry );
++    surface->funcs->detach( surface );
++    surface->hwnd = NULL;
++}
++
++static void client_surface_release_locked( struct client_surface *surface )
++{
++    ULONG ref = InterlockedDecrement( &surface->ref );
++    TRACE( "%s decreasing refcount to %u\n", debugstr_client_surface( surface ), ref );
++
++    if (!ref)
++    {
++        client_surface_detach_locked( surface );
++        surface->funcs->destroy( surface );
++        free( surface );
++    }
++}
++
+ void detach_client_surfaces( HWND hwnd )
+ {
+-    struct list detached = LIST_INIT( detached );
+     struct client_surface *surface, *next;
+ 
+     pthread_mutex_lock( &surfaces_lock );
+ 
+     LIST_FOR_EACH_ENTRY_SAFE( surface, next, &client_surfaces, struct client_surface, entry )
+-    {
+-        if (surface->hwnd != hwnd) continue;
+-
+-        list_remove( &surface->entry );
+-        list_add_tail( &detached, &surface->entry );
+-        client_surface_add_ref( surface );
+-
+-        surface->funcs->detach( surface );
+-        surface->hwnd = NULL;
+-    }
++        if (surface->hwnd == hwnd) client_surface_detach_locked( surface );
+ 
+     pthread_mutex_unlock( &surfaces_lock );
+-
+-    LIST_FOR_EACH_ENTRY_SAFE( surface, next, &detached, struct client_surface, entry )
+-    {
+-        list_remove( &surface->entry );
+-        client_surface_release( surface );
+-    }
+ }
+ 
+ void update_client_surfaces( HWND hwnd )
+@@ -340,22 +346,9 @@ void client_surface_add_ref( struct client_surface *surface )
+ 
+ void client_surface_release( struct client_surface *surface )
+ {
+-    ULONG ref = InterlockedDecrement( &surface->ref );
+-    TRACE( "%s decreasing refcount to %u\n", debugstr_client_surface( surface ), ref );
+-
+-    if (!ref)
+-    {
+-        pthread_mutex_lock( &surfaces_lock );
+-        if (surface->hwnd)
+-        {
+-            surface->funcs->detach( surface );
+-            list_remove( &surface->entry );
+-        }
+-        pthread_mutex_unlock( &surfaces_lock );
+-
+-        surface->funcs->destroy( surface );
+-        free( surface );
+-    }
++    pthread_mutex_lock( &surfaces_lock );
++    client_surface_release_locked( surface );
++    pthread_mutex_unlock( &surfaces_lock );
+ }
+ 
+ void client_surface_present( struct client_surface *surface )
+-- 
+2.55.0
+
