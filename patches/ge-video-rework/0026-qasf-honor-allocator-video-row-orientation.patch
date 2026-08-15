@@ -1,0 +1,145 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Proton GE Team <proton-ge@example.com>
+Date: Fri, 14 Aug 2026 00:00:00 +0000
+Subject: [PATCH] qasf: Honor allocator video row orientation.
+
+AMMultiMediaStream's DirectDraw stream accepts a conventional bottom-up RGB
+connection, but its allocator-backed samples describe the locked DirectDraw
+surface with a negative height because the surface memory is top-down.  The
+sample media type is how the allocator communicates that layout to the source.
+
+qasf currently decodes video into a temporary buffer and copies it directly
+into the downstream allocator sample without inspecting that sample's media
+type.  Bottom-up RGB frames are consequently copied unchanged into top-down
+DirectDraw surfaces and are displayed upside down, as seen in the WMV logos
+and intro used by Ys: Memories of Celceta.
+
+Remember compatible RGB layouts reported by allocator samples and reverse the
+row order when their height sign differs from the connected output type.  Keep
+the conversion in qasf's temporary-buffer copy path and restrict it to
+uncompressed RGB formats, leaving YUV and allocator-owned delivery unchanged.
+---
+ dlls/qasf/asfreader.c | 81 +++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 79 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/qasf/asfreader.c b/dlls/qasf/asfreader.c
+--- a/dlls/qasf/asfreader.c
++++ b/dlls/qasf/asfreader.c
+@@ -171,6 +171,12 @@ struct asf_stream
+     struct SourceSeeking seek;
+     DWORD index;
+     BOOL hidden;
++
++    BOOL allocator_layout_valid;
++    BOOL flip_allocator_rows;
++    DWORD source_stride;
++    DWORD allocator_stride;
++    DWORD frame_height;
+ };
+ 
+ struct asf_reader
+@@ -991,6 +997,56 @@ static HRESULT WINAPI reader_callback_OnStatus(IWMReaderCallback *iface, WMT_STA
+     return S_OK;
+ }
+ 
++static BOOL get_rgb_layout(const AM_MEDIA_TYPE *mt, LONG *height, DWORD *stride)
++{
++    const BITMAPINFOHEADER *bitmap;
++    DWORD width;
++
++    if (!IsEqualGUID(&mt->majortype, &MEDIATYPE_Video)
++            || !IsEqualGUID(&mt->formattype, &FORMAT_VideoInfo)
++            || mt->cbFormat < sizeof(VIDEOINFOHEADER))
++        return FALSE;
++
++    bitmap = &((const VIDEOINFOHEADER *)mt->pbFormat)->bmiHeader;
++    if ((bitmap->biCompression != BI_RGB && bitmap->biCompression != BI_BITFIELDS)
++            || bitmap->biWidth <= 0 || !bitmap->biHeight || !bitmap->biBitCount)
++        return FALSE;
++
++    width = bitmap->biWidth;
++    *height = bitmap->biHeight;
++    *stride = ((width * bitmap->biBitCount + 31) & ~31) / 8;
++    return TRUE;
++}
++
++static void update_allocator_layout(struct asf_stream *stream, IMediaSample *sample)
++{
++    LONG source_height, allocator_height;
++    DWORD source_stride, allocator_stride;
++    AM_MEDIA_TYPE *sample_mt;
++    HRESULT hr;
++
++    if ((hr = IMediaSample_GetMediaType(sample, &sample_mt)) != S_OK)
++        return;
++
++    stream->allocator_layout_valid = FALSE;
++    if (IsEqualGUID(&stream->source.pin.mt.subtype, &sample_mt->subtype)
++            && get_rgb_layout(&stream->source.pin.mt, &source_height, &source_stride)
++            && get_rgb_layout(sample_mt, &allocator_height, &allocator_stride)
++            && labs(source_height) == labs(allocator_height))
++    {
++        stream->allocator_layout_valid = TRUE;
++        stream->flip_allocator_rows = (source_height < 0) != (allocator_height < 0);
++        stream->source_stride = source_stride;
++        stream->allocator_stride = allocator_stride;
++        stream->frame_height = labs(source_height);
++        TRACE("Allocator RGB layout is %s, source stride %lu, allocator stride %lu, height %lu.\n",
++                stream->flip_allocator_rows ? "inverted" : "matching",
++                source_stride, allocator_stride, stream->frame_height);
++    }
++
++    DeleteMediaType(sample_mt);
++}
++
+ static HRESULT WINAPI reader_callback_OnSample(IWMReaderCallback *iface, DWORD output, QWORD time,
+         QWORD duration, DWORD flags, INSSBuffer *sample, void *context)
+ {
+@@ -1000,7 +1056,7 @@ static HRESULT WINAPI reader_callback_OnSample(IWMReaderCallback *iface, DWORD o
+     IMediaSample *media_sample = NULL;
+     struct buffer *buffer;
+     DWORD buffer_len;
+-    BYTE *src, *dst;
++    BYTE *src, *dst, *src_row, *dst_row;
+     HRESULT hr = S_OK;
+ 
+     TRACE("iface %p, output %lu, time %I64u, duration %I64u, flags %#lx, sample %p, context %p.\n",
+@@ -1035,14 +1091,35 @@ static HRESULT WINAPI reader_callback_OnSample(IWMReaderCallback *iface, DWORD o
+             return VFW_E_BUFFER_OVERFLOW;
+         }
+ 
++        update_allocator_layout(stream, media_sample);
+         if (FAILED(hr = IMediaSample_GetPointer(media_sample, &dst)))
+         {
+             WARN("Failed to get sample pointer, hr %#lx.\n", hr);
+             IMediaSample_Release(media_sample);
+             return hr;
+         }
+ 
+-        memcpy(dst, src, buffer_len);
++        if (stream->allocator_layout_valid && stream->flip_allocator_rows
++                && (ULONGLONG)stream->source_stride * stream->frame_height <= buffer_len
++                && (ULONGLONG)stream->allocator_stride * stream->frame_height
++                <= (DWORD)IMediaSample_GetSize(media_sample))
++        {
++            DWORD copy_size = min(stream->source_stride, stream->allocator_stride);
++            DWORD row;
++
++            src_row = src + stream->source_stride * (stream->frame_height - 1);
++            dst_row = dst;
++            for (row = 0; row < stream->frame_height; ++row)
++            {
++                memcpy(dst_row, src_row, copy_size);
++                src_row -= stream->source_stride;
++                dst_row += stream->allocator_stride;
++            }
++        }
++        else
++        {
++            memcpy(dst, src, buffer_len);
++        }
+         IMediaSample_SetActualDataLength(media_sample, buffer_len);
+     }
+ 
+-- 
+2.51.0
