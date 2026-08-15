@@ -151,7 +151,7 @@ apply_all_in_dir() {
     # loader-KeyboardLayouts - already applied
     # ntdll-Syscall_Emulation - already applied
     # ntdll_reg_flush - already applied
-    # wintrust-WTHelperGetProvCertFromChain - already applied by the wine-wayland patchset
+    # wintrust-WTHelperGetProvCertFromChain - already applied by Wine upstream
 
     # ntdll-Hide_Wine_Exports - applied manually
     # kernel32-Debugger - applied manually
@@ -260,9 +260,6 @@ apply_all_in_dir() {
 
     echo "WINE: -HOTFIX- Preserve driver-reported OpenGL GPU identity"
     apply_patch "../patches/wine-hotfixes/pending/wined3d-preserve-runtime-opengl-gpu-description.patch"
-
-    echo "WINE: -HOTFIX- Check GWL_EXSTYLE for WS_EX_LAYERED"
-    apply_patch "../patches/wine-hotfixes/pending/winex11-check-layered-extended-style.patch"
 
 ### END WINE HOTFIX/BACKPORT SECTION ###
 
