@@ -486,9 +486,11 @@ PROTON_ENABLE_HDR=1 %command%
 ```
 
 > [!NOTE]
-> Enabling HDR auto-enables the wine-wayland driver as it is a requirement.
-> As of right now, in-game Steam overlay WILL NOT work with Wayland enabled.
-> Please also note that Steam Input also does not work properly with the wine-wayland driver due to the overlay being broken.
+> Setting PROTON_ENABLE_HDR=1 does NOT enable the  Wine Wayland driver. Gamescope
+> can use PROTON_ENABLE_HDR, and automatically enabling native Wine Wayland
+> here would break that path. For HDR outside of gamescope, enable PROTON_ENABLE_HDR=1 
+> AND PROTON_ENABLE_WAYLAND=1 together only when using a native wayland desktop and
+> not using gamescope.
 
 ##### Enabling NTSync
 For NTSync to work, your kernel must be version 6.14 or newer and built with `CONFIG_NTSYNC=y` or `CONFIG_NTSYNC=m`. On non-systemd systems, you must also have a `ulimit -Hn` of 524288 or higher.
