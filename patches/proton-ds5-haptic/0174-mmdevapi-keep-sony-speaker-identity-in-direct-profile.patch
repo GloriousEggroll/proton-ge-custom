@@ -1,0 +1,163 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Sat, 15 Aug 2026 18:00:00 -0600
+Subject: [PATCH] mmdevapi: Separate Sony transport mode from endpoint names
+
+The host Default and Direct profiles expose the same physical Sony USB audio
+function with different Pulse descriptions. MMDevAPI retains one Windows
+endpoint ID and updates its backend in place as the profile changes.
+
+The Windows Sony audio-mode state was also used to choose the public endpoint
+name. Native endpoint activation therefore selected the four-channel transport
+and renamed every later profile or hotplug endpoint to "Wireless Controller".
+Native Sony clients rely on the model-specific controller-speaker identity to
+create their effects voice, so profile changes and reconnects then lost both
+speaker output and haptics.
+
+Track transport selection and canonical Windows naming independently. Native
+activation may select the Windows/PipeWire four-channel transport while keeping
+the model-specific speaker identity. Only an explicit option, Death Stranding,
+or a complete Windows-style capability sweep selects the canonical endpoint
+name. Direct render endpoints receive the same model-specific speaker identity
+as their Default counterparts, preserving client identity through profile
+changes and physical hotplug.
+---
+ dlls/mmdevapi/devenum.c | 67 +++++++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 56 insertions(+), 11 deletions(-)
+
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -973,6 +973,26 @@ static BOOL is_dualsense_device_path(const WCHAR *device_path)
+             wcsstr(device_path, L"VID_054C&PID_0DF2"));
+ }
+ 
++static const WCHAR *sony_controller_speaker_name(const WCHAR *device_path)
++{
++    if (!device_path)
++        return NULL;
++    if (wcsstr(device_path, L"VID_054C&PID_05C4") ||
++            wcsstr(device_path, L"VID_054C&PID_09CC"))
++        return L"DualShock 4 Wireless Controller Speaker";
++    if (wcsstr(device_path, L"VID_054C&PID_0CE6"))
++        return L"DualSense wireless controller (PS5) Internal Mono Speaker";
++    if (wcsstr(device_path, L"VID_054C&PID_0DF2"))
++        return L"DualSense Edge wireless controller (PS5) Internal Mono Speaker";
++    return NULL;
++}
++
++static BOOL is_sony_direct_render_name(const WCHAR *name)
++{
++    return is_dualsense_endpoint_name(name) &&
++            wcsstr(name, L"Direct Wireless Controller");
++}
++
+ static BOOL enable_mhwilds_usb_audio(void)
+ {
+     const char *env = getenv("PROTON_ENABLE_MHWILDS_USB_AUDIO");
+@@ -984,6 +1004,7 @@ static BOOL enable_mhwilds_usb_audio(void)
+ #define SONY_AUDIO_CAPABILITY_PROBE_THRESHOLD 8
+ 
+ static LONG sony_windows_audio_mode;
++static LONG sony_windows_controller_names;
+ static HANDLE sony_windows_audio_mode_event;
+ 
+ static BOOL sony_windows_audio_mode_event_enabled(void)
+@@ -1020,8 +1041,7 @@ static BOOL use_windows_sony_controller_names(void)
+ 
+     return (env && env[0] == '1' && !env[1]) ||
+             use_death_stranding_controller_effects() ||
+-            InterlockedCompareExchange(&sony_windows_audio_mode, 0, 0) ||
+-            sony_windows_audio_mode_event_enabled();
++            InterlockedCompareExchange(&sony_windows_controller_names, 0, 0);
+ }
+ 
+ static BOOL is_dualsense_mono_endpoint_name(const WCHAR *name)
+@@ -1671,6 +1691,8 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
+     const WCHAR *device_desc = flow == eRender ? L"Speakers" : L"Microphone";
+     const WCHAR *friendly_name_fmt = L"%ls (%ls)";
+     BOOL dualsense_mono_endpoint;
++    BOOL sony_direct_endpoint;
++    const WCHAR *sony_direct_public_name = NULL;
+ 
+     static const PROPERTYKEY deviceinterface_key = {
+         {0x233164c8, 0x1b2c, 0x4c7d, {0xbc, 0x68, 0xb6, 0x71, 0x68, 0x7a, 0x25, 0x67}}, 1
+@@ -1683,6 +1705,7 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
+     PropVariantInit(&device_path);
+     PropVariantInit(&container_id);
+     dualsense_mono_endpoint = flow == eRender && is_dualsense_mono_endpoint_name(name);
++    sony_direct_endpoint = flow == eRender && is_sony_direct_render_name(name);
+ 
+     EnterCriticalSection(&device_list_cs);
+     LIST_FOR_EACH_ENTRY(device, &device_list, MMDevice, entry)
+@@ -1748,7 +1771,11 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
+             if (SUCCEEDED(set_driver_prop_value(id, flow, &devicepath_key))) {
+                 if (SUCCEEDED(MMDevice_GetPropValue(id, flow, &devicepath_key, &device_path)) && device_path.vt == VT_LPWSTR) {
+                     const WCHAR *override;
++
++                    if (sony_direct_endpoint)
++                        sony_direct_public_name = sony_controller_speaker_name(device_path.pwszVal);
+-                    if (!dualsense_mono_endpoint && (override = find_product_name_override(device_path.pwszVal)) != NULL) {
++                    if (!dualsense_mono_endpoint &&
++                            (override = find_product_name_override(device_path.pwszVal)) != NULL) {
+                         device_iname = override;
+                         swprintf(friendly_name, FRIENDLY_NAME_MAX, friendly_name_fmt, device_desc, device_iname);
+                     }
+@@ -1757,8 +1784,12 @@ static MMDevice *MMDevice_Create(const WCHAR *name, GUID *id, EDataFlow flow, DW
+ 
+             pv.vt = VT_LPWSTR;
+ 
+-            public_device_iname = dualsense_mono_endpoint && use_windows_sony_controller_names() ?
+-                    L"Wireless Controller" : device_iname;
++            if (sony_direct_public_name)
++                public_device_iname = sony_direct_public_name;
++            else if (dualsense_mono_endpoint && use_windows_sony_controller_names())
++                public_device_iname = L"Wireless Controller";
++            else
++                public_device_iname = device_iname;
+             swprintf(public_friendly_name, ARRAY_SIZE(public_friendly_name), friendly_name_fmt,
+                     device_desc, public_device_iname);
+ 
+@@ -2577,20 +2608,34 @@ BOOL auto_select_sony_audio_mode(IMMDevice *iface, AUDCLNT_SHAREMODE mode,
+         const WAVEFORMATEX *format, unsigned int *probe_count)
+ {
+     MMDevice *device = impl_from_IMMDevice(iface);
++    BOOL selected, select_windows_names;
+     BOOL mono_speaker;
+ 
+     if (mode != AUDCLNT_SHAREMODE_SHARED || !is_sony_controller_render_endpoint(device))
+         return FALSE;
+ 
+     mono_speaker = is_dualsense_mono_endpoint(device);
++    selected = sony_windows_audio_mode_selected();
++    select_windows_names = InterlockedCompareExchange(
++            &sony_windows_controller_names, 0, 0);
+ 
+     /* A capability sweep is how Windows-style Sony audio clients discover the
+-     * four-channel endpoint. Direct mono/stereo speaker clients never perform
+-     * enough probes to leave the default hotplug path. */
+-    if (!sony_windows_audio_mode_event_enabled() &&
+-            !InterlockedCompareExchange(&sony_windows_audio_mode, 0, 0) &&
+-            !(mono_speaker && is_sony_four_channel_audio_format(format)) &&
+-            ++*probe_count < SONY_AUDIO_CAPABILITY_PROBE_THRESHOLD)
++     * four-channel endpoint. A native client may already have selected the
++     * same transport by activating the endpoint, but it keeps the model-specific
++     * controller-speaker identity unless it performs the complete sweep. */
++    if (!select_windows_names && !selected && mono_speaker &&
++            is_sony_four_channel_audio_format(format))
++        select_windows_names = TRUE;
++    else if (!select_windows_names &&
++            *probe_count < SONY_AUDIO_CAPABILITY_PROBE_THRESHOLD &&
++            ++*probe_count >= SONY_AUDIO_CAPABILITY_PROBE_THRESHOLD)
++        select_windows_names = TRUE;
++
++    if (select_windows_names &&
++            !InterlockedExchange(&sony_windows_controller_names, 1))
++        TRACE("Selected canonical Windows Sony controller endpoint names.\n");
++
++    if (!selected && !select_windows_names)
+         return FALSE;
+ 
+     return select_sony_windows_audio_mode(device, *probe_count, FALSE);
+-- 
+2.55.0

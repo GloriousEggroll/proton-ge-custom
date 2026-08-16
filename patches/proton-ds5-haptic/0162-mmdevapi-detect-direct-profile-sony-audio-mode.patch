@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Sat, 15 Aug 2026 02:00:00 -0600
+Subject: [PATCH] mmdevapi: Detect Windows Sony audio mode with Direct profile
+
+The automatic Windows Sony audio-mode selector originally identified the
+controller render endpoint by its Pulse description.  This worked while Wine
+forced DualSense cards from the Direct profile to the speaker profile, where
+the endpoint name contains "Internal Mono Speaker".
+
+After removing that forced profile change, PipeWire is allowed to retain the
+user-selected Direct profile.  Its four-channel render endpoint is named
+"Direct__Direct__sink", so the name-only check rejects every format probe and
+the Windows Sony path is never selected.  Applications such as Assassin's
+Creed Shadows then open the default raw-ALSA haptic path; taking the PCM away
+from PipeWire removes and recreates the Direct endpoint, invalidating the
+stream and losing both haptics and controller audio.
+
+Recognize render endpoints belonging to supported Sony controller USB
+containers as candidates for the capability-sweep detector.  Keep the
+single-probe four-channel shortcut restricted to the known mono-speaker
+endpoint: a Direct-profile endpoint must still perform the full sweep before
+changing modes, so direct clients using the Spider-Man hotplug path do not
+switch modes from one ordinary format query.
+
+This restores automatic mode selection without changing the active PipeWire
+card profile or persisting any profile choice.
+---
+ dlls/mmdevapi/devenum.c | 26 ++++++++++++++++++++++++--
+ 1 file changed, 24 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -2164,6 +2164,26 @@ static BOOL is_sony_four_channel_audio_format(const WAVEFORMATEX *format)
+             IsEqualGUID(&extensible->SubFormat, &KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
+ }
+ 
++static BOOL is_sony_controller_render_endpoint(const MMDevice *device)
++{
++    PROPVARIANT container_id;
++    BOOL ret = FALSE;
++
++    if (device->flow != eRender)
++        return FALSE;
++    if (is_dualsense_mono_endpoint(device))
++        return TRUE;
++
++    PropVariantInit(&container_id);
++    if (SUCCEEDED(MMDevice_GetPropValue(&device->devguid, device->flow,
++            (const PROPERTYKEY *)&DEVPKEY_Device_ContainerId, &container_id)) &&
++            container_id.vt == VT_CLSID && container_id.puuid)
++        ret = is_dualsense_audioendpoint_container(container_id.puuid);
++    PropVariantClear(&container_id);
++
++    return ret;
++}
++
+ BOOL auto_select_sony_audio_mode(IMMDevice *iface, AUDCLNT_SHAREMODE mode,
+         const WAVEFORMATEX *format, unsigned int *probe_count)
+ {
+@@ -2171,17 +2191,19 @@ BOOL auto_select_sony_audio_mode(IMMDevice *iface, AUDCLNT_SHAREMODE mode,
+     MMDevice *device = impl_from_IMMDevice(iface);
+     BOOL selected;
+     HANDLE event;
++    BOOL mono_speaker;
+ 
+-    if (mode != AUDCLNT_SHAREMODE_SHARED || !is_dualsense_mono_endpoint(device))
++    if (mode != AUDCLNT_SHAREMODE_SHARED || !is_sony_controller_render_endpoint(device))
+         return FALSE;
+ 
++    mono_speaker = is_dualsense_mono_endpoint(device);
+     selected = InterlockedCompareExchange(&sony_windows_audio_mode, 0, 0) ||
+             sony_windows_audio_mode_event_enabled();
+ 
+     /* A capability sweep is how Windows-style Sony audio clients discover the
+      * four-channel endpoint. Direct mono/stereo speaker clients never perform
+      * enough probes to leave the default hotplug path. */
+-    if (!selected && !is_sony_four_channel_audio_format(format) &&
++    if (!selected && !(mono_speaker && is_sony_four_channel_audio_format(format)) &&
+             ++*probe_count < SONY_AUDIO_CAPABILITY_PROBE_THRESHOLD)
+         return FALSE;
+ 
+-- 
+2.55.0

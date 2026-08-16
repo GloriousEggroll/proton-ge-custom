@@ -1,0 +1,368 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Sat, 15 Aug 2026 12:00:00 -0600
+Subject: [PATCH] mmdevapi: Keep Sony streams alive across profile replacement
+
+PipeWire can publish a Sony Default/Direct profile transition in two forms:
+either as one render remove/add delta, or as a render removal followed by the
+paired capture profile delta.  MMDevAPI treated both forms as a physical
+disconnect.  Games consequently released their selected controller speaker
+and haptic streams, and did not always recreate both of them.
+
+Normalize generated Sony render endpoint names before comparing physical
+identity.  Keep the existing MMDevice active when a replacement is present in
+the same delta.  When the render replacement is asynchronous, defer removal
+until the paired capture delta identifies whether this was a profile change.
+A standard DualSense or DualShock speaker uses Wine's stable `.HiFi__` alias,
+so classify that alias as the Default profile before comparing it with the
+host's `.Direct__` endpoint name.  DualSense Edge retains its distinct stable
+identity and physical disconnects still create normal removal notifications.
+A real unplug still has no opposite-profile replacement and follows the full
+endpoint removal path.
+---
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -145,31 +145,54 @@
+     return hash;
+ }
+ 
+-static size_t get_dualsense_device_identity_length(const char *name)
++enum dualsense_audio_profile
+ {
+-    static const char * const profile_suffixes[] =
+-    {
+-        ".Default__Speaker__sink",
+-        ".Direct__Direct__sink",
+-    };
++    DUALSENSE_AUDIO_PROFILE_UNKNOWN,
++    DUALSENSE_AUDIO_PROFILE_DEFAULT,
++    DUALSENSE_AUDIO_PROFILE_DIRECT,
++};
++
++static enum dualsense_audio_profile get_dualsense_audio_profile(const char *name)
++{
++    if (strstr(name, ".Default__") || strstr(name, ".HiFi__"))
++        return DUALSENSE_AUDIO_PROFILE_DEFAULT;
++    if (strstr(name, ".Direct__"))
++        return DUALSENSE_AUDIO_PROFILE_DIRECT;
++    return DUALSENSE_AUDIO_PROFILE_UNKNOWN;
++}
++
++static size_t get_dualsense_physical_identity_length(const char *name)
++{
++    const char *default_profile = strstr(name, ".Default__");
++    const char *hifi_profile = strstr(name, ".HiFi__");
++    const char *direct_profile = strstr(name, ".Direct__");
+     size_t length = strlen(name);
+-    unsigned int i;
+ 
+-    for (i = 0; i < ARRAY_SIZE(profile_suffixes); ++i)
+-    {
+-        size_t suffix_length = strlen(profile_suffixes[i]);
++    if (!default_profile || (hifi_profile && hifi_profile < default_profile))
++        default_profile = hifi_profile;
++    if (default_profile && (!direct_profile || default_profile < direct_profile))
++        return default_profile - name;
++    if (direct_profile)
++        return direct_profile - name;
++    return length;
++}
+ 
+-        if (length > suffix_length &&
+-                !strcmp(name + length - suffix_length, profile_suffixes[i]))
+-            return length - suffix_length;
+-    }
++static size_t get_dualsense_device_identity_length(const char *name, EDataFlow flow)
++{
++    const char *hotplug_suffix;
++    size_t length = strlen(name);
++
++    if (flow == eRender && get_dualsense_audio_profile(name) != DUALSENSE_AUDIO_PROFILE_UNKNOWN)
++        return get_dualsense_physical_identity_length(name);
++    if ((hotplug_suffix = strstr(name, "#wine-sony-hotplug-")))
++        return hotplug_suffix - name;
+ 
+     return length;
+ }
+ 
+ static void get_stable_dualsense_device_guid(EDataFlow flow, const char *name, GUID *guid)
+ {
+-    size_t identity_length = get_dualsense_device_identity_length(name);
++    size_t identity_length = get_dualsense_device_identity_length(name, flow);
+     DWORD hashes[4];
+ 
+     hashes[0] = hash_dualsense_device_name(name, identity_length, flow, 0x811c9dc5);
+@@ -315,20 +335,40 @@
+     return NULL;
+ }
+ 
+-static BOOL dualsense_device_names_share_identity(const char *left, const char *right)
++static BOOL dualsense_device_names_share_identity(const char *left, const char *right,
++        EDataFlow flow)
++{
++    size_t left_length = get_dualsense_device_identity_length(left, flow);
++    size_t right_length = get_dualsense_device_identity_length(right, flow);
++
++    return left_length == right_length && !memcmp(left, right, left_length);
++}
++
++static BOOL dualsense_device_names_share_physical_identity(const char *left, const char *right)
+ {
+-    size_t left_length = get_dualsense_device_identity_length(left);
+-    size_t right_length = get_dualsense_device_identity_length(right);
++    size_t left_length = get_dualsense_physical_identity_length(left);
++    size_t right_length = get_dualsense_physical_identity_length(right);
+ 
+     return left_length == right_length && !memcmp(left, right, left_length);
+ }
+ 
++static BOOL dualsense_device_names_replace_profile(const char *left, const char *right)
++{
++    enum dualsense_audio_profile left_profile = get_dualsense_audio_profile(left);
++    enum dualsense_audio_profile right_profile = get_dualsense_audio_profile(right);
++
++    return left_profile != DUALSENSE_AUDIO_PROFILE_UNKNOWN &&
++            right_profile != DUALSENSE_AUDIO_PROFILE_UNKNOWN &&
++            left_profile != right_profile &&
++            dualsense_device_names_share_physical_identity(left, right);
++}
++
+ static struct device *find_dualsense_identity_in_cache(const char *name, EDataFlow flow)
+ {
+     struct device *dev;
+ 
+     LIST_FOR_EACH_ENTRY(dev, &devices_cache, struct device, entry)
+-        if (dev->flow == flow && dualsense_device_names_share_identity(dev->name, name))
++        if (dev->flow == flow && dualsense_device_names_share_identity(dev->name, name, flow))
+             return dev;
+     return NULL;
+ }
+@@ -338,7 +378,7 @@
+     struct device *dev;
+ 
+     LIST_FOR_EACH_ENTRY(dev, &devices_cache, struct device, entry)
+-        if (dev->flow == flow && dualsense_device_names_share_identity(dev->name, name))
++        if (dev->flow == flow && dualsense_device_names_share_identity(dev->name, name, flow))
+             dev->guid = *guid;
+ }
+ 
+@@ -1953,8 +1993,58 @@
+     {
+         const char *added_name = (const char *)params->endpoints + params->endpoints[i].device;
+ 
+-        if (strcmp(added_name, removed_name) && is_dualsense_backend_name(added_name) &&
+-                dualsense_device_names_share_identity(added_name, removed_name))
++        if (is_dualsense_backend_name(added_name) &&
++                dualsense_device_names_replace_profile(added_name, removed_name))
++            return TRUE;
++    }
++
++    return FALSE;
++}
++
++struct pending_sony_endpoint_removal
++{
++    struct list entry;
++    GUID guid;
++    EDataFlow flow;
++    char backend_name[];
++};
++
++static BOOL queue_pending_sony_endpoint_removal(struct list *pending_removals,
++        EDataFlow flow, const GUID *guid, const char *backend_name)
++{
++    struct pending_sony_endpoint_removal *pending;
++    size_t name_length = strlen(backend_name) + 1;
++
++    LIST_FOR_EACH_ENTRY(pending, pending_removals, struct pending_sony_endpoint_removal, entry)
++        if (pending->flow == flow && IsEqualGUID(&pending->guid, guid))
++            return TRUE;
++
++    if (!(pending = malloc(offsetof(struct pending_sony_endpoint_removal,
++            backend_name[name_length]))))
++        return FALSE;
++
++    pending->guid = *guid;
++    pending->flow = flow;
++    memcpy(pending->backend_name, backend_name, name_length);
++    list_add_tail(pending_removals, &pending->entry);
++    return TRUE;
++}
++
++static BOOL endpoint_batch_completes_pending_sony_profile_change(
++        const struct get_endpoint_ids_params *params,
++        const struct pending_sony_endpoint_removal *pending)
++{
++    UINT i;
++
++    if (params->flow != eCapture)
++        return FALSE;
++
++    for (i = 0; i < params->num; ++i)
++    {
++        const char *added_name = (const char *)params->endpoints + params->endpoints[i].device;
++
++        if (is_dualsense_backend_name(added_name) &&
++                dualsense_device_names_replace_profile(added_name, pending->backend_name))
+             return TRUE;
+     }
+ 
+@@ -1963,6 +2053,77 @@
+ 
+ static void MMDevice_Destroy(MMDevice *This);
+ 
++static void remove_sony_controller_endpoint(MMDevice *dev)
++{
++    BOOL dualsense_mono_endpoint = is_dualsense_mono_endpoint(dev);
++    GUID id = dev->devguid;
++
++    TRACE("Removing disconnected Sony controller endpoint %s from active device list.\n",
++            debugstr_guid(&id));
++    if (dualsense_mono_endpoint)
++    {
++        if (keep_sony_audio_endpoint_visible())
++            remove_persistent_sony_audioendpoint_devices(NULL);
++        else
++            remove_dualsense_audioendpoint_devices();
++        remove_dualsense_media_devices();
++    }
++    notify_endpoint_removed(dev->flow, &id);
++    remove_device_from_cache(&id);
++    delete_device_state_key(dev);
++    dev->removed = TRUE;
++    dev->state = DEVICE_STATE_NOTPRESENT;
++    list_remove(&dev->entry);
++    list_init(&dev->entry);
++    if (!dev->ref)
++        MMDevice_Destroy(dev);
++}
++
++static void finish_pending_sony_endpoint_removals(struct list *pending_removals,
++        const struct get_endpoint_ids_params *params)
++{
++    struct pending_sony_endpoint_removal *pending, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE(pending, next, pending_removals,
++            struct pending_sony_endpoint_removal, entry)
++    {
++        MMDevice *dev;
++
++        list_remove(&pending->entry);
++        if (endpoint_batch_completes_pending_sony_profile_change(params, pending))
++        {
++            TRACE("Keeping Sony controller endpoint %s active across asynchronous audio profile replacement.\n",
++                    debugstr_guid(&pending->guid));
++            free(pending);
++            continue;
++        }
++
++        EnterCriticalSection(&device_list_cs);
++        LIST_FOR_EACH_ENTRY(dev, &device_list, MMDevice, entry)
++        {
++            if (dev->flow == pending->flow && IsEqualGUID(&dev->devguid, &pending->guid))
++            {
++                remove_sony_controller_endpoint(dev);
++                break;
++            }
++        }
++        LeaveCriticalSection(&device_list_cs);
++        free(pending);
++    }
++}
++
++static void free_pending_sony_endpoint_removals(struct list *pending_removals)
++{
++    struct pending_sony_endpoint_removal *pending, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE(pending, next, pending_removals,
++            struct pending_sony_endpoint_removal, entry)
++    {
++        list_remove(&pending->entry);
++        free(pending);
++    }
++}
++
+ static HANDLE g_update_thread;
+ static BOOL g_update_thread_running;
+ static LONG render_update_in_progress;
+@@ -1987,6 +2148,7 @@
+ static DWORD WINAPI update_thread_proc(void *user)
+ {
+     struct get_endpoint_ids_params params;
++    struct list pending_sony_removals = LIST_INIT(pending_sony_removals);
+     struct endpoint_notification *pending_hid_notifications = NULL;
+     unsigned int pending_hid_count = 0, pending_hid_capacity = 0;
+     UINT i;
+@@ -2039,7 +2201,6 @@
+                         (dev->drv_id && is_dualsense_mono_endpoint_name(name) && !wcscmp(dev->drv_id, name))) {
+                     struct NotificationClientWrapper *wrapper;
+                     const GUID *id = &dev->devguid;
+-                    BOOL dualsense_mono_endpoint = is_dualsense_mono_endpoint(dev);
+                     BOOL sony_controller_endpoint = is_dualsense_endpoint_name(dev->drv_id);
+                     BOOL profile_replacement = endpoint_batch_replaces_dualsense_profile(
+                             &params, dev_name);
+@@ -2047,29 +2208,23 @@
+ 
+                     if (sony_controller_endpoint)
+                     {
+-                        TRACE("Removing disconnected Sony controller endpoint %s from active device list.\n",
+-                                debugstr_guid(id));
+-                        if (dualsense_mono_endpoint)
++                        if (profile_replacement)
+                         {
+-                            if (keep_sony_audio_endpoint_visible())
+-                                remove_persistent_sony_audioendpoint_devices(NULL);
+-                            else
+-                                remove_dualsense_audioendpoint_devices();
+-                            remove_dualsense_media_devices();
++                            TRACE("Keeping Sony controller endpoint %s active across audio profile replacement.\n",
++                                    debugstr_guid(id));
++                            break;
+                         }
+-                        notify_endpoint_removed(dev->flow, id);
+-                        if (profile_replacement)
+-                            TRACE("Retaining Sony controller endpoint ID %s across audio profile replacement.\n",
++
++                        if (params.flow == eRender && use_stable_dualsense_device_ids() &&
++                                params.more_data && queue_pending_sony_endpoint_removal(
++                                &pending_sony_removals, dev->flow, id, dev_name))
++                        {
++                            TRACE("Deferring Sony controller endpoint removal %s until the paired capture update.\n",
+                                     debugstr_guid(id));
+-                        else
+-                            remove_device_from_cache(id);
+-                        delete_device_state_key(dev);
+-                        dev->removed = TRUE;
+-                        dev->state = DEVICE_STATE_NOTPRESENT;
+-                        list_remove(&dev->entry);
+-                        list_init(&dev->entry);
+-                        if (!dev->ref)
+-                            MMDevice_Destroy(dev);
++                            break;
++                        }
++
++                        remove_sony_controller_endpoint(dev);
+                         break;
+                     }
+ 
+@@ -2105,6 +2260,9 @@
+         /* add devices only after removing devices */
+         add_endpoints_from_params(&params, TRUE);
+ 
++        if (params.flow == eCapture && !list_empty(&pending_sony_removals))
++            finish_pending_sony_endpoint_removals(&pending_sony_removals, &params);
++
+         if (params.flow == eRender)
+         {
+             enum dualsense_mono_model model = DUALSENSE_MONO_MODEL_UNKNOWN;
+@@ -2144,6 +2302,7 @@
+     InterlockedExchange(&render_update_in_progress, 0);
+     InterlockedExchange(&dualsense_mono_render_add_pending, 0);
+     dualsense_mono_render_add_model = DUALSENSE_MONO_MODEL_UNKNOWN;
++    free_pending_sony_endpoint_removals(&pending_sony_removals);
+     free(pending_hid_notifications);
+     free(params.endpoints);
+     return 0;
+-- 
+2.55.0

@@ -1,0 +1,163 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Sat, 15 Aug 2026 14:00:00 -0600
+Subject: [PATCH] ds5: Refresh delayed render profile after capture
+
+PipeWire can report a Sony Default-to-Direct profile transition before the
+new Direct render node is ready.  Wine observes the Default render removal,
+then receives only the Direct monitor and capture additions.  Since the
+render event has already been consumed, the new Direct node is never added to
+MMDevAPI.  The retained Windows endpoint consequently keeps the Default
+backend name and format, breaking controller haptics and effect audio until a
+later profile transition happens to refresh it.
+
+When a Sony capture replacement contains a monitor whose corresponding render
+node is still absent, schedule another render refresh.  Promote that delayed
+render addition to the stable MMDevice GUID and discard its stale profile
+mapping.  This also lets winepulse retarget active raw effect streams once the
+new render node actually exists.
+---
+diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -241,6 +241,44 @@
+     return FALSE;
+ }
+ 
++static BOOL device_list_has_missing_dualsense_render_profile(struct list *capture_devices)
++{
++    static const char monitor_suffix[] = ".monitor";
++    PhysDevice *capture, *render;
++
++    LIST_FOR_EACH_ENTRY(capture, capture_devices, PhysDevice, entry)
++    {
++        size_t capture_length, render_length;
++        BOOL found = FALSE;
++
++        if (capture->bus_type != phys_device_bus_usb || capture->vendor_id != 0x054c ||
++                (capture->product_id != 0x05c4 && capture->product_id != 0x09cc &&
++                 capture->product_id != 0x0ce6 && capture->product_id != 0x0df2))
++            continue;
++
++        capture_length = strlen(capture->pulse_name);
++        if (capture_length <= sizeof(monitor_suffix) - 1 ||
++                strcmp(capture->pulse_name + capture_length -
++                (sizeof(monitor_suffix) - 1), monitor_suffix))
++            continue;
++        render_length = capture_length - (sizeof(monitor_suffix) - 1);
++
++        LIST_FOR_EACH_ENTRY(render, &g_phys_speakers, PhysDevice, entry)
++        {
++            if (strlen(render->pulse_name) == render_length &&
++                    !memcmp(render->pulse_name, capture->pulse_name, render_length))
++            {
++                found = TRUE;
++                break;
++            }
++        }
++        if (!found)
++            return TRUE;
++    }
++
++    return FALSE;
++}
++
+ static NTSTATUS pulse_not_implemented(void *args)
+ {
+     return STATUS_SUCCESS;
+@@ -636,6 +674,7 @@
+     BOOL delta = params->delta;
+     BOOL find_dualsense_haptic_alsa = FALSE;
+     BOOL retarget_haptic = use_pipewire_dualsense_haptic_target();
++    BOOL refresh_render_after_capture = FALSE;
+     char *dualsense_mono_target = NULL;
+     char *dualsense_haptic_target = NULL;
+     char *dualsense_haptic_alsa_path = NULL;
+@@ -760,6 +799,11 @@
+         pulse_get_endpoints(list_added, &endpoint, &offset, params->endpoints);
+         pulse_get_endpoints(list_removed, &endpoint, &offset, params->endpoints);
+ 
++        refresh_render_after_capture = params->flow == eCapture &&
++                device_list_has_dualsense_audio_device(list_added) &&
++                device_list_has_dualsense_audio_device(list_removed) &&
++                device_list_has_missing_dualsense_render_profile(list_added);
++
+         LIST_FOR_EACH_ENTRY_SAFE(dev, dev_next, list_added, PhysDevice, entry) {
+             if (params->flow == eRender && is_dualsense_speaker_sink(dev))
+             {
+@@ -792,6 +836,12 @@
+         }
+         params->more_data = list_count(other_list_added) + list_count(other_list_removed)
+                 || (g_phys_event_mask & other_event_mask);
++        if (refresh_render_after_capture)
++        {
++            TRACE("Scheduling a render refresh after Sony capture profile replacement.\n");
++            g_phys_event_mask |= PHYS_EVENT_RENDER;
++            params->more_data = TRUE;
++        }
+     }
+     else
+     {
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -1967,6 +1967,8 @@
+ static LONG dualsense_mono_render_add_pending;
+ static LONG dualsense_mono_activation_serial;
+ static enum dualsense_mono_model dualsense_mono_render_add_model;
++static void promote_delayed_dualsense_profile_in_cache(const GUID *guid,
++        const char *added_name, EDataFlow flow);
+ 
+ static void add_endpoints_from_params(struct get_endpoint_ids_params *params, BOOL hotplug)
+ {
+@@ -1979,6 +1981,7 @@
+         const WCHAR *name = (WCHAR *)((char *)params->endpoints + params->endpoints[i].name);
+         const char *dev_name = (char *)params->endpoints + params->endpoints[i].device;
+         get_device_guid(params->flow, dev_name, TRUE, &guid);
++        promote_delayed_dualsense_profile_in_cache(&guid, dev_name, params->flow);
+         already_published = device_is_published(&guid, params->flow);
+         device = MMDevice_Create(name, &guid, params->flow, DEVICE_STATE_ACTIVE, params->default_idx == i);
+         if (device && params->flow == eRender &&
+@@ -2035,6 +2038,42 @@
+     LeaveCriticalSection(&devices_cache_cs);
+ }
+ 
++static void promote_delayed_dualsense_profile_in_cache(const GUID *guid,
++        const char *added_name, EDataFlow flow)
++{
++    struct device *cached, *next, *current = NULL;
++
++    if (!use_stable_dualsense_device_ids() || !is_dualsense_backend_name(added_name))
++        return;
++
++    EnterCriticalSection(&devices_cache_cs);
++    LIST_FOR_EACH_ENTRY(cached, &devices_cache, struct device, entry)
++    {
++        if (cached->flow == flow && IsEqualGUID(&cached->guid, guid))
++        {
++            current = cached;
++            break;
++        }
++    }
++    if (!current || !dualsense_device_names_replace_profile(added_name, current->name, flow))
++    {
++        LeaveCriticalSection(&devices_cache_cs);
++        return;
++    }
++
++    TRACE("Promoting delayed Sony profile endpoint %s over stale backend %s for %s.\n",
++            debugstr_a(added_name), debugstr_a(current->name), debugstr_guid(guid));
++    LIST_FOR_EACH_ENTRY_SAFE(cached, next, &devices_cache, struct device, entry)
++    {
++        if (cached->flow != flow || !IsEqualGUID(&cached->guid, guid))
++            continue;
++        list_remove(&cached->entry);
++        free(cached);
++    }
++    add_device_to_cache(guid, added_name, flow);
++    LeaveCriticalSection(&devices_cache_cs);
++}
++
+ static BOOL endpoint_batch_replaces_dualsense_profile(
+         const struct get_endpoint_ids_params *params, const char *removed_name)
+ {

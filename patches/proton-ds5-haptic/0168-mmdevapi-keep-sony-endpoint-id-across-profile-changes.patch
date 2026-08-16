@@ -1,0 +1,205 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Sat, 15 Aug 2026 05:00:00 -0600
+Subject: [PATCH] mmdevapi: Keep Sony endpoint ID across profile changes
+
+PipeWire replaces a Sony controller's render node when its card changes
+between the Default and Direct profiles.  The stable endpoint-ID path hashed
+the complete node name, including the profile-specific suffix, so Windows
+saw that host profile change as one audio device being removed and a
+different device being added.
+
+Some games retain the selected secondary audio output by MMDevice ID.  After
+several profile changes, Death Stranding 2 recreated its haptic stream on the
+new endpoint but no longer recreated the separate controller-speaker stream
+because its selected output still referred to the preceding profile's ID.
+
+Derive stable Sony IDs from the physical node prefix by excluding only the
+known Default__Speaker__sink and Direct__Direct__sink suffixes.  For existing
+prefixes, alias cached profile names to the currently active endpoint's ID so
+the migration does not require deleting the prefix or introduce a third ID.
+The endpoint object is still removed and recreated as PipeWire reports it;
+all other Sony endpoint names and disconnect handling remain unchanged.
+---
+ dlls/mmdevapi/devenum.c | 115 ++++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 103 insertions(+), 12 deletions(-)
+
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -129,12 +129,13 @@ static BOOL use_stable_dualsense_device_ids(void)
+     return (env && env[0] == '1' && !env[1]) || use_death_stranding_controller_effects();
+ }
+ 
+-static DWORD hash_dualsense_device_name(const char *name, EDataFlow flow, DWORD seed)
++static DWORD hash_dualsense_device_name(const char *name, size_t length,
++        EDataFlow flow, DWORD seed)
+ {
+     const unsigned char *p = (const unsigned char *)name;
+     DWORD hash = seed;
+ 
+-    while (*p)
++    while (length--)
+     {
+         hash ^= *p++;
+         hash *= 0x01000193;
+@@ -144,14 +145,37 @@ static DWORD hash_dualsense_device_name(const char *name, EDataFlow flow, DWORD
+     return hash;
+ }
+ 
++static size_t get_dualsense_device_identity_length(const char *name)
++{
++    static const char * const profile_suffixes[] =
++    {
++        ".Default__Speaker__sink",
++        ".Direct__Direct__sink",
++    };
++    size_t length = strlen(name);
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(profile_suffixes); ++i)
++    {
++        size_t suffix_length = strlen(profile_suffixes[i]);
++
++        if (length > suffix_length &&
++                !strcmp(name + length - suffix_length, profile_suffixes[i]))
++            return length - suffix_length;
++    }
++
++    return length;
++}
++
+ static void get_stable_dualsense_device_guid(EDataFlow flow, const char *name, GUID *guid)
+ {
++    size_t identity_length = get_dualsense_device_identity_length(name);
+     DWORD hashes[4];
+ 
+-    hashes[0] = hash_dualsense_device_name(name, flow, 0x811c9dc5);
+-    hashes[1] = hash_dualsense_device_name(name, flow, 0x9e3779b9);
+-    hashes[2] = hash_dualsense_device_name(name, flow, 0x85ebca6b);
+-    hashes[3] = hash_dualsense_device_name(name, flow, 0xc2b2ae35);
++    hashes[0] = hash_dualsense_device_name(name, identity_length, flow, 0x811c9dc5);
++    hashes[1] = hash_dualsense_device_name(name, identity_length, flow, 0x9e3779b9);
++    hashes[2] = hash_dualsense_device_name(name, identity_length, flow, 0x85ebca6b);
++    hashes[3] = hash_dualsense_device_name(name, identity_length, flow, 0xc2b2ae35);
+ 
+     guid->Data1 = hashes[0];
+     guid->Data2 = hashes[1];
+@@ -291,6 +315,33 @@ static struct device *find_device_name_in_cache( const char *name, EDataFlow flo
+     return NULL;
+ }
+ 
++static BOOL dualsense_device_names_share_identity(const char *left, const char *right)
++{
++    size_t left_length = get_dualsense_device_identity_length(left);
++    size_t right_length = get_dualsense_device_identity_length(right);
++
++    return left_length == right_length && !memcmp(left, right, left_length);
++}
++
++static struct device *find_dualsense_identity_in_cache(const char *name, EDataFlow flow)
++{
++    struct device *dev;
++
++    LIST_FOR_EACH_ENTRY(dev, &devices_cache, struct device, entry)
++        if (dev->flow == flow && dualsense_device_names_share_identity(dev->name, name))
++            return dev;
++    return NULL;
++}
++
++static void alias_dualsense_identity_in_cache(const char *name, EDataFlow flow, const GUID *guid)
++{
++    struct device *dev;
++
++    LIST_FOR_EACH_ENTRY(dev, &devices_cache, struct device, entry)
++        if (dev->flow == flow && dualsense_device_names_share_identity(dev->name, name))
++            dev->guid = *guid;
++}
++
+ static void remove_device_from_cache( const GUID *guid )
+ {
+     struct device *dev, *next;
+@@ -392,13 +443,26 @@ static void get_device_guid( EDataFlow flow, const char *dev_name, BOOL create,
+         struct device *dev;
+ 
+         EnterCriticalSection( &devices_cache_cs );
+-        if ((dev = find_device_name_in_cache( dev_name, flow )))
+-            *guid = dev->guid;
+-        else if (use_stable_dualsense_device_ids())
++        if (use_stable_dualsense_device_ids())
+         {
+-            get_stable_dualsense_device_guid( flow, dev_name, guid );
+-            if (create) add_device_to_cache( guid, dev_name, flow );
++            if ((dev = find_device_name_in_cache( dev_name, flow )))
++            {
++                *guid = dev->guid;
++                alias_dualsense_identity_in_cache( dev_name, flow, guid );
++            }
++            else if ((dev = find_dualsense_identity_in_cache( dev_name, flow )))
++            {
++                *guid = dev->guid;
++                if (create) add_device_to_cache( guid, dev_name, flow );
++            }
++            else
++            {
++                get_stable_dualsense_device_guid( flow, dev_name, guid );
++                if (create) add_device_to_cache( guid, dev_name, flow );
++            }
+         }
++        else if ((dev = find_device_name_in_cache( dev_name, flow )))
++            *guid = dev->guid;
+         else if (create)
+         {
+             CoCreateGuid( guid );
+@@ -1876,6 +1940,27 @@ static void add_endpoints_from_params(struct get_endpoint_ids_params *params, BO
+     }
+ }
+ 
++static BOOL endpoint_batch_replaces_dualsense_profile(
++        const struct get_endpoint_ids_params *params, const char *removed_name)
++{
++    UINT i;
++
++    if (!use_stable_dualsense_device_ids() || params->flow != eRender ||
++            !is_dualsense_backend_name(removed_name))
++        return FALSE;
++
++    for (i = 0; i < params->num; ++i)
++    {
++        const char *added_name = (const char *)params->endpoints + params->endpoints[i].device;
++
++        if (strcmp(added_name, removed_name) && is_dualsense_backend_name(added_name) &&
++                dualsense_device_names_share_identity(added_name, removed_name))
++            return TRUE;
++    }
++
++    return FALSE;
++}
++
+ static void MMDevice_Destroy(MMDevice *This);
+ 
+ static HANDLE g_update_thread;
+@@ -1956,6 +2041,8 @@ static DWORD CALLBACK update_thread_proc(void *user)
+                     const GUID *id = &dev->devguid;
+                     BOOL dualsense_mono_endpoint = is_dualsense_mono_endpoint(dev);
+                     BOOL sony_controller_endpoint = is_dualsense_endpoint_name(dev->drv_id);
++                    BOOL profile_replacement = endpoint_batch_replaces_dualsense_profile(
++                            &params, dev_name);
+                     WCHAR devid[56];
+ 
+                     if (sony_controller_endpoint)
+@@ -1971,7 +2058,11 @@ static DWORD CALLBACK update_thread_proc(void *user)
+                             remove_dualsense_media_devices();
+                         }
+                         notify_endpoint_removed(dev->flow, id);
+-                        remove_device_from_cache(id);
++                        if (profile_replacement)
++                            TRACE("Retaining Sony controller endpoint ID %s across audio profile replacement.\n",
++                                    debugstr_guid(id));
++                        else
++                            remove_device_from_cache(id);
+                         delete_device_state_key(dev);
+                         dev->removed = TRUE;
+                         dev->state = DEVICE_STATE_NOTPRESENT;
+-- 
+2.55.0

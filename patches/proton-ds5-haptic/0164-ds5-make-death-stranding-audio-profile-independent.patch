@@ -1,0 +1,233 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Sat, 15 Aug 2026 04:00:00 -0600
+Subject: [PATCH] ds5: Make Death Stranding audio profile-independent
+
+Death Stranding's controller effects currently require six Proton options.
+Five of them merely enable supporting pieces of the same controller-audio
+path: Windows Sony naming, persistent endpoint publication, PipeWire haptic
+routing, split four-channel audio, and shared-mode emulation for exclusive
+clients.  Requiring Proton to keep these options synchronized makes profile
+handling fragile and obscures the one game-specific behavior switch.
+
+Use PROTON_DEATH_STRANDING_CONTROLLER_EFFECTS as the umbrella for those
+supporting behaviors while retaining the individual options as aliases for
+manual testing and other games.  Explicit PROTON_MMDEV_FAKE_EXCLUSIVE=0 keeps
+its existing precedence over the umbrella.
+
+The game's output-selection hook was also notified only for the mono speaker
+endpoint exposed by PipeWire's Default profile.  Notify it for a Sony
+Direct__Direct__sink as well, without applying the mono-endpoint lifecycle
+logic to that public four-channel endpoint.  Combined with the profile-aware
+PipeWire target, this lets Death Stranding select and use the controller in
+either profile without changing the user's PipeWire configuration.
+---
+ dlls/hidclass.sys/device.c   |  7 ++++++-
+ dlls/mmdevapi/client.c       | 10 ++++------
+ dlls/mmdevapi/devenum.c      | 20 +++++++++++++++-----
+ dlls/sechost/service.c       |  4 +++-
+ dlls/winebus.sys/main.c      |  8 ++++++--
+ dlls/winepulse.drv/pulse.c   | 17 +++++++++++------
+ 6 files changed, 45 insertions(+), 21 deletions(-)
+
+diff --git a/dlls/hidclass.sys/device.c b/dlls/hidclass.sys/device.c
+--- a/dlls/hidclass.sys/device.c
++++ b/dlls/hidclass.sys/device.c
+@@ -408,10 +408,15 @@ static BOOL use_windows_sony_controller_names(void)
+ static BOOL use_windows_sony_controller_names(void)
+ {
+     static const WCHAR name[] = L"PROTON_SONY_WINDOWS_DEVICE_NAMES";
++    static const WCHAR death_stranding[] = L"PROTON_DEATH_STRANDING_CONTROLLER_EFFECTS";
+     WCHAR value[2];
+     SIZE_T len;
+ 
+-    return !RtlQueryEnvironmentVariable(NULL, name, ARRAY_SIZE(name) - 1,
++    if (!RtlQueryEnvironmentVariable(NULL, name, ARRAY_SIZE(name) - 1,
++            value, ARRAY_SIZE(value) - 1, &len) && len == 1 && value[0] == '1')
++        return TRUE;
++
++    return !RtlQueryEnvironmentVariable(NULL, death_stranding, ARRAY_SIZE(death_stranding) - 1,
+             value, ARRAY_SIZE(value) - 1, &len) && len == 1 && value[0] == '1';
+ }
+ 
+diff --git a/dlls/mmdevapi/client.c b/dlls/mmdevapi/client.c
+--- a/dlls/mmdevapi/client.c
++++ b/dlls/mmdevapi/client.c
+@@ -55,13 +55,11 @@ static BOOL device_fake_exclusive(void)
+     WCHAR str[10];
+     DWORD ret = GetEnvironmentVariableW(L"PROTON_MMDEV_FAKE_EXCLUSIVE", str, ARRAY_SIZE(str));
+ 
+-    if (!ret)
+-        return FALSE;
++    if (ret)
++        return !(ret == 1 && str[0] == L'0');
+ 
+-    if (ret == 1 && str[0] == L'0')
+-        return FALSE;
+-
+-    return TRUE;
++    ret = GetEnvironmentVariableW(L"PROTON_DEATH_STRANDING_CONTROLLER_EFFECTS", str, ARRAY_SIZE(str));
++    return ret == 1 && str[0] == L'1';
+ }
+ 
+ static HANDLE main_loop_thread;
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -115,11 +115,18 @@ static BOOL is_dualsense_backend_name( const char *name )
+             strstr( name, "Sony_Interactive_Entertainment" ));
+ }
+ 
++static BOOL use_death_stranding_controller_effects(void)
++{
++    const char *env = getenv("PROTON_DEATH_STRANDING_CONTROLLER_EFFECTS");
++
++    return env && env[0] == '1' && !env[1];
++}
++
+ static BOOL use_stable_dualsense_device_ids(void)
+ {
+     const char *env = getenv("PROTON_DUALSENSE_SPLIT_AUDIO");
+ 
+-    return env && env[0] == '1' && !env[1];
++    return (env && env[0] == '1' && !env[1]) || use_death_stranding_controller_effects();
+ }
+ 
+ static DWORD hash_dualsense_device_name(const char *name, EDataFlow flow, DWORD seed)
+@@ -861,6 +868,7 @@ static BOOL keep_sony_audio_endpoint_visible(void)
+     const char *env = getenv("PROTON_KEEP_SONY_AUDIO_ENDPOINT_VISIBLE");
+ 
+     return (env && env[0] == '1' && !env[1]) ||
++            use_death_stranding_controller_effects() ||
+             InterlockedCompareExchange(&sony_windows_audio_mode, 0, 0) ||
+             sony_windows_audio_mode_event_enabled();
+ }
+@@ -870,6 +878,7 @@ static BOOL use_windows_sony_controller_names(void)
+     const char *env = getenv("PROTON_SONY_WINDOWS_DEVICE_NAMES");
+ 
+     return (env && env[0] == '1' && !env[1]) ||
++            use_death_stranding_controller_effects() ||
+             InterlockedCompareExchange(&sony_windows_audio_mode, 0, 0) ||
+             sony_windows_audio_mode_event_enabled();
+ }
+@@ -1841,13 +1850,14 @@ static void add_endpoints_from_params(struct get_endpoint_ids_params *params, BO
+         const char *dev_name = (char *)params->endpoints + params->endpoints[i].device;
+         get_device_guid(params->flow, dev_name, TRUE, &guid);
+         device = MMDevice_Create(name, &guid, params->flow, DEVICE_STATE_ACTIVE, params->default_idx == i);
+-        if (device && params->flow == eRender && is_dualsense_mono_endpoint(device))
++        if (device && params->flow == eRender &&
++                (is_dualsense_mono_endpoint(device) ||
++                 (is_dualsense_backend_name(dev_name) && strstr(dev_name, "Direct__Direct__sink"))))
+         {
+             const GUID *id = &device->devguid;
+             WCHAR devid[56];
+ 
+-            if (should_prioritize_dualsense_mono_endpoint(device) &&
+-                    !should_hide_from_endpoint_collection(device))
++            if ((device->state & DEVICE_STATE_ACTIVE) && !should_hide_from_endpoint_collection(device))
+             {
+                 swprintf(devid, ARRAY_SIZE(devid), devid_formatW,
+                         device->flow, id->Data1, id->Data2, id->Data3,
+@@ -1856,7 +1866,8 @@ static void add_endpoints_from_params(struct get_endpoint_ids_params *params, BO
+                 death_stranding_controller_endpoint_seen(devid);
+             }
+ 
+-            if (hotplug || !death_stranding_controller_output_hook_active())
++            if (is_dualsense_mono_endpoint(device) &&
++                    (hotplug || !death_stranding_controller_output_hook_active()))
+             {
+                 dualsense_mono_render_add_model = dualsense_mono_endpoint_model(device);
+                 InterlockedExchange(&dualsense_mono_render_add_pending, 1);
+diff --git a/dlls/sechost/service.c b/dlls/sechost/service.c
+--- a/dlls/sechost/service.c
++++ b/dlls/sechost/service.c
+@@ -2141,10 +2141,12 @@ static BOOL use_sony_usb_parent_container_fallback(void)
+ static BOOL use_sony_usb_parent_container_fallback(void)
+ {
+     const char *env = getenv("PROTON_KEEP_SONY_AUDIO_ENDPOINT_VISIBLE");
++    const char *death_stranding = getenv("PROTON_DEATH_STRANDING_CONTROLLER_EFFECTS");
+     HANDLE event;
+     BOOL enabled;
+ 
+-    if (env && env[0] == '1' && !env[1])
++    if ((env && env[0] == '1' && !env[1]) ||
++            (death_stranding && death_stranding[0] == '1' && !death_stranding[1]))
+         return TRUE;
+ 
+     if (!(event = OpenEventW(SYNCHRONIZE, FALSE, L"__wine_sony_windows_audio_mode")))
+diff --git a/dlls/winebus.sys/main.c b/dlls/winebus.sys/main.c
+--- a/dlls/winebus.sys/main.c
++++ b/dlls/winebus.sys/main.c
+@@ -646,7 +646,9 @@ static void hidraw_enable_dualsense_usb_haptics(DEVICE_OBJECT *device)
+ {
+     struct device_extension *ext = (struct device_extension *)device->DeviceExtension;
+     const char *raw_haptics = getenv("PROTON_DUALSENSE_HAPTICS_PREFER_NON_EVENT");
+-    BOOL enable_speaker = raw_haptics && raw_haptics[0] == '1' && !raw_haptics[1];
++    const char *death_stranding = getenv("PROTON_DEATH_STRANDING_CONTROLLER_EFFECTS");
++    BOOL enable_speaker = (raw_haptics && raw_haptics[0] == '1' && !raw_haptics[1]) ||
++            (death_stranding && death_stranding[0] == '1' && !death_stranding[1]);
+     HID_XFER_PACKET packet;
+     IO_STATUS_BLOCK io = {0};
+     BYTE report[DUALSENSE_OUTPUT_REPORT_USB_SIZE] = {0};
+@@ -697,9 +699,11 @@ static void hidraw_preserve_dualsense_usb_speaker_route(struct device_extension
+         HID_XFER_PACKET *packet)
+ {
+     const char *raw_haptics = getenv("PROTON_DUALSENSE_HAPTICS_PREFER_NON_EVENT");
++    const char *death_stranding = getenv("PROTON_DEATH_STRANDING_CONTROLLER_EFFECTS");
+     BYTE *report = packet->reportBuffer;
+ 
+-    if (!raw_haptics || raw_haptics[0] != '1' || raw_haptics[1])
++    if ((!raw_haptics || raw_haptics[0] != '1' || raw_haptics[1]) &&
++            (!death_stranding || death_stranding[0] != '1' || death_stranding[1]))
+         return;
+     if (!ext->desc.is_hidraw || ext->desc.bus_type == BUS_TYPE_BLUETOOTH)
+         return;
+diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -1341,11 +1341,19 @@ static BOOL is_dualsense_speaker_sink(const PhysDevice *dev)
+                     && strstr(dev->pulse_name, "Wireless_Controller"))));
+ }
+ 
++static BOOL use_death_stranding_controller_effects(void)
++{
++    const char *env = getenv("PROTON_DEATH_STRANDING_CONTROLLER_EFFECTS");
++
++    return env && env[0] == '1' && !env[1];
++}
++
+ static BOOL use_windows_sony_controller_names(void)
+ {
+     const char *env = getenv("PROTON_SONY_WINDOWS_DEVICE_NAMES");
+ 
+     return (env && env[0] == '1' && !env[1]) ||
++            use_death_stranding_controller_effects() ||
+             InterlockedCompareExchange(&g_sony_windows_audio_mode, 0, 0);
+ }
+ 
+@@ -1354,6 +1362,7 @@ static BOOL use_pipewire_dualsense_haptic_target(void)
+     const char *env = getenv("PROTON_DUALSENSE_HAPTICS_PREFER_NON_EVENT");
+ 
+     return (env && env[0] == '1' && !env[1]) ||
++            use_death_stranding_controller_effects() ||
+             InterlockedCompareExchange(&g_sony_windows_audio_mode, 0, 0);
+ }
+ 
+@@ -1361,14 +1370,7 @@ static BOOL use_dualsense_split_audio(void)
+ {
+     const char *env = getenv("PROTON_DUALSENSE_SPLIT_AUDIO");
+ 
+-    return env && env[0] == '1' && !env[1];
+-}
+-
+-static BOOL use_death_stranding_controller_effects(void)
+-{
+-    const char *env = getenv("PROTON_DEATH_STRANDING_CONTROLLER_EFFECTS");
+-
+-    return env && env[0] == '1' && !env[1];
++    return (env && env[0] == '1' && !env[1]) || use_death_stranding_controller_effects();
+ }
+ 
+ static char *make_pipewire_dualsense_haptic_path(const char *target)
+-- 
+2.55.0

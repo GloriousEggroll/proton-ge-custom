@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Sat, 15 Aug 2026 06:15:00 -0600
+Subject: [PATCH] winepulse: Retarget Sony effects during device refresh
+
+Sony Default/Direct profile changes replace the PipeWire render node. The
+device refresh path immediately migrates mono speaker streams, but leaves
+four-channel controller-effect streams for a later MMDevice enumeration pass.
+That pass is not guaranteed to occur before an application reuses or tears
+down the old stream, making haptic and controller-speaker survival dependent
+on timing.
+
+Capture the replacement raw target during the same render-device refresh and
+retarget registered four-channel streams alongside mono streams. Apply this
+whenever the PipeWire Sony route is active so profile migration behaves the
+same for every game. Repeated discovery of an unchanged target remains a
+no-op through the connected-target guard.
+---
+ dlls/winepulse.drv/pulse.c | 32 ++++++++++++++++++++++++++++++--
+ 1 file changed, 30 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -1749,7 +1749,11 @@ static BOOL pulse_refresh_devices(EDataFlow flow)
+     pa_mainloop *ml;
+     pa_context *ctx;
+     pa_operation *o;
++    BOOL find_dualsense_haptic_alsa = FALSE;
++    BOOL retarget_haptic = flow == eRender && use_pipewire_dualsense_haptic_target();
+     char *dualsense_mono_target = NULL;
++    char *dualsense_haptic_target = NULL;
++    char *dualsense_haptic_alsa_path = NULL;
+ 
+     if (!(ml = pa_mainloop_new()))
+         return FALSE;
+@@ -1832,6 +1836,18 @@ static BOOL pulse_refresh_devices(EDataFlow flow)
+                     dualsense_mono_target = target;
+                 }
+             }
++            if (retarget_haptic && dev->raw_haptic_target)
++            {
++                char *target = strdup(dev->raw_haptic_target);
++
++                if (target)
++                {
++                    free(dualsense_haptic_target);
++                    dualsense_haptic_target = target;
++                }
++            }
++            else if (retarget_haptic && is_dualsense_speaker_sink(dev))
++                find_dualsense_haptic_alsa = TRUE;
+         }
+         list_remove(&dev->entry);
+         list_add_tail(added, &dev->entry);
+@@ -1839,12 +1855,22 @@ static BOOL pulse_refresh_devices(EDataFlow flow)
+ 
+     g_phys_unlock();
+ 
+-    if (dualsense_mono_target)
++    if (!dualsense_haptic_target && find_dualsense_haptic_alsa)
++        dualsense_haptic_alsa_path = find_dualsense_haptic_alsa_path();
++
++    if (dualsense_mono_target || dualsense_haptic_target || dualsense_haptic_alsa_path)
+     {
+         pulse_lock();
+-        pulse_retarget_dualsense_mono_streams(dualsense_mono_target);
++        if (dualsense_mono_target)
++            pulse_retarget_dualsense_mono_streams(dualsense_mono_target);
++        if (dualsense_haptic_target)
++            pulse_retarget_dualsense_haptic_streams(dualsense_haptic_target);
++        else if (dualsense_haptic_alsa_path)
++            pulse_retarget_dualsense_haptic_streams_to_alsa(dualsense_haptic_alsa_path);
+         pulse_unlock();
+         free(dualsense_mono_target);
++        free(dualsense_haptic_target);
++        free(dualsense_haptic_alsa_path);
+     }
+ 
+     pa_context_unref(ctx);
+@@ -1858,6 +1884,8 @@ static BOOL pulse_refresh_devices(EDataFlow flow)
+ 
+ fail:
+     free(dualsense_mono_target);
++    free(dualsense_haptic_target);
++    free(dualsense_haptic_alsa_path);
+     pa_context_unref(ctx);
+     pa_mainloop_free(ml);
+     LIST_FOR_EACH_ENTRY_SAFE(dev, next, &current, PhysDevice, entry)
+-- 
+2.55.0
