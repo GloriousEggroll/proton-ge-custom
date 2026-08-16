@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Sun, 16 Aug 2026 00:00:00 -0600
+Subject: [PATCH] winebus: Match DualSense hotplug cleanup by physical identity.
+
+The DualSense hidraw preference patch removes stale devices before exposing a
+new hidraw node. Matching those devices only by VID, PID, and HID usage also
+matches every other connected controller of the same model. Adding a second
+DualSense therefore unlinks the first controller and leaves its reports without
+a Wine device.
+
+Restrict DualSense cleanup to the same physical controller. Prefer the stable
+serial reported by USB or HID_UNIQ reported by Bluetooth. If a USB device has
+no usable serial, only match interfaces carrying the same bus container ID,
+which identifies the current USB connection. If neither identity is available,
+leave the existing device for the normal udev removal path instead of risking
+the removal of a different controller.
+
+This preserves stale reconnect and evdev sibling cleanup without preventing
+multiple identical DualSense controllers from being connected concurrently.
+---
+ dlls/winebus.sys/main.c | 47 +++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 42 insertions(+), 5 deletions(-)
+
+diff --git a/dlls/winebus.sys/main.c b/dlls/winebus.sys/main.c
+--- a/dlls/winebus.sys/main.c
++++ b/dlls/winebus.sys/main.c
+@@ -696,16 +696,57 @@ static void bus_unlink_hid_device(DEVICE_OBJECT *device)
+     RtlLeaveCriticalSection(&device_list_cs);
+ }
+ 
+-static void bus_unlink_devices_from_vid_pid(struct device_desc *desc, USAGE_AND_PAGE *usages)
++static BOOL device_desc_has_stable_serial(const struct device_desc *desc)
++{
++    return desc->serialnumber[0] && wcscmp(desc->serialnumber, L"0000");
++}
++
++static BOOL device_desc_matches_physical_device(const struct device_desc *left,
++        const struct device_desc *right)
++{
++    if (left->bus_type != right->bus_type) return FALSE;
++
++    if (device_desc_has_stable_serial(left) && device_desc_has_stable_serial(right))
++        return !wcscmp(left->serialnumber, right->serialnumber);
++
++    if (left->bus_type == BUS_TYPE_USB &&
++            !IsEqualGUID(&left->bus_container_id, &GUID_NULL) &&
++            !IsEqualGUID(&right->bus_container_id, &GUID_NULL))
++        return IsEqualGUID(&left->bus_container_id, &right->bus_container_id);
++
++    return FALSE;
++}
++
++static DEVICE_OBJECT *bus_find_device_from_identity(const BOOL is_hidraw,
++        struct device_desc *desc, USAGE_AND_PAGE *usages)
++{
++    struct device_extension *ext;
++    UINT buttons;
++    USAGE_AND_PAGE found_usages;
++
++    LIST_FOR_EACH_ENTRY(ext, &device_list, struct device_extension, entry)
++    {
++        found_usages = get_device_usages(ext->unix_device, &buttons);
++        if (ext->desc.is_hidraw == is_hidraw && ext->desc.vid == desc->vid &&
++                ext->desc.pid == desc->pid && found_usages.UsagePage == usages->UsagePage &&
++                found_usages.Usage == usages->Usage &&
++                device_desc_matches_physical_device(&ext->desc, desc))
++            return ext->device;
++    }
++
++    return NULL;
++}
++
++static void bus_unlink_devices_from_identity(struct device_desc *desc, USAGE_AND_PAGE *usages)
+ {
+     DEVICE_OBJECT *device;
+ 
+-    while ((device = bus_find_device_from_vid_pid(FALSE, desc, usages)))
++    while ((device = bus_find_device_from_identity(FALSE, desc, usages)))
+         bus_unlink_hid_device(device);
+ 
+     /* Fast USB reconnect can create a new hidraw node before the old removal event
+      * is processed. Remove stale matching hidraw devices before exposing the new one. */
+-    while ((device = bus_find_device_from_vid_pid(TRUE, desc, usages)))
++    while ((device = bus_find_device_from_identity(TRUE, desc, usages)))
+         bus_unlink_hid_device(device);
+ }
+ 
+@@ -1576,7 +1617,7 @@ static DWORD CALLBACK bus_main_thread(void *args)
+             {
+                 RtlEnterCriticalSection(&device_list_cs);
+                 if (is_dualsense_gamepad(desc.vid, desc.pid))
+-                    bus_unlink_devices_from_vid_pid(&event->device_created.desc, &usages);
++                    bus_unlink_devices_from_identity(&event->device_created.desc, &usages);
+                 else if ((device = bus_find_device_from_vid_pid(FALSE, &event->device_created.desc, &usages)))
+                     bus_unlink_hid_device(device);
+                 device = bus_create_hid_device(&event->device_created.desc, event->device);
+-- 
+2.51.0
