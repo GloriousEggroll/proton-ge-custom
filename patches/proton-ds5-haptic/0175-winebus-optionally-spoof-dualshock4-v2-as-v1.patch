@@ -1,0 +1,509 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Sat, 15 Aug 2026 12:00:00 -0600
+Subject: [PATCH] winebus: Optionally expose DualShock 4 v2 as v1
+
+Add PROTON_SONY_DUALSHOCK4_V2_AS_V1=1 to expose a native
+second-generation DualShock 4 (054c:09cc) directly as a first-generation
+model (054c:05c4).
+
+When PROTON_SONY_DUALSENSE_AS_DUALSHOCK4 is also enabled, resolve the
+DualSense or DualSense Edge target directly to DS4 v1. Keep the existing
+DualSense-to-DS4 report translator, but expose the genuine DS4 v1 report
+descriptor and firmware identity instead of first presenting a v2 device.
+
+Native DS4 v2 input and output reports share the v1 common wire layout.
+Translate the Bluetooth transport wrappers and calibration report where
+needed while retaining the physical identity internally for audio,
+haptics, containers, and hotplug handling.
+---
+diff --git a/dlls/winebus.sys/bus_udev.c b/dlls/winebus.sys/bus_udev.c
+index 2e7729fd..c516d803 100644
+--- a/dlls/winebus.sys/bus_udev.c
++++ b/dlls/winebus.sys/bus_udev.c
+@@ -1519,6 +1519,13 @@ static BOOL spoof_dualsense_as_dualshock4(void)
+     return env && env[0] == '1' && !env[1];
+ }
+ 
++static BOOL spoof_dualshock4_v2_as_v1(void)
++{
++    const char *env = getenv("PROTON_SONY_DUALSHOCK4_V2_AS_V1");
++
++    return env && env[0] == '1' && !env[1];
++}
++
+ static NTSTATUS hidraw_device_create(struct udev_device *dev, int fd, const char *devnode, struct device_desc desc)
+ {
+ #ifdef HAVE_LINUX_HIDRAW_H
+@@ -1537,7 +1544,16 @@ static NTSTATUS hidraw_device_create(struct udev_device *dev, int fd, const char
+     if (!desc.is_gamepad && spoof_dualsense_as_dualshock4() && is_dualsense_gamepad(desc.vid, desc.pid))
+     {
+         desc.spoof_dualshock4 = TRUE;
+-        TRACE("exposing DualSense hidraw controller %04x:%04x as DualShock 4.\n", desc.vid, desc.pid);
++        desc.spoof_dualshock4_v1 = spoof_dualshock4_v2_as_v1();
++        TRACE("exposing DualSense hidraw controller %04x:%04x directly as DualShock 4 %s.\n",
++                desc.vid, desc.pid, desc.spoof_dualshock4_v1 ? "v1" : "v2");
++    }
++    else if (!desc.is_gamepad && spoof_dualshock4_v2_as_v1() &&
++            desc.vid == 0x054c && desc.pid == 0x09cc)
++    {
++        desc.spoof_dualshock4_v1 = TRUE;
++        TRACE("exposing DualShock 4 v2 hidraw controller %04x:%04x directly as DualShock 4 v1.\n",
++                desc.vid, desc.pid);
+     }
+ 
+     if (!desc.product[0] && ioctl(fd, HIDIOCGRAWNAME(sizeof(buffer) - 1), buffer) >= 0)
+diff --git a/dlls/winebus.sys/main.c b/dlls/winebus.sys/main.c
+index 1201f814..d5bc6028 100644
+--- a/dlls/winebus.sys/main.c
++++ b/dlls/winebus.sys/main.c
+@@ -76,8 +76,16 @@ enum device_state
+ #define HIDRAW_FIXUP_DUALSENSE_BT 0x2
+ 
+ #define DUALSHOCK4_INPUT_REPORT_SIZE 64
++#define DUALSHOCK4_INPUT_REPORT_BT 0x11
++#define DUALSHOCK4_INPUT_REPORT_BT_SIZE 78
+ #define DUALSHOCK4_OUTPUT_REPORT_USB 0x05
+ #define DUALSHOCK4_OUTPUT_REPORT_USB_SIZE 32
++#define DUALSHOCK4_OUTPUT_REPORT_BT 0x11
++#define DUALSHOCK4_OUTPUT_REPORT_BT_SIZE 78
++#define DUALSHOCK4_OUTPUT_REPORT_BT_HW_CONTROL_OFFSET 1
++#define DUALSHOCK4_OUTPUT_REPORT_BT_HW_CONTROL 0xc0
++#define DUALSHOCK4_OUTPUT_REPORT_BT_COMMON_OFFSET 3
++#define DUALSHOCK4_OUTPUT_REPORT_USB_COMMON_OFFSET 1
+ #define DUALSHOCK4_OUTPUT_VALID_FLAG0_OFFSET 1
+ #define DUALSHOCK4_OUTPUT_VALID_FLAG0_LIGHTBAR 0x02
+ #define DUALSHOCK4_OUTPUT_MOTOR_RIGHT_OFFSET 4
+@@ -85,6 +93,8 @@ enum device_state
+ #define DUALSHOCK4_OUTPUT_LIGHTBAR_RED_OFFSET 6
+ #define DUALSHOCK4_FEATURE_REPORT_CALIBRATION 0x02
+ #define DUALSHOCK4_FEATURE_REPORT_CALIBRATION_SIZE 37
++#define DUALSHOCK4_FEATURE_REPORT_CALIBRATION_BT 0x05
++#define DUALSHOCK4_FEATURE_REPORT_CALIBRATION_BT_SIZE 41
+ #define DUALSHOCK4_FEATURE_REPORT_PAIRING_INFO 0x12
+ #define DUALSHOCK4_FEATURE_REPORT_PAIRING_INFO_SIZE 16
+ #define DUALSHOCK4_FEATURE_REPORT_FIRMWARE_INFO 0xa3
+@@ -143,6 +153,52 @@ enum device_state
+ #define DUALSENSE_FEATURE_REPORT_FIRMWARE_INFO_SIZE 64
+ #define SONY_OUTPUT_CRC32_SEED 0xa2
+ 
++/* Report descriptor from a first-generation USB DualShock 4 (054c:05c4). */
++static const BYTE dualshock4_v1_report_descriptor[] =
++{
++    0x05, 0x01, 0x09, 0x05, 0xa1, 0x01, 0x85, 0x01, 0x09, 0x30, 0x09, 0x31,
++    0x09, 0x32, 0x09, 0x35, 0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x95,
++    0x04, 0x81, 0x02, 0x09, 0x39, 0x15, 0x00, 0x25, 0x07, 0x35, 0x00, 0x46,
++    0x3b, 0x01, 0x65, 0x14, 0x75, 0x04, 0x95, 0x01, 0x81, 0x42, 0x65, 0x00,
++    0x05, 0x09, 0x19, 0x01, 0x29, 0x0e, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01,
++    0x95, 0x0e, 0x81, 0x02, 0x06, 0x00, 0xff, 0x09, 0x20, 0x75, 0x06, 0x95,
++    0x01, 0x15, 0x00, 0x25, 0x7f, 0x81, 0x02, 0x05, 0x01, 0x09, 0x33, 0x09,
++    0x34, 0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x95, 0x02, 0x81, 0x02,
++    0x06, 0x00, 0xff, 0x09, 0x21, 0x95, 0x36, 0x81, 0x02, 0x85, 0x05, 0x09,
++    0x22, 0x95, 0x1f, 0x91, 0x02, 0x85, 0x04, 0x09, 0x23, 0x95, 0x24, 0xb1,
++    0x02, 0x85, 0x02, 0x09, 0x24, 0x95, 0x24, 0xb1, 0x02, 0x85, 0x08, 0x09,
++    0x25, 0x95, 0x03, 0xb1, 0x02, 0x85, 0x10, 0x09, 0x26, 0x95, 0x04, 0xb1,
++    0x02, 0x85, 0x11, 0x09, 0x27, 0x95, 0x02, 0xb1, 0x02, 0x85, 0x12, 0x06,
++    0x02, 0xff, 0x09, 0x21, 0x95, 0x0f, 0xb1, 0x02, 0x85, 0x13, 0x09, 0x22,
++    0x95, 0x16, 0xb1, 0x02, 0x85, 0x14, 0x06, 0x05, 0xff, 0x09, 0x20, 0x95,
++    0x10, 0xb1, 0x02, 0x85, 0x15, 0x09, 0x21, 0x95, 0x2c, 0xb1, 0x02, 0x06,
++    0x80, 0xff, 0x85, 0x80, 0x09, 0x20, 0x95, 0x06, 0xb1, 0x02, 0x85, 0x81,
++    0x09, 0x21, 0x95, 0x06, 0xb1, 0x02, 0x85, 0x82, 0x09, 0x22, 0x95, 0x05,
++    0xb1, 0x02, 0x85, 0x83, 0x09, 0x23, 0x95, 0x01, 0xb1, 0x02, 0x85, 0x84,
++    0x09, 0x24, 0x95, 0x04, 0xb1, 0x02, 0x85, 0x85, 0x09, 0x25, 0x95, 0x06,
++    0xb1, 0x02, 0x85, 0x86, 0x09, 0x26, 0x95, 0x06, 0xb1, 0x02, 0x85, 0x87,
++    0x09, 0x27, 0x95, 0x23, 0xb1, 0x02, 0x85, 0x88, 0x09, 0x28, 0x95, 0x22,
++    0xb1, 0x02, 0x85, 0x89, 0x09, 0x29, 0x95, 0x02, 0xb1, 0x02, 0x85, 0x90,
++    0x09, 0x30, 0x95, 0x05, 0xb1, 0x02, 0x85, 0x91, 0x09, 0x31, 0x95, 0x03,
++    0xb1, 0x02, 0x85, 0x92, 0x09, 0x32, 0x95, 0x03, 0xb1, 0x02, 0x85, 0x93,
++    0x09, 0x33, 0x95, 0x0c, 0xb1, 0x02, 0x85, 0xa0, 0x09, 0x40, 0x95, 0x06,
++    0xb1, 0x02, 0x85, 0xa1, 0x09, 0x41, 0x95, 0x01, 0xb1, 0x02, 0x85, 0xa2,
++    0x09, 0x42, 0x95, 0x01, 0xb1, 0x02, 0x85, 0xa3, 0x09, 0x43, 0x95, 0x30,
++    0xb1, 0x02, 0x85, 0xa4, 0x09, 0x44, 0x95, 0x0d, 0xb1, 0x02, 0x85, 0xa5,
++    0x09, 0x45, 0x95, 0x15, 0xb1, 0x02, 0x85, 0xa6, 0x09, 0x46, 0x95, 0x15,
++    0xb1, 0x02, 0x85, 0xf0, 0x09, 0x47, 0x95, 0x3f, 0xb1, 0x02, 0x85, 0xf1,
++    0x09, 0x48, 0x95, 0x3f, 0xb1, 0x02, 0x85, 0xf2, 0x09, 0x49, 0x95, 0x0f,
++    0xb1, 0x02, 0x85, 0xa7, 0x09, 0x4a, 0x95, 0x01, 0xb1, 0x02, 0x85, 0xa8,
++    0x09, 0x4b, 0x95, 0x01, 0xb1, 0x02, 0x85, 0xa9, 0x09, 0x4c, 0x95, 0x08,
++    0xb1, 0x02, 0x85, 0xaa, 0x09, 0x4e, 0x95, 0x01, 0xb1, 0x02, 0x85, 0xab,
++    0x09, 0x4f, 0x95, 0x39, 0xb1, 0x02, 0x85, 0xac, 0x09, 0x50, 0x95, 0x39,
++    0xb1, 0x02, 0x85, 0xad, 0x09, 0x51, 0x95, 0x0b, 0xb1, 0x02, 0x85, 0xae,
++    0x09, 0x52, 0x95, 0x01, 0xb1, 0x02, 0x85, 0xaf, 0x09, 0x53, 0x95, 0x02,
++    0xb1, 0x02, 0x85, 0xb0, 0x09, 0x54, 0x95, 0x3f, 0xb1, 0x02, 0x85, 0xb1,
++    0x09, 0x55, 0x95, 0x02, 0xb1, 0x02, 0x85, 0xb2, 0x09, 0x56, 0x95, 0x02,
++    0xb1, 0x02, 0xc0,
++};
++
+ /* Report descriptor from a second-generation USB DualShock 4 (054c:09cc). */
+ static const BYTE dualshock4_v2_report_descriptor[] =
+ {
+@@ -191,6 +247,15 @@ static const BYTE dualshock4_v2_report_descriptor[] =
+     0xb1, 0x02, 0xc0,
+ };
+ 
++/* A valid CUH-ZCT1 firmware report. */
++static const BYTE dualshock4_v1_firmware_info[] =
++{
++    0xa3, 'A', 'p', 'r', ' ', ' ', '8', ' ', '2', '0', '1', '4', 0x00, 0x00, 0x00, 0x00,
++    0x00, '0', '9', ':', '4', '6', ':', '0', '6', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x01, 0x00, 0x43, 0x03, 0x00, 0x00, 0x00, 0x51, 0x00, 0x05, 0x00, 0x00, 0x80, 0x03,
++    0x00,
++};
++
+ /* A valid CUH-ZCT2 firmware report. DualSense firmware reports use a
+  * different layout, and exposing those fields under report ID 0xa3 makes
+  * DS4-aware applications reject the otherwise spoofed controller. */
+@@ -342,13 +407,15 @@ static const WCHAR *bus_type_str[] =
+ 
+ static UINT get_windows_product_id(const struct device_extension *ext)
+ {
++    if (ext->desc.spoof_dualshock4_v1) return 0x05c4;
+     if (ext->desc.spoof_dualshock4) return 0x09cc;
+     return ext->desc.pid;
+ }
+ 
+ static const WCHAR *get_windows_product_string(const struct device_extension *ext)
+ {
+-    if (ext->desc.spoof_dualshock4) return L"Wireless Controller";
++    if (ext->desc.spoof_dualshock4 || ext->desc.spoof_dualshock4_v1)
++        return L"Wireless Controller";
+     return ext->desc.product;
+ }
+ 
+@@ -1050,10 +1117,47 @@ done:
+     return TRUE;
+ }
+ 
++static BOOL hidraw_fixup_dualshock4_v2_input_as_v1(struct device_extension *ext,
++        struct hid_report *report)
++{
++    BYTE translated[DUALSHOCK4_INPUT_REPORT_SIZE] = {0};
++    BYTE touch_reports;
++
++    if (!ext->desc.spoof_dualshock4_v1 || ext->desc.spoof_dualshock4 ||
++            ext->desc.bus_type != BUS_TYPE_BLUETOOTH)
++        return TRUE;
++
++    if (report->buffer[0] == 0x01 && report->length >= 10)
++    {
++        memcpy(translated, report->buffer, min(report->length, sizeof(translated)));
++    }
++    else if (report->buffer[0] == DUALSHOCK4_INPUT_REPORT_BT &&
++            report->length >= DUALSHOCK4_INPUT_REPORT_BT_SIZE)
++    {
++        translated[0] = 0x01;
++        memcpy(translated + 1, report->buffer + 3, 32);
++        touch_reports = min(report->buffer[35], 3);
++        translated[33] = touch_reports;
++        memcpy(translated + 34, report->buffer + 36, touch_reports * 9);
++    }
++    else
++    {
++        WARN("Ignoring unexpected DualShock 4 v2 Bluetooth input report %#x/%lu while spoofing v1.\n",
++                report->buffer[0], report->length);
++        return FALSE;
++    }
++
++    memcpy(report->buffer, translated, sizeof(translated));
++    report->length = sizeof(translated);
++    return TRUE;
++}
++
+ static void process_hid_report(DEVICE_OBJECT *device, BYTE *report_buf, DWORD report_len)
+ {
+     struct device_extension *ext = (struct device_extension *)device->DeviceExtension;
+-    ULONG buffer_len = max(report_len, ext->desc.spoof_dualshock4 ? DUALSHOCK4_INPUT_REPORT_SIZE : 0);
++    ULONG buffer_len = max(report_len,
++            (ext->desc.spoof_dualshock4 || ext->desc.spoof_dualshock4_v1)
++            ? DUALSHOCK4_INPUT_REPORT_SIZE : 0);
+     ULONG size = offsetof(struct hid_report, buffer[buffer_len]);
+     struct hid_report *report, *last_report;
+     IRP *irp;
+@@ -1071,6 +1175,11 @@ static void process_hid_report(DEVICE_OBJECT *device, BYTE *report_buf, DWORD re
+         RtlFreeHeap(GetProcessHeap(), 0, report);
+         return;
+     }
++    if (!hidraw_fixup_dualshock4_v2_input_as_v1(ext, report))
++    {
++        RtlFreeHeap(GetProcessHeap(), 0, report);
++        return;
++    }
+ 
+     if (ext->report_fixups & HIDRAW_FIXUP_DUALSHOCK_BT)
+     {
+@@ -1135,12 +1244,14 @@ static void process_hid_report(DEVICE_OBJECT *device, BYTE *report_buf, DWORD re
+     }
+ 
+     if (!ext->collection_desc.ReportIDs[0].ReportID) last_report = ext->last_reports[0];
+-    else if (ext->desc.spoof_dualshock4) last_report = ext->last_reports[report->buffer[0]];
++    else if (ext->desc.spoof_dualshock4 || ext->desc.spoof_dualshock4_v1)
++        last_report = ext->last_reports[report->buffer[0]];
+     else last_report = ext->last_reports[report_buf[0]];
+     if (!last_report)
+     {
+         WARN("Ignoring report with unexpected id %#x\n",
+-                ext->desc.spoof_dualshock4 ? report->buffer[0] : *report_buf);
++                (ext->desc.spoof_dualshock4 || ext->desc.spoof_dualshock4_v1)
++                ? report->buffer[0] : *report_buf);
+         RtlLeaveCriticalSection(&ext->cs);
+         RtlFreeHeap(GetProcessHeap(), 0, report);
+         return;
+@@ -1148,7 +1259,7 @@ static void process_hid_report(DEVICE_OBJECT *device, BYTE *report_buf, DWORD re
+ 
+     list_add_tail(&ext->reports, &report->entry);
+ 
+-    if (ext->desc.spoof_dualshock4)
++    if (ext->desc.spoof_dualshock4 || ext->desc.spoof_dualshock4_v1)
+         memcpy(last_report->buffer, report->buffer, min(report->length, last_report->length));
+     else
+         memcpy(last_report->buffer, report_buf, report_len);
+@@ -1311,15 +1422,28 @@ static NTSTATUS get_device_descriptors(UINT64 unix_device, BYTE **report_desc, U
+ static NTSTATUS get_windows_device_descriptors(struct device_extension *ext, BYTE **report_desc,
+         UINT *report_desc_length, HIDP_DEVICE_DESC *device_desc)
+ {
++    const BYTE *spoofed_report_desc;
++    const char *generation;
+     NTSTATUS status;
+ 
+-    if (!ext->desc.spoof_dualshock4)
++    if (ext->desc.spoof_dualshock4_v1)
++    {
++        spoofed_report_desc = dualshock4_v1_report_descriptor;
++        *report_desc_length = sizeof(dualshock4_v1_report_descriptor);
++        generation = "v1";
++    }
++    else if (ext->desc.spoof_dualshock4)
++    {
++        spoofed_report_desc = dualshock4_v2_report_descriptor;
++        *report_desc_length = sizeof(dualshock4_v2_report_descriptor);
++        generation = "v2";
++    }
++    else
+         return get_device_descriptors(ext->unix_device, report_desc, report_desc_length, device_desc);
+ 
+-    *report_desc_length = sizeof(dualshock4_v2_report_descriptor);
+     if (!(*report_desc = RtlAllocateHeap(GetProcessHeap(), 0, *report_desc_length)))
+         return STATUS_NO_MEMORY;
+-    memcpy(*report_desc, dualshock4_v2_report_descriptor, *report_desc_length);
++    memcpy(*report_desc, spoofed_report_desc, *report_desc_length);
+ 
+     status = HidP_GetCollectionDescription(*report_desc, *report_desc_length, PagedPool, device_desc);
+     if (status != HIDP_STATUS_SUCCESS)
+@@ -1330,7 +1454,8 @@ static NTSTATUS get_windows_device_descriptors(struct device_extension *ext, BYT
+         return status;
+     }
+ 
+-    TRACE("Using DualShock 4 v2 report descriptor for DualSense device %p.\n", ext->device);
++    TRACE("Using DualShock 4 %s report descriptor for physical Sony device %04x:%04x.\n",
++            generation, ext->desc.vid, ext->desc.pid);
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -1958,7 +2083,8 @@ static void hidraw_disable_report_fixups(DEVICE_OBJECT *device)
+     /* XInput consumes the translated basic input report even after sending a
+      * valid Bluetooth output report, which switches Sony controllers to their
+      * extended input report. */
+-    if (sony_hidraw_xinput_enabled() || ext->desc.spoof_dualshock4) return;
++    if (sony_hidraw_xinput_enabled() || ext->desc.spoof_dualshock4 ||
++            ext->desc.spoof_dualshock4_v1) return;
+ 
+     /* FIXME: we may want to validate CRC at the end of the outbound HID reports,
+      * as controllers do not switch modes if it is incorrect.
+@@ -2001,6 +2127,8 @@ static BOOL hidraw_get_spoofed_dualshock4_feature_report(DEVICE_OBJECT *device,
+         HID_XFER_PACKET *packet, IO_STATUS_BLOCK *io)
+ {
+     struct device_extension *ext = (struct device_extension *)device->DeviceExtension;
++    const BYTE *firmware_info;
++    ULONG firmware_info_size;
+     BYTE native_report[DUALSENSE_FEATURE_REPORT_FIRMWARE_INFO_SIZE] = {0};
+     HID_XFER_PACKET native_packet =
+     {
+@@ -2009,12 +2137,24 @@ static BOOL hidraw_get_spoofed_dualshock4_feature_report(DEVICE_OBJECT *device,
+     IO_STATUS_BLOCK native_io = {0};
+     ULONG response_size;
+ 
+-    if (!ext->desc.spoof_dualshock4 || !ext->desc.is_hidraw)
++    if (!ext->desc.is_hidraw ||
++            (!ext->desc.spoof_dualshock4 && !ext->desc.spoof_dualshock4_v1))
+         return FALSE;
+ 
+     if (packet->reportId == DUALSHOCK4_FEATURE_REPORT_FIRMWARE_INFO)
+     {
+-        if (packet->reportBufferLen < sizeof(dualshock4_v2_firmware_info))
++        if (ext->desc.spoof_dualshock4_v1)
++        {
++            firmware_info = dualshock4_v1_firmware_info;
++            firmware_info_size = sizeof(dualshock4_v1_firmware_info);
++        }
++        else
++        {
++            firmware_info = dualshock4_v2_firmware_info;
++            firmware_info_size = sizeof(dualshock4_v2_firmware_info);
++        }
++
++        if (packet->reportBufferLen < firmware_info_size)
+         {
+             io->Information = 0;
+             io->Status = STATUS_BUFFER_TOO_SMALL;
+@@ -2022,28 +2162,43 @@ static BOOL hidraw_get_spoofed_dualshock4_feature_report(DEVICE_OBJECT *device,
+         }
+ 
+         memset(packet->reportBuffer, 0, packet->reportBufferLen);
+-        memcpy(packet->reportBuffer, dualshock4_v2_firmware_info,
+-                sizeof(dualshock4_v2_firmware_info));
+-        io->Information = sizeof(dualshock4_v2_firmware_info);
++        memcpy(packet->reportBuffer, firmware_info, firmware_info_size);
++        io->Information = firmware_info_size;
+         io->Status = STATUS_SUCCESS;
+-        TRACE("returned synthetic DualShock 4 firmware report for physical DualSense.\n");
++        TRACE("returned synthetic DualShock 4 %s firmware report for physical Sony device %04x:%04x.\n",
++                ext->desc.spoof_dualshock4_v1 ? "v1" : "v2", ext->desc.vid, ext->desc.pid);
+         return TRUE;
+     }
+ 
+-    switch (packet->reportId)
++    if (!ext->desc.spoof_dualshock4)
+     {
+-        case DUALSHOCK4_FEATURE_REPORT_CALIBRATION:
+-            native_packet.reportId = DUALSENSE_FEATURE_REPORT_CALIBRATION;
+-            native_packet.reportBufferLen = DUALSENSE_FEATURE_REPORT_CALIBRATION_SIZE;
+-            response_size = DUALSHOCK4_FEATURE_REPORT_CALIBRATION_SIZE;
+-            break;
+-        case DUALSHOCK4_FEATURE_REPORT_PAIRING_INFO:
+-            native_packet.reportId = DUALSENSE_FEATURE_REPORT_PAIRING_INFO;
+-            native_packet.reportBufferLen = DUALSENSE_FEATURE_REPORT_PAIRING_INFO_SIZE;
+-            response_size = DUALSHOCK4_FEATURE_REPORT_PAIRING_INFO_SIZE;
+-            break;
+-        default:
++        /* DS4 v1 and v2 share their report layout. Bluetooth calibration is
++         * the only feature report whose transport ID and size differ. */
++        if (ext->desc.bus_type != BUS_TYPE_BLUETOOTH ||
++                packet->reportId != DUALSHOCK4_FEATURE_REPORT_CALIBRATION)
+             return FALSE;
++
++        native_packet.reportId = DUALSHOCK4_FEATURE_REPORT_CALIBRATION_BT;
++        native_packet.reportBufferLen = DUALSHOCK4_FEATURE_REPORT_CALIBRATION_BT_SIZE;
++        response_size = DUALSHOCK4_FEATURE_REPORT_CALIBRATION_SIZE;
++    }
++    else
++    {
++        switch (packet->reportId)
++        {
++            case DUALSHOCK4_FEATURE_REPORT_CALIBRATION:
++                native_packet.reportId = DUALSENSE_FEATURE_REPORT_CALIBRATION;
++                native_packet.reportBufferLen = DUALSENSE_FEATURE_REPORT_CALIBRATION_SIZE;
++                response_size = DUALSHOCK4_FEATURE_REPORT_CALIBRATION_SIZE;
++                break;
++            case DUALSHOCK4_FEATURE_REPORT_PAIRING_INFO:
++                native_packet.reportId = DUALSENSE_FEATURE_REPORT_PAIRING_INFO;
++                native_packet.reportBufferLen = DUALSENSE_FEATURE_REPORT_PAIRING_INFO_SIZE;
++                response_size = DUALSHOCK4_FEATURE_REPORT_PAIRING_INFO_SIZE;
++                break;
++            default:
++                return FALSE;
++        }
+     }
+ 
+     if (packet->reportBufferLen < response_size)
+@@ -2057,7 +2212,7 @@ static BOOL hidraw_get_spoofed_dualshock4_feature_report(DEVICE_OBJECT *device,
+     unix_device_get_feature_report(device, &native_packet, &native_io);
+     if (native_io.Status)
+     {
+-        WARN("Failed to retrieve physical DualSense feature report %#x for spoofed DualShock 4 report %#x, status %#lx.\n",
++        WARN("Failed to retrieve physical Sony feature report %#x for spoofed DualShock 4 report %#x, status %#lx.\n",
+                 native_packet.reportId, packet->reportId, native_io.Status);
+         *io = native_io;
+         return TRUE;
+@@ -2069,8 +2224,21 @@ static BOOL hidraw_get_spoofed_dualshock4_feature_report(DEVICE_OBJECT *device,
+     switch (packet->reportId)
+     {
+         case DUALSHOCK4_FEATURE_REPORT_CALIBRATION:
+-            /* The USB DS4 and DualSense calibration fields share offsets 1-36. */
+-            memcpy(packet->reportBuffer + 1, native_report + 1, 36);
++            if (!ext->desc.spoof_dualshock4 && ext->desc.bus_type == BUS_TYPE_BLUETOOTH)
++            {
++                memcpy(packet->reportBuffer + 1, native_report + 1, 6);
++                memcpy(packet->reportBuffer + 7, native_report + 7, 2);   /* pitch plus */
++                memcpy(packet->reportBuffer + 9, native_report + 13, 2);  /* pitch minus */
++                memcpy(packet->reportBuffer + 11, native_report + 9, 2);  /* yaw plus */
++                memcpy(packet->reportBuffer + 13, native_report + 15, 2); /* yaw minus */
++                memcpy(packet->reportBuffer + 15, native_report + 11, 2); /* roll plus */
++                memcpy(packet->reportBuffer + 17, native_report + 17, 20);
++            }
++            else
++            {
++                /* USB DS4 and DualSense calibration fields share offsets 1-36. */
++                memcpy(packet->reportBuffer + 1, native_report + 1, 36);
++            }
+             break;
+         case DUALSHOCK4_FEATURE_REPORT_PAIRING_INFO:
+             /* Both reports store the controller MAC in little-endian order at offset 1. */
+@@ -2081,7 +2249,7 @@ static BOOL hidraw_get_spoofed_dualshock4_feature_report(DEVICE_OBJECT *device,
+     io->Information = response_size;
+     io->Status = STATUS_SUCCESS;
+ 
+-    TRACE("translated physical DualSense feature report %#x to spoofed DualShock 4 report %#x.\n",
++    TRACE("translated physical Sony feature report %#x to spoofed DualShock 4 report %#x.\n",
+             native_packet.reportId, packet->reportId);
+     return TRUE;
+ }
+@@ -2115,13 +2283,36 @@ static BOOL hidraw_fixup_spoofed_dualshock4_output_report(struct device_extensio
+ {
+     BYTE *common;
+ 
+-    if (!ext->desc.spoof_dualshock4 || !ext->desc.is_hidraw)
++    if (!ext->desc.is_hidraw ||
++            (!ext->desc.spoof_dualshock4 && !ext->desc.spoof_dualshock4_v1))
+         return FALSE;
+     if (packet->reportId != DUALSHOCK4_OUTPUT_REPORT_USB
+             || packet->reportBufferLen != DUALSHOCK4_OUTPUT_REPORT_USB_SIZE
+             || packet->reportBuffer[0] != DUALSHOCK4_OUTPUT_REPORT_USB)
+         return FALSE;
+ 
++    if (!ext->desc.spoof_dualshock4)
++    {
++        if (ext->desc.bus_type != BUS_TYPE_BLUETOOTH)
++            return FALSE;
++
++        memset(fixed_report, 0, DUALSHOCK4_OUTPUT_REPORT_BT_SIZE);
++        fixed_report[0] = DUALSHOCK4_OUTPUT_REPORT_BT;
++        fixed_report[DUALSHOCK4_OUTPUT_REPORT_BT_HW_CONTROL_OFFSET] =
++                DUALSHOCK4_OUTPUT_REPORT_BT_HW_CONTROL;
++        memcpy(fixed_report + DUALSHOCK4_OUTPUT_REPORT_BT_COMMON_OFFSET,
++                packet->reportBuffer + DUALSHOCK4_OUTPUT_REPORT_USB_COMMON_OFFSET, 10);
++
++        *fixed_packet = *packet;
++        fixed_packet->reportId = DUALSHOCK4_OUTPUT_REPORT_BT;
++        fixed_packet->reportBuffer = fixed_report;
++        fixed_packet->reportBufferLen = DUALSHOCK4_OUTPUT_REPORT_BT_SIZE;
++        sony_set_output_report_crc(fixed_report, fixed_packet->reportBufferLen);
++
++        TRACE("translated spoofed DualShock 4 v1 USB output report to physical v2 Bluetooth report.\n");
++        return TRUE;
++    }
++
+     memset(fixed_report, 0, DUALSENSE_OUTPUT_REPORT_BT_SIZE);
+     *fixed_packet = *packet;
+ 
+@@ -2254,7 +2445,8 @@ static NTSTATUS WINAPI hid_internal_dispatch(DEVICE_OBJECT *device, IRP *irp)
+             attr->Size = sizeof(*attr);
+             attr->VendorID = ext->desc.vid;
+             attr->ProductID = get_windows_product_id(ext);
+-            attr->VersionNumber = ext->desc.spoof_dualshock4 ? 0x0100 : ext->desc.version;
++            attr->VersionNumber = (ext->desc.spoof_dualshock4 || ext->desc.spoof_dualshock4_v1)
++                    ? 0x0100 : ext->desc.version;
+ 
+             irp->IoStatus.Status = STATUS_SUCCESS;
+             irp->IoStatus.Information = sizeof(*attr);
+diff --git a/dlls/winebus.sys/unixlib.h b/dlls/winebus.sys/unixlib.h
+index 562dd46f..6ac652ea 100644
+--- a/dlls/winebus.sys/unixlib.h
++++ b/dlls/winebus.sys/unixlib.h
+@@ -42,6 +42,7 @@ struct device_desc
+     BOOL is_gamepad;
+     BOOL is_hidraw;
+     BOOL spoof_dualshock4;
++    BOOL spoof_dualshock4_v1;
+ 
+     WCHAR manufacturer[MAX_PATH];
+     WCHAR product[MAX_PATH];
+
