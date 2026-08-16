@@ -1,0 +1,757 @@
+From 044a1ff32ed0dc049afefe0f4fe2eff899ead177 Mon Sep 17 00:00:00 2001
+From: Alexandre Julliard <julliard@winehq.org>
+Date: Sun, 16 Aug 2026 02:24:57 -0600
+Subject: [PATCH] ntdll: Add heuristics to prefer native dll based on the
+ version resource.
+
+For now checking that CompanyName is not "Microsoft".
+
+Backport of Wine commit a31ec8da9572672e04ae46792a398da942649875. Include its required version-resource transport from 43ede577eab34ef8d6ccac371b768187ffdfe427 and adapt it to Proton Wine's pre-pe_mapping_info loader API.
+---
+ dlls/ntdll/unix/loader.c       |   9 +--
+ dlls/ntdll/unix/loadorder.c    | 116 +++++++++++++++++++++++++++++--
+ dlls/ntdll/unix/unix_private.h |   5 +-
+ dlls/ntdll/unix/virtual.c      |  29 +++++---
+ include/wine/server_protocol.h |   3 +
+ server/mapping.c               | 101 ++++++++++++++++++++++++++-
+ server/protocol.def            |   2 +
+ server/request_handlers.h      |   5 +-
+ server/request_trace.h         |   3 +
+ server/trace.c                 | 120 ++++++++++++++++++++++++++++++---
+ 10 files changed, 356 insertions(+), 37 deletions(-)
+
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index 217357f..24ed112 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -1071,7 +1071,7 @@ static NTSTATUS load_so_dll( void *args )
+     NTSTATUS status;
+     DWORD len;
+ 
+-    if (get_load_order( nt_name ) == LO_DISABLED) return STATUS_DLL_NOT_FOUND;
++    if (get_load_order( nt_name, NULL, 0 ) == LO_DISABLED) return STATUS_DLL_NOT_FOUND;
+     InitializeObjectAttributes( &attr, nt_name, OBJ_CASE_INSENSITIVE, 0, 0 );
+     if (!get_nt_and_unix_names( &attr, &true_nt_name, &unix_name, FILE_OPEN, FALSE ))
+     {
+@@ -1745,13 +1745,14 @@ done:
+  * Return STATUS_IMAGE_ALREADY_LOADED if we should keep the native one that we have found.
+  */
+ NTSTATUS load_builtin( const struct pe_image_info *image_info, UNICODE_STRING *nt_name,
+-                       ANSI_STRING *exp_name, USHORT machine, SECTION_IMAGE_INFORMATION *info,
++                       ANSI_STRING *exp_name, void *version_res, ULONG version_len,
++                       USHORT machine, SECTION_IMAGE_INFORMATION *info,
+                        void **module, SIZE_T *size, ULONG_PTR limit_low, ULONG_PTR limit_high,
+                        off_t offset )
+ {
+     NTSTATUS status;
+     USHORT search_machine = image_info->machine;
+-    enum loadorder loadorder = get_load_order( nt_name );
++    enum loadorder loadorder = get_load_order( nt_name, version_res, version_len );
+ 
+     if (loadorder == LO_DISABLED) return STATUS_DLL_NOT_FOUND;
+ 
+@@ -1885,7 +1886,7 @@ static NTSTATUS open_main_image( UNICODE_STRING *nt_name, void **module, SECTION
+  */
+ NTSTATUS load_main_exe( UNICODE_STRING *nt_name, USHORT load_machine, void **module )
+ {
+-    enum loadorder loadorder = get_load_order( nt_name );
++    enum loadorder loadorder = get_load_order( nt_name, NULL, 0 );
+     unsigned int status;
+     SIZE_T size;
+     USHORT search_machine;
+diff --git a/dlls/ntdll/unix/loadorder.c b/dlls/ntdll/unix/loadorder.c
+index 722190d..616e030 100644
+--- a/dlls/ntdll/unix/loadorder.c
++++ b/dlls/ntdll/unix/loadorder.c
+@@ -32,6 +32,7 @@
+ #define WIN32_NO_STATUS
+ #include "windef.h"
+ #include "winternl.h"
++#include "verrsrc.h"
+ #include "unix_private.h"
+ 
+ #include "wine/debug.h"
+@@ -53,6 +54,22 @@ static struct
+     struct module_loadorder *order;
+ } env_list;
+ 
++struct version_info
++{
++    WORD  len;
++    WORD  val_len;
++    WORD  type;
++    WCHAR key[1];
++};
++
++struct version_entry
++{
++    const struct version_info *info;
++    const void                *value;
++    const void                *next;
++    const void                *child;
++};
++
+ static const WCHAR separatorsW[] = {',',' ','\t',0};
+ 
+ static HANDLE std_key;
+@@ -61,6 +78,47 @@ static BOOL init_done;
+ static BOOL main_exe_loaded;
+ static BOOL eac_launcher_process;
+ 
++/***************************************************************************
++ *	get_version_entry
++ *
++ * Validate a version resource entry and fill a descriptor to it.
++ */
++static BOOL get_version_entry( struct version_entry *entry, const void *ptr, const void *end )
++{
++    unsigned int len;
++    const struct version_info *info = ptr;
++
++    if ((const char *)(info + 1) > (const char *)end) return FALSE;
++    if ((const char *)info + info->len > (const char *)end) return FALSE;
++
++    for (len = 0; info->key[len]; len++)
++        if (offsetof(struct version_info, key[len + 1]) > info->len) return FALSE;
++
++    len = (offsetof(struct version_info, key[len + 1]) + 3) & ~3;
++    if (len + info->val_len * (info->type ? 2 : 1) > info->len) return FALSE;
++
++    entry->info  = info;
++    entry->value = (const char *)info + len;
++    entry->child = (const char *)info + len + ((info->val_len * (info->type ? 2 : 1) + 3) & ~3);
++    entry->next  = (const char *)info + ((info->len + 3) & ~3);
++    return TRUE;
++}
++
++/***************************************************************************
++ *	version_find_key
++ *
++ * Find a specific key in a version resource block.
++ */
++static BOOL version_find_key( const struct version_entry *parent, const WCHAR *name,
++                              struct version_entry *child )
++{
++    if (!get_version_entry( child, parent->child, parent->next )) return FALSE;
++    for (;;)
++    {
++        if (!wcsicmp( child->info->key, name )) return TRUE;
++        if (!get_version_entry( child, child->next, parent->next )) return FALSE;
++    }
++}
+ 
+ /***************************************************************************
+  *	cmp_sort_func	(internal, static)
+@@ -358,6 +416,44 @@ static enum loadorder get_load_order_value( HANDLE std_key, HANDLE app_key, WCHA
+ }
+ 
+ 
++/***********************************************************************
++ *           prefer_native_heuristics
++ *
++ * Check if we should prefer loading native using heuristics based on the version resource.
++ */
++static BOOL prefer_native_heuristics( const UNICODE_STRING *nt_name, void *version_res, ULONG version_len )
++{
++    static const WCHAR fileinfoW[] = {'S','t','r','i','n','g','F','i','l','e','I','n','f','o',0};
++    static const WCHAR companyW[] = {'C','o','m','p','a','n','y','N','a','m','e',0};
++    static const WCHAR microsoftW[] = {'M','i','c','r','o','s','o','f','t'};
++
++    struct version_entry entry;
++    const VS_FIXEDFILEINFO *fileinfo;
++    const WCHAR *name;
++    ULONG len;
++
++    if (!version_len) return FALSE;
++    if (!get_version_entry( &entry, version_res, (char *)version_res + version_len )) return FALSE;
++    fileinfo = entry.value;
++    if (entry.info->val_len < sizeof(*fileinfo)) return FALSE;
++    if (fileinfo->dwSignature != VS_FFI_SIGNATURE) return FALSE;
++
++    if (!version_find_key( &entry, fileinfoW, &entry )) return FALSE;
++    /* get the first child (usually "040904B0") */
++    if (!get_version_entry( &entry, entry.child, entry.next )) return FALSE;
++    if (!version_find_key( &entry, companyW, &entry )) return FALSE;
++    if (!entry.info->type || !entry.info->val_len) return FALSE;
++
++    name = entry.value;
++    len = entry.info->val_len;
++    if (!name[len - 1]) len--;
++    if (len >= ARRAY_SIZE(microsoftW) && !wcsnicmp( name, microsoftW, ARRAY_SIZE(microsoftW) ))
++        return FALSE;
++    TRACE( "preferring native from %s for %s\n", debugstr_wn( name, len ), debugstr_us( nt_name ));
++    return TRUE;
++}
++
++
+ /***************************************************************************
+  *	set_load_order_app_name
+  */
+@@ -390,7 +486,7 @@ void set_load_order_app_name( const WCHAR *app_name )
+  * Return the loadorder of a module.
+  * The system directory and '.dll' extension is stripped from the path.
+  */
+-enum loadorder get_load_order( const UNICODE_STRING *nt_name )
++enum loadorder get_load_order( const UNICODE_STRING *nt_name, void *version_res, ULONG version_len )
+ {
+     static const WCHAR easyanticheat_x86W[] = {'e','a','s','y','a','n','t','i','c','h','e','a','t','_','x','8','6',0};
+     static const WCHAR easyanticheat_x64W[] = {'e','a','s','y','a','n','t','i','c','h','e','a','t','_','x','6','4',0};
+@@ -492,12 +588,20 @@ enum loadorder get_load_order( const UNICODE_STRING *nt_name )
+     if (basename != module+1 && ((ret = get_load_order_value( std_key, app_key, basename )) != LO_INVALID))
+         goto done;
+ 
+-    /* if loading the main exe with an explicit path, try native first */
+-    if (!main_exe_loaded && basename != module+1)
++    /* now some heuristics for explicit paths */
++    if (basename != module + 1)
+     {
+-        ret = LO_NATIVE_BUILTIN;
+-        TRACE( "got main exe default %s for %s\n", debugstr_loadorder(ret), debugstr_us(nt_name) );
+-        goto done;
++        if (!main_exe_loaded)  /* if loading the main exe, try native first */
++        {
++            ret = LO_NATIVE_BUILTIN;
++            TRACE( "got main exe default %s for %s\n", debugstr_loadorder(ret), debugstr_us(nt_name) );
++            goto done;
++        }
++        if (prefer_native_heuristics( nt_name, version_res, version_len ))
++        {
++            ret = LO_NATIVE_BUILTIN;
++            goto done;
++        }
+     }
+ 
+     /* and last the hard-coded default */
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index 3014cba..588afdb 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -231,7 +231,8 @@ extern void *create_startup_info( const UNICODE_STRING *nt_image, ULONG process_
+ extern char *get_alternate_wineloader( WORD machine );
+ extern NTSTATUS exec_wineloader( char **argv, int socketfd, const struct pe_image_info *pe_info );
+ extern NTSTATUS load_builtin( const struct pe_image_info *image_info, UNICODE_STRING *nt_name,
+-                              ANSI_STRING *exp_name, USHORT machine, SECTION_IMAGE_INFORMATION *info,
++                              ANSI_STRING *exp_name, void *version_res, ULONG version_len,
++                              USHORT machine, SECTION_IMAGE_INFORMATION *info,
+                               void **module, SIZE_T *size, ULONG_PTR limit_low, ULONG_PTR limit_high, off_t offset );
+ extern BOOL is_builtin_path( const UNICODE_STRING *path, WORD *machine );
+ extern NTSTATUS load_main_exe( UNICODE_STRING *nt_name, USHORT load_machine, void **module );
+@@ -591,7 +592,7 @@ enum loadorder
+ };
+ 
+ extern void set_load_order_app_name( const WCHAR *app_name );
+-extern enum loadorder get_load_order( const UNICODE_STRING *nt_name );
++extern enum loadorder get_load_order( const UNICODE_STRING *nt_name, void *version_res, ULONG version_len );
+ 
+ static inline WCHAR ntdll_towupper( WCHAR ch )
+ {
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index a115b0e..df31b19 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -3506,11 +3506,11 @@ done:
+  */
+ static unsigned int get_mapping_info( HANDLE handle, ACCESS_MASK access, unsigned int *sec_flags,
+                                       mem_size_t *full_size, HANDLE *shared_file,
+-                                      struct pe_image_info **info, UNICODE_STRING *nt_name,
+-                                      ANSI_STRING *exp_name )
++                                      struct pe_image_info **info, void **version_res,
++                                      ULONG *version_len, UNICODE_STRING *nt_name, ANSI_STRING *exp_name )
+ {
+     struct pe_image_info *image_info;
+-    SIZE_T namelen, total, size = 1024;
++    SIZE_T namelen, total, size = 2048;
+     unsigned int status;
+ 
+     for (;;)
+@@ -3526,6 +3526,7 @@ static unsigned int get_mapping_info( HANDLE handle, ACCESS_MASK access, unsigne
+             *sec_flags   = reply->flags;
+             *full_size   = reply->size;
+             namelen      = reply->name_len;
++            *version_len = reply->ver_len;
+             total        = reply->total;
+             *shared_file = wine_server_ptr_handle( reply->shared_file );
+         }
+@@ -3541,10 +3542,12 @@ static unsigned int get_mapping_info( HANDLE handle, ACCESS_MASK access, unsigne
+     {
+         assert( total >= sizeof(*image_info) );
+         total -= sizeof(*image_info);
+-        nt_name->Buffer = (WCHAR *)(image_info + 1);
++        assert( total >= *version_len + namelen );
++        *version_res = image_info + 1;
++        nt_name->Buffer = (WCHAR *)((char *)(image_info + 1) + *version_len);
+         nt_name->Length = nt_name->MaximumLength = namelen;
+         exp_name->Buffer = (char *)nt_name->Buffer + namelen;
+-        exp_name->Length = exp_name->MaximumLength = total - namelen;
++        exp_name->Length = exp_name->MaximumLength = total - *version_len - namelen;
+         *info = image_info;
+     }
+     else free( image_info );
+@@ -3716,6 +3719,8 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
+     ACCESS_MASK access;
+     SIZE_T size;
+     struct pe_image_info *image_info = NULL;
++    void *version_res;
++    ULONG version_len;
+     UNICODE_STRING nt_name;
+     ANSI_STRING exp_name;
+     void *base;
+@@ -3749,7 +3754,7 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
+     }
+ 
+     res = get_mapping_info( handle, access, &sec_flags, &full_size, &shared_file,
+-                            &image_info, &nt_name, &exp_name );
++                            &image_info, &version_res, &version_len, &nt_name, &exp_name );
+     if (res) return res;
+ 
+     offset.QuadPart = offset_ptr ? offset_ptr->QuadPart : 0;
+@@ -3765,7 +3770,7 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
+             NtCurrentTeb64()->Tib.ArbitraryUserPointer = PtrToUlong(NtCurrentTeb()->Tib.ArbitraryUserPointer);
+         }
+         /* check if we can replace that mapping with the builtin */
+-        res = load_builtin( image_info, &nt_name, &exp_name, machine, &info,
++        res = load_builtin( image_info, &nt_name, &exp_name, version_res, version_len, machine, &info,
+                             addr_ptr, size_ptr, limit_low, limit_high, offset.QuadPart );
+         if (res == STATUS_IMAGE_ALREADY_LOADED)
+             res = virtual_map_image( handle, addr_ptr, size_ptr, shared_file, limit_low, limit_high,
+@@ -4024,12 +4029,14 @@ NTSTATUS virtual_map_builtin_module( HANDLE mapping, void **module, SIZE_T *size
+     unsigned int sec_flags;
+     HANDLE shared_file;
+     struct pe_image_info *image_info = NULL;
++    void *version_res;
++    ULONG version_len;
+     NTSTATUS status;
+     UNICODE_STRING nt_name;
+     ANSI_STRING exp_name;
+ 
+     if ((status = get_mapping_info( mapping, SECTION_MAP_READ, &sec_flags, &full_size, &shared_file,
+-                                    &image_info, &nt_name, &exp_name )))
++                                    &image_info, &version_res, &version_len, &nt_name, &exp_name )))
+         return status;
+ 
+     if (!image_info) return STATUS_INVALID_PARAMETER;
+@@ -4072,11 +4079,13 @@ NTSTATUS virtual_map_module( HANDLE mapping, void **module, SIZE_T *size, SECTIO
+     unsigned int sec_flags;
+     HANDLE shared_file;
+     struct pe_image_info *image_info = NULL;
++    void *version_res;
++    ULONG version_len;
+     UNICODE_STRING nt_name;
+     ANSI_STRING exp_name;
+ 
+     if ((status = get_mapping_info( mapping, SECTION_MAP_READ, &sec_flags, &full_size, &shared_file,
+-                                    &image_info, &nt_name, &exp_name )))
++                                    &image_info, &version_res, &version_len, &nt_name, &exp_name )))
+         return status;
+ 
+     if (!image_info) return STATUS_INVALID_PARAMETER;
+@@ -4085,7 +4094,7 @@ NTSTATUS virtual_map_module( HANDLE mapping, void **module, SIZE_T *size, SECTIO
+     *size = 0;
+ 
+     /* check if we can replace that mapping with the builtin */
+-    status = load_builtin( image_info, &nt_name, &exp_name, machine, info,
++    status = load_builtin( image_info, &nt_name, &exp_name, version_res, version_len, machine, info,
+                            module, size, limit_low, limit_high, 0 );
+     if (status == STATUS_IMAGE_ALREADY_LOADED)
+     {
+diff --git a/include/wine/server_protocol.h b/include/wine/server_protocol.h
+index 540c7c7..215fb3e 100644
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -2229,10 +2229,13 @@ struct get_mapping_info_reply
+     unsigned int flags;
+     obj_handle_t shared_file;
+     data_size_t  name_len;
++    data_size_t  ver_len;
+     data_size_t  total;
+     /* VARARG(image,pe_image_info); */
++    /* VARARG(version,version_res,ver_len); */
+     /* VARARG(name,unicode_str,name_len); */
+     /* VARARG(exp_name,string); */
++    char __pad_36[4];
+ };
+ 
+ 
+diff --git a/server/mapping.c b/server/mapping.c
+index 7248fd8..3450af3 100644
+--- a/server/mapping.c
++++ b/server/mapping.c
+@@ -168,7 +168,9 @@ struct mapping
+     struct ranges       *committed;  /* list of committed ranges in this mapping */
+     struct shared_map   *shared;     /* temp file for shared PE mapping */
+     char                *exp_name;   /* export name (for PE image mapping) */
++    void                *ver_res;    /* version resource (for PE image mapping) */
+     data_size_t          exp_len;    /* length of export name (for PE image mapping) */
++    data_size_t          ver_len;    /* length of version resource (for PE image mapping) */
+ };
+ 
+ static void mapping_dump( struct object *obj, int verbose );
+@@ -771,6 +773,79 @@ static int load_export_name( char **ret_buf, size_t va, size_t size, size_t alig
+     return end - buffer;
+ }
+ 
++/* find a resource entry by id */
++static size_t find_resource_id( const IMAGE_RESOURCE_DIRECTORY_ENTRY *entries, unsigned int count,
++                                unsigned int id, int want_dir )
++{
++    for (unsigned int i = 0; i < count; i++)
++        if (entries[i].Id == id && !entries[i].DataIsDirectory == !want_dir)
++            return entries[i].OffsetToDirectory;
++    return 0;
++}
++
++/* find a resource entry in a directory */
++static size_t find_resource_entry( unsigned int id, IMAGE_DATA_DIRECTORY *data,
++                                   size_t offset, size_t align_mask, int unix_fd,
++                                   IMAGE_SECTION_HEADER *sec, unsigned int nb_sec )
++{
++    IMAGE_RESOURCE_DIRECTORY_ENTRY *entries;
++    IMAGE_RESOURCE_DIRECTORY res;
++    size_t size;
++    int ret;
++
++    if (offset >= data->Size) return 0;
++    ret = load_data_dir( &res, sizeof(res), data->VirtualAddress + offset, data->Size - offset,
++                         align_mask, unix_fd, sec, nb_sec );
++    if (ret != sizeof(res)) return 0;
++    offset += ret + res.NumberOfNamedEntries * sizeof(*entries);
++    if (offset >= data->Size) return 0;
++    size = res.NumberOfIdEntries * sizeof(*entries);
++    if (!(entries = malloc( size ))) return 0;
++    ret = load_data_dir( entries, size, data->VirtualAddress + offset, data->Size - offset,
++                         align_mask, unix_fd, sec, nb_sec );
++    offset = 0;
++    if (ret >= sizeof(*entries))
++    {
++        unsigned int count = ret / sizeof(*entries);
++        if (!id)  /* try various languages */
++        {
++            if (!(offset = find_resource_id( entries, count, 0x0409, 0 )) &&
++                !(offset = find_resource_id( entries, count, 0x0000, 0 )) &&
++                !entries[0].DataIsDirectory)
++                offset = entries[0].OffsetToData;
++        }
++        else offset = find_resource_id( entries, count, id, 1 );
++    }
++    free( entries );
++    return offset;
++}
++
++/* load the version resource */
++static int load_version_resource( void **ret_buf, IMAGE_DATA_DIRECTORY *data, size_t align_mask,
++                                  int unix_fd, IMAGE_SECTION_HEADER *sec, unsigned int nb_sec )
++{
++    IMAGE_RESOURCE_DATA_ENTRY entry;
++    size_t offset;
++    int ret;
++
++    if (!(offset = find_resource_entry( RT_VERSION, data, 0, align_mask, unix_fd, sec, nb_sec ))) return 0;
++    if (!(offset = find_resource_entry( 1, data, offset, align_mask, unix_fd, sec, nb_sec ))) return 0;
++    if (!(offset = find_resource_entry( 0, data, offset, align_mask, unix_fd, sec, nb_sec ))) return 0;
++    if (offset >= data->Size) return 0;
++    ret = load_data_dir( &entry, sizeof(entry), data->VirtualAddress + offset, data->Size - offset,
++                         align_mask, unix_fd, sec, nb_sec );
++    if (ret != sizeof(entry)) return 0;
++    if (!(*ret_buf = malloc( entry.Size + 3 ))) return 0;
++    if ((ret = load_data_dir( *ret_buf, entry.Size, entry.OffsetToData, entry.Size,
++                              align_mask, unix_fd, sec, nb_sec )) > 0)
++    {
++        if (ret % 4) memset( (char *)*ret_buf + ret, 0, 4 - ret % 4 );
++        return (ret + 3) & ~3;
++    }
++    free( *ret_buf );
++    return 0;
++}
++
+ /* load the CLR header from its section */
+ static int load_clr_header( IMAGE_COR20_HEADER *hdr, size_t va, size_t size, size_t align_mask,
+                             int unix_fd, IMAGE_SECTION_HEADER *sec, unsigned int nb_sec )
+@@ -829,6 +904,7 @@ static unsigned int get_image_params( struct mapping *mapping, file_pos_t file_s
+     } cfg;
+     off_t pos;
+     int size, has_relocs;
++    IMAGE_DATA_DIRECTORY res_dir = {0};
+     size_t mz_size, clr_va = 0, clr_size = 0, exp_va, exp_size, cfg_va, cfg_size, align_mask;
+     unsigned int i, ret;
+ 
+@@ -875,6 +951,8 @@ static unsigned int get_image_params( struct mapping *mapping, file_pos_t file_s
+         }
+         exp_va = nt.opt.hdr32.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+         exp_size = nt.opt.hdr32.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
++        if (nt.opt.hdr32.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_RESOURCE)
++            res_dir = nt.opt.hdr32.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE];
+         cfg_va = nt.opt.hdr32.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].VirtualAddress;
+         cfg_size = nt.opt.hdr32.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].Size;
+ 
+@@ -923,6 +1001,8 @@ static unsigned int get_image_params( struct mapping *mapping, file_pos_t file_s
+         }
+         exp_va = nt.opt.hdr64.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+         exp_size = nt.opt.hdr64.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
++        if (nt.opt.hdr64.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_RESOURCE)
++            res_dir = nt.opt.hdr64.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE];
+         cfg_va = nt.opt.hdr64.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].VirtualAddress;
+         cfg_size = nt.opt.hdr64.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].Size;
+ 
+@@ -1001,6 +1081,9 @@ static unsigned int get_image_params( struct mapping *mapping, file_pos_t file_s
+     if (mapping->image.wine_builtin || mapping->image.wine_fakedll)
+         mapping->exp_len = load_export_name( &mapping->exp_name, exp_va, exp_size, align_mask,
+                                              unix_fd, sec, nt.FileHeader.NumberOfSections );
++    else if (res_dir.VirtualAddress && res_dir.Size)
++        mapping->ver_len = load_version_resource( &mapping->ver_res, &res_dir, align_mask,
++                                                  unix_fd, sec, nt.FileHeader.NumberOfSections );
+ 
+     if (load_clr_header( &clr, clr_va, clr_size, align_mask,
+                          unix_fd, sec, nt.FileHeader.NumberOfSections ) &&
+@@ -1091,7 +1174,9 @@ static struct mapping *create_mapping( struct object *root, const struct unicode
+     mapping->shared      = NULL;
+     mapping->committed   = NULL;
+     mapping->exp_name    = NULL;
++    mapping->ver_res     = NULL;
+     mapping->exp_len     = 0;
++    mapping->ver_len     = 0;
+ 
+     if (!(mapping->flags = get_mapping_flags( handle, flags ))) goto error;
+ 
+@@ -1182,7 +1267,9 @@ struct mapping *create_fd_mapping( struct object *root, const struct unicode_str
+     mapping->shared    = NULL;
+     mapping->committed = NULL;
+     mapping->exp_name  = NULL;
++    mapping->ver_res   = NULL;
+     mapping->exp_len   = 0;
++    mapping->ver_len   = 0;
+     mapping->flags     = SEC_FILE;
+     mapping->fd        = (struct fd *)grab_object( fd );
+     set_fd_user( mapping->fd, &mapping_fd_ops, NULL );
+@@ -1295,6 +1382,7 @@ static void mapping_destroy( struct object *obj )
+     if (mapping->committed) release_object( mapping->committed );
+     if (mapping->shared) release_object( mapping->shared );
+     free( mapping->exp_name );
++    free( mapping->ver_res );
+ }
+ 
+ static enum server_fd_type mapping_get_fd_type( struct fd *fd )
+@@ -1586,12 +1674,19 @@ DECL_HANDLER(get_mapping_info)
+         void *data;
+ 
+         if (mapping->fd) get_nt_name( mapping->fd, &name );
+-        reply->total = sizeof(struct pe_image_info) + name.len + mapping->exp_len;
+-        size = min( reply->total, get_reply_max_size() );
++        size = reply->total = sizeof(struct pe_image_info) + mapping->ver_len + name.len + mapping->exp_len;
++        if (size > get_reply_max_size()) size = sizeof(struct pe_image_info) + mapping->ver_len + name.len;
++        if (size > get_reply_max_size()) size = sizeof(struct pe_image_info) + mapping->ver_len;
++        if (size > get_reply_max_size()) size = sizeof(struct pe_image_info);
+         if ((data = set_reply_data_size( size )))
+         {
+             data = mem_append( data, &mapping->image, min( sizeof(struct pe_image_info), size ));
+-            if (size >= sizeof(struct pe_image_info) + name.len)
++            if (size >= sizeof(struct pe_image_info) + mapping->ver_len)
++            {
++                data = mem_append( data, mapping->ver_res, mapping->ver_len );
++                reply->ver_len = mapping->ver_len;
++            }
++            if (size >= sizeof(struct pe_image_info) + mapping->ver_len + name.len)
+             {
+                 data = mem_append( data, name.str, name.len );
+                 reply->name_len = name.len;
+diff --git a/server/protocol.def b/server/protocol.def
+index 4eaa010..2047b40 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -1840,8 +1840,10 @@ enum server_fd_type
+     unsigned int flags;         /* SEC_* flags */
+     obj_handle_t shared_file;   /* shared mapping file handle */
+     data_size_t  name_len;      /* length of file name  */
++    data_size_t  ver_len;       /* length of version resource  */
+     data_size_t  total;         /* total required buffer size in bytes */
+     VARARG(image,pe_image_info);/* image info for SEC_IMAGE mappings */
++    VARARG(version,version_res,ver_len);/* version resource for SEC_IMAGE mappings */
+     VARARG(name,unicode_str,name_len);  /* filename for SEC_IMAGE mappings */
+     VARARG(exp_name,string);    /* exported name for SEC_IMAGE mappings */
+ @END
+diff --git a/server/request_handlers.h b/server/request_handlers.h
+index d24f972..ca85ff8 100644
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -1108,8 +1108,9 @@ C_ASSERT( offsetof(struct get_mapping_info_reply, size) == 8 );
+ C_ASSERT( offsetof(struct get_mapping_info_reply, flags) == 16 );
+ C_ASSERT( offsetof(struct get_mapping_info_reply, shared_file) == 20 );
+ C_ASSERT( offsetof(struct get_mapping_info_reply, name_len) == 24 );
+-C_ASSERT( offsetof(struct get_mapping_info_reply, total) == 28 );
+-C_ASSERT( sizeof(struct get_mapping_info_reply) == 32 );
++C_ASSERT( offsetof(struct get_mapping_info_reply, ver_len) == 28 );
++C_ASSERT( offsetof(struct get_mapping_info_reply, total) == 32 );
++C_ASSERT( sizeof(struct get_mapping_info_reply) == 40 );
+ C_ASSERT( offsetof(struct get_image_map_address_request, handle) == 12 );
+ C_ASSERT( sizeof(struct get_image_map_address_request) == 16 );
+ C_ASSERT( offsetof(struct get_image_map_address_reply, addr) == 8 );
+diff --git a/server/request_trace.h b/server/request_trace.h
+index 4446a6b..96f2462 100644
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -55,6 +55,7 @@ static void dump_varargs_unicode_str( const char *prefix, data_size_t size );
+ static void dump_varargs_unicode_strings( const char *prefix, data_size_t size );
+ static void dump_varargs_user_handles( const char *prefix, data_size_t size );
+ static void dump_varargs_ushorts( const char *prefix, data_size_t size );
++static void dump_varargs_version_res( const char *prefix, data_size_t size );
+ 
+ static const void *cur_data;
+ static data_size_t cur_size;
+@@ -890,8 +891,10 @@ static void dump_get_mapping_info_reply( const struct get_mapping_info_reply *re
+     fprintf( stderr, ", flags=%08x", req->flags );
+     fprintf( stderr, ", shared_file=%04x", req->shared_file );
+     fprintf( stderr, ", name_len=%u", req->name_len );
++    fprintf( stderr, ", ver_len=%u", req->ver_len );
+     fprintf( stderr, ", total=%u", req->total );
+     dump_varargs_pe_image_info( ", image=", cur_size );
++    dump_varargs_version_res( ", version=", min( cur_size, req->ver_len ));
+     dump_varargs_unicode_str( ", name=", min( cur_size, req->name_len ));
+     dump_varargs_string( ", exp_name=", cur_size );
+ }
+diff --git a/server/trace.c b/server/trace.c
+index 80621d5..3b66b39 100644
+--- a/server/trace.c
++++ b/server/trace.c
+@@ -83,6 +83,17 @@ static const char *get_status_name( unsigned int status )
+     return buffer;
+ }
+ 
++static void dump_ushorts( const char *prefix, const unsigned short *ptr, int len )
++{
++    fprintf( stderr, "%s{", prefix );
++    while (len > 0)
++    {
++        fprintf( stderr, "%04x", *ptr++ );
++        if (--len) fputc( ',', stderr );
++    }
++    fputc( '}', stderr );
++}
++
+ static void dump_uints( const char *prefix, const unsigned int *ptr, int len )
+ {
+     fprintf( stderr, "%s{", prefix );
+@@ -542,16 +553,7 @@ static void dump_varargs_uints64( const char *prefix, data_size_t size )
+ 
+ static void dump_varargs_ushorts( const char *prefix, data_size_t size )
+ {
+-    const unsigned short *data = cur_data;
+-    data_size_t len = size / sizeof(*data);
+-
+-    fprintf( stderr, "%s{", prefix );
+-    while (len > 0)
+-    {
+-        fprintf( stderr, "%04x", *data++ );
+-        if (--len) fputc( ',', stderr );
+-    }
+-    fputc( '}', stderr );
++    dump_ushorts( prefix, cur_data, size / sizeof(unsigned short) );
+     remove_data( size );
+ }
+ 
+@@ -1387,6 +1389,104 @@ static void dump_varargs_pe_image_info( const char *prefix, data_size_t size )
+     remove_data( min( size, sizeof(info) ));
+ }
+ 
++struct version_info
++{
++    unsigned short len;
++    unsigned short val_len;
++    unsigned short type;
++    WCHAR          key[1];
++};
++
++struct version_entry
++{
++    const struct version_info *info;
++    const void                *value;
++    const void                *next;
++    const void                *child;
++    data_size_t                namelen;
++};
++
++static int get_version_entry( struct version_entry *entry, const void *ptr, const void *end )
++{
++    unsigned int len;
++    const struct version_info *info = ptr;
++
++    if ((const char *)(info + 1) > (const char *)end) return 0;
++    if ((const char *)info + info->len > (const char *)end) return 0;
++
++    for (len = 0; info->key[len]; len++)
++        if (offsetof(struct version_info, key[len + 1]) > info->len) return 0;
++
++    entry->info  = info;
++    entry->namelen = len * sizeof(WCHAR);
++
++    len = (offsetof(struct version_info, key[len + 1]) + 3) & ~3;
++    if (len + info->val_len * (info->type ? 2 : 1) > info->len) return 0;
++
++    entry->value = (const char *)info + len;
++    entry->child = (const char *)info + len + ((info->val_len * (info->type ? 2 : 1) + 3) & ~3);
++    entry->next  = (const char *)info + ((info->len + 3) & ~3);
++    return 1;
++}
++
++static void dump_version_children( const struct version_entry *parent )
++{
++    struct version_entry child;
++
++    if (!get_version_entry( &child, parent->child, parent->next )) return;
++    fputc( '{', stderr );
++    for (;;)
++    {
++        if (child.info->val_len || child.value == child.next)
++        {
++            dump_unicode_str( "", child.info->key, child.namelen );
++            if (child.info->type)
++            {
++                data_size_t len = child.info->val_len;
++                if (len && !((WCHAR *)child.value)[len - 1]) len--;
++                dump_unicode_str( "=", child.value, len * sizeof(WCHAR) );
++            }
++            else dump_ushorts( "=", child.value, child.info->val_len / sizeof(unsigned short) );
++        }
++        else
++        {
++            dump_unicode_str( "", child.info->key, child.namelen );
++            fputc( '=', stderr );
++        }
++        dump_version_children( &child );
++        if (!get_version_entry( &child, child.next, parent->next )) break;
++        fputc( ',', stderr );
++    }
++    fputc( '}', stderr );
++}
++
++static void dump_varargs_version_res( const char *prefix, data_size_t size )
++{
++    struct version_entry entry;
++
++    fprintf( stderr, "%s{", prefix );
++    if (get_version_entry( &entry, cur_data, (char *)cur_data + size ))
++    {
++        const VS_FIXEDFILEINFO *info = entry.value;
++        if (entry.info->val_len >= sizeof(VS_FIXEDFILEINFO))
++        {
++            fprintf( stderr, "signature=%08x,version=%u.%u,filever=%u.%u.%u.%u,prodver=%u.%u.%u.%u,",
++                     info->dwSignature, HIWORD(info->dwStrucVersion), LOWORD(info->dwStrucVersion),
++                     HIWORD(info->dwFileVersionMS), LOWORD(info->dwFileVersionMS),
++                     HIWORD(info->dwFileVersionLS), LOWORD(info->dwFileVersionLS),
++                     HIWORD(info->dwProductVersionMS), LOWORD(info->dwProductVersionMS),
++                     HIWORD(info->dwProductVersionLS), LOWORD(info->dwProductVersionLS) );
++            fprintf( stderr, "mask=%x,flags=%x,os=%u.%u,type=%u.%u,date=%x.%x,",
++                     info->dwFileFlagsMask, info->dwFileFlags,
++                     HIWORD(info->dwFileOS), LOWORD(info->dwFileOS),
++                     info->dwFileType, info->dwFileSubtype, info->dwFileDateMS, info->dwFileDateLS );
++        }
++        dump_version_children( &entry );
++    }
++    fputc( '}', stderr );
++    remove_data( size );
++}
++
+ static void dump_varargs_rawinput_devices(const char *prefix, data_size_t size )
+ {
+     const struct rawinput_device *device;
+-- 
+2.55.0
+
