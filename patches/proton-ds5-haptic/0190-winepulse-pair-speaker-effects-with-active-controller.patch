@@ -1,0 +1,201 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Sun, 16 Aug 2026 23:55:00 -0600
+Subject: [PATCH] winepulse: Pair speaker effects with the active controller
+
+Games can open their Sony speaker-only and actuator-only streams on different
+physical controller endpoints.  A fixed canonical endpoint cannot correct
+this when two controllers of the same model are connected: speaker effects
+then always play on whichever endpoint the game happened to enumerate.
+
+Generalize the existing Death Stranding channel classifier and timestamp real
+AUX1 speaker and AUX2/AUX3 actuator activity.  When those signals occur within
+500 ms, move only the speaker-only stream to the actuator stream's physical
+PCM and carry its container binding with it.  This makes an action's speaker
+effect follow the controller producing its haptic effect.  Streams carrying
+both kinds of data remain untouched, and stale activity cannot redirect idle
+per-controller streams.
+
+---
+ dlls/winepulse.drv/pulse.c | 108 ++++++++++++++++++++++++++------------------
+ 1 file changed, 64 insertions(+), 44 deletions(-)
+
+diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -151,8 +151,10 @@ struct pulse_stream
+     BOOL dualsense_haptic_registered;
+     GUID sony_controller_container_id;
+     BOOL sony_controller_container_valid;
+-    BOOL death_stranding_speaker_source;
+-    BOOL death_stranding_actuator_source;
++    BOOL sony_speaker_source;
++    BOOL sony_actuator_source;
++    pa_usec_t sony_speaker_signal_time;
++    pa_usec_t sony_actuator_signal_time;
+     BOOL speaker_route_selected;
+ };
+ 
+@@ -3673,16 +3675,35 @@ static HRESULT pulse_retarget_dualsense_haptic_stream_path(struct pulse_stream
+     return S_OK;
+ }
+ 
+-static BOOL pulse_align_death_stranding_controller_stream(struct pulse_stream *stream,
++static BOOL pulse_sony_effect_signals_correlate(pa_usec_t first, pa_usec_t second)
++{
++    pa_usec_t delta;
++
++    if (!first || !second)
++        return FALSE;
++
++    delta = first > second ? first - second : second - first;
++    return delta <= 500000;
++}
++
++static void pulse_bind_sony_effect_stream(struct pulse_stream *stream,
++        const struct pulse_stream *source)
++{
++    stream->sony_controller_container_valid = source->sony_controller_container_valid;
++    if (source->sony_controller_container_valid)
++        stream->sony_controller_container_id = source->sony_controller_container_id;
++}
++
++static BOOL pulse_align_sony_controller_stream(struct pulse_stream *stream,
+         const int16_t *samples, UINT32 frames)
+ {
+-    struct pulse_stream *other, *next;
++    struct pulse_stream *active = NULL, *other, *next;
+     unsigned int speaker_peak = 0, actuator_peak = 0;
+-    const char *active_path = NULL;
++    BOOL speaker_signal = FALSE, actuator_signal = FALSE;
++    pa_usec_t now;
+     UINT32 frame;
+ 
+-    if (!use_death_stranding_controller_effects() || stream->ss.channels < 4 ||
+-            !stream->dualsense_haptic_registered)
++    if (stream->ss.channels < 4 || !stream->dualsense_haptic_registered)
+         return FALSE;
+ 
+     for (frame = 0; frame < frames; ++frame)
+@@ -3698,63 +3719,71 @@ static BOOL pulse_align_death_stranding_controller_stream(struct pulse_stream *
+         actuator_peak = max(actuator_peak, max(left_amplitude, right_amplitude));
+     }
+ 
++    now = pa_rtclock_now();
+     if (speaker_peak >= 128 && speaker_peak > actuator_peak * 2)
+-        stream->death_stranding_speaker_source = TRUE;
++    {
++        stream->sony_speaker_source = TRUE;
++        stream->sony_speaker_signal_time = now;
++        speaker_signal = TRUE;
++    }
+     if (actuator_peak >= 512 && actuator_peak > speaker_peak * 2)
+-        stream->death_stranding_actuator_source = TRUE;
++    {
++        stream->sony_actuator_source = TRUE;
++        stream->sony_actuator_signal_time = now;
++        actuator_signal = TRUE;
++    }
+ 
+-    if (stream->death_stranding_actuator_source && stream->haptic_alsa_path &&
+-            stream->haptic_alsa_path[0])
+-        active_path = stream->haptic_alsa_path;
+-    else if (stream->death_stranding_speaker_source &&
+-            !stream->death_stranding_actuator_source)
++    if (speaker_signal && stream->sony_speaker_source && !stream->sony_actuator_source)
+     {
+         LIST_FOR_EACH_ENTRY(other, &dualsense_haptic_streams,
+                 struct pulse_stream, dualsense_haptic_entry)
+         {
+-            if (other->death_stranding_actuator_source && other->haptic_alsa_path &&
+-                    other->haptic_alsa_path[0] &&
+-                    (!stream->sony_controller_container_valid ||
+-                     !other->sony_controller_container_valid ||
+-                     IsEqualGUID(&stream->sony_controller_container_id,
+-                             &other->sony_controller_container_id)))
++            if (!other->sony_actuator_source || other->sony_speaker_source ||
++                    !other->haptic_alsa_path || !other->haptic_alsa_path[0] ||
++                    !pulse_sony_effect_signals_correlate(
++                            stream->sony_speaker_signal_time,
++                            other->sony_actuator_signal_time))
++                continue;
++
++            if (!active || other->sony_actuator_signal_time > active->sony_actuator_signal_time)
++                active = other;
++        }
++
++        if (active && (!stream->haptic_alsa_path ||
++                strcmp(stream->haptic_alsa_path, active->haptic_alsa_path)))
++        {
++            TRACE("Pairing Sony speaker stream %p with active actuator stream %p on %s.\n",
++                    stream, active, debugstr_a(active->haptic_alsa_path));
++            if (pulse_retarget_dualsense_haptic_stream_path(stream,
++                    active->haptic_alsa_path) == S_OK)
+             {
+-                active_path = other->haptic_alsa_path;
+-                break;
++                pulse_bind_sony_effect_stream(stream, active);
++                return TRUE;
+             }
+         }
+     }
+ 
+-    if (!active_path)
+-        return FALSE;
+-
+-    if (stream->death_stranding_speaker_source &&
+-            !stream->death_stranding_actuator_source &&
+-            (!stream->haptic_alsa_path || strcmp(stream->haptic_alsa_path, active_path)))
+-    {
+-        TRACE("Moving Death Stranding speaker stream %p to active haptic target %s.\n",
+-                stream, debugstr_a(active_path));
+-        pulse_retarget_dualsense_haptic_stream_path(stream, active_path);
+-        return TRUE;
+-    }
+-
+-    if (stream->death_stranding_actuator_source)
++    if (actuator_signal && stream->sony_actuator_source &&
++            !stream->sony_speaker_source && stream->haptic_alsa_path &&
++            stream->haptic_alsa_path[0])
+     {
+         LIST_FOR_EACH_ENTRY_SAFE(other, next, &dualsense_haptic_streams,
+                 struct pulse_stream, dualsense_haptic_entry)
+         {
+-            if (other == stream || !other->death_stranding_speaker_source ||
+-                    other->death_stranding_actuator_source ||
+-                    (stream->sony_controller_container_valid &&
+-                     other->sony_controller_container_valid &&
+-                     !IsEqualGUID(&stream->sony_controller_container_id,
+-                             &other->sony_controller_container_id)) ||
+-                    (other->haptic_alsa_path && !strcmp(other->haptic_alsa_path, active_path)))
++            if (other == stream || !other->sony_speaker_source ||
++                    other->sony_actuator_source ||
++                    !pulse_sony_effect_signals_correlate(
++                            stream->sony_actuator_signal_time,
++                            other->sony_speaker_signal_time) ||
++                    (other->haptic_alsa_path &&
++                     !strcmp(other->haptic_alsa_path, stream->haptic_alsa_path)))
+                 continue;
+ 
+-            TRACE("Moving Death Stranding speaker stream %p to active haptic target %s.\n",
+-                    other, debugstr_a(active_path));
+-            pulse_retarget_dualsense_haptic_stream_path(other, active_path);
++            TRACE("Pairing Sony speaker stream %p with active actuator stream %p on %s.\n",
++                    other, stream, debugstr_a(stream->haptic_alsa_path));
++            if (pulse_retarget_dualsense_haptic_stream_path(other,
++                    stream->haptic_alsa_path) == S_OK)
++                pulse_bind_sony_effect_stream(other, stream);
+         }
+     }
+ 
+@@ -4160,7 +4189,7 @@ static void pulse_haptic_write(struct pulse_stream *stream)
+             stream->speaker_route_selected = pulse_select_dualsense_usb_speaker();
+     }
+ 
+-    if (pulse_align_death_stranding_controller_stream(stream, write_data, frames))
++    if (pulse_align_sony_controller_stream(stream, write_data, frames))
+         return;
+ 
+     pulse_haptic_trace_channels(stream, write_data, frames);
+-- 
+2.55.0

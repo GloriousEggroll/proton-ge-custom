@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Sun, 16 Aug 2026 23:35:00 -0600
+Subject: [PATCH] winepulse: Align canonical Sony endpoint with HID order
+
+PipeWire may enumerate two identical Sony speaker sinks in a different order
+from Winebus' HID devices.  The first sink previously received the canonical
+Windows endpoint identity, even when its corresponding HID was player two.
+Games which prioritize the canonical endpoint then sent player-one effects to
+the other physical controller.
+
+Record each sink's ALSA card number, which follows the same kernel device order
+as hidraw on these USB functions.  While initially assigning simultaneous
+same-model endpoints, move the canonical identity to the lower ALSA card and
+give the other controller its container-qualified identity.  Existing endpoint
+identities discovered during refresh remain unchanged, so this does not add a
+live-stream retarget or change the hotplug path.
+
+---
+ dlls/winepulse.drv/pulse.c | 67 ++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 60 insertions(+), 7 deletions(-)
+
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -187,6 +187,7 @@ typedef struct _PhysDevice {
+     EndpointFormFactor form;
+     UINT channel_mask;
+     UINT index;
++    int alsa_card;
+     REFERENCE_TIME min_period, def_period;
+     WAVEFORMATEXTENSIBLE fmt;
+     GUID container_id;
+@@ -1453,6 +1454,7 @@ static void fill_device_info(PhysDevice *dev, pa_proplist *p)
+     dev->bus_type = phys_device_bus_invalid;
+     dev->vendor_id = 0;
+     dev->product_id = 0;
++    dev->alsa_card = -1;
+     memset(&dev->container_id, 0, sizeof(dev->container_id));
+ 
+     if (!p)
+@@ -1471,6 +1473,10 @@ static void fill_device_info(PhysDevice *dev, pa_proplist *p)
+     if ((buffer = pa_proplist_gets(p, PA_PROP_DEVICE_PRODUCT_ID)))
+         dev->product_id = strtol(buffer, NULL, 16);
+ 
++    if ((buffer = pa_proplist_gets(p, "alsa.card")) ||
++            (buffer = pa_proplist_gets(p, "api.alsa.card")))
++        dev->alsa_card = strtol(buffer, NULL, 10);
++
+     if ((buffer = pa_proplist_gets(p, "sysfs.path")))
+         dev->container_id = get_container_id(buffer);
+ }
+@@ -1718,18 +1724,19 @@ static BOOL sony_endpoint_has_physical_conflict(const PhysDevice *dev,
+     return conflict;
+ }
+ 
+-static BOOL set_physical_sony_endpoint_id(PhysDevice *dev, const char *base)
++static char *make_physical_sony_endpoint_id(const PhysDevice *dev, const char *base)
+ {
++    char *endpoint_id;
+     size_t len;
+ 
+     if (IsEqualGUID(&dev->container_id, &GUID_NULL))
+-        return !!(dev->endpoint_id = strdup(dev->pulse_name));
++        return strdup(dev->pulse_name);
+ 
+     len = strlen(base) + sizeof("#wine-sony-physical-") + 36;
+-    if (!(dev->endpoint_id = malloc(len)))
+-        return FALSE;
++    if (!(endpoint_id = malloc(len)))
++        return NULL;
+ 
+-    snprintf(dev->endpoint_id, len,
++    snprintf(endpoint_id, len,
+             "%s#wine-sony-physical-%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             base, (unsigned int)dev->container_id.Data1,
+             (unsigned int)dev->container_id.Data2,
+@@ -1742,11 +1749,36 @@ static BOOL set_physical_sony_endpoint_id(PhysDevice *dev, const char *base)
+             (unsigned int)dev->container_id.Data4[5],
+             (unsigned int)dev->container_id.Data4[6],
+             (unsigned int)dev->container_id.Data4[7]);
+-    return TRUE;
++    return endpoint_id;
++}
++
++static PhysDevice *find_canonical_sony_endpoint_in_list(const PhysDevice *dev,
++        const char *base, struct list *devices)
++{
++    PhysDevice *other;
++
++    LIST_FOR_EACH_ENTRY(other, devices, PhysDevice, entry)
++    {
++        const char *other_base = sony_render_endpoint_base(other);
++
++        if (other_base && !strcmp(other_base, base) && other->endpoint_id &&
++                !strcmp(other->endpoint_id, base) &&
++                !sony_render_device_is_same_physical(dev, other))
++            return other;
++    }
++
++    return NULL;
++}
++
++static BOOL sony_audio_device_precedes(const PhysDevice *dev, const PhysDevice *other)
++{
++    return dev->alsa_card >= 0 &&
++            (other->alsa_card < 0 || dev->alsa_card < other->alsa_card);
+ }
+ 
+ static BOOL pulse_set_endpoint_id(PhysDevice *dev, struct list *current)
+ {
++    PhysDevice *canonical;
+     const char *sony_base;
+     char *existing;
+     unsigned int generation;
+@@ -1762,8 +1794,29 @@ static BOOL pulse_set_endpoint_id(PhysDevice *dev, struct list *current)
+ 
+         if (is_dualsense_speaker_sink(dev))
+         {
++            if ((canonical = find_canonical_sony_endpoint_in_list(dev, sony_base, current)) &&
++                    sony_audio_device_precedes(dev, canonical))
++            {
++                char *canonical_id = strdup(sony_base);
++                char *physical_id = make_physical_sony_endpoint_id(canonical, sony_base);
++
++                if (!canonical_id || !physical_id)
++                {
++                    free(canonical_id);
++                    free(physical_id);
++                    return FALSE;
++                }
++
++                TRACE("Assigning canonical Sony endpoint %s to ALSA card %d instead of card %d.\n",
++                        debugstr_a(sony_base), dev->alsa_card, canonical->alsa_card);
++                free(canonical->endpoint_id);
++                canonical->endpoint_id = physical_id;
++                dev->endpoint_id = canonical_id;
++                return TRUE;
++            }
++
+             if (sony_endpoint_has_physical_conflict(dev, sony_base, current))
+-                return set_physical_sony_endpoint_id(dev, sony_base);
++                return !!(dev->endpoint_id = make_physical_sony_endpoint_id(dev, sony_base));
+ 
+             return !!(dev->endpoint_id = strdup(sony_base));
+         }
+-- 
+2.55.0

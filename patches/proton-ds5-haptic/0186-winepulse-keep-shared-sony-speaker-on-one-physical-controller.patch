@@ -1,0 +1,227 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Sun, 16 Aug 2026 21:00:00 -0600
+Subject: [PATCH] winepulse: Keep shared Sony speaker on one physical controller
+
+Spider-Man expects the standard Sony controller speaker to retain one stable
+Windows endpoint identity.  When two controllers of the same model were
+present, however, each physical PipeWire sink published that same endpoint.
+MMDevAPI consequently replaced the first controller's container metadata with
+the second controller while winepulse's process-global preferred sink also
+selected whichever sink happened to be enumerated last.  The game's player-one
+HID device and speaker endpoint no longer referred to the same controller, so
+the game submitted no controller effects.
+
+Keep an already-published shared Sony mono endpoint associated with its first
+physical controller.  Bind each live mono stream to that controller's container
+and do not let a second live controller steal it.  If the bound controller is
+removed, fall back to another currently present Sony speaker, update the stream
+binding, and keep the shared Windows endpoint alive while that replacement
+speaker exists.  This retains the stable endpoint contract required by
+Spider-Man without assigning connection-specific endpoint IDs that cannot be
+recovered after both controllers are unplugged.
+---
+ dlls/mmdevapi/devenum.c     | 16 ++++++++
+ dlls/winepulse.drv/pulse.c | 99 +++++++++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 109 insertions(+), 6 deletions(-)
+
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -115,6 +115,15 @@ static BOOL is_dualsense_backend_name( const char *name )
+             strstr( name, "Sony_Interactive_Entertainment" ));
+ }
+ 
++static BOOL is_shared_sony_mono_backend_name(const char *name)
++{
++    return name &&
++            (!strcmp(name,
++                    "alsa_output.usb-Sony_Interactive_Entertainment_Wireless_Controller-00.HiFi__Speaker__sink") ||
++             !strcmp(name,
++                    "alsa_output.usb-Sony_Interactive_Entertainment_DualSense_Edge_Wireless_Controller-00.Default__Speaker__sink"));
++}
++
+ static BOOL use_death_stranding_controller_effects(void)
+ {
+     const char *env = getenv("PROTON_DEATH_STRANDING_CONTROLLER_EFFECTS");
+@@ -2026,6 +2037,13 @@ static void add_endpoints_from_params(struct get_endpoint_ids_params *params, BO
+         get_device_guid(params->flow, dev_name, TRUE, &guid);
+         promote_delayed_dualsense_profile_in_cache(&guid, dev_name, params->flow);
+         already_published = device_is_published(&guid, params->flow);
++        if (already_published && params->flow == eRender &&
++                is_shared_sony_mono_backend_name(dev_name))
++        {
++            TRACE("Keeping the existing shared Sony speaker endpoint for duplicate backend %s.\n",
++                    debugstr_a(dev_name));
++            continue;
++        }
+         device = MMDevice_Create(name, &guid, params->flow, DEVICE_STATE_ACTIVE, params->default_idx == i);
+         if (device && params->flow == eRender &&
+                 (is_dualsense_mono_endpoint(device) ||
+diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -735,6 +735,8 @@ again:
+ 
+ static BOOL pulse_refresh_devices(EDataFlow flow);
+ static BOOL is_dualsense_speaker_sink(const PhysDevice *dev);
++static char *pulse_find_shared_sony_speaker_survivor(const PhysDevice *removed,
++        struct list *active, struct list *added);
+ static void pulse_retarget_dualsense_mono_streams(const char *preferred);
+ static BOOL use_pipewire_dualsense_haptic_target(void);
+ static BOOL use_dualsense_split_audio(void);
+@@ -878,6 +880,25 @@ static NTSTATUS pulse_get_endpoint_ids(void *args)
+         pulse_wait_devices(list_added);
+         pulse_wait_devices(list_removed);
+ 
++        if (params->flow == eRender)
++        {
++            LIST_FOR_EACH_ENTRY_SAFE(dev, dev_next, list_removed, PhysDevice, entry)
++            {
++                char *survivor = pulse_find_shared_sony_speaker_survivor(dev,
++                        list, list_added);
++
++                if (!survivor)
++                    continue;
++
++                TRACE("Keeping shared Sony speaker endpoint %s while physical sink %s survives.\n",
++                        debugstr_a(pulse_endpoint_id(dev)), debugstr_a(survivor));
++                free(dualsense_mono_target);
++                dualsense_mono_target = survivor;
++                list_remove(&dev->entry);
++                pulse_dev_free(dev);
++            }
++        }
++
+         params->num = list_count(list_added);
+         params->num_removed = list_count(list_removed);
+         offset = needed = (params->num + params->num_removed) * sizeof(*params->endpoints);
+@@ -2860,6 +2881,34 @@ static char *get_dualsense_speaker_sink(const char *preferred, BOOL require_spea
+     return direct_fallback;
+ }
+ 
++static char *pulse_find_shared_sony_speaker_survivor(const PhysDevice *removed,
++        struct list *active, struct list *added)
++{
++    struct list *const lists[] = { added, active, NULL };
++    struct list *const *list;
++    PhysDevice *dev;
++
++    if (!is_dualsense_speaker_sink(removed) ||
++            IsEqualGUID(&removed->container_id, &GUID_NULL))
++        return NULL;
++
++    for (list = lists; *list; ++list)
++    {
++        LIST_FOR_EACH_ENTRY(dev, *list, PhysDevice, entry)
++        {
++            if (!is_dualsense_speaker_sink(dev) ||
++                    IsEqualGUID(&dev->container_id, &GUID_NULL) ||
++                    IsEqualGUID(&dev->container_id, &removed->container_id) ||
++                    strcmp(pulse_endpoint_id(dev), pulse_endpoint_id(removed)))
++                continue;
++
++            return strdup(dev->pulse_name);
++        }
++    }
++
++    return NULL;
++}
++
+ static BOOL pulse_stream_dualsense_mono(const struct pulse_stream *stream)
+ {
+     return pulse_stream_dualsense_mono_format(stream) && string_contains_dualsense_name(stream->device);
+@@ -2902,21 +2957,45 @@ static void pulse_set_dualsense_mono_preferred_sink(const char *preferred)
+ 
+ static HRESULT pulse_retarget_dualsense_mono_stream(struct pulse_stream *stream, const char *preferred)
+ {
++    GUID target_container_id;
+     char *dualsense_speaker;
+     const pa_buffer_attr *attr;
++    BOOL target_container_valid;
+     HRESULT hr;
+     int success;
+ 
+     if (!stream->dualsense_mono_registered && !pulse_stream_dualsense_mono(stream))
+         return S_FALSE;
+ 
+     if (!(dualsense_speaker = get_dualsense_speaker_sink(preferred, TRUE)))
+-        return E_FAIL;
++        if (!(dualsense_speaker = get_dualsense_speaker_sink(NULL, TRUE)))
++            return E_FAIL;
++
++    target_container_valid = pulse_get_device_container_id(dualsense_speaker,
++            &target_container_id);
+ 
+     pulse_set_dualsense_mono_preferred_sink(dualsense_speaker);
+ 
++    if (target_container_valid && stream->sony_controller_container_valid &&
++            !IsEqualGUID(&stream->sony_controller_container_id, &target_container_id) &&
++            pulse_container_is_present(&stream->sony_controller_container_id))
++    {
++        TRACE("Keeping Sony controller mono stream %p on live container %s instead of %s.\n",
++                stream, debugstr_guid(&stream->sony_controller_container_id),
++                debugstr_guid(&target_container_id));
++        stream->dualsense_mono_hotplug_generation = g_dualsense_mono_speaker_add_generation;
++        stream->haptic_hotplug_generation = g_haptic_hotplug_generation;
++        free(dualsense_speaker);
++        return S_FALSE;
++    }
++
+     if (stream->device && !strcmp(stream->device, dualsense_speaker) && pulse_stream_ready(stream))
+     {
++        if (target_container_valid)
++        {
++            stream->sony_controller_container_id = target_container_id;
++            stream->sony_controller_container_valid = TRUE;
++        }
+         stream->dualsense_mono_hotplug_generation = g_dualsense_mono_speaker_add_generation;
+         stream->haptic_hotplug_generation = g_haptic_hotplug_generation;
+         free(dualsense_speaker);
+@@ -2942,6 +3015,12 @@ static HRESULT pulse_retarget_dualsense_mono_stream(struct pulse_stream *stream,
+     if ((attr = pa_stream_get_buffer_attr(stream->stream)))
+         stream->attr = *attr;
+ 
++    if (target_container_valid)
++    {
++        stream->sony_controller_container_id = target_container_id;
++        stream->sony_controller_container_valid = TRUE;
++    }
++
+     stream->dualsense_mono_hotplug_generation = g_dualsense_mono_speaker_add_generation;
+     stream->haptic_hotplug_generation = g_haptic_hotplug_generation;
+     stream->just_underran = TRUE;
+@@ -4051,11 +4130,12 @@ static NTSTATUS pulse_create_stream(void *args)
+     connect_device = params->device;
+     if (dualsense_mono_candidate)
+     {
+-        const char *preferred = g_dualsense_mono_preferred_sink ? g_dualsense_mono_preferred_sink : params->device;
+-
+-        dualsense_speaker = get_dualsense_speaker_sink(preferred, TRUE);
+-        if (!dualsense_speaker && preferred != params->device && strcmp(preferred, params->device))
+-            dualsense_speaker = get_dualsense_speaker_sink(params->device, TRUE);
++        dualsense_speaker = get_dualsense_speaker_sink(params->device, TRUE);
++        if (!dualsense_speaker && g_dualsense_mono_preferred_sink &&
++                strcmp(g_dualsense_mono_preferred_sink, params->device))
++            dualsense_speaker = get_dualsense_speaker_sink(g_dualsense_mono_preferred_sink, TRUE);
++        if (!dualsense_speaker)
++            dualsense_speaker = get_dualsense_speaker_sink(NULL, TRUE);
+         if (dualsense_speaker)
+             connect_device = dualsense_speaker;
+     }
+@@ -4161,6 +4240,13 @@ static NTSTATUS pulse_create_stream(void *args)
+             stream->haptic_hotplug_generation = g_haptic_hotplug_generation;
+         if (dualsense_mono_candidate)
+         {
++            if (pulse_get_device_container_id(connect_device,
++                    &stream->sony_controller_container_id))
++            {
++                stream->sony_controller_container_valid = TRUE;
++                TRACE("Bound Sony controller mono stream %p to container %s.\n", stream,
++                        debugstr_guid(&stream->sony_controller_container_id));
++            }
+             pulse_set_dualsense_mono_preferred_sink(connect_device);
+ 
+             stream->dualsense_mono_hotplug_generation = g_dualsense_mono_speaker_add_generation;
+-- 
+2.55.0
