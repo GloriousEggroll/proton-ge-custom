@@ -1,0 +1,270 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Sun, 16 Aug 2026 00:00:00 -0600
+Subject: [PATCH] winebus: Generalize hatswitch encoding and XInput translation.
+
+Based on SeongChan Lee's v2 hatswitch patch:
+https://gitlab.winehq.org/foriequal0/wine/-/commit/5066616a23f1cadbdd48049da5287a749e919374
+
+Wine-generated controllers currently advertise directions as 1 through 8 and
+use zero as neutral. Some games, including Assetto Corsa Rally, expect the
+encoding used by Sony gamepads, the Thrustmaster T300RS, and Logitech G29:
+directions 0 through 7 with an out-of-range null value.
+
+Generate the latter encoding and initialize every synthesized hatswitch to
+0xf, its four-bit null value. Read the hatswitch logical range from the HID
+descriptor in both XInput implementations, allowing native controllers using
+either 0..7 or 1..8 to be translated without a vendor-specific hatswitch path.
+
+Keep the Sony-specific face-button, axis, trigger, and output-report mappings
+from the existing native Sony XInput patch; those are independent of hatswitch
+encoding.
+
+diff --git a/dlls/winebus.sys/hid.c b/dlls/winebus.sys/hid.c
+--- a/dlls/winebus.sys/hid.c
++++ b/dlls/winebus.sys/hid.c
+@@ -138,6 +138,7 @@ BOOL hid_device_end_input_report(struct unix_device *iface)
+ {
+     struct hid_report_descriptor *desc = &iface->hid_report_descriptor;
+     struct hid_device_state *state = &iface->hid_device_state;
++    ULONG i;
+ 
+     state->report_len = (state->bit_size + 7) / 8;
+     if (!(state->report_buf = calloc(1, state->report_len))) return FALSE;
+@@ -145,6 +146,14 @@ BOOL hid_device_end_input_report(struct unix_device *iface)
+ 
+     state->report_buf[0] = state->id;
+     state->last_report_buf[0] = state->id;
++    for (i = 0; i < state->hatswitch_count; ++i)
++    {
++        ULONG offset = state->hatswitch_start + i / 2;
++        BYTE neutral = 0x0f << (4 * (i % 2));
++
++        state->report_buf[offset] |= neutral;
++        state->last_report_buf[offset] |= neutral;
++    }
+     return hid_device_end_collection(desc);
+ }
+ 
+@@ -230,8 +239,8 @@ BOOL hid_device_add_hatswitch(struct unix_device *iface, INT count)
+     {
+         USAGE_PAGE(1, HID_USAGE_PAGE_GENERIC),
+         USAGE(1, HID_USAGE_GENERIC_HATSWITCH),
+-        LOGICAL_MINIMUM(1, 1),
+-        LOGICAL_MAXIMUM(1, 8),
++        LOGICAL_MINIMUM(1, 0),
++        LOGICAL_MAXIMUM(1, 7),
+         REPORT_SIZE(1, 4),
+         REPORT_COUNT(4, count),
+         UNIT(1, 0x0), /* None */
+@@ -1493,33 +1502,32 @@ BOOL hid_device_set_button(struct unix_device *iface, ULONG index, BOOL is_set)
+ /* hatswitch x / y vs value:
+  *      -1  x +1
+  *     +-------->
+- *  -1 | 8  1  2
+- *   y | 7  0  3
+- *  +1 | 6  5  4
++ *  -1 | 7  0  1
++ *   y | 6  f  2
++ *  +1 | 5  4  3
+  *     v
+  */
+ static void hatswitch_decompose(BYTE value, ULONG index, LONG *x, LONG *y)
+ {
+     value = (index % 2) ? (value >> 4) : (value & 0x0f);
+     *x = *y = 0;
+-    if (value == 8 || value == 1 || value == 2) *y = -1;
+-    if (value == 6 || value == 5 || value == 4) *y = +1;
+-    if (value == 8 || value == 7 || value == 6) *x = -1;
+-    if (value == 2 || value == 3 || value == 4) *x = +1;
++    if (value == 7 || value == 0 || value == 1) *y = -1;
++    if (value == 5 || value == 4 || value == 3) *y = +1;
++    if (value == 7 || value == 6 || value == 5) *x = -1;
++    if (value == 1 || value == 2 || value == 3) *x = +1;
+ }
+ 
+ static void hatswitch_compose(LONG x, LONG y, BYTE *value, ULONG index)
+ {
+-    BYTE new_value = 0;
+-    if (x == 0 && y == 0) new_value = 0;
+-    else if (x == 0 && y < 0) new_value = 1;
+-    else if (x > 0 && y < 0) new_value = 2;
+-    else if (x > 0 && y == 0) new_value = 3;
+-    else if (x > 0 && y > 0) new_value = 4;
+-    else if (x == 0 && y > 0) new_value = 5;
+-    else if (x < 0 && y > 0) new_value = 6;
+-    else if (x < 0 && y == 0) new_value = 7;
+-    else if (x < 0 && y < 0) new_value = 8;
++    BYTE new_value = 0x0f;
++    if (x == 0 && y < 0) new_value = 0;
++    else if (x > 0 && y < 0) new_value = 1;
++    else if (x > 0 && y == 0) new_value = 2;
++    else if (x > 0 && y > 0) new_value = 3;
++    else if (x == 0 && y > 0) new_value = 4;
++    else if (x < 0 && y > 0) new_value = 5;
++    else if (x < 0 && y == 0) new_value = 6;
++    else if (x < 0 && y < 0) new_value = 7;
+ 
+     if (index % 2)
+     {
+diff --git a/dlls/xinput1_3/main.c b/dlls/xinput1_3/main.c
+--- a/dlls/xinput1_3/main.c
++++ b/dlls/xinput1_3/main.c
+@@ -93,6 +93,7 @@ struct xinput_controller
+         HIDP_VALUE_CAPS rx_caps;
+         HIDP_VALUE_CAPS ry_caps;
+         HIDP_VALUE_CAPS rt_caps;
++        HIDP_VALUE_CAPS hatswitch_caps;
+ 
+         OVERLAPPED read_ovl;
+ 
+@@ -159,6 +160,7 @@ static void check_value_caps(struct xinput_controller *controller, USHORT usage,
+     case HID_USAGE_GENERIC_RX: controller->hid.rx_caps = *caps; break;
+     case HID_USAGE_GENERIC_RY: controller->hid.ry_caps = *caps; break;
+     case HID_USAGE_GENERIC_RZ: controller->hid.rt_caps = *caps; break;
++    case HID_USAGE_GENERIC_HATSWITCH: controller->hid.hatswitch_caps = *caps; break;
+     }
+ }
+ 
+@@ -696,6 +698,33 @@ static LONG scale_value(ULONG value, const HIDP_VALUE_CAPS *caps, LONG min, LONG
+     return min + MulDiv(tmp - caps->LogicalMin, max - min, caps->LogicalMax - caps->LogicalMin);
+ }
+ 
++static WORD hatswitch_to_xinput_buttons(ULONG value, const HIDP_VALUE_CAPS *caps)
++{
++    LONG hat;
++
++    if (!caps->UsagePage) return 0;
++    hat = sign_extend(value, caps);
++    if (hat < caps->LogicalMin || hat > caps->LogicalMax) return 0;
++    if (caps->LogicalMax - caps->LogicalMin != 7)
++    {
++        WARN("Unsupported hatswitch logical range %ld..%ld.\n", caps->LogicalMin, caps->LogicalMax);
++        return 0;
++    }
++
++    switch (hat - caps->LogicalMin)
++    {
++    case 0: return XINPUT_GAMEPAD_DPAD_UP;
++    case 1: return XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_RIGHT;
++    case 2: return XINPUT_GAMEPAD_DPAD_RIGHT;
++    case 3: return XINPUT_GAMEPAD_DPAD_RIGHT | XINPUT_GAMEPAD_DPAD_DOWN;
++    case 4: return XINPUT_GAMEPAD_DPAD_DOWN;
++    case 5: return XINPUT_GAMEPAD_DPAD_DOWN | XINPUT_GAMEPAD_DPAD_LEFT;
++    case 6: return XINPUT_GAMEPAD_DPAD_LEFT;
++    case 7: return XINPUT_GAMEPAD_DPAD_LEFT | XINPUT_GAMEPAD_DPAD_UP;
++    default: return 0;
++    }
++}
++
+ static USHORT sony_gamepad_product_id(const WCHAR *path)
+ {
+     UINT vid, pid;
+@@ -784,33 +813,7 @@ static void read_controller_state(struct xinput_controller *controller)
+ 
+     status = HidP_GetUsageValue(HidP_Input, HID_USAGE_PAGE_GENERIC, 0, HID_USAGE_GENERIC_HATSWITCH, &value, controller->hid.preparsed, report_buf, report_len);
+     if (status != HIDP_STATUS_SUCCESS) WARN("HidP_GetUsageValue HID_USAGE_PAGE_GENERIC / HID_USAGE_GENERIC_HATSWITCH returned %#lx\n", status);
+-    else if (controller->hid.is_sony_gamepad) switch (value)
+-    {
+-    /* DualShock and DualSense use 0..7 for directions and 8 for neutral. */
+-    case 0: state.Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_UP; break;
+-    case 1: state.Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_RIGHT; break;
+-    case 2: state.Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_RIGHT; break;
+-    case 3: state.Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_RIGHT | XINPUT_GAMEPAD_DPAD_DOWN; break;
+-    case 4: state.Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_DOWN; break;
+-    case 5: state.Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_DOWN | XINPUT_GAMEPAD_DPAD_LEFT; break;
+-    case 6: state.Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_LEFT; break;
+-    case 7: state.Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_LEFT | XINPUT_GAMEPAD_DPAD_UP; break;
+-    }
+-    else switch (value)
+-    {
+-    /* 8 1 2
+-     * 7 0 3
+-     * 6 5 4 */
+-    case 0: break;
+-    case 1: state.Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_UP; break;
+-    case 2: state.Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_RIGHT; break;
+-    case 3: state.Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_RIGHT; break;
+-    case 4: state.Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_RIGHT | XINPUT_GAMEPAD_DPAD_DOWN; break;
+-    case 5: state.Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_DOWN; break;
+-    case 6: state.Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_DOWN | XINPUT_GAMEPAD_DPAD_LEFT; break;
+-    case 7: state.Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_LEFT; break;
+-    case 8: state.Gamepad.wButtons |= XINPUT_GAMEPAD_DPAD_LEFT | XINPUT_GAMEPAD_DPAD_UP; break;
+-    }
++    else state.Gamepad.wButtons |= hatswitch_to_xinput_buttons(value, &controller->hid.hatswitch_caps);
+ 
+     status = HidP_GetUsageValue(HidP_Input, HID_USAGE_PAGE_GENERIC, 0, HID_USAGE_GENERIC_X, &value, controller->hid.preparsed, report_buf, report_len);
+     if (status != HIDP_STATUS_SUCCESS) WARN("HidP_GetUsageValue HID_USAGE_PAGE_GENERIC / HID_USAGE_GENERIC_X returned %#lx\n", status);
+diff --git a/dlls/winexinput.sys/main.c b/dlls/winexinput.sys/main.c
+--- a/dlls/winexinput.sys/main.c
++++ b/dlls/winexinput.sys/main.c
+@@ -159,6 +159,7 @@ struct func_device
+     HIDP_VALUE_CAPS rx_caps;
+     HIDP_VALUE_CAPS ry_caps;
+     HIDP_VALUE_CAPS rt_caps;
++    HIDP_VALUE_CAPS hatswitch_caps;
+     HIDP_DEVICE_DESC device_desc;
+     BOOL is_sony_gamepad;
+ 
+@@ -193,6 +194,22 @@ static LONG scale_value(ULONG value, const HIDP_VALUE_CAPS *caps, LONG min, LONG
+     return min + MulDiv(tmp - caps->LogicalMin, max - min, caps->LogicalMax - caps->LogicalMin);
+ }
+ 
++static WORD hatswitch_to_xinput_buttons(ULONG value, const HIDP_VALUE_CAPS *caps)
++{
++    LONG hat;
++
++    if (!caps->UsagePage) return 0;
++    hat = sign_extend(value, caps);
++    if (hat < caps->LogicalMin || hat > caps->LogicalMax) return 0;
++    if (caps->LogicalMax - caps->LogicalMin != 7)
++    {
++        WARN("Unsupported hatswitch logical range %ld..%ld.\n", caps->LogicalMin, caps->LogicalMax);
++        return 0;
++    }
++
++    return (hat - caps->LogicalMin + 1) << 10;
++}
++
+ static USAGE sony_button_to_xinput_usage(USAGE usage)
+ {
+     static const USAGE map[] =
+@@ -219,7 +236,12 @@ static void translate_report_to_xinput_state(struct func_device *fdo)
+     if (status != HIDP_STATUS_SUCCESS) WARN("HidP_GetUsages returned %#lx\n", status);
+     status = HidP_GetUsageValue(HidP_Input, HID_USAGE_PAGE_GENERIC, 0, HID_USAGE_GENERIC_HATSWITCH,
+                                 &hat, preparsed, fdo->report_buf, fdo->report_len);
+-    if (status != HIDP_STATUS_SUCCESS) WARN("HidP_GetUsageValue hat returned %#lx\n", status);
++    if (status != HIDP_STATUS_SUCCESS)
++    {
++        WARN("HidP_GetUsageValue hat returned %#lx\n", status);
++        fdo->xinput_state.buttons = 0;
++    }
++    else fdo->xinput_state.buttons = hatswitch_to_xinput_buttons(hat, &fdo->hatswitch_caps);
+     status = HidP_GetUsageValue(HidP_Input, HID_USAGE_PAGE_GENERIC, 0, HID_USAGE_GENERIC_X,
+                                 &lx, preparsed, fdo->report_buf, fdo->report_len);
+     if (status != HIDP_STATUS_SUCCESS) WARN("HidP_GetUsageValue x returned %#lx\n", status);
+@@ -239,14 +261,6 @@ static void translate_report_to_xinput_state(struct func_device *fdo)
+                                 &rt, preparsed, fdo->report_buf, fdo->report_len);
+     if (status != HIDP_STATUS_SUCCESS) WARN("HidP_GetUsageValue rz returned %#lx\n", status);
+ 
+-    if (fdo->is_sony_gamepad)
+-    {
+-        /* Sony reports 0..7 for directions and 8 for neutral. */
+-        if (hat > 7) fdo->xinput_state.buttons = 0;
+-        else fdo->xinput_state.buttons = (hat + 1) << 10;
+-    }
+-    else if (hat < 1 || hat > 8) fdo->xinput_state.buttons = 0;
+-    else fdo->xinput_state.buttons = hat << 10;
+     for (i = 0; i < count; i++)
+     {
+         USAGE usage = fdo->is_sony_gamepad ? sony_button_to_xinput_usage(usages[i]) : usages[i];
+@@ -673,6 +687,7 @@ static void check_value_caps(struct func_device *fdo, USHORT usage, HIDP_VALUE_C
+     case HID_USAGE_GENERIC_RX: fdo->rx_caps = *caps; break;
+     case HID_USAGE_GENERIC_RY: fdo->ry_caps = *caps; break;
+     case HID_USAGE_GENERIC_RZ: fdo->rt_caps = *caps; break;
++    case HID_USAGE_GENERIC_HATSWITCH: fdo->hatswitch_caps = *caps; break;
+     }
+ }
+ 
+-- 
+2.51.0
