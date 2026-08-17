@@ -231,9 +231,6 @@ apply_all_in_dir() {
     echo "WINE: -GAME FIXES- add TBH: Task Bar Hero fixes"
     apply_patch "../patches/game-patches/layered-overlay-wine.patch"
 
-    echo "WINE: -GAME FIXES- force Battle.net and Warframe launchers to use in-process GPU on winewayland"
-    apply_patch "../patches/game-patches/battlenet-launcher-in-process-gpu.patch"
-
     echo "WINE: -GAME FIXES- use X11 for cross-process launcher UIs under winewayland"
     apply_patch "../patches/game-patches/multi-process-launcher-x11-fallback.patch"
 
