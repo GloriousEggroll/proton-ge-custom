@@ -231,8 +231,11 @@ apply_all_in_dir() {
     echo "WINE: -GAME FIXES- add TBH: Task Bar Hero fixes"
     apply_patch "../patches/game-patches/layered-overlay-wine.patch"
 
-    echo "WINE: -GAME FIXES- force Battle.net Launcher in-process GPU on winewayland"
+    echo "WINE: -GAME FIXES- force Battle.net and Warframe launchers to use in-process GPU on winewayland"
     apply_patch "../patches/game-patches/battlenet-launcher-in-process-gpu.patch"
+
+    echo "WINE: -GAME FIXES- use X11 for cross-process launcher UIs under winewayland"
+    apply_patch "../patches/game-patches/multi-process-launcher-x11-fallback.patch"
 
     echo "WINE: -GAME FIXES- add fixes Guilty Gear Accent Core Plus R intro video (win32u related)"
     apply_patch "../patches/game-patches/0001-win32u-Avoid-zero-WM_ACTIVATEAPP-lparam-on-first-for.patch"
@@ -260,6 +263,10 @@ apply_all_in_dir() {
 
     echo "WINE: -HOTFIX- Preserve driver-reported OpenGL GPU identity"
     apply_patch "../patches/wine-hotfixes/pending/wined3d-preserve-runtime-opengl-gpu-description.patch"
+
+    # https://gitlab.winehq.org/wine/wine/-/commit/a31ec8da9572672e04ae46792a398da942649875
+    echo "WINE: -HOTFIX- Prefer native non-Microsoft DLLs using version resources"
+    apply_patch "../patches/wine-hotfixes/pending/ntdll-prefer-native-version-resource-heuristics.patch"
 
 ### END WINE HOTFIX/BACKPORT SECTION ###
 

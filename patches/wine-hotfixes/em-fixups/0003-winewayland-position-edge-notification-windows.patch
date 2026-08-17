@@ -1,0 +1,237 @@
+From: GE-Proton <noreply@localhost>
+Subject: [PATCH] winewayland: preserve positioned desktop notification windows
+
+Use layer-shell for small layered/topmost tool windows that applications place
+against an output edge. These are desktop notification windows whose absolute
+positions cannot be represented by xdg_toplevel, causing compositors to center
+them. Keep notification layers independent from the single tray-menu layer and
+do not give them keyboard focus.
+
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -186,7 +186,7 @@
+ 
+ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data,
+                                                     struct wayland_surface *owner_surface,
+-                                                    BOOL use_layer_shell)
++                                                    BOOL use_layer_shell, BOOL layer_menu)
+ {
+     struct wayland_surface *surface;
+     enum wayland_surface_role role;
+@@ -254,7 +254,7 @@
+         wayland_surface_make_popup(surface, owner_surface);
+         break;
+     case WAYLAND_SURFACE_ROLE_LAYER:
+-        wayland_surface_make_layer(surface, &data->rects.window);
++        wayland_surface_make_layer(surface, &data->rects.window, layer_menu);
+         break;
+     case WAYLAND_SURFACE_ROLE_TOPLEVEL:
+         wayland_surface_make_toplevel(surface, server_decor);
+@@ -548,6 +548,56 @@
+     return FALSE;
+ }
+ 
++static BOOL is_notification_window(HWND hwnd, UINT swp_flags,
++                                   const struct window_rects *rects)
++{
++    const DWORD required_ex_style = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
++    struct wayland_output *output;
++    const struct wayland_output_state *state;
++    int width, height, output_width, output_height;
++    RECT rect = rects->window, output_rect;
++    DWORD style, ex_style;
++    BOOL at_edge;
++
++    style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
++    ex_style = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
++
++    if ((swp_flags & SWP_HIDEWINDOW) || !(style & WS_VISIBLE)) return FALSE;
++    if (!(style & WS_POPUP) || (style & (WS_CHILD | WS_CAPTION | WS_THICKFRAME))) return FALSE;
++    if ((ex_style & required_ex_style) != required_ex_style || (ex_style & WS_EX_APPWINDOW))
++        return FALSE;
++    if (wayland_is_popup_menu_class(hwnd)) return FALSE;
++
++    width = rect.right - rect.left;
++    height = rect.bottom - rect.top;
++    if (width <= 0 || height <= 0) return FALSE;
++
++    if (!(output = wayland_output_for_rect(&rect))) return FALSE;
++    state = &output->current;
++    if (!state->current_mode)
++    {
++        wayland_output_release(output);
++        return FALSE;
++    }
++
++    SetRect(&output_rect, state->physical_x, state->physical_y,
++            state->physical_x + state->current_mode->width,
++            state->physical_y + state->current_mode->height);
++    output_width = output_rect.right - output_rect.left;
++    output_height = output_rect.bottom - output_rect.top;
++
++    /* Desktop notification windows are small, borderless surfaces deliberately
++     * placed against an output edge. This excludes centered overlays, splash
++     * screens, and ordinary layered game windows with the same extended styles. */
++    at_edge = abs(rect.left - output_rect.left) <= 64 ||
++              abs(rect.right - output_rect.right) <= 64 ||
++              abs(rect.top - output_rect.top) <= 64 ||
++              abs(rect.bottom - output_rect.bottom) <= 64;
++    wayland_output_release(output);
++
++    return at_edge && width <= output_width / 2 && height <= output_height / 2;
++}
++
+ /***********************************************************************
+  *           WAYLAND_DestroyWindow
+  */
+@@ -588,13 +638,16 @@
+     struct wayland_win_data *data, *owner_data;
+     BOOL managed, fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
+     BOOL tray_menu = swp_flags & WINE_SWP_TRAY_MENU;
++    BOOL notification = FALSE;
+     BOOL use_layer_shell = FALSE;
+ 
+     /* Get the managed state with win_data unlocked, as is_window_managed
+      * may need to query win_data information about other HWNDs and thus
+      * acquire the lock itself internally. */
+     if (!(managed = is_window_managed(hwnd, swp_flags, fullscreen)) && surface) owner = owner_hint;
+-    if (tray_menu && surface && process_wayland.zwlr_layer_shell_v1)
++    if (!tray_menu && surface && process_wayland.zwlr_layer_shell_v1)
++        notification = is_notification_window(hwnd, swp_flags, new_rects);
++    if ((tray_menu || notification) && surface && process_wayland.zwlr_layer_shell_v1)
+     {
+         managed = FALSE;
+         owner = NULL;
+@@ -623,7 +676,7 @@
+             data->wayland_surface = NULL;
+         }
+     }
+-    else if (wayland_win_data_create_wayland_surface(data, owner_surface, use_layer_shell))
++    else if (wayland_win_data_create_wayland_surface(data, owner_surface, use_layer_shell, tray_menu))
+     {
+         wayland_win_data_update_wayland_state(data);
+     }
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -243,8 +243,20 @@
+ static void zwlr_layer_surface_v1_handle_closed(void *private,
+                                                 struct zwlr_layer_surface_v1 *layer_surface)
+ {
+-    TRACE("hwnd=%p\n", private);
+-    wayland_cancel_layer_menu(private);
++    struct wayland_surface *surface;
++    struct wayland_win_data *data;
++    BOOL menu = FALSE;
++    HWND hwnd = private;
++
++    TRACE("hwnd=%p\n", hwnd);
++
++    if ((data = wayland_win_data_get(hwnd)))
++    {
++        if ((surface = data->wayland_surface) && surface->zwlr_layer_surface_v1 == layer_surface)
++            menu = surface->layer_menu;
++        wayland_win_data_release(data);
++    }
++    if (menu) wayland_cancel_layer_menu(hwnd);
+ }
+ 
+ static const struct zwlr_layer_surface_v1_listener zwlr_layer_surface_v1_listener =
+@@ -716,16 +728,18 @@
+     zwlr_layer_surface_v1_set_exclusive_zone(surface->zwlr_layer_surface_v1, -1);
+     zwlr_layer_surface_v1_set_keyboard_interactivity(
+         surface->zwlr_layer_surface_v1,
+-        ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE);
++        surface->layer_menu ? ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE :
++                              ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
+ }
+ 
+ /**********************************************************************
+  *          wayland_surface_make_layer
+  *
+- * Gives the layer-shell role to a tray menu surface. Unlike an xdg_toplevel,
+- * layer-shell permits positioning the menu at the StatusNotifierItem anchor.
++ * Gives the layer-shell role to a tray menu or desktop-notification surface.
++ * Unlike an xdg_toplevel, layer-shell preserves the application's requested
++ * screen-edge position.
+  */
+-void wayland_surface_make_layer(struct wayland_surface *surface, const RECT *rect)
++void wayland_surface_make_layer(struct wayland_surface *surface, const RECT *rect, BOOL menu)
+ {
+     struct wl_output *output;
+     double initial_scale;
+@@ -736,13 +750,14 @@
+     assert(!surface->role || surface->role == WAYLAND_SURFACE_ROLE_LAYER);
+     output = layer_surface_get_output(rect, &output_rect, &initial_scale);
+ 
+-    if (surface->zwlr_layer_surface_v1 && surface->layer_output != output)
++    if (surface->zwlr_layer_surface_v1 &&
++        (surface->layer_output != output || surface->layer_menu != menu))
+         wayland_surface_clear_role(surface);
+ 
+     if (surface->zwlr_layer_surface_v1)
+     {
+         wayland_surface_update_layer_config(surface, rect, &output_rect);
+-        wayland_set_layer_menu_hwnd(surface->hwnd);
++        if (surface->layer_menu) wayland_set_layer_menu_hwnd(surface->hwnd);
+         wl_surface_commit(surface->wl_surface);
+         wl_display_flush(process_wayland.wl_display);
+         return;
+@@ -751,11 +766,12 @@
+     wayland_surface_clear_role(surface);
+     surface->role = WAYLAND_SURFACE_ROLE_LAYER;
+     surface->layer_output = output;
++    surface->layer_menu = menu;
+     surface->zwlr_layer_surface_v1 =
+         zwlr_layer_shell_v1_get_layer_surface(process_wayland.zwlr_layer_shell_v1,
+                                               surface->wl_surface, output,
+                                               ZWLR_LAYER_SHELL_V1_LAYER_TOP,
+-                                              "wine-menu");
++                                              menu ? "wine-menu" : "wine-notification");
+     if (!surface->zwlr_layer_surface_v1) goto err;
+ 
+     zwlr_layer_surface_v1_add_listener(surface->zwlr_layer_surface_v1,
+@@ -763,7 +779,7 @@
+                                        surface->hwnd);
+     wayland_surface_init_fractional_scale(surface, initial_scale);
+     wayland_surface_update_layer_config(surface, rect, &output_rect);
+-    wayland_set_layer_menu_hwnd(surface->hwnd);
++    if (surface->layer_menu) wayland_set_layer_menu_hwnd(surface->hwnd);
+ 
+     wl_surface_commit(surface->wl_surface);
+     wl_display_flush(process_wayland.wl_display);
+@@ -854,13 +870,14 @@
+         break;
+ 
+     case WAYLAND_SURFACE_ROLE_LAYER:
+-        wayland_clear_layer_menu_hwnd(surface->hwnd);
++        if (surface->layer_menu) wayland_clear_layer_menu_hwnd(surface->hwnd);
+         if (surface->zwlr_layer_surface_v1)
+         {
+             zwlr_layer_surface_v1_destroy(surface->zwlr_layer_surface_v1);
+             surface->zwlr_layer_surface_v1 = NULL;
+         }
+         surface->layer_output = NULL;
++        surface->layer_menu = FALSE;
+         break;
+     }
+ 
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -409,6 +409,7 @@
+     HWND owner_hwnd;
+     struct zwlr_layer_surface_v1 *zwlr_layer_surface_v1;
+     struct wl_output *layer_output;
++    BOOL layer_menu;
+ 
+     union
+     {
+@@ -464,7 +465,7 @@
+                                      struct wayland_surface *parent);
+ void wayland_surface_make_popup(struct wayland_surface *surface,
+                                 struct wayland_surface *owner);
+-void wayland_surface_make_layer(struct wayland_surface *surface, const RECT *rect);
++void wayland_surface_make_layer(struct wayland_surface *surface, const RECT *rect, BOOL menu);
+ void wayland_surface_clear_role(struct wayland_surface *surface);
+ void wayland_surface_attach_shm(struct wayland_surface *surface,
+                                 struct wayland_shm_buffer *shm_buffer,
+
