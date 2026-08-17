@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Sun, 16 Aug 2026 23:00:00 -0600
+Subject: [PATCH] mmdevapi: Propagate Sony mode to GetMixFormat
+
+MMDevAPI selects the Windows Sony audio path while activating a controller
+endpoint, but winepulse previously learned about that selection only when the
+stream was initialized.  GetMixFormat happens first, so the first physical
+controller could advertise the host mono format while a later controller
+advertised the Windows four-channel format.  Applications then constructed an
+inconsistent endpoint topology and could crash while activating the streams.
+
+Pass the selected mode through the mix-format Unix call and apply it before
+winepulse returns the endpoint format.  This keeps simultaneous physical Sony
+endpoints consistent without creating, moving, or reopening live streams.
+
+---
+ dlls/mmdevapi/client.c              | 1 +
+ dlls/mmdevapi/devenum.c             | 4 ++--
+ dlls/mmdevapi/mmdevapi_private.h    | 1 +
+ dlls/mmdevapi/unixlib.h             | 1 +
+ dlls/winepulse.drv/pulse.c          | 6 ++++++
+ 5 files changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/mmdevapi/mmdevapi_private.h b/dlls/mmdevapi/mmdevapi_private.h
+--- a/dlls/mmdevapi/mmdevapi_private.h
++++ b/dlls/mmdevapi/mmdevapi_private.h
+@@ -134,6 +134,7 @@
+ extern HRESULT load_driver_devices(EDataFlow flow);
+ extern BOOL auto_select_sony_audio_mode(IMMDevice *device, AUDCLNT_SHAREMODE mode,
+         const WAVEFORMATEX *format, unsigned int *probe_count);
++extern BOOL sony_windows_audio_mode_selected(void);
+ extern BOOL select_sony_audio_mode_for_stream(IMMDevice *device, AUDCLNT_SHAREMODE mode,
+         const WAVEFORMATEX *format);
+ extern void death_stranding_controller_endpoint_seen(const WCHAR *id);
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -122,7 +122,7 @@ static BOOL sony_audio_endpoint_continuity_enabled(void)
+     return env && env[0] == '1' && !env[1];
+ }
+ 
+-static BOOL sony_windows_audio_mode_selected(void);
++BOOL sony_windows_audio_mode_selected(void);
+ 
+ static BOOL use_stable_dualsense_device_ids(void)
+ {
+@@ -1038,7 +1038,7 @@ static BOOL sony_windows_audio_mode_event_enabled(void)
+     return enabled;
+ }
+ 
+-static BOOL sony_windows_audio_mode_selected(void)
++BOOL sony_windows_audio_mode_selected(void)
+ {
+     return InterlockedCompareExchange(&sony_windows_audio_mode, 0, 0) ||
+             sony_windows_audio_mode_event_enabled();
+diff --git a/dlls/mmdevapi/client.c b/dlls/mmdevapi/client.c
+--- a/dlls/mmdevapi/client.c
++++ b/dlls/mmdevapi/client.c
+@@ -977,6 +977,7 @@ static HRESULT WINAPI client_GetMixFormat(IAudioClient3 *iface, WAVEFORMATEX **p
+     params.device = This->device_name;
+     params.flow   = This->dataflow;
+     params.fmt    = CoTaskMemAlloc(sizeof(WAVEFORMATEXTENSIBLE));
++    params.sony_windows_audio_mode = sony_windows_audio_mode_selected();
+     if (!params.fmt)
+         return E_OUTOFMEMORY;
+ 
+diff --git a/dlls/mmdevapi/unixlib.h b/dlls/mmdevapi/unixlib.h
+--- a/dlls/mmdevapi/unixlib.h
++++ b/dlls/mmdevapi/unixlib.h
+@@ -165,6 +165,7 @@ struct get_mix_format_params
+     EDataFlow flow;
+     WAVEFORMATEXTENSIBLE *fmt;
+     HRESULT result;
++    BOOL sony_windows_audio_mode;
+ };
+ 
+ struct get_device_period_params
+diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -5681,6 +5681,10 @@ static NTSTATUS pulse_get_mix_format(void *args)
+     struct list *list = (params->flow == eRender) ? &g_phys_speakers : &g_phys_sources;
+     PhysDevice *dev;
+ 
++    if (params->sony_windows_audio_mode &&
++            !InterlockedExchange(&g_sony_windows_audio_mode, 1))
++        TRACE("Selected Windows Sony audio mode before returning the mix format.\n");
++
+     g_phys_lock();
+     LIST_FOR_EACH_ENTRY(dev, list, PhysDevice, entry) {
+         if (!pulse_device_matches(dev, params->device))
+@@ -6305,12 +6309,14 @@ static NTSTATUS pulse_wow64_get_mix_format(void *args)
+         EDataFlow flow;
+         PTR32 fmt;
+         HRESULT result;
++        BOOL sony_windows_audio_mode;
+     } *params32 = args;
+     struct get_mix_format_params params =
+     {
+         .device = ULongToPtr(params32->device),
+         .flow = params32->flow,
+         .fmt = ULongToPtr(params32->fmt),
++        .sony_windows_audio_mode = params32->sony_windows_audio_mode,
+     };
+     pulse_get_mix_format(&params);
+     params32->result = params.result;
+-- 
+2.55.0

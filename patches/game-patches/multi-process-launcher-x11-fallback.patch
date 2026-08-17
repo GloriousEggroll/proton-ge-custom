@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Sat, 15 Aug 2026 00:00:00 -0600
+Subject: [PATCH] user32: Use X11 for cross-process launcher UIs under
+ Wine-Wayland
+
+Wine-Wayland cannot attach a client surface created by one process to a
+window owned by another. Multi-process CEF and Qt launcher UIs can therefore
+render white or fail to create their main view.
+
+Allow Proton to explicitly select the desktop graphics driver without
+disabling the other compiled drivers. Select winex11.drv only inside the
+affected launcher processes when the desktop graphics driver is
+winewayland.drv. Graphics-driver loading is per process, so games launched by
+them continue to use the desktop's Wine-Wayland driver.
+
+Use full installation-path checks for generic executable names so unrelated
+launchers remain on Wine-Wayland. Cover Ubisoft Connect, the HoYoPlay and
+GRYPHLINK launcher trees while excluding installed games, EA App, and legacy
+Origin.
+---
+ dlls/user32/user_main.c     | 55 +++++++++++++++++++++++++++++++++++++++++
+ programs/explorer/desktop.c | 19 +++++++++-----
+ 2 files changed, 67 insertions(+), 7 deletions(-)
+
+diff --git a/programs/explorer/desktop.c b/programs/explorer/desktop.c
+index 700272c0de2..e9be827b3a8 100644
+--- a/programs/explorer/desktop.c
++++ b/programs/explorer/desktop.c
+@@ -1004,17 +1004,22 @@ static void load_graphics_driver( const WCHAR *driver, GUID *guid )
+     HMODULE module = 0;
+     HKEY hkey;
+     char error[80];
++    DWORD size;
+ 
+     if (!driver)
+     {
+-        lstrcpyW( buffer, default_driver );
+-
+-        /* @@ Wine registry key: HKCU\Software\Wine\Drivers */
+-        if (!RegOpenKeyW( HKEY_CURRENT_USER, L"Software\\Wine\\Drivers", &hkey ))
++        size = GetEnvironmentVariableW( L"WINE_GRAPHICS_DRIVER", buffer, ARRAY_SIZE(buffer) );
++        if (!size || size >= ARRAY_SIZE(buffer))
+         {
+-            DWORD count = sizeof(buffer);
+-            RegQueryValueExW( hkey, L"Graphics", 0, NULL, (LPBYTE)buffer, &count );
+-            RegCloseKey( hkey );
++            lstrcpyW( buffer, default_driver );
++
++            /* @@ Wine registry key: HKCU\Software\Wine\Drivers */
++            if (!RegOpenKeyW( HKEY_CURRENT_USER, L"Software\\Wine\\Drivers", &hkey ))
++            {
++                DWORD count = sizeof(buffer);
++                RegQueryValueExW( hkey, L"Graphics", 0, NULL, (LPBYTE)buffer, &count );
++                RegCloseKey( hkey );
++            }
+         }
+     }
+     else lstrcpynW( buffer, driver, ARRAY_SIZE( buffer ));
+
+diff --git a/dlls/user32/user_main.c b/dlls/user32/user_main.c
+index c7e4ddf672b..3c0cda52528 100644
+--- a/dlls/user32/user_main.c
++++ b/dlls/user32/user_main.c
+@@ -127,11 +127,66 @@ static NTSTATUS WINAPI User32RenderSynthesizedFormat( void *args, ULONG size )
+     return STATUS_SUCCESS;
+ }
+ 
++static BOOL path_contains( const WCHAR *path, const WCHAR *needle )
++{
++    size_t len = wcslen( needle );
++
++    for (; *path; path++)
++        if (!wcsnicmp( path, needle, len )) return TRUE;
++    return FALSE;
++}
++
++static BOOL use_x11_launcher_driver( const WCHAR *image, const WCHAR *name )
++{
++    if (!wcsicmp( name, L"UbisoftConnect.exe" ) ||
++        !wcsicmp( name, L"UbisoftGameLauncher.exe" ) ||
++        !wcsicmp( name, L"UbisoftGameLauncher64.exe" ) ||
++        !wcsicmp( name, L"upc.exe" ) ||
++        !wcsicmp( name, L"UplayWebCore.exe" ))
++        return TRUE;
++
++    if (path_contains( image, L"\\HoYoPlay\\" ) &&
++        !path_contains( image, L"\\HoYoPlay\\games\\" ))
++        return TRUE;
++
++    if (path_contains( image, L"\\GRYPHLINK\\" ) &&
++        !path_contains( image, L"\\GRYPHLINK\\games\\" ))
++        return TRUE;
++
++    if (path_contains( image, L"\\Electronic Arts\\EA Desktop\\" ) ||
++        path_contains( image, L"\\Program Files (x86)\\Origin\\" ) ||
++        path_contains( image, L"\\Program Files\\Origin\\" ))
++        return TRUE;
++
++    return FALSE;
++}
++
+ static NTSTATUS WINAPI User32LoadDriver( void *args, ULONG size )
+ {
+     const WCHAR *path = args;
++    const WCHAR *image = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
++    const WCHAR *name = image, *p;
+     UNICODE_STRING str;
+     HMODULE module;
++    NTSTATUS status;
+ 
++    if ((p = wcsrchr( name, '\\' ))) name = p + 1;
++    if ((p = wcsrchr( name, '/' ))) name = p + 1;
++
++    /* These multi-process launcher UIs need X11's cross-process client
++     * surfaces. Keep games launched by them on the desktop's Wayland driver. */
++    if (!wcsicmp( path, L"winewayland.drv" ) && use_x11_launcher_driver( image, name ))
++    {
++        RtlInitUnicodeString( &str, L"winex11.drv" );
++        status = LdrLoadDll( L"c:\\windows\\system32", 0, &str, &module );
++        if (!status)
++        {
++            TRACE( "using winex11.drv for launcher process %s\n", debugstr_w(image) );
++            return status;
++        }
++        TRACE( "winex11.drv unavailable for launcher process %s, using winewayland.drv, status %#lx\n",
++               debugstr_w(image), status );
++    }
++
+     RtlInitUnicodeString( &str, path );
+     return LdrLoadDll( L"c:\\windows\\system32", 0, &str, &module );
+ }
+-- 
+2.54.0

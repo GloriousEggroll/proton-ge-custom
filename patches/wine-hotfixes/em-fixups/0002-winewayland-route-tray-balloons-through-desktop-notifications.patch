@@ -1,0 +1,239 @@
+diff --git a/dlls/shell32/systray.c b/dlls/shell32/systray.c
+index 98645ca5311ef819407645e1db4ea6476bc16ac3..9205852afb334f1c4adb4daa0b6945f9fe05bda1 100644
+--- a/dlls/shell32/systray.c
++++ b/dlls/shell32/systray.c
+@@ -70,6 +70,12 @@ static LRESULT notify_icon_sni( DWORD message, NOTIFYICONDATAW *nid )
+     return ret;
+ }
+ 
++static BOOL notify_balloon_sni( const NOTIFYICONDATAW *nid )
++{
++    return NtUserMessageCall( nid->hWnd, WINE_SYSTRAY_NOTIFY_BALLOON_SNI, 0, 0,
++                              (void *)nid, NtUserSystemTrayCall, FALSE );
++}
++
+ struct notify_data_icon
+ {
+     /* data for the icon bitmap */
+@@ -218,10 +224,11 @@ BOOL WINAPI Shell_NotifyIconW(DWORD dwMessage, PNOTIFYICONDATAW nid)
+     COPYDATASTRUCT cds;
+     struct notify_data data_buffer;
+     struct notify_data *data = &data_buffer;
++    NOTIFYICONDATAW native_nid;
+     ICONINFO icon_info = { 0 }, balloon_icon_info = { 0 };
+     BITMAP mask, color, balloon_mask, balloon_color;
+     LONG mask_size = 0, color_size = 0, balloon_mask_size = 0, balloon_color_size = 0;
+-    BOOL ret;
++    BOOL native_balloon = FALSE, ret;
+ 
+     TRACE("dwMessage = %ld, nid->cbSize=%ld\n", dwMessage, nid->cbSize);
+ 
+@@ -240,6 +247,20 @@ BOOL WINAPI Shell_NotifyIconW(DWORD dwMessage, PNOTIFYICONDATAW nid)
+         return Shell_NotifyIconW(dwMessage, &newNid);
+     }
+ 
++    /* Desktop notification placement belongs to the host notification daemon,
++     * independently of whether this icon is currently registered through SNI.
++     * If it accepts the balloon, remove NIF_INFO from any icon fallback so the
++     * explorer tray cannot also create a free-standing Wine tooltip window. */
++    if (dwMessage != NIM_DELETE && nid->cbSize >= NOTIFYICONDATAW_V2_SIZE &&
++        (nid->uFlags & NIF_INFO) && nid->szInfo[0] && notify_balloon_sni( nid ))
++    {
++        memset( &native_nid, 0, sizeof(native_nid) );
++        CopyMemory( &native_nid, nid, nid->cbSize );
++        native_nid.uFlags &= ~NIF_INFO;
++        nid = &native_nid;
++        native_balloon = TRUE;
++    }
++
+     {
+         LRESULT ret = notify_icon_sni( dwMessage, nid );
+         if (ret != -1)
+@@ -249,6 +270,12 @@ BOOL WINAPI Shell_NotifyIconW(DWORD dwMessage, PNOTIFYICONDATAW nid)
+         }
+     }
+ 
++    if (native_balloon && dwMessage == NIM_MODIFY && !nid->uFlags)
++    {
++        SetLastError( ERROR_SUCCESS );
++        return TRUE;
++    }
++
+     tray = FindWindowExW(0, NULL, L"Shell_TrayWnd", NULL);
+     if (!tray)
+     {
+diff --git a/dlls/win32u/ntuser_private.h b/dlls/win32u/ntuser_private.h
+index de8a24d9d39a9cbb27113687c9a76c85dba44ddd..1063ef0527b1354f21b0f5654515ca53719cfc87 100644
+--- a/dlls/win32u/ntuser_private.h
++++ b/dlls/win32u/ntuser_private.h
+@@ -230,6 +230,7 @@ extern void check_for_events( UINT flags );
+ /* systray.c */
+ extern LRESULT system_tray_call( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, void *data );
+ extern LRESULT sni_notify_icon( HWND owner, UINT msg, NOTIFYICONDATAW *nid );
++extern BOOL sni_notify_balloon( const NOTIFYICONDATAW *nid );
+ extern void sni_cleanup_icons( HWND owner );
+ extern void sni_run_loop( void );
+ extern BOOL sni_has_icons( void );
+diff --git a/dlls/win32u/sni.c b/dlls/win32u/sni.c
+index c555386fd8f1932df785d77c0b8ab51cebdccde2..b0a00c27e6364c5b57b3772102cb7d1513b0bf26 100644
+--- a/dlls/win32u/sni.c
++++ b/dlls/win32u/sni.c
+@@ -67,6 +67,9 @@ WINE_DEFAULT_DEBUG_CHANNEL(systray);
+ #define SNI_WATCHER_PATH      "/StatusNotifierWatcher"
+ #define SNI_WATCHER_IFACE     "org.kde.StatusNotifierWatcher"
+ #define SNI_ITEM_IFACE        "org.kde.StatusNotifierItem"
++#define NOTIFY_SERVICE        "org.freedesktop.Notifications"
++#define NOTIFY_PATH           "/org/freedesktop/Notifications"
++#define NOTIFY_IFACE          "org.freedesktop.Notifications"
+ #define DBUS_PROPS_IFACE      "org.freedesktop.DBus.Properties"
+ #define DBUS_INTROSPECT_IFACE "org.freedesktop.DBus.Introspectable"
+ 
+@@ -111,6 +114,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(systray);
+     DO_FUNC(dbus_message_new_method_call); \
+     DO_FUNC(dbus_message_new_method_return); \
+     DO_FUNC(dbus_message_new_signal); \
++    DO_FUNC(dbus_message_set_no_reply); \
+     DO_FUNC(dbus_message_unref); \
+     DO_FUNC(dbus_threads_init_default)
+ 
+@@ -1001,18 +1005,30 @@ static void sni_emit_status( struct sni_icon *icon )
+ 
+ /* A NIF_INFO balloon has no SNI item equivalent. Surface it as a desktop
+  * notification (what an SNI host shows for tray toasts) instead of dropping it. */
+-static void sni_show_balloon( const NOTIFYICONDATAW *nid )
++static BOOL sni_show_balloon( DBusConnection *conn, const NOTIFYICONDATAW *nid )
+ {
+     DBusMessage *msg;
+     DBusMessageIter args, sub;
++    DBusError error;
+     char title[sizeof(nid->szInfoTitle) / sizeof(WCHAR) * 3 + 1];   /* worst-case UTF-8 size */
+     char body[sizeof(nid->szInfo) / sizeof(WCHAR) * 3 + 1];
+     const char *app = "Wine", *icon_name = "", *p_title = title, *p_body = body;
+     dbus_uint32_t replaces = 0;
+     dbus_int32_t timeout = -1;
+     ULONG len = 0;
++    BOOL ret = FALSE;
+     int n;
+ 
++    p_dbus_error_init( &error );
++    if (!p_dbus_bus_name_has_owner( conn, NOTIFY_SERVICE, &error ))
++    {
++        if (p_dbus_error_is_set( &error ))
++            WARN( "failed to query desktop notification service: %s\n", error.message );
++        p_dbus_error_free( &error );
++        return FALSE;
++    }
++    p_dbus_error_free( &error );
++
+     for (n = 0; n < ARRAY_SIZE(nid->szInfoTitle) && nid->szInfoTitle[n]; n++) {}
+     if (RtlUnicodeToUTF8N( title, sizeof(title) - 1, &len, nid->szInfoTitle, n * sizeof(WCHAR) )) len = 0;
+     title[len] = 0;
+@@ -1020,24 +1036,48 @@ static void sni_show_balloon( const NOTIFYICONDATAW *nid )
+     if (RtlUnicodeToUTF8N( body, sizeof(body) - 1, &len, nid->szInfo, n * sizeof(WCHAR) )) len = 0;
+     body[len] = 0;
+ 
+-    if (!(msg = p_dbus_message_new_method_call( "org.freedesktop.Notifications",
+-                                                "/org/freedesktop/Notifications",
+-                                                "org.freedesktop.Notifications", "Notify" )))
+-        return;
++    if (!(msg = p_dbus_message_new_method_call( NOTIFY_SERVICE, NOTIFY_PATH, NOTIFY_IFACE, "Notify" )))
++        return FALSE;
++    p_dbus_message_set_no_reply( msg, TRUE );
+     p_dbus_message_iter_init_append( msg, &args );
+-    p_dbus_message_iter_append_basic( &args, DBUS_TYPE_STRING, &app );
+-    p_dbus_message_iter_append_basic( &args, DBUS_TYPE_UINT32, &replaces );
+-    p_dbus_message_iter_append_basic( &args, DBUS_TYPE_STRING, &icon_name );
+-    p_dbus_message_iter_append_basic( &args, DBUS_TYPE_STRING, &p_title );
+-    p_dbus_message_iter_append_basic( &args, DBUS_TYPE_STRING, &p_body );
+-    if (p_dbus_message_iter_open_container( &args, DBUS_TYPE_ARRAY, "s", &sub ))   /* actions */
+-        p_dbus_message_iter_close_container( &args, &sub );
+-    if (p_dbus_message_iter_open_container( &args, DBUS_TYPE_ARRAY, "{sv}", &sub )) /* hints */
+-        p_dbus_message_iter_close_container( &args, &sub );
+-    p_dbus_message_iter_append_basic( &args, DBUS_TYPE_INT32, &timeout );
+-    p_dbus_connection_send( sni_connection, msg, NULL );
++    if (!p_dbus_message_iter_append_basic( &args, DBUS_TYPE_STRING, &app ) ||
++        !p_dbus_message_iter_append_basic( &args, DBUS_TYPE_UINT32, &replaces ) ||
++        !p_dbus_message_iter_append_basic( &args, DBUS_TYPE_STRING, &icon_name ) ||
++        !p_dbus_message_iter_append_basic( &args, DBUS_TYPE_STRING, &p_title ) ||
++        !p_dbus_message_iter_append_basic( &args, DBUS_TYPE_STRING, &p_body ) ||
++        !p_dbus_message_iter_open_container( &args, DBUS_TYPE_ARRAY, "s", &sub ) ||
++        !p_dbus_message_iter_close_container( &args, &sub ) ||
++        !p_dbus_message_iter_open_container( &args, DBUS_TYPE_ARRAY, "{sv}", &sub ) ||
++        !p_dbus_message_iter_close_container( &args, &sub ) ||
++        !p_dbus_message_iter_append_basic( &args, DBUS_TYPE_INT32, &timeout ))
++        goto done;
++
++    if (p_dbus_connection_send( conn, msg, NULL ))
++    {
++        p_dbus_connection_flush( conn );
++        ret = TRUE;
++    }
++
++done:
+     p_dbus_message_unref( msg );
+-    p_dbus_connection_flush( sni_connection );
++    return ret;
++}
++
++BOOL sni_notify_balloon( const NOTIFYICONDATAW *nid )
++{
++    DBusConnection *conn = NULL;
++    BOOL ret;
++
++    pthread_mutex_lock( &sni_mutex );
++    if (!sni_init_done) sni_init();
++    if (sni_connection && p_dbus_connection_get_is_connected( sni_connection ))
++        conn = p_dbus_connection_ref( sni_connection );
++    pthread_mutex_unlock( &sni_mutex );
++
++    if (!conn) return FALSE;
++    ret = sni_show_balloon( conn, nid );
++    p_dbus_connection_unref( conn );
++    return ret;
+ }
+ 
+ /* Give the icon its OWN private connection (= its own unique bus name), export
+@@ -1247,10 +1287,6 @@ LRESULT sni_notify_icon( HWND owner, UINT msg, NOTIFYICONDATAW *nid )
+     }
+     if (queued_dead) sni_wake();   /* let the pump reap (close+free) the deleted item */
+ 
+-    /* a tray balloon has no SNI item equivalent: surface it as a notification.
+-     * skip it on a fallback (ret -1) since explorer then shows its own balloon. */
+-    if (ret != -1 && msg != NIM_DELETE && (nid->uFlags & NIF_INFO) && nid->szInfo[0])
+-        sni_show_balloon( nid );
+     return ret;
+ }
+ 
+@@ -1508,6 +1544,7 @@ BOOL sni_is_available( void )
+ #else  /* SONAME_LIBDBUS_1 */
+ 
+ LRESULT sni_notify_icon( HWND owner, UINT msg, NOTIFYICONDATAW *nid ) { return -1; }
++BOOL sni_notify_balloon( const NOTIFYICONDATAW *nid ) { return FALSE; }
+ void sni_cleanup_icons( HWND owner ) { }
+ void sni_run_loop( void ) { }
+ BOOL sni_has_icons( void ) { return FALSE; }
+diff --git a/dlls/win32u/systray.c b/dlls/win32u/systray.c
+index f95f2c4855db3ac8d3f22802dd757214b33d6070..e5ae7e60be908ebac34a22959cdf90488fb85423 100644
+--- a/dlls/win32u/systray.c
++++ b/dlls/win32u/systray.c
+@@ -42,6 +42,8 @@ LRESULT system_tray_call( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, voi
+         return 0;
+     case WINE_SYSTRAY_NOTIFY_ICON_SNI:
+         return sni_notify_icon( hwnd, wparam, data );
++    case WINE_SYSTRAY_NOTIFY_BALLOON_SNI:
++        return sni_notify_balloon( data );
+     case WINE_SYSTRAY_DBUS_RUN:
+         sni_run_loop();
+         return 0;
+diff --git a/include/ntuser.h b/include/ntuser.h
+index 3e2b75439803ef710f22714ea304eba6f0d6520a..4903f59a63713e71a4290a523e458316de00d337 100644
+--- a/include/ntuser.h
++++ b/include/ntuser.h
+@@ -701,6 +701,7 @@ enum wine_systray_call
+     WINE_SYSTRAY_DBUS_RUN,
+     WINE_SYSTRAY_NOTIFY_ICON_SNI,
+     WINE_SYSTRAY_DBUS_HAS_ICONS,
++    WINE_SYSTRAY_NOTIFY_BALLOON_SNI,
+ };
+ 
+ /* NtUserDragDropCall calls */

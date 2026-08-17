@@ -1,0 +1,397 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Sun, 16 Aug 2026 22:15:00 -0600
+Subject: [PATCH] ds5: Publish simultaneous Sony controllers separately
+
+The controller audio path historically assigned one canonical endpoint ID to
+every controller of a given Sony model.  MMDevAPI then treated a second
+physical controller as a duplicate and removed the first controller's PnP
+AudioEndpoint registration.  Applications consequently saw multiple HID
+controllers associated with one ambiguous audio endpoint.  Spider-Man lost
+speaker effects and Assassin's Creed Shadows did not create haptic streams
+until all controllers were removed and only one was connected again.
+
+Retain the canonical endpoint ID for the first controller so the established
+single-controller and hotplug behavior remains unchanged.  Give additional
+same-model controllers a container-qualified endpoint ID, preserve that ID
+across profile replacement, and keep it distinct in MMDevAPI's identity cache.
+Also preserve every active Sony AudioEndpoint while registering another one,
+and remove only the disconnected physical container during hot-unplug.
+
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -1571,23 +1571,6 @@
+     dev->fmt.dwChannelMask = KSAUDIO_SPEAKER_QUAD;
+ }
+ 
+-static BOOL is_dualsense_edge_speaker_sink(const PhysDevice *dev)
+-{
+-    return is_dualsense_speaker_sink(dev) &&
+-            (dev->product_id == 0x0df2 ||
+-             strstr(dev->pulse_name, "DualSense_Edge_Wireless_Controller"));
+-}
+-
+-static BOOL is_dualsense_endpoint_speaker_sink(const PhysDevice *dev)
+-{
+-    /* Keep the standard DualSense/DualShock controller speaker on the shared
+-     * app-facing endpoint id even if Pulse also tagged it as a raw haptic
+-     * target. DualSense Edge keeps a separate id below; sharing the standard
+-     * id with Edge makes Spider-Man Remastered crash while enumerating
+-     * endpoints at startup. */
+-    return is_dualsense_speaker_sink(dev) && !is_dualsense_edge_speaker_sink(dev);
+-}
+-
+ static BOOL pulse_name_looks_like_dualsense_speaker_sink(const char *name)
+ {
+     return name && strstr(name, "alsa_output.usb-Sony_Interactive_Entertainment_")
+@@ -1639,19 +1622,152 @@
+ #define DUALSENSE_EDGE_MONO_ENDPOINT_ID \
+     "alsa_output.usb-Sony_Interactive_Entertainment_DualSense_Edge_Wireless_Controller-00.Default__Speaker__sink"
+ 
+-static BOOL pulse_set_endpoint_id(PhysDevice *dev)
++static const char *sony_render_endpoint_base(const PhysDevice *dev)
++{
++    if (dev->flow != eRender || !is_dualsense_audio_device(dev))
++        return NULL;
++
++    if (dev->product_id == 0x0df2 ||
++            strstr(dev->pulse_name, "DualSense_Edge_Wireless_Controller"))
++        return DUALSENSE_EDGE_MONO_ENDPOINT_ID;
++
++    return DUALSENSE_MONO_ENDPOINT_ID;
++}
++
++static BOOL sony_render_device_is_same_physical(const PhysDevice *a, const PhysDevice *b)
++{
++    if (!IsEqualGUID(&a->container_id, &GUID_NULL) &&
++            !IsEqualGUID(&b->container_id, &GUID_NULL))
++        return IsEqualGUID(&a->container_id, &b->container_id);
++
++    return !strcmp(a->pulse_name, b->pulse_name);
++}
++
++static const char *find_sony_endpoint_for_physical_in_list(const PhysDevice *dev,
++        const char *base, struct list *devices)
++{
++    PhysDevice *other;
++
++    LIST_FOR_EACH_ENTRY(other, devices, PhysDevice, entry)
++    {
++        const char *other_base = sony_render_endpoint_base(other);
++
++        if (other_base && !strcmp(other_base, base) && other->endpoint_id &&
++                sony_render_device_is_same_physical(dev, other))
++            return other->endpoint_id;
++    }
++
++    return NULL;
++}
++
++static BOOL sony_endpoint_conflicts_in_list(const PhysDevice *dev, const char *base,
++        struct list *devices)
++{
++    PhysDevice *other;
++
++    LIST_FOR_EACH_ENTRY(other, devices, PhysDevice, entry)
++    {
++        const char *other_base = sony_render_endpoint_base(other);
++
++        if (other_base && !strcmp(other_base, base) &&
++                !sony_render_device_is_same_physical(dev, other))
++            return TRUE;
++    }
++
++    return FALSE;
++}
++
++static char *find_existing_sony_physical_endpoint(const PhysDevice *dev,
++        const char *base, struct list *current)
++{
++    const char *endpoint;
++    char *ret = NULL;
++
++    if ((endpoint = find_sony_endpoint_for_physical_in_list(dev, base, current)))
++        return strdup(endpoint);
++
++    g_phys_lock();
++    if (current != &g_phys_speakers &&
++            (endpoint = find_sony_endpoint_for_physical_in_list(dev, base,
++            &g_phys_speakers)))
++        ret = strdup(endpoint);
++    if (!ret && current != &g_phys_speakers_added &&
++            (endpoint = find_sony_endpoint_for_physical_in_list(dev, base,
++            &g_phys_speakers_added)))
++        ret = strdup(endpoint);
++    g_phys_unlock();
++
++    return ret;
++}
++
++static BOOL sony_endpoint_has_physical_conflict(const PhysDevice *dev,
++        const char *base, struct list *current)
+ {
++    BOOL conflict;
++
++    if (sony_endpoint_conflicts_in_list(dev, base, current))
++        return TRUE;
++
++    g_phys_lock();
++    conflict = (current != &g_phys_speakers &&
++            sony_endpoint_conflicts_in_list(dev, base, &g_phys_speakers)) ||
++            (current != &g_phys_speakers_added &&
++            sony_endpoint_conflicts_in_list(dev, base, &g_phys_speakers_added));
++    g_phys_unlock();
++
++    return conflict;
++}
++
++static BOOL set_physical_sony_endpoint_id(PhysDevice *dev, const char *base)
++{
++    size_t len;
++
++    if (IsEqualGUID(&dev->container_id, &GUID_NULL))
++        return !!(dev->endpoint_id = strdup(dev->pulse_name));
++
++    len = strlen(base) + sizeof("#wine-sony-physical-") + 36;
++    if (!(dev->endpoint_id = malloc(len)))
++        return FALSE;
++
++    snprintf(dev->endpoint_id, len,
++            "%s#wine-sony-physical-%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
++            base, (unsigned int)dev->container_id.Data1,
++            (unsigned int)dev->container_id.Data2,
++            (unsigned int)dev->container_id.Data3,
++            (unsigned int)dev->container_id.Data4[0],
++            (unsigned int)dev->container_id.Data4[1],
++            (unsigned int)dev->container_id.Data4[2],
++            (unsigned int)dev->container_id.Data4[3],
++            (unsigned int)dev->container_id.Data4[4],
++            (unsigned int)dev->container_id.Data4[5],
++            (unsigned int)dev->container_id.Data4[6],
++            (unsigned int)dev->container_id.Data4[7]);
++    return TRUE;
++}
++
++static BOOL pulse_set_endpoint_id(PhysDevice *dev, struct list *current)
++{
++    const char *sony_base;
++    char *existing;
+     unsigned int generation;
+     size_t len;
+ 
+-    if (is_dualsense_edge_speaker_sink(dev))
+-        return !!(dev->endpoint_id = strdup(DUALSENSE_EDGE_MONO_ENDPOINT_ID));
++    if ((sony_base = sony_render_endpoint_base(dev)))
++    {
++        if ((existing = find_existing_sony_physical_endpoint(dev, sony_base, current)))
++        {
++            dev->endpoint_id = existing;
++            return TRUE;
++        }
+ 
+-    if (is_dualshock_speaker_sink(dev))
+-        return !!(dev->endpoint_id = strdup(DUALSENSE_MONO_ENDPOINT_ID));
++        if (is_dualsense_speaker_sink(dev))
++        {
++            if (sony_endpoint_has_physical_conflict(dev, sony_base, current))
++                return set_physical_sony_endpoint_id(dev, sony_base);
+ 
+-    if (is_dualsense_endpoint_speaker_sink(dev))
+-        return !!(dev->endpoint_id = strdup(DUALSENSE_MONO_ENDPOINT_ID));
++            return !!(dev->endpoint_id = strdup(sony_base));
++        }
++    }
+ 
+     if (!is_dualsense_audio_device(dev) || (dev->flow == eRender && !dev->raw_haptic_target
+             && strstr(dev->pulse_name, "Speaker__sink")))
+@@ -1744,7 +1860,7 @@
+         }
+     }
+     memcpy(dev->pulse_name, pulse_name, len + 1);
+-    if (!pulse_set_endpoint_id(dev))
++    if (!pulse_set_endpoint_id(dev, list))
+     {
+         pulse_dev_free(dev);
+         return;
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -115,15 +115,6 @@
+             strstr( name, "Sony_Interactive_Entertainment" ));
+ }
+ 
+-static BOOL is_shared_sony_mono_backend_name(const char *name)
+-{
+-    return name &&
+-            (!strcmp(name,
+-                    "alsa_output.usb-Sony_Interactive_Entertainment_Wireless_Controller-00.HiFi__Speaker__sink") ||
+-             !strcmp(name,
+-                    "alsa_output.usb-Sony_Interactive_Entertainment_DualSense_Edge_Wireless_Controller-00.Default__Speaker__sink"));
+-}
+-
+ static BOOL use_death_stranding_controller_effects(void)
+ {
+     const char *env = getenv("PROTON_DEATH_STRANDING_CONTROLLER_EFFECTS");
+@@ -211,6 +202,13 @@
+     const char *hotplug_suffix;
+     size_t length = strlen(name);
+ 
++    /* A physical suffix deliberately distinguishes simultaneous controllers
++     * which otherwise expose the same Pulse/UCM endpoint name.  Include it in
++     * the stable identity instead of folding the endpoints back together at
++     * the profile separator below. */
++    if (strstr(name, "#wine-sony-physical-"))
++        return length;
++
+     if (flow == eRender && get_dualsense_audio_profile(name) != DUALSENSE_AUDIO_PROFILE_UNKNOWN)
+         return get_dualsense_physical_identity_length(name);
+     if ((hotplug_suffix = strstr(name, "#wine-sony-hotplug-")))
+@@ -523,7 +521,19 @@
+         struct device *dev;
+ 
+         EnterCriticalSection( &devices_cache_cs );
+-        if (use_stable_dualsense_device_ids())
++        if (strstr( dev_name, "#wine-sony-physical-" ))
++        {
++            if ((dev = find_device_name_in_cache( dev_name, flow )))
++                *guid = dev->guid;
++            else if (create)
++            {
++                get_stable_dualsense_device_guid( flow, dev_name, guid );
++                add_device_to_cache( guid, dev_name, flow );
++            }
++            else
++                memset( guid, 0, sizeof(*guid) );
++        }
++        else if (use_stable_dualsense_device_ids())
+         {
+             if ((dev = find_device_name_in_cache( dev_name, flow )))
+             {
+@@ -1395,7 +1405,35 @@
+     SetupDiDestroyDeviceInfoList(device_set);
+ }
+ 
+-static void remove_persistent_sony_audioendpoint_devices(const GUID *keep_container_id)
++static BOOL active_sony_audioendpoint_container(const GUID *container_id)
++{
++    MMDevice *device;
++    BOOL found = FALSE;
++
++    EnterCriticalSection(&device_list_cs);
++    LIST_FOR_EACH_ENTRY(device, &device_list, MMDevice, entry)
++    {
++        PROPVARIANT value = {VT_EMPTY};
++
++        if (!(device->state & DEVICE_STATE_ACTIVE) ||
++                !is_dualsense_endpoint_name(device->drv_id))
++            continue;
++
++        if (SUCCEEDED(MMDevice_GetPropValue(&device->devguid, device->flow,
++                (const PROPERTYKEY *)&DEVPKEY_Device_ContainerId, &value)) &&
++                value.vt == VT_CLSID && IsEqualGUID(value.puuid, container_id))
++            found = TRUE;
++        PropVariantClear(&value);
++        if (found)
++            break;
++    }
++    LeaveCriticalSection(&device_list_cs);
++
++    return found;
++}
++
++static void remove_persistent_sony_audioendpoint_devices(const GUID *keep_container_id,
++        const GUID *remove_container_id)
+ {
+     static const GUID AudioEndpoint_ClassGUID = { 0xc166523c, 0xfe0c, 0x4a94, { 0xa5, 0x86, 0xf1, 0xa8, 0x0c, 0xfb, 0xbf, 0x3e } };
+     HDEVINFO device_set;
+@@ -1410,7 +1448,7 @@
+     {
+         WCHAR container_id_string[39], friendly_name[256], instance_id[256];
+         GUID container_id;
+-        BOOL keep = FALSE, sony = FALSE;
++        BOOL keep = FALSE, remove = FALSE, sony = FALSE;
+ 
+         memset(&device_info_data, 0, sizeof(device_info_data));
+         device_info_data.cbSize = sizeof(device_info_data);
+@@ -1431,12 +1469,16 @@
+                 is_dualsense_audioendpoint_container(&container_id))
+         {
+             sony = TRUE;
+-            keep = keep_container_id && IsEqualGUID(keep_container_id, &container_id);
++            if (remove_container_id)
++                remove = IsEqualGUID(remove_container_id, &container_id);
++            else
++                keep = (keep_container_id && IsEqualGUID(keep_container_id, &container_id)) ||
++                        active_sony_audioendpoint_container(&container_id);
+         }
+         else if (is_persistent_sony_audioendpoint_name(friendly_name))
+             sony = TRUE;
+ 
+-        if (sony && !keep)
++        if (sony && (remove_container_id ? remove : !keep))
+         {
+             TRACE("Removing stale Sony AudioEndpoint device %s (%s).\n",
+                     debugstr_w(friendly_name), debugstr_w(instance_id));
+@@ -1505,11 +1547,8 @@
+ 
+         if (skip_audioendpoint && is_dualsense_device_path(device_path))
+         {
+-            if (keep_sony_audio_endpoint_visible())
+-                remove_persistent_sony_audioendpoint_devices(IsEqualGUID(container_id, &GUID_NULL) ?
+-                        NULL : container_id);
+-            else
+-                remove_dualsense_audioendpoint_devices();
++            remove_persistent_sony_audioendpoint_devices(
++                    IsEqualGUID(container_id, &GUID_NULL) ? NULL : container_id, NULL);
+             skip_audioendpoint = FALSE;
+         }
+ 
+@@ -2035,13 +2074,6 @@
+         get_device_guid(params->flow, dev_name, TRUE, &guid);
+         promote_delayed_dualsense_profile_in_cache(&guid, dev_name, params->flow);
+         already_published = device_is_published(&guid, params->flow);
+-        if (already_published && params->flow == eRender &&
+-                is_shared_sony_mono_backend_name(dev_name))
+-        {
+-            TRACE("Keeping the existing shared Sony speaker endpoint for duplicate backend %s.\n",
+-                    debugstr_a(dev_name));
+-            continue;
+-        }
+         device = MMDevice_Create(name, &guid, params->flow, DEVICE_STATE_ACTIVE, params->default_idx == i);
+         if (device && params->flow == eRender &&
+                 (is_dualsense_mono_endpoint(device) ||
+@@ -2209,18 +2241,22 @@
+ static void remove_sony_controller_endpoint(MMDevice *dev)
+ {
+     BOOL dualsense_mono_endpoint = is_dualsense_mono_endpoint(dev);
++    PROPVARIANT container_id = {VT_EMPTY};
+     GUID id = dev->devguid;
+ 
+     TRACE("Removing disconnected Sony controller endpoint %s from active device list.\n",
+             debugstr_guid(&id));
+     if (dualsense_mono_endpoint)
+     {
+-        if (keep_sony_audio_endpoint_visible())
+-            remove_persistent_sony_audioendpoint_devices(NULL);
+-        else
++        if (SUCCEEDED(MMDevice_GetPropValue(&dev->devguid, dev->flow,
++                (const PROPERTYKEY *)&DEVPKEY_Device_ContainerId, &container_id)) &&
++                container_id.vt == VT_CLSID)
++            remove_persistent_sony_audioendpoint_devices(NULL, container_id.puuid);
++        else if (!keep_sony_audio_endpoint_visible())
+             remove_dualsense_audioendpoint_devices();
+         remove_dualsense_media_devices();
+     }
++    PropVariantClear(&container_id);
+     notify_endpoint_removed(dev->flow, &id);
+     remove_device_from_cache(&id);
+     delete_device_state_key(dev);
+@@ -2351,7 +2387,8 @@
+                 if (dev->flow != params.flow)
+                     continue;
+                 if (IsEqualGUID(&dev->devguid, &guid) ||
+-                        (dev->drv_id && is_dualsense_mono_endpoint_name(name) && !wcscmp(dev->drv_id, name))) {
++                        (!strstr(dev_name, "#wine-sony-physical-") && dev->drv_id &&
++                         is_dualsense_mono_endpoint_name(name) && !wcscmp(dev->drv_id, name))) {
+                     struct NotificationClientWrapper *wrapper;
+                     const GUID *id = &dev->devguid;
+                     BOOL sony_controller_endpoint = is_dualsense_endpoint_name(dev->drv_id);
