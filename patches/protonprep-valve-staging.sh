@@ -24,6 +24,8 @@ apply_all_in_dir() {
     pushd vkd3d-proton
     git reset --hard HEAD
     git clean -xdf
+    echo "VKD3D-PROTON: prevent stalled present waits from deadlocking swapchain teardown"
+    apply_all_in_dir "../patches/vkd3d-proton/"
     popd
 
     pushd dxvk-nvapi

@@ -8,6 +8,8 @@
 #include "steam_overlay_bridge.h"
 
 #include <dlfcn.h>
+#include <limits.h>
+#include <link.h>
 #include <linux/input.h>
 #include <math.h>
 #include <pthread.h>
@@ -15,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <X11/Xatom.h>
@@ -129,7 +132,11 @@ static int overlay_initialized;
 static int overlay_active;
 static int overlay_input_active;
 static int overlay_focus_owner;
+static int overlay_requested_focus;
+static int overlay_advertised_focus = -1;
 static int overlay_bridge_suspended;
+static uint64_t overlay_next_init_retry_ms;
+static int overlay_wait_logged;
 static int pointer_x;
 static int pointer_y;
 static struct overlay_cursor_entry overlay_cursor_map[GE_CURSOR_MAP_SIZE];
@@ -161,6 +168,60 @@ static int env_enabled(const char *name, int default_value)
 {
     const char *value = getenv(name);
     return value ? atoi(value) != 0 : default_value;
+}
+
+static uint64_t monotonic_msec(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts)) return 0;
+    return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+struct overlay_renderer_lookup
+{
+    char path[PATH_MAX];
+};
+
+static int find_overlay_renderer(struct dl_phdr_info *info, size_t size,
+                                 void *data)
+{
+    struct overlay_renderer_lookup *lookup = data;
+
+    (void)size;
+    if (!info->dlpi_name || !strstr(info->dlpi_name, "gameoverlayrenderer"))
+        return 0;
+
+    snprintf(lookup->path, sizeof(lookup->path), "%s", info->dlpi_name);
+    return 1;
+}
+
+static int resolve_overlay_renderer_hook(void)
+{
+    struct overlay_renderer_lookup lookup = {0};
+    void *handle;
+
+    if (overlay_check_if_event) return 1;
+
+    dl_iterate_phdr(find_overlay_renderer, &lookup);
+    if (!lookup.path[0]) return 0;
+
+    handle = dlopen(lookup.path, RTLD_LAZY | RTLD_LOCAL | RTLD_NOLOAD);
+    if (!handle) return 0;
+
+    overlay_check_if_event =
+        (xcheck_if_event_fn)dlsym(handle, "XCheckIfEvent");
+    if (!overlay_check_if_event)
+    {
+        dlclose(handle);
+        return 0;
+    }
+
+    overlay_trace("resolved XCheckIfEvent directly from %s\n", lookup.path);
+    /* gameoverlayrenderer is already loaded by Steam. Do not retain another
+     * reference which would keep its process resources alive after teardown. */
+    dlclose(handle);
+    return 1;
 }
 
 static Bool match_overlay_event(Display *display, XEvent *event, XPointer arg)
@@ -436,7 +497,7 @@ static int forward_overlay_x11_event(XEvent *event)
     return consumed;
 }
 
-static int init_overlay_bridge(void)
+static int init_overlay_bridge(int force_retry)
 {
     XSetWindowAttributes attributes = {0};
     XClassHint class_hint;
@@ -446,7 +507,7 @@ static int init_overlay_bridge(void)
     char window_class[128];
     unsigned long pid;
     Atom net_wm_pid;
-    Dl_info info;
+    uint64_t now;
 
     pthread_mutex_lock(&overlay_mutex);
     if (overlay_bridge_suspended)
@@ -465,34 +526,38 @@ static int init_overlay_bridge(void)
     if (!env_enabled("WINE_WAYLAND_STEAM_OVERLAY_LAYER", 0) ||
         env_enabled("DISABLE_WINE_WAYLAND_STEAM_OVERLAY_LAYER", 0) ||
         !env_enabled("WAYLANDDRV_STEAM_OVERLAY_X11", 1))
-        goto unavailable;
+        goto disabled;
 
-    overlay_check_if_event =
-        (xcheck_if_event_fn)dlsym(RTLD_DEFAULT, "XCheckIfEvent");
-    if (!overlay_check_if_event ||
-        !dladdr((void *)overlay_check_if_event, &info) || !info.dli_fname ||
-        !strstr(info.dli_fname, "gameoverlayrenderer"))
-        goto unavailable;
+    now = monotonic_msec();
+    if (!force_retry && overlay_next_init_retry_ms &&
+        now < overlay_next_init_retry_ms)
+    {
+        pthread_mutex_unlock(&overlay_mutex);
+        return 0;
+    }
+
+    if (!resolve_overlay_renderer_hook())
+        goto retry;
 
     display_name = getenv("DISPLAY");
     if (!display_name) display_name = getenv("GAMESCOPE_XWAYLAND_DISPLAY");
-    if (!display_name) goto unavailable;
+    if (!display_name) goto retry;
 
     XInitThreads();
-    if (!(overlay_display = XOpenDisplay(display_name))) goto unavailable;
+    if (!(overlay_display = XOpenDisplay(display_name))) goto retry;
 
     overlay_root = DefaultRootWindow(overlay_display);
     attributes.override_redirect = True;
     attributes.event_mask = KeyPressMask | KeyReleaseMask | ButtonPressMask |
                             ButtonReleaseMask | PointerMotionMask;
-    overlay_window = XCreateWindow(overlay_display, overlay_root, -1, -1, 1, 1,
-                                   0, 0, InputOnly, CopyFromParent,
-                                   CWOverrideRedirect | CWEventMask, &attributes);
+    overlay_window = XCreateWindow(
+        overlay_display, overlay_root, -1, -1, 1, 1, 0, 0, InputOnly,
+        CopyFromParent, CWOverrideRedirect | CWEventMask, &attributes);
     if (!overlay_window)
     {
         XCloseDisplay(overlay_display);
         overlay_display = NULL;
-        goto unavailable;
+        goto retry;
     }
 
     XSelectInput(overlay_display, overlay_window, attributes.event_mask);
@@ -525,15 +590,114 @@ static int init_overlay_bridge(void)
     XMapWindow(overlay_display, overlay_window);
     XFlush(overlay_display);
     overlay_initialized = 1;
+    overlay_next_init_retry_ms = 0;
+    overlay_wait_logged = 0;
     pthread_mutex_unlock(&overlay_mutex);
 
     overlay_trace("created X11 input proxy window %#lx\n", overlay_window);
     return 1;
 
-unavailable:
+retry:
+    overlay_next_init_retry_ms = now + 200;
+    if (!overlay_wait_logged)
+    {
+        overlay_trace("waiting for gameoverlayrenderer X11 hooks\n");
+        overlay_wait_logged = 1;
+    }
+    pthread_mutex_unlock(&overlay_mutex);
+    return 0;
+
+disabled:
     overlay_initialized = -1;
     pthread_mutex_unlock(&overlay_mutex);
     return 0;
+}
+
+static void sync_overlay_focus(void)
+{
+    XEvent event = {0};
+    Window current_focus;
+    Window selection_owner;
+    int advertise_focus = 0;
+    int focused;
+    int revert_to;
+
+    pthread_mutex_lock(&overlay_mutex);
+    if (overlay_initialized <= 0 || !overlay_display)
+    {
+        pthread_mutex_unlock(&overlay_mutex);
+        return;
+    }
+
+    focused = overlay_requested_focus;
+    if (overlay_advertised_focus == focused)
+    {
+        pthread_mutex_unlock(&overlay_mutex);
+        return;
+    }
+
+    XLockDisplay(overlay_display);
+    if (focused)
+    {
+        selection_owner =
+            XGetSelectionOwner(overlay_display, overlay_owner_atom);
+        if (selection_owner != overlay_window)
+        {
+            /* The native Wayland process that actually has keyboard focus
+             * must own the per-game proxy.  Transfer ownership directly from
+             * a launcher or an earlier process instead of waiting for that
+             * process to exit and retrying from a foreign helper thread. */
+            XSetSelectionOwner(overlay_display, overlay_owner_atom,
+                               overlay_window, CurrentTime);
+            XSync(overlay_display, False);
+        }
+        overlay_focus_owner = XGetSelectionOwner(
+            overlay_display, overlay_owner_atom) == overlay_window;
+
+        if (overlay_focus_owner)
+        {
+            XSetInputFocus(overlay_display, overlay_window,
+                           RevertToParent, CurrentTime);
+            advertise_focus = 1;
+        }
+    }
+    else if (overlay_focus_owner)
+    {
+        XGetInputFocus(overlay_display, &current_focus, &revert_to);
+        if (current_focus == overlay_window)
+            XSetInputFocus(overlay_display, PointerRoot,
+                           RevertToPointerRoot, CurrentTime);
+
+        /* Retain ownership until bridge_destroy(). Releasing it on every
+         * FocusOut makes gameoverlayrenderer tear down and reacquire its
+         * per-game input path while the game is still alive. */
+        advertise_focus = 1;
+    }
+    else
+    {
+        overlay_advertised_focus = 0;
+    }
+    XFlush(overlay_display);
+    XUnlockDisplay(overlay_display);
+
+    if (advertise_focus) overlay_advertised_focus = focused;
+    pthread_mutex_unlock(&overlay_mutex);
+
+    if (!advertise_focus)
+        return;
+
+    overlay_trace("X11 focus proxy is now %s\n",
+                  focused ? "focused" : "unfocused");
+    event.type = focused ? FocusIn : FocusOut;
+    event.xfocus.mode = NotifyNormal;
+    event.xfocus.detail = NotifyNonlinear;
+    forward_overlay_x11_event(&event);
+    update_overlay_active();
+}
+
+static void update_overlay_focus(void)
+{
+    sync_overlay_focus();
 }
 
 static int dispatch_overlay_event(XEvent *event)
@@ -541,14 +705,15 @@ static int dispatch_overlay_event(XEvent *event)
     int active;
     int consumed;
 
-    if (!init_overlay_bridge()) return 0;
+    if (!init_overlay_bridge(0)) return 0;
+    update_overlay_focus();
     consumed = forward_overlay_x11_event(event);
 
     if (event->type == MotionNotify)
         update_overlay_pointer_ownership(consumed);
 
     active = update_overlay_active();
-    if (active) apply_overlay_cursor(1);
+    if (active) apply_overlay_cursor(0);
     return consumed || active;
 }
 
@@ -675,58 +840,12 @@ static int dispatch_wheel(uint32_t time, int value, int horizontal)
 
 static void bridge_focus(int focused)
 {
-    XEvent event = {0};
-    Window current_focus;
-    Window selection_owner;
-    int advertise_focus = 0;
-    int revert_to;
-
-    if (!init_overlay_bridge()) return;
-
     pthread_mutex_lock(&overlay_mutex);
-    XLockDisplay(overlay_display);
-    if (focused)
-    {
-        selection_owner =
-            XGetSelectionOwner(overlay_display, overlay_owner_atom);
-        if (selection_owner == None || selection_owner == overlay_window)
-        {
-            XSetSelectionOwner(overlay_display, overlay_owner_atom,
-                               overlay_window, CurrentTime);
-            XSync(overlay_display, False);
-            overlay_focus_owner = XGetSelectionOwner(
-                overlay_display, overlay_owner_atom) == overlay_window;
-        }
-
-        if (overlay_focus_owner)
-        {
-            XSetInputFocus(overlay_display, overlay_window,
-                           RevertToParent, CurrentTime);
-            advertise_focus = 1;
-        }
-    }
-    else if (overlay_focus_owner)
-    {
-        XGetInputFocus(overlay_display, &current_focus, &revert_to);
-        if (current_focus == overlay_window)
-            XSetInputFocus(overlay_display, PointerRoot,
-                           RevertToPointerRoot, CurrentTime);
-        advertise_focus = 1;
-    }
-    XFlush(overlay_display);
-    XUnlockDisplay(overlay_display);
+    overlay_requested_focus = !!focused;
     pthread_mutex_unlock(&overlay_mutex);
 
-    if (!advertise_focus)
-    {
-        overlay_trace("another process owns the X11 focus proxy\n");
-        return;
-    }
-
-    event.type = focused ? FocusIn : FocusOut;
-    event.xfocus.mode = NotifyNormal;
-    event.xfocus.detail = NotifyNonlinear;
-    dispatch_overlay_event(&event);
+    if (!init_overlay_bridge(1)) return;
+    update_overlay_focus();
 }
 
 static int bridge_filter_key(uint32_t time, uint32_t key, int pressed)
@@ -734,7 +853,8 @@ static int bridge_filter_key(uint32_t time, uint32_t key, int pressed)
     XEvent event = {0};
     int consumed;
 
-    if (!init_overlay_bridge()) return 0;
+    if (!init_overlay_bridge(1)) return 0;
+    update_overlay_focus();
     if (key > 247) return update_overlay_active();
 
     event.type = pressed ? KeyPress : KeyRelease;
@@ -759,7 +879,8 @@ static int bridge_filter_pointer_button(uint32_t time, uint32_t button,
 {
     unsigned int xbutton;
 
-    if (!init_overlay_bridge()) return 0;
+    if (!init_overlay_bridge(1)) return 0;
+    update_overlay_focus();
     if (!(xbutton = button_to_xbutton(button))) return update_overlay_active();
     return dispatch_button(time, xbutton, pressed);
 }
@@ -772,7 +893,8 @@ static int bridge_filter_pointer_frame(
     int scroll = 0;
     int horz_scroll = 0;
 
-    if (!frame || !init_overlay_bridge()) return 0;
+    if (!frame || !init_overlay_bridge(0)) return 0;
+    update_overlay_focus();
 
     if (frame->flags & GE_STEAM_OVERLAY_FRAME_ABSOLUTE)
     {
@@ -835,12 +957,9 @@ static int bridge_filter_pointer_frame(
 
 static int bridge_is_active(void)
 {
-    int ready;
-
-    pthread_mutex_lock(&overlay_mutex);
-    ready = overlay_initialized > 0;
-    pthread_mutex_unlock(&overlay_mutex);
-    return ready ? update_overlay_active() : 0;
+    if (!init_overlay_bridge(0)) return 0;
+    update_overlay_focus();
+    return update_overlay_active();
 }
 
 static void bridge_enable(void)
@@ -852,6 +971,11 @@ static void bridge_enable(void)
         overlay_trace("re-enabled bridge for a new Wayland toplevel\n");
     }
     pthread_mutex_unlock(&overlay_mutex);
+
+    /* Toplevel creation normally follows gameoverlayrenderer loading. Set up
+     * the proxy now instead of dropping the first shortcut while waiting for
+     * a passive retry interval to expire. */
+    if (init_overlay_bridge(1)) update_overlay_focus();
 }
 
 static void bridge_destroy(void)
@@ -861,9 +985,15 @@ static void bridge_destroy(void)
     int revert_to;
 
     pthread_mutex_lock(&overlay_mutex);
+    overlay_requested_focus = 0;
     overlay_bridge_suspended = 1;
+    overlay_advertised_focus = -1;
+    overlay_next_init_retry_ms = 0;
+    overlay_wait_logged = 0;
     if (overlay_initialized <= 0)
     {
+        overlay_initialized = 0;
+        overlay_check_if_event = NULL;
         pthread_mutex_unlock(&overlay_mutex);
         return;
     }
@@ -893,13 +1023,13 @@ static void bridge_destroy(void)
     overlay_root = None;
     overlay_owner_atom = None;
     previous_after_function = NULL;
-    overlay_check_if_event = NULL;
     overlay_serial = 0;
     overlay_state = 0;
     overlay_initialized = 0;
     overlay_active = 0;
     overlay_input_active = 0;
     overlay_focus_owner = 0;
+    overlay_check_if_event = NULL;
     pointer_x = 0;
     pointer_y = 0;
 

@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Tue, 18 Aug 2026 15:00:00 -0600
+Subject: [PATCH] vkd3d: Bound present waits during swapchain teardown
+
+The swapchain drain path sets skip_waits and waits for the present-wait queue
+to become empty. However, the worker may already be blocked in an infinite
+vkWaitForPresentKHR or vkWaitForPresent2KHR call by then. If the native window
+surface is withdrawn before its final presentation completes, that wait may
+never return and swapchain teardown deadlocks.
+
+Use bounded waits and check skip_waits between attempts. Mark waits skippable
+both while replacing a native swapchain and before joining the waiter during
+final cleanup. Normal presentations still complete in a single wait, while
+teardown can interrupt a stalled wait within 100 ms. Also read skip_waits under
+its mutex to avoid a data race.
+---
+ libs/vkd3d/swapchain.c | 39 +++++++++++++++++++++++++++++++++------
+ 1 file changed, 33 insertions(+), 6 deletions(-)
+
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index 5f2e9355..7cf25f63 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -17,6 +17,7 @@
+  */
+ 
+ #define VKD3D_DBG_CHANNEL VKD3D_DBG_CHANNEL_API
++#define VKD3D_PRESENT_WAIT_POLL_NS (100ull * 1000 * 1000)
+ 
+ #ifdef _WIN32
+ #include "vkd3d_win32.h"
+@@ -543,6 +544,10 @@ static void dxgi_vk_swap_chain_cleanup_low_latency(struct dxgi_vk_swap_chain *c
+ 
+ static void dxgi_vk_swap_chain_cleanup_waiter_thread(struct dxgi_vk_swap_chain *chain)
+ {
++    pthread_mutex_lock(&chain->wait_thread.lock);
++    chain->wait_thread.skip_waits = true;
++    pthread_mutex_unlock(&chain->wait_thread.lock);
++
+     dxgi_vk_swap_chain_push_present_id(chain, 0, 0, 0, true);
+     pthread_join(chain->wait_thread.thread, NULL);
+     pthread_mutex_destroy(&chain->wait_thread.lock);
+@@ -1664,6 +1669,16 @@ static void dxgi_vk_swap_chain_drain_waiter(struct dxgi_vk_swap_chain *chain)
+     pthread_mutex_unlock(&chain->wait_thread.lock);
+ }
+ 
++static bool dxgi_vk_swap_chain_should_skip_present_waits(struct dxgi_vk_swap_chain *chain)
++{
++    bool skip_waits;
++
++    pthread_mutex_lock(&chain->wait_thread.lock);
++    skip_waits = chain->wait_thread.skip_waits;
++    pthread_mutex_unlock(&chain->wait_thread.lock);
++    return skip_waits;
++}
++
+ static void dxgi_vk_swap_chain_destroy_swapchain_in_present_task(struct dxgi_vk_swap_chain *chain)
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
+@@ -3631,8 +3646,10 @@ static void *dxgi_vk_swap_chain_wait_worker(void *chain_)
+         {
+             cookie = vkd3d_queue_timeline_trace_register_present_wait(timeline_trace, entry.id);
+             /* In skip wait mode we just need to make sure that we signal latency fences properly. */
+-            if (!chain->wait_thread.skip_waits)
++            if (!dxgi_vk_swap_chain_should_skip_present_waits(chain))
+             {
++                VkResult vr;
++
+                 /* We don't really care if we observed OUT_OF_DATE or something here. */
+                 if (chain->present.wait2)
+                 {
+@@ -3640,14 +3657,24 @@ static void *dxgi_vk_swap_chain_wait_worker(void *chain_)
+                     memset(&wait_info, 0, sizeof(wait_info));
+                     wait_info.sType = VK_STRUCTURE_TYPE_PRESENT_WAIT_2_INFO_KHR;
+                     wait_info.presentId = entry.id;
+-                    wait_info.timeout = UINT64_MAX;
+-                    VK_CALL(vkWaitForPresent2KHR(chain->queue->device->vk_device, chain->present.vk_swapchain,
+-                            &wait_info));
++                    wait_info.timeout = VKD3D_PRESENT_WAIT_POLL_NS;
++                    do
++                    {
++                        vr = VK_CALL(vkWaitForPresent2KHR(chain->queue->device->vk_device,
++                                chain->present.vk_swapchain, &wait_info));
++                    }
++                    while (vr == VK_TIMEOUT &&
++                            !dxgi_vk_swap_chain_should_skip_present_waits(chain));
+                 }
+                 else
+                 {
+-                    VK_CALL(vkWaitForPresentKHR(chain->queue->device->vk_device, chain->present.vk_swapchain,
+-                            entry.id, UINT64_MAX));
++                    do
++                    {
++                        vr = VK_CALL(vkWaitForPresentKHR(chain->queue->device->vk_device,
++                                chain->present.vk_swapchain, entry.id, VKD3D_PRESENT_WAIT_POLL_NS));
++                    }
++                    while (vr == VK_TIMEOUT &&
++                            !dxgi_vk_swap_chain_should_skip_present_waits(chain));
+                 }
+             }
+             vkd3d_queue_timeline_trace_complete_present_wait(timeline_trace, cookie);
+-- 
+2.55.0

@@ -5,13 +5,13 @@ Subject: [PATCH] winewayland: forward Steam overlay events to external bridge
 
 ---
  dlls/winewayland.drv/Makefile.in            |   1 +
- dlls/winewayland.drv/steam_overlay.c        | 309 ++++++++++++++++++++
+ dlls/winewayland.drv/steam_overlay.c        | 388 ++++++++++++++++++++++++++
  dlls/winewayland.drv/steam_overlay_bridge.h |  83 ++++++
  dlls/winewayland.drv/wayland_keyboard.c     |  10 +
  dlls/winewayland.drv/wayland_pointer.c      | 126 +++++++-
  dlls/winewayland.drv/waylanddrv.h           |  17 ++
- dlls/winewayland.drv/window.c               |  28 ++
- 7 files changed, 562 insertions(+), 12 deletions(-)
+ dlls/winewayland.drv/window.c               |  35 ++
+ 7 files changed, 648 insertions(+), 12 deletions(-)
  create mode 100644 dlls/winewayland.drv/steam_overlay.c
  create mode 100644 dlls/winewayland.drv/steam_overlay_bridge.h
 
@@ -29,10 +29,10 @@ index e9a665fe31e..d5eeb4c8581 100644
  	viewporter.xml \
 diff --git a/dlls/winewayland.drv/steam_overlay.c b/dlls/winewayland.drv/steam_overlay.c
 new file mode 100644
-index 00000000000..ddb884a11af
+index 00000000000..c26324d50de
 --- /dev/null
 +++ b/dlls/winewayland.drv/steam_overlay.c
-@@ -0,0 +1,309 @@
+@@ -0,0 +1,388 @@
 +/*
 + * Wine Wayland forwarding shim for the external Steam overlay bridge
 + *
@@ -66,10 +66,14 @@ index 00000000000..ddb884a11af
 +
 +WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
 +
-+static pthread_once_t overlay_api_once = PTHREAD_ONCE_INIT;
++static pthread_mutex_t overlay_api_mutex = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t overlay_api_cond = PTHREAD_COND_INITIALIZER;
 +static pthread_mutex_t overlay_event_mutex = PTHREAD_MUTEX_INITIALIZER;
 +static const struct ge_steam_overlay_api_v1 *overlay_api;
 +static void *overlay_library;
++static unsigned int overlay_api_users;
++static BOOL overlay_api_enabled;
++static BOOL overlay_api_destroying;
 +static HANDLE overlay_event;
 +static BOOL overlay_event_owned;
 +
@@ -213,7 +217,7 @@ index 00000000000..ddb884a11af
 +    wayland_pointer_set_overlay_cursor_shape(bridge_shape_to_wayland(shape));
 +}
 +
-+static void load_overlay_api(void)
++static void load_overlay_api_locked(void)
 +{
 +    ge_steam_overlay_bridge_get_v1_fn get_api;
 +    struct ge_steam_overlay_host_v1 host = {
@@ -247,37 +251,69 @@ index 00000000000..ddb884a11af
 +    }
 +}
 +
-+static const struct ge_steam_overlay_api_v1 *get_overlay_api(void)
++static const struct ge_steam_overlay_api_v1 *acquire_overlay_api(void)
 +{
-+    pthread_once(&overlay_api_once, load_overlay_api);
-+    return overlay_api;
++    const struct ge_steam_overlay_api_v1 *api;
++
++    pthread_mutex_lock(&overlay_api_mutex);
++    api = overlay_api_enabled && !overlay_api_destroying ? overlay_api : NULL;
++    if (api) ++overlay_api_users;
++    pthread_mutex_unlock(&overlay_api_mutex);
++    return api;
++}
++
++static void release_overlay_api(void)
++{
++    pthread_mutex_lock(&overlay_api_mutex);
++    if (!--overlay_api_users) pthread_cond_broadcast(&overlay_api_cond);
++    pthread_mutex_unlock(&overlay_api_mutex);
 +}
 +
 +void wayland_steam_overlay_focus(BOOL focused)
 +{
-+    const struct ge_steam_overlay_api_v1 *api = get_overlay_api();
-+    if (api) api->focus(focused);
++    const struct ge_steam_overlay_api_v1 *api = acquire_overlay_api();
++
++    if (api)
++    {
++        api->focus(focused);
++        release_overlay_api();
++    }
 +}
 +
 +BOOL wayland_steam_overlay_filter_key(uint32_t time, uint32_t key, uint32_t state)
 +{
-+    const struct ge_steam_overlay_api_v1 *api = get_overlay_api();
-+    return api && api->filter_key(
-+        time, key, state == WL_KEYBOARD_KEY_STATE_PRESSED);
++    const struct ge_steam_overlay_api_v1 *api = acquire_overlay_api();
++    BOOL ret = FALSE;
++
++    if (api)
++    {
++        ret = api->filter_key(time, key,
++                              state == WL_KEYBOARD_KEY_STATE_PRESSED);
++        release_overlay_api();
++    }
++    return ret;
 +}
 +
 +BOOL wayland_steam_overlay_filter_pointer_button(uint32_t time, uint32_t button,
 +                                                 uint32_t state)
 +{
-+    const struct ge_steam_overlay_api_v1 *api = get_overlay_api();
-+    return api && api->filter_pointer_button(
-+        time, button, state == WL_POINTER_BUTTON_STATE_PRESSED);
++    const struct ge_steam_overlay_api_v1 *api = acquire_overlay_api();
++    BOOL ret = FALSE;
++
++    if (api)
++    {
++        ret = api->filter_pointer_button(
++            time, button, state == WL_POINTER_BUTTON_STATE_PRESSED);
++        release_overlay_api();
++    }
++    return ret;
 +}
 +
 +BOOL wayland_steam_overlay_filter_pointer_frame(const struct wayland_pointer_frame *frame)
 +{
-+    const struct ge_steam_overlay_api_v1 *api = get_overlay_api();
++    const struct ge_steam_overlay_api_v1 *api = acquire_overlay_api();
 +    struct ge_steam_overlay_pointer_frame_v1 bridge_frame;
++    BOOL ret;
 +
 +    if (!api) return FALSE;
 +
@@ -304,32 +340,70 @@ index 00000000000..ddb884a11af
 +    if (frame->flags & WAYLAND_POINTER_FRAME_AXIS_HORZ)
 +        bridge_frame.flags |= GE_STEAM_OVERLAY_FRAME_AXIS_HORZ;
 +
-+    return api->filter_pointer_frame(&bridge_frame);
++    ret = api->filter_pointer_frame(&bridge_frame);
++    release_overlay_api();
++    return ret;
 +}
 +
 +BOOL wayland_steam_overlay_is_active(void)
 +{
-+    const struct ge_steam_overlay_api_v1 *api = get_overlay_api();
-+    return api && api->is_active();
++    const struct ge_steam_overlay_api_v1 *api = acquire_overlay_api();
++    BOOL ret = FALSE;
++
++    if (api)
++    {
++        ret = api->is_active();
++        release_overlay_api();
++    }
++    return ret;
 +}
 +
 +void wayland_steam_overlay_set_cursor_shape(
 +    enum wp_cursor_shape_device_v1_shape shape)
 +{
-+    const struct ge_steam_overlay_api_v1 *api = get_overlay_api();
-+    if (api) api->set_cursor_shape(wayland_shape_to_bridge(shape));
++    const struct ge_steam_overlay_api_v1 *api = acquire_overlay_api();
++
++    if (api)
++    {
++        api->set_cursor_shape(wayland_shape_to_bridge(shape));
++        release_overlay_api();
++    }
 +}
 +
 +void wayland_steam_overlay_enable(void)
 +{
-+    const struct ge_steam_overlay_api_v1 *api = get_overlay_api();
-+    if (api) api->enable();
++    const struct ge_steam_overlay_api_v1 *api;
++
++    pthread_mutex_lock(&overlay_api_mutex);
++    while (overlay_api_destroying)
++        pthread_cond_wait(&overlay_api_cond, &overlay_api_mutex);
++    overlay_api_enabled = TRUE;
++    if (!overlay_api) load_overlay_api_locked();
++    api = overlay_api;
++    if (api) ++overlay_api_users;
++    pthread_mutex_unlock(&overlay_api_mutex);
++
++    if (api)
++    {
++        api->enable();
++        release_overlay_api();
++    }
 +}
 +
 +void wayland_steam_overlay_destroy(void)
 +{
-+    const struct ge_steam_overlay_api_v1 *api = get_overlay_api();
++    const struct ge_steam_overlay_api_v1 *api;
 +    HANDLE event;
++
++    pthread_mutex_lock(&overlay_api_mutex);
++    while (overlay_api_destroying)
++        pthread_cond_wait(&overlay_api_cond, &overlay_api_mutex);
++    overlay_api_enabled = FALSE;
++    while (overlay_api_users)
++        pthread_cond_wait(&overlay_api_cond, &overlay_api_mutex);
++    overlay_api_destroying = TRUE;
++    api = overlay_api;
++    pthread_mutex_unlock(&overlay_api_mutex);
 +
 +    if (api) api->destroy();
 +
@@ -341,6 +415,11 @@ index 00000000000..ddb884a11af
 +    overlay_event_owned = FALSE;
 +    pthread_mutex_unlock(&overlay_event_mutex);
 +    if (event) NtClose(event);
++
++    pthread_mutex_lock(&overlay_api_mutex);
++    overlay_api_destroying = FALSE;
++    pthread_cond_broadcast(&overlay_api_cond);
++    pthread_mutex_unlock(&overlay_api_mutex);
 +}
 diff --git a/dlls/winewayland.drv/steam_overlay_bridge.h b/dlls/winewayland.drv/steam_overlay_bridge.h
 new file mode 100644
@@ -752,7 +831,7 @@ diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
 index c52106fb995..746e7e1d10b 100644
 --- a/dlls/winewayland.drv/window.c
 +++ b/dlls/winewayland.drv/window.c
-@@ -601,14 +601,32 @@ static BOOL is_notification_window(HWND hwnd, UINT swp_flags,
+@@ -601,14 +601,36 @@ static BOOL is_notification_window(HWND hwnd, UINT swp_flags,
  /***********************************************************************
   *           WAYLAND_DestroyWindow
   */
@@ -771,29 +850,33 @@ index c52106fb995..746e7e1d10b 100644
 +    return TRUE;
 +}
 +
++static HWND steam_overlay_pending_destroy_hwnd;
++
  void WAYLAND_DestroyWindow(HWND hwnd)
  {
      struct wayland_win_data *data;
-+    BOOL last_toplevel = FALSE;
++    BOOL destroy_overlay = FALSE;
  
      TRACE("%p\n", hwnd);
  
      if (!(data = wayland_win_data_get(hwnd))) return;
-+    last_toplevel = wayland_win_data_is_last_toplevel(data);
++    destroy_overlay = wayland_win_data_is_last_toplevel(data) ||
++                      steam_overlay_pending_destroy_hwnd == hwnd;
++    if (destroy_overlay) steam_overlay_pending_destroy_hwnd = NULL;
      wayland_win_data_destroy(data);
-+    if (last_toplevel) wayland_steam_overlay_destroy();
++    if (destroy_overlay) wayland_steam_overlay_destroy();
  }
  
  /***********************************************************************
-@@ -640,6 +658,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+@@ -640,6 +662,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
      BOOL tray_menu = swp_flags & WINE_SWP_TRAY_MENU;
      BOOL notification = FALSE;
      BOOL use_layer_shell = FALSE;
-+    BOOL last_toplevel, destroy_overlay, enable_overlay;
++    BOOL last_toplevel, suspend_overlay, enable_overlay;
  
      /* Get the managed state with win_data unlocked, as is_window_managed
       * may need to query win_data information about other HWNDs and thus
-@@ -658,6 +677,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+@@ -658,6 +681,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
            owner, debugstr_window_rects(new_rects), insert_after, swp_flags);
  
      if (!(data = wayland_win_data_get(hwnd))) return;
@@ -801,23 +884,25 @@ index c52106fb995..746e7e1d10b 100644
      owner_data = owner && owner != hwnd ? wayland_win_data_get(owner) : NULL;
      owner_surface = owner_data ? owner_data->wayland_surface : NULL;
      /* for it to be a popup, we need a valid xdg surface. */
-@@ -681,8 +701,16 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+@@ -681,8 +705,19 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
          wayland_win_data_update_wayland_state(data);
      }
  
-+    destroy_overlay = last_toplevel &&
++    suspend_overlay = last_toplevel &&
 +                      (!data->wayland_surface ||
 +                       !wayland_surface_is_toplevel(data->wayland_surface));
 +    enable_overlay = data->wayland_surface &&
 +                     wayland_surface_is_toplevel(data->wayland_surface);
 +
++    if (enable_overlay) steam_overlay_pending_destroy_hwnd = NULL;
++    if (suspend_overlay) steam_overlay_pending_destroy_hwnd = hwnd;
++
      if (owner_data) wayland_win_data_release(owner_data);
      wayland_win_data_release(data);
 +    if (enable_overlay) wayland_steam_overlay_enable();
-+    if (destroy_overlay) wayland_steam_overlay_destroy();
++    if (suspend_overlay) wayland_steam_overlay_focus(FALSE);
  }
  
  static void wayland_configure_window(HWND hwnd)
 -- 
 2.55.0
-

@@ -1,9 +1,12 @@
 # Wine Wayland Steam overlay bridge
 
 This component keeps the temporary Steam overlay compatibility code outside
-`winewayland.drv`. It is packaged as an implicit Vulkan layer, but the same
-shared object is loaded directly by the small Wine-Wayland forwarding shim so
-OpenGL and other non-Vulkan games use the same implementation.
+`winewayland.drv`. The small Wine-Wayland forwarding shim loads the shared
+object directly, so Vulkan, OpenGL, and other applications all use the same
+implementation without putting the bridge into their graphics dispatch chain.
+The shared object retains transparent Vulkan-layer entry points and its private
+manifest for development, but Proton does not register that manifest by
+default.
 
 The external component owns all X11 state: the proxy window, Steam focus
 metadata, event translation and consumption, cursor tracking, and teardown.

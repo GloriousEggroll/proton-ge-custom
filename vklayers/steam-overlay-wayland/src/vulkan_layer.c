@@ -162,11 +162,9 @@ static VKAPI_ATTR void VKAPI_CALL overlay_destroy_instance(
     void *key = dispatch_key(instance);
 
     pthread_mutex_lock(&dispatch_mutex);
-    for (cursor = &instance_dispatches; *cursor; cursor = &(*cursor)->next)
-        if ((*cursor)->key == key)
+    for (entry = instance_dispatches; entry; entry = entry->next)
+        if (entry->key == key)
         {
-            entry = *cursor;
-            *cursor = entry->next;
             break;
         }
     pthread_mutex_unlock(&dispatch_mutex);
@@ -175,6 +173,15 @@ static VKAPI_ATTR void VKAPI_CALL overlay_destroy_instance(
     {
         if (entry->destroy_instance)
             entry->destroy_instance(instance, allocator);
+
+        pthread_mutex_lock(&dispatch_mutex);
+        for (cursor = &instance_dispatches; *cursor; cursor = &(*cursor)->next)
+            if (*cursor == entry)
+            {
+                *cursor = entry->next;
+                break;
+            }
+        pthread_mutex_unlock(&dispatch_mutex);
         free(entry);
     }
 }
@@ -233,11 +240,9 @@ static VKAPI_ATTR void VKAPI_CALL overlay_destroy_device(
     void *key = dispatch_key(device);
 
     pthread_mutex_lock(&dispatch_mutex);
-    for (cursor = &device_dispatches; *cursor; cursor = &(*cursor)->next)
-        if ((*cursor)->key == key)
+    for (entry = device_dispatches; entry; entry = entry->next)
+        if (entry->key == key)
         {
-            entry = *cursor;
-            *cursor = entry->next;
             break;
         }
     pthread_mutex_unlock(&dispatch_mutex);
@@ -245,6 +250,15 @@ static VKAPI_ATTR void VKAPI_CALL overlay_destroy_device(
     if (entry)
     {
         if (entry->destroy_device) entry->destroy_device(device, allocator);
+
+        pthread_mutex_lock(&dispatch_mutex);
+        for (cursor = &device_dispatches; *cursor; cursor = &(*cursor)->next)
+            if (*cursor == entry)
+            {
+                *cursor = entry->next;
+                break;
+            }
+        pthread_mutex_unlock(&dispatch_mutex);
         free(entry);
     }
 }
