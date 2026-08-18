@@ -1740,7 +1740,6 @@ class Session:
         self.log_file = None
         self.env = dict(os.environ)
         self.xrandr_bin = g_proton.xrandr_bin
-        self.force_steam_input_appid = False
         self.dlloverrides = {
                 "steam.exe": "b", #always use our special built-in steam.exe
                 "dotnetfx35.exe": "b", #replace the broken installer, as does Windows
@@ -2457,6 +2456,17 @@ class Session:
 
         # Don't use wayland backend when WAYLAND_DISPLAY is not set
         if "wayland" in self.compat_config and "WAYLAND_DISPLAY" in self.env:
+            # Keep Steam's X11 overlay compatibility bridge outside Wine's
+            # Wayland driver. The same shared object is an implicit Vulkan
+            # layer and a small helper loaded by winewayland.drv.
+            if not nonzero(self.env.get("DISABLE_WINE_WAYLAND_STEAM_OVERLAY_LAYER", "0")):
+                self.env["WINE_WAYLAND_STEAM_OVERLAY_LAYER"] = "1"
+                append_to_env_str(
+                    self.env,
+                    "VK_IMPLICIT_LAYER_PATH",
+                    g_proton.dist_dir + "share/steam-overlay-wayland/implicit_layer.d",
+                    ":",
+                )
             # Set primary monitor if given
             if "PROTON_WAYLAND_MONITOR" in self.env:
                 self.env["WAYLANDDRV_PRIMARY_MONITOR"] = self.env["PROTON_WAYLAND_MONITOR"]
@@ -2478,11 +2488,18 @@ class Session:
             # It is not possible for winewayland to support xalia since
             # there is no way to position toplevel surfaces dynamically in wayland
             self.env["PROTON_USE_XALIA"] = "0"
-            # Never expose Steam's desktop virtual controller on winewayland.
-            self.env["PROTON_NO_STEAMINPUT"] = "1"
-            # Steam cannot track native Wayland window focus, so keep it from
-            # falling back to the global desktop controller layout.
-            self.force_steam_input_appid = True
+            # Steam advertises its per-game virtual controller through these
+            # variables. Keep that device available when the game's Steam Input
+            # toggle is enabled. The Wine-Wayland overlay bridge exposes an X11
+            # focus proxy so Steam can select the game's controller profile.
+            steam_input_enabled = (
+                ("SteamVirtualGamepadInfo" in self.env and
+                 nonzero(self.env["SteamVirtualGamepadInfo"])) or
+                ("SDL_GAMECONTROLLER_ALLOW_STEAM_VIRTUAL_GAMEPAD" in self.env and
+                 nonzero(self.env["SDL_GAMECONTROLLER_ALLOW_STEAM_VIRTUAL_GAMEPAD"]))
+            )
+            if "PROTON_NO_STEAMINPUT" not in self.env:
+                self.env["PROTON_NO_STEAMINPUT"] = "0" if steam_input_enabled else "1"
             # Disable other steam input related stuff
             if nonzero(self.env["PROTON_NO_STEAMINPUT"]):
                 # When steam input is disabled we need the ignored controllers to work again
@@ -2654,32 +2671,6 @@ class Session:
             local_env = self.env
         return subprocess.call(args, env=local_env, stderr=self.log_file, stdout=self.log_file)
 
-    def set_steam_input_appid(self, appid):
-        steam_bin = shutil.which("steam")
-        if not steam_bin:
-            log("Unable to set Steam Input AppID: steam executable not found.")
-            return False
-
-        env = dict(os.environ)
-        for name in ("SteamAppId", "SteamGameId", "STEAM_COMPAT_APP_ID"):
-            env.pop(name, None)
-
-        try:
-            result = subprocess.run(
-                [steam_bin, "steam://forceinputappid/" + str(appid)],
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=5,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as e:
-            log("Unable to set Steam Input AppID: " + str(e))
-            return False
-
-        return result.returncode == 0
-
     def run(self):
         if shutil.which('steam-runtime-launcher-interface-0') is not None:
             adverb = ['steam-runtime-launcher-interface-0', 'proton']
@@ -2729,17 +2720,7 @@ class Session:
             else:
                 argv = [g_proton.wine_bin, "c:\\windows\\system32\\steam.exe"]
 
-        steam_input_appid_forced = False
-        if self.force_steam_input_appid:
-            appid = os.environ.get("SteamGameId", os.environ.get("STEAM_COMPAT_APP_ID", "0"))
-            if str(appid).isdigit() and str(appid) != "0":
-                steam_input_appid_forced = self.set_steam_input_appid(appid)
-
-        try:
-            rc = self.run_proc(adverb + argv + sys.argv[2:] + self.cmdlineappend)
-        finally:
-            if steam_input_appid_forced:
-                self.set_steam_input_appid(0)
+        rc = self.run_proc(adverb + argv + sys.argv[2:] + self.cmdlineappend)
 
         if remote_debug_proc:
             remote_debug_proc.kill()
