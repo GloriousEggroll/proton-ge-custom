@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Mon, 17 Aug 2026 18:30:00 -0600
+Subject: [PATCH] winewayland: suspend Steam overlay proxy without toplevels
+
+The overlay callback thread may observe a focus transition immediately after
+the final Wayland toplevel loses its role.  Previously that callback recreated
+the X11 proxy which teardown had just destroyed.  The mapped replacement kept
+gameoverlayrenderer and its process alive after the visible game window had
+closed.
+
+Make final-toplevel teardown terminal until the process creates another real
+Wayland toplevel.  This also prevents transient secondary processes from
+recreating owner candidates after their only window closes.
+---
+ dlls/winewayland.drv/steam_overlay.c | 23 +++++++++++++++++++++++
+ dlls/winewayland.drv/waylanddrv.h    |  1 +
+ dlls/winewayland.drv/window.c        |  5 ++++-
+ 3 files changed, 28 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/winewayland.drv/steam_overlay.c b/dlls/winewayland.drv/steam_overlay.c
+--- a/dlls/winewayland.drv/steam_overlay.c
++++ b/dlls/winewayland.drv/steam_overlay.c
+@@ -144,5 +144,6 @@ static BOOL overlay_event_owned;
+ static BOOL overlay_focus_owner;
+ static Atom overlay_owner_atom;
++static BOOL overlay_bridge_suspended;
+ static int pointer_x, pointer_y;
+ 
+ #define OVERLAY_CURSOR_MAP_SIZE 64
+@@ -488,6 +489,12 @@ static BOOL init_overlay_bridge(void)
+     Dl_info info;
+ 
+     pthread_mutex_lock(&overlay_mutex);
++    if (overlay_bridge_suspended)
++    {
++        pthread_mutex_unlock(&overlay_mutex);
++        return FALSE;
++    }
++
+     if (overlay_initialized)
+     {
+         BOOL ready = overlay_initialized > 0;
+@@ -846,6 +853,17 @@ BOOL wayland_steam_overlay_is_active(void)
+     return update_overlay_active();
+ }
+ 
++void wayland_steam_overlay_enable(void)
++{
++    pthread_mutex_lock(&overlay_mutex);
++    if (overlay_bridge_suspended)
++    {
++        overlay_bridge_suspended = FALSE;
++        TRACE("re-enabled Steam overlay X11 input proxy for new Wayland toplevel\n");
++    }
++    pthread_mutex_unlock(&overlay_mutex);
++}
++
+ void wayland_steam_overlay_destroy(void)
+ {
+     Window current_focus;
+@@ -854,6 +872,7 @@ void wayland_steam_overlay_destroy(void)
+     int revert_to;
+ 
+     pthread_mutex_lock(&overlay_mutex);
++    overlay_bridge_suspended = TRUE;
+     if (overlay_initialized <= 0)
+     {
+         pthread_mutex_unlock(&overlay_mutex);
+@@ -935,6 +954,10 @@ BOOL wayland_steam_overlay_is_active(void)
+     return FALSE;
+ }
+ 
++void wayland_steam_overlay_enable(void)
++{
++}
++
+ void wayland_steam_overlay_destroy(void)
+ {
+ }
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -590,6 +590,7 @@ BOOL wayland_steam_overlay_filter_pointer_frame(const struct wayland_pointer_fra
+ BOOL wayland_steam_overlay_is_active(void);
+ void wayland_steam_overlay_set_cursor_shape(enum wp_cursor_shape_device_v1_shape shape);
+ void wayland_steam_overlay_destroy(void);
++void wayland_steam_overlay_enable(void);
+ 
+ 
+ /**********************************************************************
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -679,7 +679,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT
+     BOOL tray_menu = swp_flags & WINE_SWP_TRAY_MENU;
+     BOOL notification = FALSE;
+     BOOL use_layer_shell = FALSE;
+-    BOOL last_toplevel, destroy_overlay;
++    BOOL last_toplevel, destroy_overlay, enable_overlay;
+ 
+     /* Get the managed state with win_data unlocked, as is_window_managed
+      * may need to query win_data information about other HWNDs and thus
+@@ -721,9 +721,12 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT
+     destroy_overlay = last_toplevel &&
+                       (!data->wayland_surface ||
+                        !wayland_surface_is_toplevel(data->wayland_surface));
++    enable_overlay = data->wayland_surface &&
++                     wayland_surface_is_toplevel(data->wayland_surface);
+ 
+     if (owner_data) wayland_win_data_release(owner_data);
+     wayland_win_data_release(data);
++    if (enable_overlay) wayland_steam_overlay_enable();
+     if (destroy_overlay) wayland_steam_overlay_destroy();
+ }
+ 
+-- 
+2.53.0

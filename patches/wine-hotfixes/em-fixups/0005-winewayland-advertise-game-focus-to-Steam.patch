@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Mon, 17 Aug 2026 16:55:00 -0600
+Subject: [PATCH] winewayland: Advertise native game focus to Steam through X11
+
+Steam's controller focus manager cannot identify a native Wayland game window.
+The overlay input bridge already owns a private X11 proxy, so give that proxy
+the same PID and WM_CLASS metadata as a Wine X11 game window and focus it while
+the native Wayland surface has keyboard focus.
+
+This lets Steam choose the per-game controller profile and naturally switch to
+its ClientUI profile while the overlay is active. It avoids the global
+steam://forceinputappid override, which classified ClientUI AppID 769 as a game
+and spawned launch requests that could reopen a game's launcher.
+---
+ dlls/winewayland.drv/steam_overlay.c | 41 +++++++++++++++++++++++++++++
+ 1 file changed, 41 insertions(+)
+
+diff --git a/dlls/winewayland.drv/steam_overlay.c b/dlls/winewayland.drv/steam_overlay.c
+--- a/dlls/winewayland.drv/steam_overlay.c
++++ b/dlls/winewayland.drv/steam_overlay.c
+@@ -29,13 +29,16 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <unistd.h>
+ 
+ #ifdef SONAME_LIBX11
+ #include <dlfcn.h>
+ #include <linux/input.h>
+ #undef SW_MAX /* Also defined in winuser.rh */
++#include <X11/Xatom.h>
+ #include <X11/cursorfont.h>
+ #include <X11/Xlib.h>
++#include <X11/Xutil.h>
+ enum { OVERLAY_X11_CONTROL_MASK = ControlMask };
+ #undef Status /* Avoid conflicts with winternl.h */
+ #undef ControlMask /* Avoid conflicts with processthreadsapi.h */
+@@ -474,7 +477,11 @@ static BOOL forward_overlay_x11_event(XEvent *event)
+ static BOOL init_overlay_bridge(void)
+ {
+     XSetWindowAttributes attributes = {0};
++    XClassHint class_hint;
+     const char *display_name, *env;
++    char window_class[128];
++    unsigned long pid;
++    Atom net_wm_pid;
+     Dl_info info;
+ 
+     pthread_mutex_lock(&overlay_mutex);
+@@ -517,6 +524,20 @@ static BOOL init_overlay_bridge(void)
+     }
+ 
+     XSelectInput(overlay_display, overlay_window, attributes.event_mask);
++    env = getenv("SteamAppId");
++    if (env && env[0])
++        snprintf(window_class, sizeof(window_class), "steam_app_%s", env);
++    else
++        snprintf(window_class, sizeof(window_class), "steam_proton");
++    class_hint.res_name = window_class;
++    class_hint.res_class = window_class;
++    XSetClassHint(overlay_display, overlay_window, &class_hint);
++    XStoreName(overlay_display, overlay_window, window_class);
++
++    pid = getpid();
++    net_wm_pid = XInternAtom(overlay_display, "_NET_WM_PID", False);
++    XChangeProperty(overlay_display, overlay_window, net_wm_pid, XA_CARDINAL, 32,
++                    PropModeReplace, (unsigned char *)&pid, 1);
+     previous_after_function = XSetAfterFunction(overlay_display, overlay_x11_after_request);
+     XMapWindow(overlay_display, overlay_window);
+     XFlush(overlay_display);
+@@ -655,9 +676,29 @@ static BOOL dispatch_wheel(uint32_t time, int value, BOOL horizontal)
+ void wayland_steam_overlay_focus(BOOL focused)
+ {
+     XEvent event = {0};
++    Window current_focus;
++    int revert_to;
+ 
+     if (!init_overlay_bridge()) return;
+ 
++    pthread_mutex_lock(&overlay_mutex);
++    XLockDisplay(overlay_display);
++    if (focused)
++    {
++        XSetInputFocus(overlay_display, overlay_window, RevertToParent, CurrentTime);
++    }
++    else
++    {
++        XGetInputFocus(overlay_display, &current_focus, &revert_to);
++        if (current_focus == overlay_window)
++            XSetInputFocus(overlay_display, PointerRoot, RevertToPointerRoot, CurrentTime);
++    }
++    XFlush(overlay_display);
++    XUnlockDisplay(overlay_display);
++    pthread_mutex_unlock(&overlay_mutex);
++
++    TRACE("Steam overlay X11 focus proxy is now %s\n", focused ? "focused" : "unfocused");
++
+     event.type = focused ? FocusIn : FocusOut;
+     event.xfocus.mode = NotifyNormal;
+     event.xfocus.detail = NotifyNonlinear;
+-- 
+2.53.0

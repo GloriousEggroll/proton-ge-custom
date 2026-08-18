@@ -1,15 +1,15 @@
-From 884eb746d762cc4926d5c9189ee371e029822af8 Mon Sep 17 00:00:00 2001
+From 10d18f6510b6e9dd009b86bd51838eb1b9b600c9 Mon Sep 17 00:00:00 2001
 From: GloriousEggroll <gloriouseggroll@gmail.com>
 Date: Mon, 17 Aug 2026 12:28:19 -0600
 Subject: [PATCH] winewayland: bridge Steam overlay input through X11
 
 ---
  dlls/winewayland.drv/Makefile.in        |   5 +-
- dlls/winewayland.drv/steam_overlay.c    | 768 ++++++++++++++++++++++++
+ dlls/winewayland.drv/steam_overlay.c    | 805 ++++++++++++++++++++++++
  dlls/winewayland.drv/wayland_keyboard.c |  10 +
  dlls/winewayland.drv/wayland_pointer.c  | 126 +++-
  dlls/winewayland.drv/waylanddrv.h       |  15 +
- 5 files changed, 910 insertions(+), 14 deletions(-)
+ 5 files changed, 947 insertions(+), 14 deletions(-)
  create mode 100644 dlls/winewayland.drv/steam_overlay.c
 
 diff --git a/dlls/winewayland.drv/Makefile.in b/dlls/winewayland.drv/Makefile.in
@@ -36,10 +36,10 @@ index e9a665f..a22e2ee 100644
  	viewporter.xml \
 diff --git a/dlls/winewayland.drv/steam_overlay.c b/dlls/winewayland.drv/steam_overlay.c
 new file mode 100644
-index 0000000..4f20521
+index 0000000..1a61994
 --- /dev/null
 +++ b/dlls/winewayland.drv/steam_overlay.c
-@@ -0,0 +1,768 @@
+@@ -0,0 +1,805 @@
 +/*
 + * Steam overlay input bridge for the Wayland driver
 + *
@@ -180,6 +180,7 @@ index 0000000..4f20521
 +static int overlay_initialized;
 +static BOOL overlay_active;
 +static BOOL overlay_input_active;
++static BOOL overlay_event_owned;
 +static int pointer_x, pointer_y;
 +
 +#define OVERLAY_CURSOR_MAP_SIZE 64
@@ -451,16 +452,65 @@ index 0000000..4f20521
 +
 +static void update_overlay_pointer_ownership(BOOL consumed)
 +{
-+    BOOL changed;
++    LARGE_INTEGER timeout = {0};
++    BOOL changed, event_active;
 +
 +    pthread_mutex_lock(&overlay_mutex);
 +    changed = consumed != overlay_input_active;
 +    overlay_input_active = consumed;
++
++    /* Wine's controller drivers use this event to stop delivering game input
++     * while Steam owns it. Some games never pump the lsteamclient callback
++     * which normally maintains the event, so mirror the ownership detected
++     * directly from gameoverlayrenderer. Never reset an event which was
++     * already signalled by lsteamclient. */
++    event_active = overlay_event &&
++                   NtWaitForSingleObject(overlay_event, FALSE, &timeout) == WAIT_OBJECT_0;
++    if (consumed && overlay_event && !event_active)
++    {
++        if (!NtSetEvent(overlay_event, NULL)) overlay_event_owned = TRUE;
++    }
++    else if (!consumed && overlay_event_owned)
++    {
++        if (!NtResetEvent(overlay_event, NULL)) overlay_event_owned = FALSE;
++    }
 +    pthread_mutex_unlock(&overlay_mutex);
 +
 +    if (changed)
 +        TRACE("Steam overlay %s pointer ownership through X11 input\n",
 +              consumed ? "acquired" : "released");
++}
++
++static BOOL forward_overlay_x11_event(XEvent *event)
++{
++    struct overlay_event_match match;
++    XEvent returned;
++    BOOL consumed;
++
++    pthread_mutex_lock(&overlay_mutex);
++    if (overlay_initialized <= 0 || !overlay_display)
++    {
++        pthread_mutex_unlock(&overlay_mutex);
++        return FALSE;
++    }
++
++    event->xany.display = overlay_display;
++    event->xany.window = overlay_window;
++    event->xany.send_event = False;
++    event->xany.serial = ++overlay_serial;
++
++    match.window = overlay_window;
++    match.serial = overlay_serial;
++    match.type = event->type;
++
++    XLockDisplay(overlay_display);
++    _XPutBackEvent(overlay_display, event);
++    XUnlockDisplay(overlay_display);
++
++    consumed = !XCheckIfEvent(overlay_display, &returned, match_overlay_event,
++                              (XPointer)&match);
++    pthread_mutex_unlock(&overlay_mutex);
++    return consumed;
 +}
 +
 +static BOOL init_overlay_bridge(void)
@@ -527,29 +577,10 @@ index 0000000..4f20521
 +
 +static BOOL dispatch_overlay_event(XEvent *event)
 +{
-+    struct overlay_event_match match;
-+    XEvent returned;
 +    BOOL active, consumed = FALSE;
 +
 +    if (!init_overlay_bridge()) return FALSE;
-+
-+    pthread_mutex_lock(&overlay_mutex);
-+    event->xany.display = overlay_display;
-+    event->xany.window = overlay_window;
-+    event->xany.send_event = False;
-+    event->xany.serial = ++overlay_serial;
-+
-+    match.window = overlay_window;
-+    match.serial = overlay_serial;
-+    match.type = event->type;
-+
-+    XLockDisplay(overlay_display);
-+    _XPutBackEvent(overlay_display, event);
-+    XUnlockDisplay(overlay_display);
-+
-+    consumed = !XCheckIfEvent(overlay_display, &returned, match_overlay_event,
-+                              (XPointer)&match);
-+    pthread_mutex_unlock(&overlay_mutex);
++    consumed = forward_overlay_x11_event(event);
 +
 +    /* Some games do not pump the Steam callback that signals
 +     * __wine_steamclient_GameOverlayActivated. gameoverlayrenderer consuming
@@ -721,21 +752,26 @@ index 0000000..4f20521
 +
 +    if (frame->flags & WAYLAND_POINTER_FRAME_ABSOLUTE)
 +    {
++        pthread_mutex_lock(&overlay_mutex);
 +        pointer_x = frame->x;
 +        pointer_y = frame->y;
++        pthread_mutex_unlock(&overlay_mutex);
 +    }
 +    else if (frame->flags & WAYLAND_POINTER_FRAME_RELATIVE)
 +    {
++        pthread_mutex_lock(&overlay_mutex);
 +        pointer_x += round(frame->dx);
 +        pointer_y += round(frame->dy);
 +        pointer_x = max(0, min(pointer_x,
 +                               DisplayWidth(overlay_display, DefaultScreen(overlay_display)) - 1));
 +        pointer_y = max(0, min(pointer_y,
 +                               DisplayHeight(overlay_display, DefaultScreen(overlay_display)) - 1));
++        pthread_mutex_unlock(&overlay_mutex);
 +    }
 +
 +    if (frame->flags & (WAYLAND_POINTER_FRAME_ABSOLUTE | WAYLAND_POINTER_FRAME_RELATIVE))
 +    {
++        pthread_mutex_lock(&overlay_mutex);
 +        event.type = MotionNotify;
 +        event.xmotion.root = overlay_root;
 +        event.xmotion.subwindow = None;
@@ -747,6 +783,7 @@ index 0000000..4f20521
 +        event.xmotion.state = overlay_state;
 +        event.xmotion.is_hint = NotifyNormal;
 +        event.xmotion.same_screen = True;
++        pthread_mutex_unlock(&overlay_mutex);
 +        consumed = dispatch_overlay_event(&event);
 +    }
 +
