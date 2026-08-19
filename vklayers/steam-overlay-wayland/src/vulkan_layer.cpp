@@ -30,6 +30,19 @@ static void destroy_surface_state(surface_state state)
 class instance_overrides
 {
 public:
+    static VkResult CreateInstance(
+        PFN_vkCreateInstance create_instance,
+        const VkInstanceCreateInfo *create_info,
+        const VkAllocationCallbacks *allocator,
+        VkInstance *instance)
+    {
+        VkResult result = create_instance(create_info, allocator, instance);
+
+        if (result == VK_SUCCESS)
+            ge_overlay_focus_proxy_instance_created();
+        return result;
+    }
+
     static VkResult CreateWaylandSurfaceKHR(
         const vkroots::VkInstanceDispatch& dispatch,
         VkInstance instance,
@@ -96,6 +109,7 @@ public:
 
         for (auto state : stale_surfaces) destroy_surface_state(state);
         dispatch.DestroyInstance(instance, allocator);
+        ge_overlay_focus_proxy_instance_destroyed();
     }
 };
 

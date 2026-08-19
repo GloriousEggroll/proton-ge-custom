@@ -52,6 +52,9 @@ struct ge_steam_overlay_pointer_frame
 
 struct ge_overlay_wayland_surface;
 
+void ge_overlay_focus_proxy_instance_created(void);
+void ge_overlay_focus_proxy_instance_destroyed(void);
+
 struct ge_overlay_wayland_surface *ge_overlay_wayland_surface_create(
     struct wl_display *display, struct wl_surface *surface);
 void ge_overlay_wayland_surface_destroy(struct ge_overlay_wayland_surface *surface);

@@ -56,13 +56,10 @@ endif()
 add_library(VkLayer_GE_Wayland_SteamOverlay SHARED
     ${RELATIVE_POINTER_PROTOCOL_CODE}
     ${RELATIVE_POINTER_PROTOCOL_HEADER}
+    src/focus_proxy.c
     src/steam_overlay_bridge.c
     src/vulkan_layer.cpp
     src/wayland_input.c
-)
-
-add_executable(ge-wayland-steam-focus-proxy
-    src/focus_proxy.c
 )
 
 target_compile_features(VkLayer_GE_Wayland_SteamOverlay PRIVATE
@@ -91,19 +88,6 @@ target_link_libraries(VkLayer_GE_Wayland_SteamOverlay PRIVATE
     ${CMAKE_DL_LIBS}
     m
 )
-target_compile_features(ge-wayland-steam-focus-proxy PRIVATE c_std_11)
-target_compile_definitions(ge-wayland-steam-focus-proxy PRIVATE _GNU_SOURCE)
-target_compile_options(ge-wayland-steam-focus-proxy PRIVATE
-    -Wall
-    -Wextra
-    -Wformat=2
-)
-target_include_directories(ge-wayland-steam-focus-proxy PRIVATE
-    ${X11_INCLUDE_DIR}
-)
-target_link_libraries(ge-wayland-steam-focus-proxy PRIVATE
-    ${X11_LIBRARIES}
-)
 set_target_properties(VkLayer_GE_Wayland_SteamOverlay PROPERTIES
     C_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN YES
@@ -117,9 +101,6 @@ configure_file(
 
 install(TARGETS VkLayer_GE_Wayland_SteamOverlay
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-)
-install(TARGETS ge-wayland-steam-focus-proxy
-    RUNTIME DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_GE_wayland_steam_overlay.json
     DESTINATION ${CMAKE_INSTALL_DATADIR}/vulkan/implicit_layer.d
