@@ -3,7 +3,12 @@
 
 #include <stdint.h>
 
-#define GE_STEAM_OVERLAY_BRIDGE_ABI_VERSION 1u
+struct wl_display;
+struct wl_surface;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 enum ge_steam_overlay_cursor_shape
 {
@@ -23,15 +28,15 @@ enum ge_steam_overlay_cursor_shape
 
 enum ge_steam_overlay_pointer_frame_flags
 {
-    GE_STEAM_OVERLAY_FRAME_RELATIVE = 1u << 0,
-    GE_STEAM_OVERLAY_FRAME_ABSOLUTE = 1u << 1,
-    GE_STEAM_OVERLAY_FRAME_DISCRETE_WHEEL = 1u << 2,
-    GE_STEAM_OVERLAY_FRAME_DISCRETE_WHEEL_HORZ = 1u << 3,
-    GE_STEAM_OVERLAY_FRAME_AXIS = 1u << 4,
-    GE_STEAM_OVERLAY_FRAME_AXIS_HORZ = 1u << 5,
+    GE_STEAM_OVERLAY_FRAME_ABSOLUTE = 1u << 0,
+    GE_STEAM_OVERLAY_FRAME_DISCRETE_WHEEL = 1u << 1,
+    GE_STEAM_OVERLAY_FRAME_DISCRETE_WHEEL_HORZ = 1u << 2,
+    GE_STEAM_OVERLAY_FRAME_AXIS = 1u << 3,
+    GE_STEAM_OVERLAY_FRAME_AXIS_HORZ = 1u << 4,
+    GE_STEAM_OVERLAY_FRAME_RELATIVE = 1u << 5,
 };
 
-struct ge_steam_overlay_pointer_frame_v1
+struct ge_steam_overlay_pointer_frame
 {
     uint32_t time;
     int32_t x;
@@ -45,39 +50,27 @@ struct ge_steam_overlay_pointer_frame_v1
     uint32_t flags;
 };
 
-struct ge_steam_overlay_host_v1
-{
-    uint32_t abi_version;
-    uint32_t struct_size;
-    void *userdata;
+struct ge_overlay_wayland_surface;
 
-    void (*set_overlay_active)(void *userdata, int active);
-    void (*set_cursor_shape)(void *userdata, uint32_t shape);
-    int (*overlay_event_is_active)(void *userdata);
-    void (*set_overlay_event_owned)(void *userdata, int owned);
-};
+struct ge_overlay_wayland_surface *ge_overlay_wayland_surface_create(
+    struct wl_display *display, struct wl_surface *surface);
+void ge_overlay_wayland_surface_destroy(struct ge_overlay_wayland_surface *surface);
+void ge_overlay_wayland_surface_dispatch(struct ge_overlay_wayland_surface *surface);
+void ge_overlay_wayland_set_cursor_shape(uint32_t shape);
+void ge_overlay_wayland_set_cursor_position(int32_t x, int32_t y);
+void ge_overlay_wayland_set_overlay_active(int active);
 
-struct ge_steam_overlay_api_v1
-{
-    uint32_t abi_version;
-    uint32_t struct_size;
+void ge_overlay_bridge_surface_created(void);
+void ge_overlay_bridge_surface_destroyed(void);
+void ge_overlay_bridge_focus(int focused);
+int ge_overlay_bridge_filter_key(uint32_t time, uint32_t key, int pressed);
+int ge_overlay_bridge_filter_pointer_button(uint32_t time, uint32_t button,
+                                            int pressed);
+int ge_overlay_bridge_filter_pointer_frame(
+    const struct ge_steam_overlay_pointer_frame *frame);
 
-    void (*enable)(void);
-    void (*destroy)(void);
-    void (*focus)(int focused);
-    int (*filter_key)(uint32_t time, uint32_t key, int pressed);
-    int (*filter_pointer_button)(uint32_t time, uint32_t button, int pressed);
-    int (*filter_pointer_frame)(const struct ge_steam_overlay_pointer_frame_v1 *frame);
-    int (*is_active)(void);
-    void (*set_cursor_shape)(uint32_t shape);
-};
-
-typedef const struct ge_steam_overlay_api_v1 *
-(*ge_steam_overlay_bridge_get_v1_fn)(uint32_t abi_version,
-                                     const struct ge_steam_overlay_host_v1 *host);
-
-const struct ge_steam_overlay_api_v1 *
-ge_steam_overlay_bridge_get_v1(uint32_t abi_version,
-                               const struct ge_steam_overlay_host_v1 *host);
+#ifdef __cplusplus
+}
+#endif
 
 #endif

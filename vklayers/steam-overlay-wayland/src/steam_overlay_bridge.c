@@ -1,15 +1,13 @@
 /*
  * Steam overlay X11 compatibility bridge for native Wine Wayland games.
  *
- * The bridge intentionally lives outside winewayland.drv. Wine forwards only
- * the Wayland events which an external component cannot observe directly.
+ * Wayland input is collected by the Vulkan layer on a private event queue and
+ * translated here for Steam's existing X11 overlay hooks.
  */
 
 #include "steam_overlay_bridge.h"
 
 #include <dlfcn.h>
-#include <limits.h>
-#include <link.h>
 #include <linux/input.h>
 #include <math.h>
 #include <pthread.h>
@@ -119,7 +117,6 @@ extern int _XPutBackEvent(Display *display, XEvent *event);
 
 static pthread_mutex_t overlay_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t cursor_mutex = PTHREAD_MUTEX_INITIALIZER;
-static struct ge_steam_overlay_host_v1 overlay_host;
 static Display *overlay_display;
 static Window overlay_window;
 static Window overlay_root;
@@ -135,6 +132,8 @@ static int overlay_focus_owner;
 static int overlay_requested_focus;
 static int overlay_advertised_focus = -1;
 static int overlay_bridge_suspended;
+static unsigned int overlay_surface_count;
+static unsigned int overlay_focused_surface_count;
 static uint64_t overlay_next_init_retry_ms;
 static int overlay_wait_logged;
 static int pointer_x;
@@ -178,49 +177,21 @@ static uint64_t monotonic_msec(void)
     return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-struct overlay_renderer_lookup
-{
-    char path[PATH_MAX];
-};
-
-static int find_overlay_renderer(struct dl_phdr_info *info, size_t size,
-                                 void *data)
-{
-    struct overlay_renderer_lookup *lookup = data;
-
-    (void)size;
-    if (!info->dlpi_name || !strstr(info->dlpi_name, "gameoverlayrenderer"))
-        return 0;
-
-    snprintf(lookup->path, sizeof(lookup->path), "%s", info->dlpi_name);
-    return 1;
-}
-
 static int resolve_overlay_renderer_hook(void)
 {
-    struct overlay_renderer_lookup lookup = {0};
-    void *handle;
+    Dl_info info;
 
     if (overlay_check_if_event) return 1;
 
-    dl_iterate_phdr(find_overlay_renderer, &lookup);
-    if (!lookup.path[0]) return 0;
-
-    handle = dlopen(lookup.path, RTLD_LAZY | RTLD_LOCAL | RTLD_NOLOAD);
-    if (!handle) return 0;
-
-    overlay_check_if_event =
-        (xcheck_if_event_fn)dlsym(handle, "XCheckIfEvent");
-    if (!overlay_check_if_event)
-    {
-        dlclose(handle);
+    /* Use the process-interposed symbol exactly as an X11 application does.
+     * dlsym() on gameoverlayrenderer's handle is allowed to search its
+     * dependencies and can silently return libX11's unwrapped implementation. */
+    if (!dladdr((void *)XCheckIfEvent, &info) || !info.dli_fname ||
+        !strstr(info.dli_fname, "gameoverlayrenderer"))
         return 0;
-    }
 
-    overlay_trace("resolved XCheckIfEvent directly from %s\n", lookup.path);
-    /* gameoverlayrenderer is already loaded by Steam. Do not retain another
-     * reference which would keep its process resources alive after teardown. */
-    dlclose(handle);
+    overlay_check_if_event = XCheckIfEvent;
+    overlay_trace("using XCheckIfEvent interposed by %s\n", info.dli_fname);
     return 1;
 }
 
@@ -418,10 +389,10 @@ static void apply_overlay_cursor(int force)
     overlay_cursor_dirty = 0;
     pthread_mutex_unlock(&cursor_mutex);
 
-    if ((dirty || force) && overlay_host.set_cursor_shape)
+    if (dirty || force)
     {
         overlay_trace("applying overlay cursor shape %u\n", shape);
-        overlay_host.set_cursor_shape(overlay_host.userdata, shape);
+        ge_overlay_wayland_set_cursor_shape(shape);
     }
 }
 
@@ -432,8 +403,6 @@ static int update_overlay_active(void)
 
     pthread_mutex_lock(&overlay_mutex);
     active = overlay_input_active;
-    if (overlay_host.overlay_event_is_active)
-        active |= overlay_host.overlay_event_is_active(overlay_host.userdata);
     changed = active != overlay_active;
     overlay_active = active;
     pthread_mutex_unlock(&overlay_mutex);
@@ -442,26 +411,23 @@ static int update_overlay_active(void)
     {
         overlay_trace("overlay is now %s\n", active ? "active" : "inactive");
         if (active) bridge_set_cursor_shape(GE_STEAM_OVERLAY_CURSOR_DEFAULT);
-        if (overlay_host.set_overlay_active)
-            overlay_host.set_overlay_active(overlay_host.userdata, active);
+        ge_overlay_wayland_set_overlay_active(active);
     }
 
     return active;
 }
 
-static void update_overlay_pointer_ownership(int consumed)
+static void update_overlay_input_ownership(int consumed)
 {
     int changed;
 
     pthread_mutex_lock(&overlay_mutex);
     changed = consumed != overlay_input_active;
     overlay_input_active = consumed;
-    if (overlay_host.set_overlay_event_owned)
-        overlay_host.set_overlay_event_owned(overlay_host.userdata, consumed);
     pthread_mutex_unlock(&overlay_mutex);
 
     if (changed)
-        overlay_trace("overlay %s pointer ownership through X11 input\n",
+        overlay_trace("overlay %s ownership through X11 input\n",
                       consumed ? "acquired" : "released");
 }
 
@@ -709,8 +675,10 @@ static int dispatch_overlay_event(XEvent *event)
     update_overlay_focus();
     consumed = forward_overlay_x11_event(event);
 
-    if (event->type == MotionNotify)
-        update_overlay_pointer_ownership(consumed);
+    if (event->type == MotionNotify || event->type == KeyPress ||
+        event->type == KeyRelease || event->type == ButtonPress ||
+        event->type == ButtonRelease)
+        update_overlay_input_ownership(consumed);
 
     active = update_overlay_active();
     if (active) apply_overlay_cursor(0);
@@ -838,17 +806,21 @@ static int dispatch_wheel(uint32_t time, int value, int horizontal)
     return consumed || update_overlay_active();
 }
 
-static void bridge_focus(int focused)
+void ge_overlay_bridge_focus(int focused)
 {
     pthread_mutex_lock(&overlay_mutex);
-    overlay_requested_focus = !!focused;
+    if (focused)
+        ++overlay_focused_surface_count;
+    else if (overlay_focused_surface_count)
+        --overlay_focused_surface_count;
+    overlay_requested_focus = overlay_focused_surface_count != 0;
     pthread_mutex_unlock(&overlay_mutex);
 
     if (!init_overlay_bridge(1)) return;
     update_overlay_focus();
 }
 
-static int bridge_filter_key(uint32_t time, uint32_t key, int pressed)
+int ge_overlay_bridge_filter_key(uint32_t time, uint32_t key, int pressed)
 {
     XEvent event = {0};
     int consumed;
@@ -874,8 +846,8 @@ static int bridge_filter_key(uint32_t time, uint32_t key, int pressed)
     return consumed;
 }
 
-static int bridge_filter_pointer_button(uint32_t time, uint32_t button,
-                                        int pressed)
+int ge_overlay_bridge_filter_pointer_button(uint32_t time, uint32_t button,
+                                             int pressed)
 {
     unsigned int xbutton;
 
@@ -885,13 +857,15 @@ static int bridge_filter_pointer_button(uint32_t time, uint32_t button,
     return dispatch_button(time, xbutton, pressed);
 }
 
-static int bridge_filter_pointer_frame(
-    const struct ge_steam_overlay_pointer_frame_v1 *frame)
+int ge_overlay_bridge_filter_pointer_frame(
+    const struct ge_steam_overlay_pointer_frame *frame)
 {
     XEvent event = {0};
     int consumed = 0;
     int scroll = 0;
     int horz_scroll = 0;
+    int motion_x = 0;
+    int motion_y = 0;
 
     if (!frame || !init_overlay_bridge(0)) return 0;
     update_overlay_focus();
@@ -905,18 +879,13 @@ static int bridge_filter_pointer_frame(
     }
     else if (frame->flags & GE_STEAM_OVERLAY_FRAME_RELATIVE)
     {
-        int width;
-        int height;
-
         pthread_mutex_lock(&overlay_mutex);
         pointer_x += (int)round(frame->dx);
         pointer_y += (int)round(frame->dy);
-        width = DisplayWidth(overlay_display, DefaultScreen(overlay_display));
-        height = DisplayHeight(overlay_display, DefaultScreen(overlay_display));
-        if (pointer_x < 0) pointer_x = 0;
-        else if (pointer_x >= width) pointer_x = width - 1;
-        if (pointer_y < 0) pointer_y = 0;
-        else if (pointer_y >= height) pointer_y = height - 1;
+        pointer_x = fmax(0, fmin(pointer_x,
+            DisplayWidth(overlay_display, DefaultScreen(overlay_display)) - 1));
+        pointer_y = fmax(0, fmin(pointer_y,
+            DisplayHeight(overlay_display, DefaultScreen(overlay_display)) - 1));
         pthread_mutex_unlock(&overlay_mutex);
     }
 
@@ -935,8 +904,11 @@ static int bridge_filter_pointer_frame(
         event.xmotion.state = overlay_state;
         event.xmotion.is_hint = NotifyNormal;
         event.xmotion.same_screen = True;
+        motion_x = pointer_x;
+        motion_y = pointer_y;
         pthread_mutex_unlock(&overlay_mutex);
         consumed = dispatch_overlay_event(&event);
+        ge_overlay_wayland_set_cursor_position(motion_x, motion_y);
     }
 
     if (frame->flags & GE_STEAM_OVERLAY_FRAME_DISCRETE_WHEEL)
@@ -955,16 +927,12 @@ static int bridge_filter_pointer_frame(
     return consumed || update_overlay_active();
 }
 
-static int bridge_is_active(void)
+void ge_overlay_bridge_surface_created(void)
 {
-    if (!init_overlay_bridge(0)) return 0;
-    update_overlay_focus();
-    return update_overlay_active();
-}
+    int first_surface;
 
-static void bridge_enable(void)
-{
     pthread_mutex_lock(&overlay_mutex);
+    first_surface = !overlay_surface_count++;
     if (overlay_bridge_suspended)
     {
         overlay_bridge_suspended = 0;
@@ -972,16 +940,17 @@ static void bridge_enable(void)
     }
     pthread_mutex_unlock(&overlay_mutex);
 
+    if (!first_surface) return;
+
     /* Toplevel creation normally follows gameoverlayrenderer loading. Set up
      * the proxy now instead of dropping the first shortcut while waiting for
      * a passive retry interval to expire. */
     if (init_overlay_bridge(1)) update_overlay_focus();
 }
 
-static void bridge_destroy(void)
+static void destroy_overlay_bridge(void)
 {
     Window current_focus;
-    int restore_pointer = 0;
     int revert_to;
 
     pthread_mutex_lock(&overlay_mutex);
@@ -997,10 +966,6 @@ static void bridge_destroy(void)
         pthread_mutex_unlock(&overlay_mutex);
         return;
     }
-
-    restore_pointer = overlay_active || overlay_input_active;
-    if (overlay_host.set_overlay_event_owned)
-        overlay_host.set_overlay_event_owned(overlay_host.userdata, 0);
 
     XLockDisplay(overlay_display);
     if (overlay_focus_owner &&
@@ -1040,38 +1005,22 @@ static void bridge_destroy(void)
     pthread_mutex_unlock(&cursor_mutex);
     pthread_mutex_unlock(&overlay_mutex);
 
-    if (restore_pointer && overlay_host.set_overlay_active)
-        overlay_host.set_overlay_active(overlay_host.userdata, 0);
+    ge_overlay_wayland_set_overlay_active(0);
+    ge_overlay_wayland_set_cursor_shape(GE_STEAM_OVERLAY_CURSOR_DEFAULT);
     overlay_trace("destroyed X11 input proxy\n");
 }
 
-static const struct ge_steam_overlay_api_v1 overlay_api = {
-    .abi_version = GE_STEAM_OVERLAY_BRIDGE_ABI_VERSION,
-    .struct_size = sizeof(overlay_api),
-    .enable = bridge_enable,
-    .destroy = bridge_destroy,
-    .focus = bridge_focus,
-    .filter_key = bridge_filter_key,
-    .filter_pointer_button = bridge_filter_pointer_button,
-    .filter_pointer_frame = bridge_filter_pointer_frame,
-    .is_active = bridge_is_active,
-    .set_cursor_shape = bridge_set_cursor_shape,
-};
-
-__attribute__((visibility("default")))
-const struct ge_steam_overlay_api_v1 *
-ge_steam_overlay_bridge_get_v1(uint32_t abi_version,
-                               const struct ge_steam_overlay_host_v1 *host)
+void ge_overlay_bridge_surface_destroyed(void)
 {
-    if (abi_version != GE_STEAM_OVERLAY_BRIDGE_ABI_VERSION || !host ||
-        host->abi_version != GE_STEAM_OVERLAY_BRIDGE_ABI_VERSION ||
-        host->struct_size < sizeof(*host) || !host->set_overlay_active ||
-        !host->set_cursor_shape || !host->overlay_event_is_active ||
-        !host->set_overlay_event_owned)
-        return NULL;
+    int last_surface = 0;
 
     pthread_mutex_lock(&overlay_mutex);
-    overlay_host = *host;
+    if (overlay_surface_count && !--overlay_surface_count)
+    {
+        overlay_focused_surface_count = 0;
+        last_surface = 1;
+    }
     pthread_mutex_unlock(&overlay_mutex);
-    return &overlay_api;
+
+    if (last_surface) destroy_overlay_bridge();
 }
