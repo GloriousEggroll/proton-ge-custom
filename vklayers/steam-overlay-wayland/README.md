@@ -18,13 +18,15 @@ compiled against an incompatible Vulkan header version.
 The layer owns the Wayland keyboard, pointer, cursor, X11 proxy window, Steam
 focus metadata, event translation, and teardown. Wine-Wayland does not load or
 call this library and contains no overlay-specific bridge code. After win32u
-loads a real display driver, it initializes Vulkan before a launcher creates a
-presentation surface. The layer hooks `vkCreateInstance` and starts an
-in-process `steam_app_*` focus proxy. The proxy exits when the focused Wayland
-surface takes ownership. The layer itself is never preloaded into Wine
-processes.
+loads a real display driver, it identifies `winewayland.so`, verifies that
+`winex11.drv` remains available and that Steam injected
+`gameoverlayrenderer.so`, then adds the packaged implicit-layer manifest and
+initializes Vulkan before a launcher creates a presentation surface. The layer
+hooks `vkCreateInstance` and starts an in-process `steam_app_*` focus proxy.
+The proxy exits when the focused Wayland surface takes ownership. The layer is
+not activated for Wine-X11 processes or when Steam's overlay is disabled.
 
 Set `DISABLE_WINE_WAYLAND_STEAM_OVERLAY_LAYER=1` to disable the layer. Once
 Steam supports native Wine-Wayland overlay input, removal consists of deleting
-this directory and its build include, removing Proton's activation block, and
-dropping the `win32u` early Vulkan initialization patch.
+this directory and its build include and dropping the `win32u` automatic
+Vulkan initialization patch.

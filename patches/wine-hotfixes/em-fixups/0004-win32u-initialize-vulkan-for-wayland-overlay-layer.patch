@@ -1,16 +1,19 @@
 From: GE-Proton <noreply@localhost>
-Subject: [PATCH] win32u: initialize Vulkan after loading the display driver
+Subject: [PATCH] win32u: automatically initialize the Wayland overlay layer
 
-Wine's D3DKMT Vulkan instance is otherwise created lazily. Create it after a
-real display driver has been loaded when the Wine-Wayland Steam overlay layer
-is enabled, so the layer's vkCreateInstance hook can advertise Steam's focus
-target before a presentation surface exists.
+Wine's D3DKMT Vulkan instance is otherwise created lazily. When Wine-Wayland
+and Steam's overlay are both active, configure the packaged implicit layer and
+create the instance after the real display driver has loaded. This lets the
+layer's vkCreateInstance hook advertise Steam's focus target before a
+presentation surface exists without requiring Proton-side activation.
 
 Do not create the instance from win32u's Unix-library initialization. That is
 too early to start the layer's worker thread and can recursively crash and
 respawn Wine desktop helpers. Waiting for display-driver initialization keeps
 the hook process-local, skips service/null-driver processes, and runs before a
-GUI application creates its first window.
+GUI application creates its first window. Do not activate it when winex11 was
+explicitly disabled, the Steam overlay was not injected, or the explicit
+layer-disable option is set.
 
 --- a/dlls/win32u/d3dkmt.c
 +++ b/dlls/win32u/d3dkmt.c
@@ -35,27 +38,194 @@ GUI application creates its first window.
  HANDLE alloc_user_handle( void *ptr, unsigned short type );
 --- a/dlls/win32u/driver.c
 +++ b/dlls/win32u/driver.c
-@@ -23,6 +23,7 @@
+@@ -24,7 +24,14 @@
+ #endif
  
++#include "config.h"
++
  #include <assert.h>
++#include <dlfcn.h>
++#include <limits.h>
  #include <pthread.h>
 +#include <stdlib.h>
++#include <strings.h>
++#include <unistd.h>
  
  #include "ntstatus.h"
  #define WIN32_NO_STATUS
-@@ -1037,7 +1038,15 @@ static const struct user_driver_funcs *load_driver(void)
+@@ -1035,9 +1042,175 @@ static const struct user_driver_funcs *load_driver(void)
+     return user_driver;
+ }
  
++static BOOL override_separator( char c )
++{
++    return c == ',' || c == ' ' || c == '\t';
++}
++
++static BOOL override_name_is_winex11( const char *name, size_t len )
++{
++    return (len == strlen( "winex11" ) && !strncasecmp( name, "winex11", len )) ||
++           (len == strlen( "winex11.drv" ) && !strncasecmp( name, "winex11.drv", len ));
++}
++
++static BOOL winex11_is_disabled(void)
++{
++    const char *overrides = getenv( "WINEDLLOVERRIDES" );
++    BOOL found = FALSE, disabled = FALSE;
++
++    while (overrides && *overrides)
++    {
++        const char *entry_end = strchr( overrides, ';' );
++        const char *equals, *name;
++
++        if (!entry_end) entry_end = overrides + strlen( overrides );
++        equals = memchr( overrides, '=', entry_end - overrides );
++        if (equals)
++        {
++            name = overrides;
++            while (name < equals)
++            {
++                const char *name_end, *order;
++
++                while (name < equals && override_separator( *name )) name++;
++                name_end = name;
++                while (name_end < equals && !override_separator( *name_end )) name_end++;
++
++                if (override_name_is_winex11( name, name_end - name ))
++                {
++                    found = disabled = TRUE;
++                    order = equals + 1;
++                    while (order < entry_end)
++                    {
++                        while (order < entry_end && override_separator( *order )) order++;
++                        if (order < entry_end && (*order == 'b' || *order == 'B' ||
++                                                  *order == 'n' || *order == 'N'))
++                        {
++                            disabled = FALSE;
++                            break;
++                        }
++                        while (order < entry_end && !override_separator( *order )) order++;
++                    }
++                    break;
++                }
++                name = name_end;
++            }
++        }
++
++        overrides = *entry_end ? entry_end + 1 : entry_end;
++    }
++
++    return found && disabled;
++}
++
++static BOOL wayland_display_driver_active(void)
++{
++    const char *name;
++    Dl_info info;
++
++    if (!user_driver->pVulkanInit || !dladdr( user_driver->pVulkanInit, &info ) || !info.dli_fname)
++        return FALSE;
++
++    name = strrchr( info.dli_fname, '/' );
++    if (name) name++;
++    else name = info.dli_fname;
++    return !strcmp( name, "winewayland.so" );
++}
++
++static BOOL steam_overlay_active(void)
++{
++    void *check_if_event;
++    Dl_info info;
++
++    if (!(check_if_event = dlsym( RTLD_DEFAULT, "XCheckIfEvent" )) ||
++        !dladdr( check_if_event, &info ) || !info.dli_fname)
++        return FALSE;
++    return strstr( info.dli_fname, "gameoverlayrenderer" ) != NULL;
++}
++
++static BOOL path_list_contains( const char *list, const char *path )
++{
++    size_t path_len = strlen( path );
++
++    while (list && *list)
++    {
++        const char *end = strchr( list, ':' );
++        size_t len = end ? end - list : strlen( list );
++
++        if (len == path_len && !memcmp( list, path, len )) return TRUE;
++        if (!end) break;
++        list = end + 1;
++    }
++    return FALSE;
++}
++
++static BOOL configure_wayland_overlay_layer(void)
++{
++    static const char layer_suffix[] = "/../../../share/steam-overlay-wayland/implicit_layer.d";
++    char layer_path[PATH_MAX], resolved_path[PATH_MAX];
++    const char *old_path;
++    char *new_path = NULL;
++    const char *slash;
++    size_t dir_len;
++    Dl_info info;
++    BOOL ret = FALSE;
++
++    if (!dladdr( init_display_driver, &info ) || !info.dli_fname ||
++        !(slash = strrchr( info.dli_fname, '/' )))
++        return FALSE;
++
++    dir_len = slash - info.dli_fname;
++    if (dir_len + sizeof(layer_suffix) > sizeof(layer_path)) return FALSE;
++    memcpy( layer_path, info.dli_fname, dir_len );
++    memcpy( layer_path + dir_len, layer_suffix, sizeof(layer_suffix) );
++    if (!realpath( layer_path, resolved_path ) || access( resolved_path, R_OK )) return FALSE;
++
++    old_path = getenv( "VK_IMPLICIT_LAYER_PATH" );
++    if (!path_list_contains( old_path, resolved_path ))
++    {
++        size_t old_len = old_path && *old_path ? strlen( old_path ) : 0;
++        size_t path_len = strlen( resolved_path );
++
++        if (!(new_path = malloc( path_len + (old_len ? old_len + 2 : 1) ))) return FALSE;
++        memcpy( new_path, resolved_path, path_len );
++        if (old_len)
++        {
++            new_path[path_len++] = ':';
++            memcpy( new_path + path_len, old_path, old_len + 1 );
++        }
++        else new_path[path_len] = 0;
++
++        if (setenv( "VK_IMPLICIT_LAYER_PATH", new_path, 1 )) goto done;
++    }
++
++    if (setenv( "WINE_WAYLAND_STEAM_OVERLAY_LAYER", "1", 1 )) goto done;
++    ret = TRUE;
++
++done:
++    free( new_path );
++    return ret;
++}
++
++static void init_wayland_overlay_layer(void)
++{
++    const char *env;
++
++    if ((env = getenv( "DISABLE_WINE_WAYLAND_STEAM_OVERLAY_LAYER" )) && atoi( env )) return;
++    if (!(env = getenv( "SteamAppId" )) || !*env || !(env = getenv( "DISPLAY" )) || !*env) return;
++    if (!wayland_display_driver_active() || winex11_is_disabled() || !steam_overlay_active()) return;
++    if (!configure_wayland_overlay_layer()) return;
++
++    TRACE( "automatically enabling the Wine-Wayland Steam overlay layer\n" );
++    (void)get_d3dkmt_vulkan_instance();
++}
++
  void init_display_driver(void)
  {
-+    const char *env;
++    static pthread_once_t overlay_once = PTHREAD_ONCE_INIT;
 +
      if (user_driver == &lazy_load_driver) load_display_driver();
 +    if (user_driver == &null_user_driver) return;
-+
-+    env = getenv( "WINE_WAYLAND_STEAM_OVERLAY_LAYER" );
-+    if (env && atoi( env ) &&
-+        (!(env = getenv( "DISABLE_WINE_WAYLAND_STEAM_OVERLAY_LAYER" )) || !atoi( env )))
-+        (void)get_d3dkmt_vulkan_instance();
++    pthread_once( &overlay_once, init_wayland_overlay_layer );
  }
  
  /**********************************************************************
