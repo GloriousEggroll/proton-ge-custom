@@ -263,6 +263,9 @@ apply_all_in_dir() {
     echo "WINE: -HOTFIX- Preserve driver-reported OpenGL GPU identity"
     apply_patch "../patches/wine-hotfixes/pending/wined3d-preserve-runtime-opengl-gpu-description.patch"
 
+    echo "WINE: -HOTFIX- Retry virtual allocations with effective bounds after clearing native mappings"
+    apply_patch "../patches/wine-hotfixes/pending/ntdll-retry-native-view-allocation-with-effective-range.patch"
+
     # https://gitlab.winehq.org/wine/wine/-/commit/a31ec8da9572672e04ae46792a398da942649875
     echo "WINE: -HOTFIX- Prefer native non-Microsoft DLLs using version resources"
     apply_patch "../patches/wine-hotfixes/pending/ntdll-prefer-native-version-resource-heuristics.patch"
