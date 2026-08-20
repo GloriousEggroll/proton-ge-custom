@@ -1,0 +1,176 @@
+From 7c5dbe1d58c83f74a0ea729935a0a8726ff78f15 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Thu, 20 Aug 2026 02:30:00 -0600
+Subject: [PATCH] mfmediaengine: Bridge cross-device video frame transfers
+
+Frame server users may pass a destination texture created by a different
+D3D11 device than Media Engine's decoder output. CopySubresourceRegion cannot
+copy across devices, but it has no return value, so the old path silently
+reported success while leaving the destination unchanged.
+
+Keep the GPU copy for textures on the same device. For different devices, map
+the Media Foundation 2D buffer for reading and upload the frame through the
+destination texture's own immediate context. This also avoids depending on NT
+shared-resource handle import, which is not available for this path on Wine.
+---
+ dlls/mfmediaengine/main.c | 117 +++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 112 insertions(+), 5 deletions(-)
+
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+index 4cefe5e8f6f..6caa31f9b84 100644
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -2995,6 +2995,90 @@ static void media_engine_update_d3d11_frame_surface(ID3D11DeviceContext *context
+     IMFSample_Release(sample);
+ }
+ 
++static unsigned int media_engine_get_d3d11_format_size(DXGI_FORMAT format)
++{
++    switch (format)
++    {
++    case DXGI_FORMAT_B8G8R8A8_UNORM:
++    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
++    case DXGI_FORMAT_B8G8R8X8_UNORM:
++    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
++    case DXGI_FORMAT_R8G8B8A8_UNORM:
++    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
++        return 4;
++    default:
++        return 0;
++    }
++}
++
++static HRESULT media_engine_transfer_d3d11_cross_device(IMFSample *sample, ID3D11Texture2D *dst_texture,
++        const D3D11_TEXTURE2D_DESC *src_desc, const D3D11_TEXTURE2D_DESC *dst_desc,
++        const D3D11_BOX *src_box, const RECT *dst_rect)
++{
++    ID3D11DeviceContext *dst_context = NULL;
++    ID3D11Device *dst_device = NULL;
++    IMFMediaBuffer *media_buffer = NULL;
++    IMF2DBuffer2 *buffer_2d = NULL;
++    BYTE *scanline, *buffer_start;
++    DWORD buffer_length;
++    D3D11_BOX dst_box;
++    unsigned int format_size;
++    const BYTE *src_data;
++    LONG pitch;
++    BOOL locked = FALSE;
++    HRESULT hr;
++
++    if (src_desc->Format != dst_desc->Format
++            || !(format_size = media_engine_get_d3d11_format_size(src_desc->Format)))
++    {
++        WARN("Unsupported cross-device texture formats %#x -> %#x.\n", src_desc->Format, dst_desc->Format);
++        return MF_E_UNEXPECTED;
++    }
++
++    if (FAILED(hr = IMFSample_GetBufferByIndex(sample, 0, &media_buffer)))
++        goto done;
++    if (FAILED(hr = IMFMediaBuffer_QueryInterface(media_buffer, &IID_IMF2DBuffer2, (void **)&buffer_2d)))
++        goto done;
++    if (FAILED(hr = IMF2DBuffer2_Lock2DSize(buffer_2d, MF2DBuffer_LockFlags_Read,
++            &scanline, &pitch, &buffer_start, &buffer_length)))
++        goto done;
++    locked = TRUE;
++
++    if (pitch <= 0 || (unsigned int)pitch < src_desc->Width * format_size)
++    {
++        WARN("Unexpected cross-device source pitch %ld.\n", pitch);
++        hr = MF_E_UNEXPECTED;
++        goto done;
++    }
++
++    src_data = scanline + src_box->top * pitch + src_box->left * format_size;
++    dst_box.left = dst_rect->left;
++    dst_box.top = dst_rect->top;
++    dst_box.front = 0;
++    dst_box.right = dst_rect->left + src_box->right - src_box->left;
++    dst_box.bottom = dst_rect->top + src_box->bottom - src_box->top;
++    dst_box.back = 1;
++
++    ID3D11Texture2D_GetDevice(dst_texture, &dst_device);
++    ID3D11Device_GetImmediateContext(dst_device, &dst_context);
++    ID3D11DeviceContext_UpdateSubresource(dst_context, (ID3D11Resource *)dst_texture,
++            0, &dst_box, src_data, pitch, 0);
++    hr = S_OK;
++
++done:
++    if (dst_context)
++        ID3D11DeviceContext_Release(dst_context);
++    if (dst_device)
++        ID3D11Device_Release(dst_device);
++    if (locked)
++        IMF2DBuffer2_Unlock2D(buffer_2d);
++    if (buffer_2d)
++        IMF2DBuffer2_Release(buffer_2d);
++    if (media_buffer)
++        IMFMediaBuffer_Release(media_buffer);
++    return hr;
++}
++
+ static HRESULT media_engine_transfer_d3d11(struct media_engine *engine, ID3D11Texture2D *dst_texture,
+         const MFVideoNormalizedRect *src_rect, const RECT *dst_rect, const MFARGB *color)
+ {
+@@ -3005,6 +3089,7 @@ static HRESULT media_engine_transfer_d3d11(struct media_engine *engine, ID3D11Te
+     RECT dst_rect_default = {0};
+     D3D11_BOX src_box = {0};
+-    ID3D11Device *device;
++    ID3D11Device *device, *src_device, *dst_device;
++    BOOL device_mismatch;
+     IMFSample *sample;
+     UINT subresource;
+     HRESULT hr;
+@@ -3023,8 +3108,10 @@ static HRESULT media_engine_transfer_d3d11(struct media_engine *engine, ID3D11Te
+         return MF_E_UNEXPECTED;
+     hr = get_d3d11_resource_from_sample(sample, &src_texture, &subresource);
+-    IMFSample_Release(sample);
+     if (FAILED(hr))
++    {
++        IMFSample_Release(sample);
+         return hr;
++    }
+ 
+     ID3D11Texture2D_GetDesc(src_texture, &src_desc);
+     ID3D11Texture2D_GetDesc(dst_texture, &dst_desc);
+@@ -3041,12 +3128,31 @@ static HRESULT media_engine_transfer_d3d11(struct media_engine *engine, ID3D11Te
+     if (dst_rect->left + src_box.right - src_box.left > dst_desc.Width ||
+             dst_rect->top + src_box.bottom - src_box.top > dst_desc.Height)
+     {
++        IMFSample_Release(sample);
+         ID3D11Texture2D_Release(src_texture);
+         return MF_E_UNEXPECTED;
+     }
+ 
++    ID3D11Texture2D_GetDevice(src_texture, &src_device);
++    ID3D11Texture2D_GetDevice(dst_texture, &dst_device);
++    device_mismatch = src_device != dst_device;
++    ID3D11Device_Release(dst_device);
++    ID3D11Device_Release(src_device);
++
++    if (device_mismatch)
++    {
++        TRACE("Bridging a cross-device video frame, format %#x, size %ux%u.\n",
++                src_desc.Format, src_box.right - src_box.left, src_box.bottom - src_box.top);
++        hr = media_engine_transfer_d3d11_cross_device(sample, dst_texture,
++                &src_desc, &dst_desc, &src_box, dst_rect);
++        IMFSample_Release(sample);
++        ID3D11Texture2D_Release(src_texture);
++        return hr;
++    }
++
+     if (FAILED(hr = media_engine_lock_d3d_device(engine, &device)))
+     {
++        IMFSample_Release(sample);
+         ID3D11Texture2D_Release(src_texture);
+         return hr;
+     }
+@@ -3060,6 +3166,7 @@ static HRESULT media_engine_transfer_d3d11(struct media_engine *engine, ID3D11Te
+     ID3D11DeviceContext_Release(context);
+ 
+     media_engine_unlock_d3d_device(engine, device);
++    IMFSample_Release(sample);
+     ID3D11Texture2D_Release(src_texture);
+     return hr;
+ }
+-- 
+2.51.0

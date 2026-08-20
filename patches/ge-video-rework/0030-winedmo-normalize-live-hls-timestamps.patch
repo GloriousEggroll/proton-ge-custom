@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Proton GE Team <proton-ge@example.com>
+Date: Wed, 19 Aug 2026 19:10:00 -0600
+Subject: [PATCH] winedmo: Normalize live HLS timestamps to zero.
+
+Live HLS manifests use the broadcaster's continuously increasing MPEG-TS
+timeline.  FFmpeg exposes that as a large format start_time, while Media
+Foundation starts its presentation clock at zero.  Passing the absolute packet
+timestamps leaves every sample scheduled hours in the future and makes AVPro
+abort playback shortly after opening the source.
+
+Capture the common HLS format start time once after probing and subtract that
+fixed value from packets for unknown-duration live sources.  Twitch advances
+the playlist's internal first timestamp whenever its media sequence changes;
+consulting the mutable format timeline for every packet can consequently reset
+the presentation timestamps every few seconds.  One immutable, format-wide
+base preserves both monotonic playback and the audio/video offset.
+---
+ dlls/winedmo/unix_demuxer.c | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+index c12a80eaee3..b34bccf43cc 100644
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -54,6 +54,7 @@ struct demuxer
+     struct stream_context *stream_context;
+     struct stream *streams;
+     INT64 duration;
++    INT64 live_timestamp_base;
+     BOOL direct_url;
+ 
+     AVPacket *last_packet; /* last read packet */
+@@ -203,6 +204,17 @@ static void normalize_stream_timestamps( struct stream *stream, struct sample *s
+         sample->dts = max( 0, sample->dts - stream->timestamp_base );
+ }
+ 
++static void normalize_live_hls_timestamps( const struct demuxer *demuxer, struct sample *sample )
++{
++    if (demuxer->live_timestamp_base == AV_NOPTS_VALUE)
++        return;
++
++    if (sample->pts != AV_NOPTS_VALUE)
++        sample->pts = max( 0, sample->pts - demuxer->live_timestamp_base );
++    if (sample->dts != AV_NOPTS_VALUE)
++        sample->dts = max( 0, sample->dts - demuxer->live_timestamp_base );
++}
++
+ static void fixup_asf_mpeg4_timestamps( const AVFormatContext *ctx, AVStream *avstream,
+         struct stream *stream, struct sample *sample )
+ {
+@@ -813,6 +825,7 @@ NTSTATUS demuxer_create( void *arg )
+ 
+     if (!(demuxer = calloc( 1, sizeof(*demuxer) ))) return STATUS_NO_MEMORY;
+     demuxer->stream_context = params->context;
++    demuxer->live_timestamp_base = AV_NOPTS_VALUE;
+ 
+     if (!(demuxer->ctx = avformat_alloc_context())) goto failed;
+     if (is_http_hls_url( params->url ) || is_googlevideo_url( params->url ))
+@@ -864,6 +877,11 @@ NTSTATUS demuxer_create( void *arg )
+         params->duration = get_context_duration( demuxer->ctx );
+     }
+     demuxer->duration = params->duration;
++    if (demuxer->duration == AV_NOPTS_VALUE && demuxer->ctx->start_time != AV_NOPTS_VALUE &&
++        strstr( format->name, "hls" ))
++    {
++        demuxer->live_timestamp_base = get_user_time( demuxer->ctx->start_time, AV_TIME_BASE_Q );
++    }
+     if (!(demuxer->streams = calloc( demuxer->ctx->nb_streams, sizeof(*demuxer->streams) ))) goto failed;
+     if (demuxer_create_streams( demuxer )) goto failed;
+ 
+@@ -1003,6 +1021,7 @@ NTSTATUS demuxer_read( void *arg )
+     sample->pts = get_stream_time( stream, packet->pts );
+     sample->dts = get_stream_time( stream, packet->dts );
+     sample->duration = get_stream_time( stream, packet->duration );
++    normalize_live_hls_timestamps( demuxer, sample );
+     fixup_asf_mpeg4_timestamps( demuxer->ctx, stream, demuxer_stream, sample );
+     if (demuxer->ctx->iformat && strstr( demuxer->ctx->iformat->name, "asf" ))
+         normalize_stream_timestamps( demuxer_stream, sample );
+-- 
+2.52.0

@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Proton GE Team <proton-ge@example.com>
+Date: Wed, 19 Aug 2026 15:00:00 -0600
+Subject: [PATCH] winedmo: Open Googlevideo streams directly by URL.
+
+VRChat can resolve YouTube videos to signed Googlevideo progressive MP4
+URLs instead of HLS playlists.  URLMon reports success for these URLs but
+exposes an empty IStream, so FFmpeg cannot probe the input and VRChat reports
+PlayerError.
+
+Open signed Googlevideo streams directly with FFmpeg, as already done for
+remote HLS playlists.  Do not run custom-IStream MP4 metadata parsing for a
+direct URL because FFmpeg owns that AVIO context.
+
+Do not synchronously open the same Googlevideo URL through URLMon first.  The
+scheme handler only needs a placeholder byte stream for direct FFmpeg inputs;
+opening a large DASH stream through URLMon blocks source creation before the
+demuxer can run.
+
+Also clear media-converter contexts after freeing them on failure.  Leaving
+the caller with a dangling context causes the demuxer failure cleanup to free
+it again.
+---
+ dlls/winedmo/media_source.c            |  9 ++++++++-
+ dlls/winedmo/unix_demuxer.c           | 26 ++++++++++++++++----------
+ dlls/winedmo/unix_demuxer_mediaconv.c |  3 +++
+ 3 files changed, 27 insertions(+), 11 deletions(-)
+
+diff --git a/dlls/winedmo/media_source.c b/dlls/winedmo/media_source.c
+--- a/dlls/winedmo/media_source.c
++++ b/dlls/winedmo/media_source.c
+@@ -2792,7 +2792,14 @@ static HRESULT WINAPI scheme_handler_BeginCreateObject(IMFSchemeHandler *iface,
+     if (cancel_cookie)
+         *cancel_cookie = NULL;
+ 
+-    if (!wcsnicmp(url, L"http://", 7) || !wcsnicmp(url, L"https://", 8))
++    if ((!wcsnicmp(url, L"http://", 7) || !wcsnicmp(url, L"https://", 8))
++            && wcsstr(url, L".googlevideo.com/videoplayback"))
++    {
++        /* The demuxer opens signed Googlevideo URLs directly through FFmpeg. */
++        if (FAILED(hr = CreateStreamOnHGlobal(0, TRUE, &stream)))
++            return hr;
++    }
++    else if (!wcsnicmp(url, L"http://", 7) || !wcsnicmp(url, L"https://", 8))
+     {
+         if (FAILED(hr = URLOpenBlockingStreamW(NULL, url, &stream, 0, NULL)))
+         {
+
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -767,6 +767,13 @@ static BOOL is_http_hls_url( const char *url )
+     return !!strstr( url, ".m3u8" ) || !!strstr( url, "/hls_playlist/" );
+ }
+ 
++static BOOL is_googlevideo_url( const char *url )
++{
++    if (!url || (strncmp( url, "http://", 7 ) && strncmp( url, "https://", 8 ))) return FALSE;
++
++    return !!strstr( url, ".googlevideo.com/videoplayback" );
++}
++
+ static void demuxer_free_context( struct demuxer *demuxer )
+ {
+     if (!demuxer->ctx) return;
+@@ -801,18 +808,17 @@ NTSTATUS demuxer_create( void *arg )
+     demuxer->stream_context = params->context;
+ 
+     if (!(demuxer->ctx = avformat_alloc_context())) goto failed;
+-    if (is_http_hls_url( params->url ))
++    if (is_http_hls_url( params->url ) || is_googlevideo_url( params->url ))
+     {
+-        const AVInputFormat *hls = av_find_input_format( "hls" );
++        const AVInputFormat *format = is_http_hls_url( params->url ) ? av_find_input_format( "hls" ) : NULL;
+ 
+-        /* HLS playlists need the source URL as their base URI so relative
+-         * segment URLs can be resolved.  The custom bytestream path only
+-         * exposes the downloaded manifest bytes, which breaks YouTube HLS
+-         * streams used by VRChat's in-game video player. */
++        /* HLS playlists need the source URL as their base URI, while URLMon
++         * can expose signed Googlevideo streams as successful, empty streams.
++         * Let FFmpeg handle both remote YouTube source forms directly. */
+         demuxer->direct_url = TRUE;
+-        if ((ret = avformat_open_input( &demuxer->ctx, params->url, hls, NULL )) < 0)
++        if ((ret = avformat_open_input( &demuxer->ctx, params->url, format, NULL )) < 0)
+         {
+-            ERR( "Failed to open HLS URL, error %s.\n", debugstr_averr(ret) );
++            ERR( "Failed to open remote URL, error %s.\n", debugstr_averr(ret) );
+             goto failed;
+         }
+     }
+@@ -870,7 +876,7 @@ NTSTATUS demuxer_create( void *arg )
+         strcpy( params->mime_type, "video/x-application" );
+     }
+ 
+-    if (strstr( format->name, "mp4" )) parse_mp4_streams_metadata( demuxer );
++    if (!demuxer->direct_url && strstr( format->name, "mp4" )) parse_mp4_streams_metadata( demuxer );
+     return STATUS_SUCCESS;
+ 
+ failed:
+diff --git a/dlls/winedmo/unix_demuxer_mediaconv.c b/dlls/winedmo/unix_demuxer_mediaconv.c
+--- a/dlls/winedmo/unix_demuxer_mediaconv.c
++++ b/dlls/winedmo/unix_demuxer_mediaconv.c
+@@ -204,6 +204,7 @@ int mediaconv_demuxer_open( AVFormatContext **ctx, struct stream_context *contex
+         WARN( "Failed to find decoder for stream %u, codec %#x %s\n", i, par->codec_id, avcodec_get_name(par->codec_id) );
+         avio_context_free( &(*ctx)->pb );
+         avformat_free_context( *ctx );
++        *ctx = NULL;
+     }
+ 
+     if (!(buffer = calloc( 1, HASH_CHUNK_SIZE ))) return AVERROR(ENOMEM);
+@@ -262,6 +263,7 @@ int mediaconv_demuxer_open( AVFormatContext **ctx, struct stream_context *contex
+                                                NULL, mediaconv_demuxer_seek_callback )))
+         {
+             avformat_free_context( *ctx );
++            *ctx = NULL;
+             return AVERROR(ENOMEM);
+         }
+     }
+@@ -277,6 +279,7 @@ int mediaconv_demuxer_open( AVFormatContext **ctx, struct stream_context *contex
+         if ((ret = avio_open( &(*ctx)->pb, blank_path, AVIO_FLAG_READ )) < 0)
+         {
+             avformat_free_context( *ctx );
++            *ctx = NULL;
+             return ret;
+         }
+     }
+-- 
+2.52.0
