@@ -66,7 +66,8 @@ void ge_overlay_wayland_set_overlay_active(int active);
 void ge_overlay_bridge_surface_created(void);
 void ge_overlay_bridge_surface_destroyed(void);
 void ge_overlay_bridge_focus(int focused);
-int ge_overlay_bridge_filter_key(uint32_t time, uint32_t key, int pressed);
+int ge_overlay_bridge_filter_key(uint32_t time, uint32_t key, int pressed,
+                                 uint32_t utf32);
 int ge_overlay_bridge_filter_pointer_button(uint32_t time, uint32_t button,
                                             int pressed);
 int ge_overlay_bridge_filter_pointer_frame(

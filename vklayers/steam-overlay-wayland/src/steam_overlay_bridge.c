@@ -110,6 +110,13 @@ struct overlay_cursor_entry
 typedef Bool (*xcheck_if_event_fn)(Display *, XEvent *,
                                   Bool (*)(Display *, XEvent *, XPointer),
                                   XPointer);
+typedef void (*vulkan_steam_overlay_set_window_type_fn)(uintptr_t, int);
+typedef void (*overlay_input_stream_write_fn)(void *, const void *, size_t);
+
+#define STEAM_OVERLAY_WINDOW_TYPE_XLIB 2
+#define STEAM_OVERLAY_INPUT_SOURCE_X11 2
+#define STEAM_OVERLAY_INPUT_EVENT_CHARACTER 0x102
+#define STEAM_OVERLAY_INPUT_EVENT_SIZE 36
 
 /* Bypass gameoverlayrenderer's XPutBackEvent wrapper. The event must first be
  * observed by its wrapped XCheckIfEvent call below. */
@@ -123,6 +130,10 @@ static Window overlay_root;
 static Atom overlay_owner_atom;
 static int (*previous_after_function)(Display *display);
 static xcheck_if_event_fn overlay_check_if_event;
+static vulkan_steam_overlay_set_window_type_fn overlay_set_window_type;
+static void **overlay_input_stream_slot;
+static void *overlay_renderer_base;
+static int overlay_input_stream_scanned;
 static unsigned long overlay_serial;
 static unsigned int overlay_state;
 static int overlay_initialized;
@@ -191,7 +202,100 @@ static int resolve_overlay_renderer_hook(void)
         return 0;
 
     overlay_check_if_event = XCheckIfEvent;
+    overlay_renderer_base = info.dli_fbase;
+    overlay_set_window_type =
+        (vulkan_steam_overlay_set_window_type_fn)dlsym(
+            RTLD_DEFAULT, "VulkanSteamOverlaySetWindowType");
     overlay_trace("using XCheckIfEvent interposed by %s\n", info.dli_fname);
+    return 1;
+}
+
+static int resolve_overlay_input_stream(void)
+{
+#if defined(__x86_64__)
+    /* Steam's X11 handler writes WM_CHAR-equivalent records to this private
+     * stream after XwcLookupString(). The Wayland renderer has no XIC, so find
+     * the same stream through a tightly checked instruction sequence and fail
+     * closed when Steam changes its implementation. */
+    static const unsigned char stream_load_suffix[] =
+        {0x48, 0x8b, 0x07, 0xff, 0x50, 0x18};
+    unsigned char *function;
+    Dl_info function_info;
+    Dl_info slot_info;
+    int32_t displacement;
+    unsigned int i;
+
+    if (overlay_input_stream_slot) return 1;
+    if (overlay_input_stream_scanned) return 0;
+
+    function = (unsigned char *)dlsym(RTLD_DEFAULT, "BOverlayNeedsPresent");
+    if (!function || !dladdr(function, &function_info) ||
+        function_info.dli_fbase != overlay_renderer_base)
+        return 0;
+
+    overlay_input_stream_scanned = 1;
+    for (i = 0; i + 13 <= 128; ++i)
+    {
+        void **slot;
+
+        if (function[i] != 0x48 || function[i + 1] != 0x8b ||
+            function[i + 2] != 0x3d ||
+            memcmp(function + i + 7, stream_load_suffix,
+                   sizeof(stream_load_suffix)))
+            continue;
+
+        memcpy(&displacement, function + i + 3, sizeof(displacement));
+        slot = (void **)(function + i + 7 + displacement);
+        if (!dladdr(slot, &slot_info) ||
+            slot_info.dli_fbase != overlay_renderer_base)
+            continue;
+
+        overlay_input_stream_slot = slot;
+        overlay_trace("resolved Steam overlay character event stream\n");
+        return 1;
+    }
+
+    overlay_trace("Steam overlay character event stream signature not found\n");
+#endif
+    return 0;
+}
+
+static int dispatch_overlay_character(uint32_t utf32)
+{
+    unsigned char event[STEAM_OVERLAY_INPUT_EVENT_SIZE] = {0};
+    overlay_input_stream_write_fn write_event;
+    uint32_t source = STEAM_OVERLAY_INPUT_SOURCE_X11;
+    uint32_t message = STEAM_OVERLAY_INPUT_EVENT_CHARACTER;
+    uint64_t window;
+    int64_t character = utf32;
+    void **vtable;
+    void *stream;
+    Dl_info writer_info;
+
+    if (utf32 < 0x20 || utf32 == 0x7f || utf32 > 0x10ffff ||
+        (utf32 >= 0xd800 && utf32 <= 0xdfff))
+        return 0;
+
+    pthread_mutex_lock(&overlay_mutex);
+    if (overlay_initialized <= 0 || !overlay_window ||
+        !resolve_overlay_input_stream() ||
+        !(stream = *overlay_input_stream_slot) ||
+        !(vtable = *(void ***)stream) ||
+        !(write_event = (overlay_input_stream_write_fn)vtable[4]) ||
+        !dladdr((void *)write_event, &writer_info) ||
+        writer_info.dli_fbase != overlay_renderer_base)
+    {
+        pthread_mutex_unlock(&overlay_mutex);
+        return 0;
+    }
+
+    window = overlay_window;
+    memcpy(event, &source, sizeof(source));
+    memcpy(event + 4, &window, sizeof(window));
+    memcpy(event + 12, &message, sizeof(message));
+    memcpy(event + 20, &character, sizeof(character));
+    write_event(stream, event, sizeof(event));
+    pthread_mutex_unlock(&overlay_mutex);
     return 1;
 }
 
@@ -517,13 +621,21 @@ static int init_overlay_bridge(int force_retry)
     attributes.event_mask = KeyPressMask | KeyReleaseMask | ButtonPressMask |
                             ButtonReleaseMask | PointerMotionMask;
     overlay_window = XCreateWindow(
-        overlay_display, overlay_root, -1, -1, 1, 1, 0, 0, InputOnly,
+        overlay_display, overlay_root, -1, -1, 1, 1, 0, CopyFromParent,
+        InputOutput,
         CopyFromParent, CWOverrideRedirect | CWEventMask, &attributes);
     if (!overlay_window)
     {
         XCloseDisplay(overlay_display);
         overlay_display = NULL;
         goto retry;
+    }
+
+    if (overlay_set_window_type)
+    {
+        overlay_set_window_type((uintptr_t)overlay_window,
+                                STEAM_OVERLAY_WINDOW_TYPE_XLIB);
+        overlay_trace("registered X11 input proxy as an Xlib overlay window\n");
     }
 
     XSelectInput(overlay_display, overlay_window, attributes.event_mask);
@@ -820,7 +932,8 @@ void ge_overlay_bridge_focus(int focused)
     update_overlay_focus();
 }
 
-int ge_overlay_bridge_filter_key(uint32_t time, uint32_t key, int pressed)
+int ge_overlay_bridge_filter_key(uint32_t time, uint32_t key, int pressed,
+                                 uint32_t utf32)
 {
     XEvent event = {0};
     int consumed;
@@ -842,6 +955,8 @@ int ge_overlay_bridge_filter_key(uint32_t time, uint32_t key, int pressed)
     event.xkey.same_screen = True;
 
     consumed = dispatch_overlay_event(&event);
+    if (pressed && update_overlay_active())
+        dispatch_overlay_character(utf32);
     update_key_state(key, pressed);
     return consumed;
 }
@@ -963,6 +1078,10 @@ static void destroy_overlay_bridge(void)
     {
         overlay_initialized = 0;
         overlay_check_if_event = NULL;
+        overlay_set_window_type = NULL;
+        overlay_input_stream_slot = NULL;
+        overlay_renderer_base = NULL;
+        overlay_input_stream_scanned = 0;
         pthread_mutex_unlock(&overlay_mutex);
         return;
     }
@@ -995,6 +1114,10 @@ static void destroy_overlay_bridge(void)
     overlay_input_active = 0;
     overlay_focus_owner = 0;
     overlay_check_if_event = NULL;
+    overlay_set_window_type = NULL;
+    overlay_input_stream_slot = NULL;
+    overlay_renderer_base = NULL;
+    overlay_input_stream_scanned = 0;
     pointer_x = 0;
     pointer_y = 0;
 

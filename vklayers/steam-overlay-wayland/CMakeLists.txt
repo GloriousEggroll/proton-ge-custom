@@ -11,6 +11,7 @@ find_package(Threads REQUIRED)
 find_package(X11 REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(Wayland REQUIRED IMPORTED_TARGET wayland-client wayland-cursor)
+pkg_check_modules(Xkbcommon REQUIRED IMPORTED_TARGET xkbcommon)
 
 find_program(WAYLAND_SCANNER_EXECUTABLE NAMES wayland-scanner)
 if(NOT WAYLAND_SCANNER_EXECUTABLE)
@@ -83,6 +84,7 @@ target_include_directories(VkLayer_GE_Wayland_SteamOverlay PRIVATE
 )
 target_link_libraries(VkLayer_GE_Wayland_SteamOverlay PRIVATE
     PkgConfig::Wayland
+    PkgConfig::Xkbcommon
     Threads::Threads
     ${X11_LIBRARIES}
     ${CMAKE_DL_LIBS}
