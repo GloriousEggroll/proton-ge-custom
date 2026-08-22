@@ -266,6 +266,10 @@ apply_all_in_dir() {
     echo "WINE: -HOTFIX- Retry virtual allocations with effective bounds after clearing native mappings"
     apply_patch "../patches/wine-hotfixes/pending/ntdll-retry-native-view-allocation-with-effective-range.patch"
 
+    # https://gitlab.winehq.org/wine/wine/-/commit/f4c5b04148db5fc4e5265beec461d3b7d9f4a789
+    echo "WINE: -HOTFIX- Reserve top-down space for large-address-aware WoW64 applications"
+    apply_patch "../patches/wine-hotfixes/pending/ntdll-reserve-top-down-space-for-large-address-aware-wow64.patch"
+
     # https://gitlab.winehq.org/wine/wine/-/commit/a31ec8da9572672e04ae46792a398da942649875
     echo "WINE: -HOTFIX- Prefer native non-Microsoft DLLs using version resources"
     apply_patch "../patches/wine-hotfixes/pending/ntdll-prefer-native-version-resource-heuristics.patch"
