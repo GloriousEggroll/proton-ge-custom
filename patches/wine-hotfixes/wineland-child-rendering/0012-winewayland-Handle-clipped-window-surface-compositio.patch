@@ -1,0 +1,246 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Wed, 24 Jun 2026 11:21:51 +0200
+Subject: [PATCH 12/49] winewayland: Handle clipped window surface composition
+
+Treat clip regions that differ from the window shape as compositor
+occlusion. Use ARGB SHM buffers and clear pixels outside the visible
+clip.
+
+Mirror the constraint to the Wayland surface so direct parent dmabuf is
+disabled for constrained windows.
+---
+ dlls/winewayland.drv/wayland_surface.c | 21 +++++++
+ dlls/winewayland.drv/waylanddrv.h      |  4 ++
+ dlls/winewayland.drv/window.c          |  7 ++-
+ dlls/winewayland.drv/window_surface.c  | 81 +++++++++++++++++++++++++-
+ 4 files changed, 108 insertions(+), 5 deletions(-)
+
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 2bb01afb426..0c13bcfcfe0 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -83,6 +83,8 @@ void wayland_surface_sync_shape_input_region(struct wayland_surface *surface, HR
+     BOOL transparent = (exstyle & WS_EX_TRANSPARENT) && (exstyle & WS_EX_LAYERED);
+     struct wl_region *region = NULL;
+ 
++    surface->shaped = shape_region != 0;
++
+     if (transparent)
+     {
+         region = wl_compositor_create_region(process_wayland.wl_compositor);
+@@ -113,6 +115,19 @@ void wayland_surface_sync_window_input_region(struct wayland_surface *surface)
+     if (shape_region) NtGdiDeleteObjectApp(shape_region);
+ }
+ 
++BOOL wayland_window_surface_has_occlusion_clip(struct window_surface *window_surface)
++{
++    if (!window_surface || !window_surface->clip_region) return FALSE;
++    if (!window_surface->shape_region) return TRUE;
++    return !NtGdiEqualRgn(window_surface->clip_region, window_surface->shape_region);
++}
++
++void wayland_surface_set_occlusion_clip(struct wayland_surface *surface, BOOL clipped)
++{
++    /* Mirror the window surface clip state for dmabuf eligibility. */
++    surface->occlusion_clipped = clipped;
++}
++
+ static void request_window_surface_expose(HWND hwnd, BOOL allow_inline)
+ {
+     /* The direct dmabuf fast path may run inline from event callbacks because
+@@ -2581,6 +2596,11 @@ static BOOL wayland_hwnd_dmabuf_frame_covers_client(struct wayland_surface *surf
+            rect.right >= width && rect.bottom >= height;
+ }
+ 
++static BOOL wayland_surface_has_region_constraints(struct wayland_surface *surface)
++{
++    return surface->shaped || surface->occlusion_clipped;
++}
++
+ static BOOL wayland_surface_direct_dmabuf_candidate(struct wayland_surface *surface,
+                                                     struct wayland_win_data *data,
+                                                     const hwnd_dmabuf_frame_info_t *frames,
+@@ -2591,6 +2611,7 @@ static BOOL wayland_surface_direct_dmabuf_candidate(struct wayland_surface *surf
+     if (!data || data->client_surface) return FALSE;
+     if (data->window_contents) return FALSE;
+     if (!wl_list_empty(&surface->child_overlays)) return FALSE;
++    if (wayland_surface_has_region_constraints(surface)) return FALSE;
+     if (!wayland_surface_client_fills_window(surface)) return FALSE;
+     return wayland_hwnd_dmabuf_frame_covers_client(surface, &frames[0]);
+ }
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index 30cb7ec0e0e..c59e1855392 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -521,6 +521,8 @@ struct wayland_surface
+      * keeping the [base, client, dmabufs, overlays] order stable whichever chain
+      * restacks last. Validated against the live list before use, never freed. */
+     struct wl_surface *dmabuf_top;
++    BOOL shaped;
++    BOOL occlusion_clipped;
+     struct wayland_window_config window, comitted;
+     RECT geometry;
+     int content_width, content_height;
+@@ -578,6 +580,8 @@ BOOL wayland_surface_get_max_track_size(struct wayland_surface *surface, SIZE *s
+ BOOL wayland_surface_has_hwnd_dmabuf_content(struct wayland_surface *surface);
+ void wayland_surface_sync_shape_input_region(struct wayland_surface *surface, HRGN shape_region);
+ void wayland_surface_sync_window_input_region(struct wayland_surface *surface);
++BOOL wayland_window_surface_has_occlusion_clip(struct window_surface *window_surface);
++void wayland_surface_set_occlusion_clip(struct wayland_surface *surface, BOOL clipped);
+ void wayland_surface_prepare_direct_dmabuf_shm_commit(struct wayland_surface *surface);
+ void wayland_surface_finish_direct_dmabuf_shm_commit(struct wayland_surface *surface);
+ struct child_overlay_snapshot *child_overlays_snapshot(HWND hwnd);
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index dbe42950561..2ad1180d573 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -265,7 +265,8 @@ static BOOL should_keep_minimized_toplevel_mapped(struct wayland_surface *surfac
+ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data,
+                                                     struct wayland_surface *toplevel_surface,
+                                                     struct wayland_surface *owner_surface,
+-                                                    BOOL use_layer_shell)
++                                                    BOOL use_layer_shell,
++                                                    struct window_surface *window_surface)
+ {
+     struct wayland_client_surface *client = data->client_surface;
+     struct wayland_surface *surface;
+@@ -358,6 +359,8 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
+         else wayland_client_surface_attach(client, NULL);
+     }
+     wayland_surface_sync_window_input_region(surface);
++    wayland_surface_set_occlusion_clip(surface,
++                                       wayland_window_surface_has_occlusion_clip(window_surface));
+ 
+     /* Size/position changes affect the effective pointer constraint, so update
+      * it as needed. */
+@@ -837,7 +840,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+         }
+     }
+     else if (wayland_win_data_create_wayland_surface(data, toplevel_surface, owner_surface,
+-                                                     use_layer_shell))
++                                                     use_layer_shell, surface))
+     {
+         wayland_win_data_update_wayland_state(data);
+     }
+diff --git a/dlls/winewayland.drv/window_surface.c b/dlls/winewayland.drv/window_surface.c
+index 609e60e5a72..3db4b0bec17 100644
+--- a/dlls/winewayland.drv/window_surface.c
++++ b/dlls/winewayland.drv/window_surface.c
+@@ -46,6 +46,7 @@ struct wayland_window_surface
+     struct window_surface header;
+     struct wayland_buffer_queue *wayland_buffer_queue;
+     BOOL layered;
++    BOOL occlusion_clipped;
+ };
+ 
+ static struct wayland_window_surface *wayland_window_surface_cast(
+@@ -227,7 +228,29 @@ static void wayland_buffer_queue_add_damage(struct wayland_buffer_queue *queue,
+ static void wayland_window_surface_set_clip(struct window_surface *window_surface,
+                                             const RECT *rects, UINT count)
+ {
+-    /* TODO */
++    struct wayland_window_surface *wws = wayland_window_surface_cast(window_surface);
++    struct wayland_win_data *data;
++    BOOL occlusion_clipped;
++
++    TRACE("hwnd=%p rects=%p count=%u\n", window_surface->hwnd, rects, count);
++
++    occlusion_clipped = wayland_window_surface_has_occlusion_clip(window_surface);
++
++    if (wws->occlusion_clipped || occlusion_clipped)
++    {
++        /* Repaint the full surface when the compositor-visible region changes. */
++        window_surface->bounds = window_surface->rect;
++        NtUserPostMessage(window_surface->hwnd, WM_WAYLAND_EXPOSE, 0, 0);
++    }
++    wws->occlusion_clipped = occlusion_clipped;
++
++    if (!(data = wayland_win_data_get(window_surface->hwnd)))
++        return;
++
++    if (data->wayland_surface)
++        wayland_surface_set_occlusion_clip(data->wayland_surface, occlusion_clipped);
++
++    wayland_win_data_release(data);
+ }
+ 
+ /**********************************************************************
+@@ -337,6 +360,55 @@ static void copy_pixel_region(const char *src_pixels, RECT *src_rect,
+     free(rgndata);
+ }
+ 
++static void clear_pixel_region(struct wayland_shm_buffer *buffer, HRGN region)
++{
++    RGNDATA *rgndata = get_region_data(region);
++    RECT buffer_rect = {0, 0, buffer->width, buffer->height};
++    RECT *rgn_rect, *rgn_rect_end;
++
++    if (!rgndata) return;
++
++    rgn_rect = (RECT *)rgndata->Buffer;
++    rgn_rect_end = rgn_rect + rgndata->rdh.nCount;
++
++    for (; rgn_rect < rgn_rect_end; rgn_rect++)
++    {
++        RECT rect;
++        int y, width;
++
++        if (!intersect_rect(&rect, rgn_rect, &buffer_rect)) continue;
++        width = rect.right - rect.left;
++
++        for (y = rect.top; y < rect.bottom; y++)
++            memset((char *)buffer->map_data + ((size_t)y * buffer->width + rect.left) * 4,
++                   0, (size_t)width * 4);
++    }
++
++    free(rgndata);
++}
++
++static void wayland_shm_buffer_clear_outside_clip(struct wayland_shm_buffer *buffer,
++                                                  const RECT *dirty, HRGN clip_region)
++{
++    HRGN dirty_region, clear_region;
++
++    if (!clip_region) return;
++
++    if (!(dirty_region = NtGdiCreateRectRgn(dirty->left, dirty->top, dirty->right, dirty->bottom)))
++        return;
++    if (!(clear_region = NtGdiCreateRectRgn(0, 0, 0, 0)))
++    {
++        NtGdiDeleteObjectApp(dirty_region);
++        return;
++    }
++
++    if (NtGdiCombineRgn(clear_region, dirty_region, clip_region, RGN_DIFF) != ERROR)
++        clear_pixel_region(buffer, clear_region);
++
++    NtGdiDeleteObjectApp(clear_region);
++    NtGdiDeleteObjectApp(dirty_region);
++}
++
+ /**********************************************************************
+  *          wayland_shm_buffer_copy_data
+  */
+@@ -412,7 +484,8 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface,
+         goto done;
+     }
+ 
+-    buffer_format = (shape_bits || wws->layered) ? WL_SHM_FORMAT_ARGB8888 : WL_SHM_FORMAT_XRGB8888;
++    buffer_format = (shape_bits || wws->occlusion_clipped || wws->layered) ?
++                    WL_SHM_FORMAT_ARGB8888 : WL_SHM_FORMAT_XRGB8888;
+     if (wws->wayland_buffer_queue->format != buffer_format)
+     {
+         int width = wws->wayland_buffer_queue->width;
+@@ -464,8 +537,10 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface,
+     }
+ 
+     wayland_shm_buffer_copy_data(shm_buffer, color_bits, &surface_rect, copy_from_window_region,
+-                                 shape_bits && !wws->layered);
++                                 (shape_bits || wws->occlusion_clipped) && !wws->layered);
+     if (shape_bits) wayland_shm_buffer_copy_shape(shm_buffer, rect, shape_info, shape_bits);
++    if (wws->occlusion_clipped)
++        wayland_shm_buffer_clear_outside_clip(shm_buffer, dirty, window_surface->clip_region);
+ 
+     NtGdiSetRectRgn(shm_buffer->damage_region, 0, 0, 0, 0);
+ 

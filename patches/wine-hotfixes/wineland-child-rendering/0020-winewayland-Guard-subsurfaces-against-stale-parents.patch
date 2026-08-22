@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Mon, 29 Jun 2026 11:56:20 +0200
+Subject: [PATCH 20/49] winewayland: Guard subsurfaces against stale parents
+
+Track a monotonic serial for each Wayland surface and cache the parent
+serial on subsurfaces. If a parent HWND still matches but its wl_surface
+has been recreated, rebuild the subsurface before issuing wl_subsurface
+requests. This avoids sending position or stacking requests through an
+orphaned subsurface after libwayland has recycled proxy addresses.
+---
+ dlls/winewayland.drv/wayland_surface.c | 24 +++++++++++++++++++++++-
+ dlls/winewayland.drv/waylanddrv.h      |  2 ++
+ 2 files changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 71335ab5835..f33b81c7fa1 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -40,6 +40,8 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
+ 
++static LONG wayland_surface_serial_counter;
++
+ static void wayland_surface_clear_direct_dmabuf(struct wayland_surface *surface,
+                                                 struct wayland_win_data *data);
+ static void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface);
+@@ -1180,6 +1182,7 @@ struct wayland_surface *wayland_surface_create(HWND hwnd)
+     TRACE("surface=%p\n", surface);
+ 
+     surface->hwnd = hwnd;
++    surface->serial = InterlockedIncrement(&wayland_surface_serial_counter);
+     wl_list_init(&surface->hwnd_dmabuf_surfaces);
+     wl_list_init(&surface->child_overlays);
+     surface->wl_surface = wl_compositor_create_surface(process_wayland.wl_compositor);
+@@ -1441,7 +1444,13 @@ void wayland_surface_make_subsurface(struct wayland_surface *surface,
+                                      struct wayland_surface *parent)
+ {
+     assert(!surface->role || surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE);
+-    if (surface->wl_subsurface && surface->toplevel_hwnd == parent->hwnd) return;
++    if (surface->wl_subsurface && surface->toplevel_hwnd == parent->hwnd)
++    {
++        if (surface->parent_serial == parent->serial) return;
++
++        TRACE("hwnd=%p parent_hwnd=%p serial changed %u -> %u; recreating subsurface\n",
++              surface->hwnd, parent->hwnd, surface->parent_serial, parent->serial);
++    }
+ 
+     wayland_surface_clear_role(surface);
+     surface->role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
+@@ -1456,6 +1465,9 @@ void wayland_surface_make_subsurface(struct wayland_surface *surface,
+     wayland_surface_init_fractional_scale(surface, parent->window.scale);
+     wayland_surface_sync_alpha(surface);
+     surface->toplevel_hwnd = parent->hwnd;
++    surface->parent_serial = parent->serial;
++
++    /* Present contents independently of the parent surface. */
+     wl_subsurface_set_desync(surface->wl_subsurface);
+     wl_display_flush(process_wayland.wl_display);
+     return;
+@@ -1863,6 +1875,7 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
+         }
+ 
+         surface->toplevel_hwnd = 0;
++        surface->parent_serial = 0;
+         break;
+     }
+ 
+@@ -1993,6 +2006,15 @@ static void wayland_surface_reconfigure_subsurface(struct wayland_surface *surfa
+         !(toplevel_surface = toplevel_data->wayland_surface))
+         return;
+ 
++    if (surface->parent_serial != toplevel_surface->serial)
++    {
++        TRACE("hwnd=%p parent_hwnd=%p serial changed %u -> %u; recreating subsurface\n",
++              surface->hwnd, toplevel_surface->hwnd, surface->parent_serial,
++              toplevel_surface->serial);
++        wayland_surface_make_subsurface(surface, toplevel_surface);
++        return;
++    }
++
+     point.x = surface->window.rect.left - toplevel_surface->window.rect.left;
+     point.y = surface->window.rect.top - toplevel_surface->window.rect.top;
+     point = map_point_to_surface(surface, point);
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index ee7dd381100..12f2af93558 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -505,6 +505,7 @@ struct wayland_win_data;
+ struct wayland_surface
+ {
+     HWND hwnd;
++    unsigned int serial;
+ 
+     struct wl_surface *wl_surface;
+     struct wp_viewport *wp_viewport;
+@@ -536,6 +537,7 @@ struct wayland_surface
+         {
+             struct wl_subsurface *wl_subsurface;
+             HWND toplevel_hwnd;
++            unsigned int parent_serial;
+         };
+         struct
+         {

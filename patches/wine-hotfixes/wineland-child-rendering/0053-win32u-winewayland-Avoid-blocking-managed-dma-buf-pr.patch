@@ -1,0 +1,853 @@
+From 6440d84a68d20836d31f0e9dcbe380fd9d4604e4 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Wed, 5 Aug 2026 11:47:32 +0200
+Subject: [PATCH 53/53] win32u, winewayland: Avoid blocking managed dma-buf
+ producers.
+
+Track whether the Wayland consumer can accept frames and withhold managed frames while it is unknown or suspended. Share that state across overlapping swapchains and request it again after channel changes.
+
+Keep managed image acquisition nonblocking so synchronous window changes cannot deadlock against the producer thread. Recreate only after a consumer-owned full ring remains stalled for the watchdog interval.
+
+Adapted to the selective Wine-Wineland child-rendering series.
+
+Original commit: 129fa64fc4491756b898463f1f3b7686e14a4a55
+---
+ dlls/win32u/hwnd_dmabuf.c              |   6 +-
+ dlls/win32u/ntuser_private.h           |   2 +-
+ dlls/win32u/vulkan.c                   | 339 ++++++++++++++++---------
+ dlls/winewayland.drv/vulkan.c          |   1 +
+ dlls/winewayland.drv/wayland_surface.c |  57 +++++
+ dlls/winewayland.drv/waylanddrv.h      |   1 +
+ dlls/winewayland.drv/window.c          |  11 +
+ include/wine/hwnd_dmabuf.h             |   8 +
+ include/wine/server_protocol.h         |   3 +
+ server/protocol.def                    |   3 +
+ 10 files changed, 312 insertions(+), 119 deletions(-)
+
+diff --git a/dlls/win32u/hwnd_dmabuf.c b/dlls/win32u/hwnd_dmabuf.c
+index 60c33c2..9e22794 100644
+--- a/dlls/win32u/hwnd_dmabuf.c
++++ b/dlls/win32u/hwnd_dmabuf.c
+@@ -17,11 +17,11 @@
+ #define WM_WINE_HWND_DMABUF_FRAME (WM_WINE_FIRST_DRIVER_MSG + 3)
+ 
+ /* Wake the toplevel so winewayland recomposites dmabuf children. */
+-void hwnd_dmabuf_post_wake( HWND hwnd )
++void hwnd_dmabuf_post_wake( HWND hwnd, unsigned int flags )
+ {
+     HWND toplevel = NtUserGetAncestor( hwnd, GA_ROOT );
+ 
+-    if (toplevel) NtUserPostMessage( toplevel, WM_WINE_HWND_DMABUF_FRAME, 0, 0 );
++    if (toplevel) NtUserPostMessage( toplevel, WM_WINE_HWND_DMABUF_FRAME, flags, 0 );
+ }
+ 
+ unsigned int hwnd_dmabuf_set_pending( HWND hwnd, BOOL pending )
+@@ -133,7 +133,7 @@ int hwnd_dmabuf_channel_publish( HWND hwnd, int channel_fd, const void *desc, in
+         return hwnd_dmabuf_channel_result_from_errno( errno );
+ 
+     ret = hwnd_dmabuf_channel_send( channel_fd, desc, send_fd );
+-    if (!ret) hwnd_dmabuf_post_wake( hwnd );
++    if (!ret) hwnd_dmabuf_post_wake( hwnd, 0 );
+     return ret ? hwnd_dmabuf_channel_result_from_errno( ret ) : HWND_DMABUF_CHANNEL_OK;
+ }
+ 
+diff --git a/dlls/win32u/ntuser_private.h b/dlls/win32u/ntuser_private.h
+index be2d554..a56e11e 100644
+--- a/dlls/win32u/ntuser_private.h
++++ b/dlls/win32u/ntuser_private.h
+@@ -258,7 +258,7 @@ extern unsigned int hwnd_dmabuf_release_channel( HWND hwnd );
+ extern int hwnd_dmabuf_channel_send( int channel_fd, const void *desc, int dmabuf_fd );
+ extern int hwnd_dmabuf_channel_publish( HWND hwnd, int channel_fd, const void *desc, int dmabuf_fd );
+ extern int hwnd_dmabuf_channel_recv_release( int channel_fd, void *release );
+-extern void hwnd_dmabuf_post_wake( HWND hwnd );
++extern void hwnd_dmabuf_post_wake( HWND hwnd, unsigned int flags );
+ 
+ /* window.c */
+ HANDLE alloc_user_handle( void *ptr, unsigned short type );
+diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+index 1978e0a..8c5d2b5 100644
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -251,14 +251,37 @@ static const char *debugstr_vkextent2d( const VkExtent2D *ext )
+ #define WINE_VK_DRM_FORMAT_MOD_INVALID 0x00ffffffffffffffull
+ #define WINE_VK_MANAGED_MAX_IMAGES     8
+ #define WINE_VK_MANAGED_MAX_MODIFIERS  64
+-/* Recreate after this long with no drained release. Stays above the consumer
+- * dmabuf grace window so a briefly paused but alive consumer is not falsely lost. */
++#define WINE_VK_MANAGED_REANNOUNCE_MIN_MS  100
++#define WINE_VK_MANAGED_REANNOUNCE_MAX_MS  4000
++/* Allow brief pauses beyond the consumer's dmabuf grace period. */
+ #define WINE_VK_MANAGED_STALL_MS       2000
+ 
+ /* Serializes the producer's cross-thread queue submits and device idles. */
+ static pthread_mutex_t producer_device_lock = PTHREAD_MUTEX_INITIALIZER;
+ static LONGLONG managed_next_producer_id;
+ 
++enum wine_managed_consumer_state
++{
++    WINE_MANAGED_CONSUMER_UNKNOWN,
++    WINE_MANAGED_CONSUMER_ACTIVE,
++    WINE_MANAGED_CONSUMER_SUSPENDED,
++};
++
++/* The server reuses one channel while swapchains overlap during recreation. */
++struct wine_managed_consumer
++{
++    struct list entry;
++    HWND hwnd;
++    unsigned int refcount;
++    LONG state;
++    LONG reannounce_pending;
++    LONG last_reannounce_ms;
++    LONG reannounce_delay_ms;
++};
++
++static pthread_mutex_t managed_consumers_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct list managed_consumers = LIST_INIT( managed_consumers );
++
+ struct wine_managed_image
+ {
+     VkImage image;                  /* raw host VkImage handle (no client wrapper) */
+@@ -287,16 +310,16 @@ struct wine_managed_swapchain
+     /* ring / publish state */
+     uint32_t next_acquire;
+     UINT64 next_release_token;
+-    UINT64 pending_release_token;   /* one-frame-deferred release */
+     UINT64 present_id;              /* monotonic frame_seq counter */
+     UINT64 producer_unique_id;      /* unique across managed swapchain recreates */
+     unsigned int ring_generation;
+-    DWORD last_progress_ms;         /* NtGetTickCount of the last drained release (liveness clock) */
++    DWORD ring_full_since_ms;
+ 
+     VkQueue signal_queue;           /* host queue used for empty acquire-signal submits */
+     int channel_fd;                 /* producer end of the per-hwnd socket or -1 */
+     pthread_mutex_t lock;
+     BOOL lost;                      /* consumer channel died, force swapchain recreate */
++    struct wine_managed_consumer *consumer;
+     VkFence present_fence;          /* per-frame render-complete fence (export gate) */
+     PFN_vkWaitForFences p_vkWaitForFences;
+     PFN_vkResetFences p_vkResetFences;
+@@ -3116,6 +3139,7 @@ static uint32_t vk_collect_managed_modifiers( struct vulkan_device *device, VkFo
+  * out_mods. 0 means no intersection -> caller falls back to the host swapchain. */
+ static uint32_t vk_select_managed_modifiers( struct vulkan_device *device, HWND hwnd, VkFormat format,
+                                              VkImageUsageFlags usage, BOOL opaque, unsigned int *fourcc_out,
++                                             unsigned int *caps_flags_out,
+                                              uint64_t *out_mods, uint64_t *out_wire_mods, uint32_t max_out )
+ {
+     hwnd_dmabuf_format_modifier_t *caps_mods;
+@@ -3124,6 +3148,8 @@ static uint32_t vk_select_managed_modifiers( struct vulkan_device *device, HWND
+     UINT caps_count = 0;
+     uint32_t out_count = 0;
+ 
++    *caps_flags_out = 0;
++
+     /* The fourcc must match compositeAlpha: opaque swapchains use the X-variant
+      * (compositor ignores alpha), blended ones the A-variant. Try the matching
+      * variant first, then the other. */
+@@ -3149,6 +3175,7 @@ static uint32_t vk_select_managed_modifiers( struct vulkan_device *device, HWND
+         free( caps_mods );
+         return 0;
+     }
++    *caps_flags_out = caps.flags;
+ 
+     *fourcc_out = 0;
+     if (fourcc_first)
+@@ -3168,6 +3195,83 @@ static uint32_t vk_select_managed_modifiers( struct vulkan_device *device, HWND
+     return out_count;
+ }
+ 
++static struct wine_managed_consumer *managed_consumer_get( HWND hwnd )
++{
++    struct wine_managed_consumer *consumer;
++
++    pthread_mutex_lock( &managed_consumers_lock );
++    LIST_FOR_EACH_ENTRY( consumer, &managed_consumers, struct wine_managed_consumer, entry )
++    {
++        if (consumer->hwnd != hwnd) continue;
++        consumer->refcount++;
++        pthread_mutex_unlock( &managed_consumers_lock );
++        return consumer;
++    }
++
++    if ((consumer = calloc( 1, sizeof(*consumer) )))
++    {
++        consumer->hwnd = hwnd;
++        consumer->refcount = 1;
++        list_add_tail( &managed_consumers, &consumer->entry );
++    }
++    pthread_mutex_unlock( &managed_consumers_lock );
++    return consumer;
++}
++
++static void managed_consumer_put( struct wine_managed_consumer *consumer )
++{
++    if (!consumer) return;
++
++    pthread_mutex_lock( &managed_consumers_lock );
++    if (!--consumer->refcount)
++    {
++        list_remove( &consumer->entry );
++        free( consumer );
++    }
++    pthread_mutex_unlock( &managed_consumers_lock );
++}
++
++static enum wine_managed_consumer_state managed_consumer_state( struct wine_managed_swapchain *managed )
++{
++    return ReadAcquire( &managed->consumer->state );
++}
++
++static void managed_consumer_set_state( struct wine_managed_swapchain *managed,
++                                        enum wine_managed_consumer_state state )
++{
++    InterlockedExchange( &managed->consumer->state, state );
++    InterlockedExchange( &managed->consumer->reannounce_pending, FALSE );
++    InterlockedExchange( &managed->consumer->reannounce_delay_ms, 0 );
++}
++
++static void managed_consumer_request_state( struct wine_managed_swapchain *managed )
++{
++    struct wine_managed_consumer *consumer = managed->consumer;
++    LONG delay, last, now = NtGetTickCount();
++
++    if (managed_consumer_state( managed ) != WINE_MANAGED_CONSUMER_UNKNOWN) return;
++    if (!InterlockedExchange( &consumer->reannounce_pending, TRUE ))
++    {
++        InterlockedExchange( &consumer->last_reannounce_ms, now );
++        InterlockedExchange( &consumer->reannounce_delay_ms,
++                             WINE_VK_MANAGED_REANNOUNCE_MIN_MS );
++        hwnd_dmabuf_post_wake( managed->hwnd, HWND_DMABUF_WAKE_REANNOUNCE );
++        return;
++    }
++
++    delay = ReadAcquire( &consumer->reannounce_delay_ms );
++    if (delay < WINE_VK_MANAGED_REANNOUNCE_MIN_MS)
++        delay = WINE_VK_MANAGED_REANNOUNCE_MIN_MS;
++    last = ReadAcquire( &consumer->last_reannounce_ms );
++    if ((DWORD)(now - last) < delay) return;
++    if (InterlockedCompareExchange( &consumer->last_reannounce_ms, now, last ) == last)
++    {
++        delay = min( delay * 2, WINE_VK_MANAGED_REANNOUNCE_MAX_MS );
++        InterlockedExchange( &consumer->reannounce_delay_ms, delay );
++        hwnd_dmabuf_post_wake( managed->hwnd, HWND_DMABUF_WAKE_REANNOUNCE );
++    }
++}
++
+ static void managed_destroy_image( struct vulkan_device *device, struct wine_managed_image *image )
+ {
+     if (image->dmabuf_fd >= 0) { close( image->dmabuf_fd ); image->dmabuf_fd = -1; }
+@@ -3192,6 +3296,7 @@ static void managed_free( struct vulkan_device *device, struct wine_managed_swap
+         hwnd_dmabuf_release_channel( managed->hwnd );
+     if (managed->pending_registered)
+         hwnd_dmabuf_set_pending( managed->hwnd, FALSE );
++    managed_consumer_put( managed->consumer );
+     pthread_mutex_destroy( &managed->lock );
+     free( managed );
+ }
+@@ -3388,7 +3493,7 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
+     uint64_t wire_modifiers[WINE_VK_MANAGED_MAX_MODIFIERS];
+     struct wine_managed_swapchain *managed;
+     BOOL opaque_alpha;
+-    unsigned int fourcc = 0;
++    unsigned int caps_flags = 0, fourcc = 0;
+     uint32_t modifier_count, count, i;
+     VkImageUsageFlags usage;
+     VkResult res;
+@@ -3403,7 +3508,8 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
+      * host can export as a single-plane dmabuf, against the realized usage. */
+     modifier_count = vk_select_managed_modifiers( device, surface->hwnd, create_info->imageFormat,
+                                                   usage | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, opaque_alpha,
+-                                                  &fourcc, modifiers, wire_modifiers, ARRAY_SIZE(modifiers) );
++                                                  &fourcc, &caps_flags, modifiers, wire_modifiers,
++                                                  ARRAY_SIZE(modifiers) );
+     if (!modifier_count)
+     {
+         TRACE( "no host-exportable modifier intersection for hwnd %p format %u, falling back to host swapchain\n",
+@@ -3415,6 +3521,13 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
+     pthread_mutex_init( &managed->lock, NULL );
+     managed->channel_fd = -1;
+     managed->hwnd = surface->hwnd;
++    if (!(managed->consumer = managed_consumer_get( managed->hwnd )))
++    {
++        managed_free( device, managed );
++        return VK_ERROR_OUT_OF_HOST_MEMORY;
++    }
++    if (!(caps_flags & HWND_DMABUF_HOST_CAP_CONSUMER_STATE))
++        managed_consumer_set_state( managed, WINE_MANAGED_CONSUMER_ACTIVE );
+     managed->format = create_info->imageFormat;
+     managed->fourcc = fourcc;
+     /* If the chosen fourcc is the opaque X-variant, tell the compositor to ignore
+@@ -3439,7 +3552,7 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
+     }
+     managed->pending_registered = TRUE;
+ 
+-    /* At least 3 images for fire-and-forget publishing (no FIFO pacing). */
++    /* Keep enough images available for asynchronous consumer release. */
+     count = max( create_info->minImageCount, 3u );
+     if (count > WINE_VK_MANAGED_MAX_IMAGES) count = WINE_VK_MANAGED_MAX_IMAGES;
+ 
+@@ -3479,7 +3592,7 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
+     }
+     managed->channel_registered = TRUE;
+     managed->pending_registered = FALSE;
+-    managed->last_progress_ms = NtGetTickCount();
++    managed_consumer_request_state( managed );
+     TRACE( "managed swapchain %p hwnd %p socket channel fd %d\n", managed, surface->hwnd, managed->channel_fd );
+ 
+     *out = managed;
+@@ -3489,10 +3602,7 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
+     return VK_SUCCESS;
+ }
+ 
+-/* Signal the app's binary acquire semaphore and/or fence via an empty submit on
+- * a host queue. There is no host swapchain to do it for us. A binary semaphore
+- * is re-signaled only after the consuming present waited on it (deferred release
+- * plus WaitIdle leaves it unsignaled). This is always valid. */
++/* A managed swapchain has no host acquire operation to signal these objects. */
+ static VkResult managed_signal_acquire( struct vulkan_device *device, struct wine_managed_swapchain *managed,
+                                         VkSemaphore host_semaphore, VkFence host_fence )
+ {
+@@ -3512,15 +3622,17 @@ static VkResult managed_signal_acquire( struct vulkan_device *device, struct win
+ static void managed_drain_releases( struct wine_managed_swapchain *managed );
+ static void managed_mark_lost( struct wine_managed_swapchain *managed );
+ 
+-/* Find a free slot for AcquireNextImage. managed_present paces the ring so one is normally free. */
++/* Window changes may call into this thread; return VK_NOT_READY instead of waiting. */
+ static VkResult managed_acquire( struct vulkan_device *device, struct swapchain *swapchain,
+-                                 VkSemaphore host_semaphore, VkFence host_fence, uint32_t *image_index )
++                                 VkSemaphore host_semaphore, VkFence host_fence,
++                                 uint32_t *image_index )
+ {
+     struct wine_managed_swapchain *managed = swapchain->managed;
+     struct surface *surface = swapchain->surface;
+-    uint32_t i, slot = ~0u;
+     RECT client_rect;
+     VkResult res = VK_SUCCESS;
++    BOOL busy_any = FALSE, valid_any = FALSE;
++    uint32_t i, slot = ~0u;
+ 
+     pthread_mutex_lock( &producer_device_lock );
+     pthread_mutex_lock( &managed->lock );
+@@ -3535,25 +3647,48 @@ static VkResult managed_acquire( struct vulkan_device *device, struct swapchain
+     {
+         uint32_t idx = (managed->next_acquire + i) % managed->image_count;
+         struct wine_managed_image *image = &managed->images[idx];
+-        if (image->valid && !image->acquired && !image->busy) { slot = idx; break; }
++
++        if (!image->valid) continue;
++        valid_any = TRUE;
++        if (image->busy)
++        {
++            busy_any = TRUE;
++            continue;
++        }
++        if (image->acquired) continue;
++        slot = idx;
++        break;
+     }
+     if (slot == ~0u)
+     {
+-        /* Ring full: the consumer is not releasing. If it has made no progress for
+-         * the stall window it is wedged (alive but not draining). Force recreate
+-         * rather than spin on VK_NOT_READY forever. */
+-        VkResult ret = VK_NOT_READY;
+-        if ((DWORD)(NtGetTickCount() - managed->last_progress_ms) >= WINE_VK_MANAGED_STALL_MS)
++        if (!valid_any)
++            res = VK_ERROR_OUT_OF_DATE_KHR;
++        else
+         {
+-            WARN( "managed dmabuf channel stalled, forcing recreate\n" );
+-            managed_mark_lost( managed );
+-            ret = VK_ERROR_OUT_OF_DATE_KHR;
++            res = VK_NOT_READY;
++            if (busy_any)
++            {
++                DWORD now = NtGetTickCount();
++
++                if (!managed->ring_full_since_ms)
++                    managed->ring_full_since_ms = now;
++                else if ((DWORD)(now - managed->ring_full_since_ms) >=
++                         WINE_VK_MANAGED_STALL_MS)
++                {
++                    WARN( "managed dmabuf consumer stopped releasing frames\n" );
++                    managed_mark_lost( managed );
++                    res = VK_ERROR_OUT_OF_DATE_KHR;
++                }
++            }
++            else
++                managed->ring_full_since_ms = 0;
+         }
+         pthread_mutex_unlock( &managed->lock );
+         pthread_mutex_unlock( &producer_device_lock );
+-        return ret;
++        return res;
+     }
+ 
++    managed->ring_full_since_ms = 0;
+     managed->images[slot].acquired = TRUE;
+     managed->next_acquire = (slot + 1) % managed->image_count;
+     *image_index = slot;
+@@ -3583,6 +3718,7 @@ static void managed_release_token( struct wine_managed_swapchain *managed, UINT6
+         image->busy = FALSE;
+         image->release_token = 0;
+         if (failed) image->valid = FALSE;
++        managed->ring_full_since_ms = 0;
+         return;
+     }
+ }
+@@ -3592,13 +3728,8 @@ static void managed_mark_lost( struct wine_managed_swapchain *managed )
+ {
+     uint32_t i;
+ 
+-    if (managed->channel_fd >= 0)
+-    {
+-        close( managed->channel_fd );
+-        managed->channel_fd = -1;
+-    }
+     managed->lost = TRUE;
+-    managed->pending_release_token = 0;
++    managed->ring_full_since_ms = 0;
+     for (i = 0; i < managed->image_count; i++)
+     {
+         managed->images[i].busy = FALSE;
+@@ -3616,6 +3747,7 @@ static BOOL dmabuf_send_error_is_fatal( int err )
+ static void managed_drain_releases( struct wine_managed_swapchain *managed )
+ {
+     hwnd_dmabuf_release_t rel;
++    BOOL received = FALSE;
+     ssize_t ret;
+ 
+     if (managed->channel_fd < 0) return;
+@@ -3626,7 +3758,27 @@ static void managed_drain_releases( struct wine_managed_swapchain *managed )
+         {
+             struct wine_managed_image *image;
+ 
++            received = TRUE;
++            /* Zero-token records update the channel's consumer state. */
++            if (!rel.release_token)
++            {
++                if (rel.flags & HWND_DMABUF_RELEASE_CONSUMER_SUSPENDED)
++                {
++                    TRACE( "hwnd %p consumer suspended\n", managed->hwnd );
++                    managed_consumer_set_state( managed, WINE_MANAGED_CONSUMER_SUSPENDED );
++                }
++                else if (rel.flags & HWND_DMABUF_RELEASE_CONSUMER_ACTIVE)
++                {
++                    TRACE( "hwnd %p consumer active\n", managed->hwnd );
++                    managed_consumer_set_state( managed, WINE_MANAGED_CONSUMER_ACTIVE );
++                }
++                continue;
++            }
++
+             if (rel.producer_unique_id != managed->producer_unique_id) continue;
++            /* A release must not resume a suspended consumer. */
++            if (managed_consumer_state( managed ) == WINE_MANAGED_CONSUMER_UNKNOWN)
++                managed_consumer_set_state( managed, WINE_MANAGED_CONSUMER_ACTIVE );
+             if (rel.ring_generation != managed->ring_generation) continue;
+             if (rel.image_id >= managed->image_count) continue;
+ 
+@@ -3636,12 +3788,18 @@ static void managed_drain_releases( struct wine_managed_swapchain *managed )
+             image->busy = FALSE;
+             image->release_token = 0;
+             image->consumer_cached = !!(rel.flags & HWND_DMABUF_RELEASE_CACHED);
+-            managed->last_progress_ms = NtGetTickCount();
++            managed->ring_full_since_ms = 0;
+         }
+         else if (ret < 0 && errno == EINTR) continue;
+         else break;
+     }
+ 
++    if (received && managed_consumer_state( managed ) == WINE_MANAGED_CONSUMER_UNKNOWN)
++    {
++        InterlockedExchange( &managed->consumer->reannounce_pending, FALSE );
++        InterlockedExchange( &managed->consumer->reannounce_delay_ms, 0 );
++    }
++
+     if (ret == 0 || (ret < 0 && errno != EAGAIN && errno != EWOULDBLOCK))
+     {
+         managed_mark_lost( managed );
+@@ -3657,9 +3815,10 @@ static VkResult managed_present( struct vulkan_device *device, struct vulkan_que
+     struct surface *surface = swapchain->surface;
+     struct wine_managed_image *image;
+     hwnd_dmabuf_frame_desc_t desc;
+-    UINT64 release_token;
++    UINT64 release_token = 0;
+     int channel_fd_dup = -1;
+-    BOOL had_channel, send_fd = FALSE;
++    enum wine_managed_consumer_state consumer_state;
++    BOOL send_frame = FALSE, send_fd = FALSE;
+     RECT client_rect;
+     VkResult res = VK_SUCCESS;
+ 
+@@ -3698,37 +3857,40 @@ static VkResult managed_present( struct vulkan_device *device, struct vulkan_que
+         return res;
+     }
+ 
+-    /* Assign a fresh release token (never 0: consumer rejects token 0). */
+-    release_token = ++managed->next_release_token;
+-    if (!release_token) release_token = ++managed->next_release_token;
+-    image->release_token = release_token;
++    /* Unsent frames remain producer-owned and need no release token. */
++    consumer_state = managed_consumer_state( managed );
++    send_frame = consumer_state == WINE_MANAGED_CONSUMER_ACTIVE && managed->channel_fd >= 0;
++    send_fd = send_frame && !image->consumer_cached;
++    if (send_fd && (channel_fd_dup = dup( image->dmabuf_fd )) < 0)
++    {
++        image->acquired = FALSE;
++        pthread_mutex_unlock( &managed->lock );
++        pthread_mutex_unlock( &producer_device_lock );
++        return VK_ERROR_OUT_OF_HOST_MEMORY;
++    }
+ 
+-    desc = image->desc;
+-    desc.producer_unique_id = managed->producer_unique_id;
+-    desc.image_id = image_index;
+-    desc.ring_generation = managed->ring_generation;
+-    desc.frame_seq = (unsigned int)(++managed->present_id);
+-    desc.release_token = release_token;
++    managed->present_id++;
++    if (send_frame)
++    {
++        /* Assign a fresh release token (never 0: consumer rejects token 0). */
++        release_token = ++managed->next_release_token;
++        if (!release_token) release_token = ++managed->next_release_token;
++        image->release_token = release_token;
+ 
+-    /* Send the fd until the consumer caches this slot. */
+-    had_channel = managed->channel_fd >= 0;
+-    send_fd = had_channel && !image->consumer_cached;
+-    if (send_fd) channel_fd_dup = dup( image->dmabuf_fd );
++        desc = image->desc;
++        desc.producer_unique_id = managed->producer_unique_id;
++        desc.image_id = image_index;
++        desc.ring_generation = managed->ring_generation;
++        desc.frame_seq = (unsigned int)managed->present_id;
++        desc.release_token = release_token;
++        image->busy = TRUE;
++    }
+     image->acquired = FALSE;
+-    image->busy = TRUE;
+     pthread_mutex_unlock( &managed->lock );
+     pthread_mutex_unlock( &producer_device_lock );
+ 
+-    if (send_fd && channel_fd_dup < 0)
+-    {
+-        pthread_mutex_lock( &managed->lock );
+-        managed_release_token( managed, release_token, TRUE );
+-        pthread_mutex_unlock( &managed->lock );
+-        return VK_ERROR_OUT_OF_HOST_MEMORY;
+-    }
+-
+     /* Reclaim undelivered frames. Fatal channel errors force recreate. */
+-    if (had_channel)
++    if (send_frame)
+     {
+         int serr = hwnd_dmabuf_channel_send( managed->channel_fd, &desc, channel_fd_dup );
+         if (serr)
+@@ -3741,64 +3903,10 @@ static VkResult managed_present( struct vulkan_device *device, struct vulkan_que
+             pthread_mutex_unlock( &managed->lock );
+             if (fatal) return VK_ERROR_OUT_OF_DATE_KHR;
+         }
+-        else hwnd_dmabuf_post_wake( surface->hwnd );
+-    }
+-
+-    /* Keep one old frame in flight. Repeated stalls force recreate. */
+-    if (had_channel)
+-    {
+-        for (;;)
+-        {
+-            struct pollfd pfd = { .fd = -1, .events = POLLIN, .revents = 0 };
+-            BOOL channel_closed, lost;
+-            uint32_t busy = 0, j;
+-            int pret;
+-
+-            pthread_mutex_lock( &managed->lock );
+-            managed_drain_releases( managed );
+-            for (j = 0; j < managed->image_count; j++)
+-                if (managed->images[j].busy) busy++;
+-            lost = managed->lost;
+-            channel_closed = managed->channel_fd < 0;
+-            pfd.fd = managed->channel_fd;
+-            pthread_mutex_unlock( &managed->lock );
+-
+-            if (lost) res = VK_ERROR_OUT_OF_DATE_KHR;
+-            if (busy <= 1 || channel_closed) break;
+-
+-            pret = poll( &pfd, 1, 50 );
+-            if (pret < 0 && errno == EINTR) continue;
+-            if (pret <= 0)
+-            {
+-                pthread_mutex_lock( &managed->lock );
+-                if ((DWORD)(NtGetTickCount() - managed->last_progress_ms) >= WINE_VK_MANAGED_STALL_MS)
+-                {
+-                    WARN( "managed dmabuf channel stopped releasing frames\n" );
+-                    managed_mark_lost( managed );
+-                    res = VK_ERROR_OUT_OF_DATE_KHR;
+-                }
+-                pthread_mutex_unlock( &managed->lock );
+-                break;
+-            }
+-            if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL))
+-            {
+-                pthread_mutex_lock( &managed->lock );
+-                managed_drain_releases( managed );
+-                if (!managed->lost) managed_mark_lost( managed );
+-                pthread_mutex_unlock( &managed->lock );
+-                res = VK_ERROR_OUT_OF_DATE_KHR;
+-                break;
+-            }
+-        }
+-    }
+-    else
+-    {
+-        pthread_mutex_lock( &managed->lock );
+-        if (managed->pending_release_token)
+-            managed_release_token( managed, managed->pending_release_token, FALSE );
+-        managed->pending_release_token = release_token;
+-        pthread_mutex_unlock( &managed->lock );
++        else hwnd_dmabuf_post_wake( surface->hwnd, 0 );
+     }
++    else if (consumer_state == WINE_MANAGED_CONSUMER_UNKNOWN)
++        managed_consumer_request_state( managed );
+ 
+     if (res >= VK_SUCCESS && !extents_equals( &managed->extents, &client_rect ))
+         res = VK_SUBOPTIMAL_KHR;
+@@ -4341,6 +4449,7 @@ static VkResult managed_release_swapchain_images( struct swapchain *swapchain,
+                 break;
+             }
+             managed->images[image_index].acquired = FALSE;
++            managed->ring_full_since_ms = 0;
+         }
+     }
+     pthread_mutex_unlock( &managed->lock );
+diff --git a/dlls/winewayland.drv/vulkan.c b/dlls/winewayland.drv/vulkan.c
+index 28a0239..5cfb1c2 100644
+--- a/dlls/winewayland.drv/vulkan.c
++++ b/dlls/winewayland.drv/vulkan.c
+@@ -253,6 +253,7 @@ static UINT wayland_vulkan_get_hwnd_dmabuf_caps(HWND hwnd, void *caps_ptr, void
+     pthread_mutex_unlock(&process_wayland.dmabuf_mutex);
+ 
+     caps->format_modifier_count = copied;
++    caps->flags |= HWND_DMABUF_HOST_CAP_CONSUMER_STATE;
+     *format_modifier_count = count;
+     return HWND_DMABUF_OK;
+ }
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 5986487..3fe77bd 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -239,6 +239,13 @@ struct wayland_hwnd_dmabuf_slice
+     BOOL geometry_valid;
+ };
+ 
++enum wayland_hwnd_dmabuf_consumer_state
++{
++    WAYLAND_HWNDDMABUF_CONSUMER_UNKNOWN,
++    WAYLAND_HWNDDMABUF_CONSUMER_ACTIVE,
++    WAYLAND_HWNDDMABUF_CONSUMER_SUSPENDED,
++};
++
+ struct wayland_hwnd_dmabuf_surface
+ {
+     struct wl_list link;
+@@ -264,6 +271,7 @@ struct wayland_hwnd_dmabuf_surface
+     unsigned long long last_seen_ms; /* tick when last present in the producer list */
+     int committed_width, committed_height;
+     int channel_fd;                 /* consumer end of the producer socket, or -1 */
++    enum wayland_hwnd_dmabuf_consumer_state consumer_state;
+     struct wl_surface *stack_bottom;
+     struct wl_surface *slice_layout_sibling;
+     struct wayland_visual_constraint visual_constraint;
+@@ -318,6 +326,15 @@ static int wayland_hwnd_dmabuf_channel_send_release(int channel_fd, const hwnd_d
+     return n == sizeof(*rel) ? 0 : n < 0 ? errno : EMSGSIZE;
+ }
+ 
++static int wayland_hwnd_dmabuf_surface_send_consumer_state(
++        struct wayland_hwnd_dmabuf_surface *surface, unsigned int flag)
++{
++    hwnd_dmabuf_release_t rel = { 0, 0, flag, 0, 0, 0 };
++
++    if (surface->channel_fd < 0) return ENOTCONN;
++    return wayland_hwnd_dmabuf_channel_send_release(surface->channel_fd, &rel);
++}
++
+ static void wayland_hwnd_dmabuf_buffer_send_release(struct wayland_hwnd_dmabuf_buffer *buffer,
+                                                     unsigned int flags, BOOL keep_token)
+ {
+@@ -844,6 +861,10 @@ static void wayland_hwnd_dmabuf_surface_destroy(struct wayland_hwnd_dmabuf_surfa
+     if (surface->wl_subsurface) wl_subsurface_destroy(surface->wl_subsurface);
+     if (!surface->direct && surface->wp_viewport) wp_viewport_destroy(surface->wp_viewport);
+     if (!surface->direct && surface->wl_surface) wl_surface_destroy(surface->wl_surface);
++    if (surface->consumer_state != WAYLAND_HWNDDMABUF_CONSUMER_SUSPENDED &&
++        !wayland_hwnd_dmabuf_surface_send_consumer_state(surface,
++                HWND_DMABUF_RELEASE_CONSUMER_SUSPENDED))
++        surface->consumer_state = WAYLAND_HWNDDMABUF_CONSUMER_SUSPENDED;
+     if (surface->channel_fd >= 0) close(surface->channel_fd);
+     free(surface);
+ }
+@@ -3204,6 +3225,10 @@ static struct wayland_hwnd_dmabuf_buffer *wayland_hwnd_dmabuf_surface_import_buf
+ retry:
+     wayland_hwnd_dmabuf_surface_claim_channel(surface);
+     if (surface->channel_fd < 0) return surface->current;
++    if (surface->consumer_state != WAYLAND_HWNDDMABUF_CONSUMER_ACTIVE &&
++        !wayland_hwnd_dmabuf_surface_send_consumer_state(surface,
++                HWND_DMABUF_RELEASE_CONSUMER_ACTIVE))
++        surface->consumer_state = WAYLAND_HWNDDMABUF_CONSUMER_ACTIVE;
+ 
+     while ((r = wayland_hwnd_dmabuf_channel_recv_one(surface->channel_fd, &desc, &fd)) > 0)
+     {
+@@ -3241,6 +3266,7 @@ retry:
+     {
+         close(surface->channel_fd);
+         surface->channel_fd = -1;
++        surface->consumer_state = WAYLAND_HWNDDMABUF_CONSUMER_UNKNOWN;
+         if (!have_pending && !retried)
+         {
+             retried = TRUE;
+@@ -3608,6 +3634,34 @@ static BOOL wayland_surface_try_direct_dmabuf(HWND hwnd)
+     return ret;
+ }
+ 
++void wayland_surface_reannounce_hwnd_dmabuf_consumers(struct wayland_surface *surface)
++{
++    struct wayland_hwnd_dmabuf_surface *dmabuf_surface;
++
++    wl_list_for_each(dmabuf_surface, &surface->hwnd_dmabuf_surfaces, link)
++        dmabuf_surface->consumer_state = WAYLAND_HWNDDMABUF_CONSUMER_UNKNOWN;
++    if (surface->direct_dmabuf_surface)
++        surface->direct_dmabuf_surface->consumer_state = WAYLAND_HWNDDMABUF_CONSUMER_UNKNOWN;
++}
++
++/* Stop publishing while this surface cannot import producer frames. */
++static void wayland_surface_suspend_hwnd_dmabuf_consumers(struct wayland_surface *surface)
++{
++    struct wayland_hwnd_dmabuf_surface *dmabuf_surface;
++
++    wl_list_for_each(dmabuf_surface, &surface->hwnd_dmabuf_surfaces, link)
++        if (dmabuf_surface->consumer_state != WAYLAND_HWNDDMABUF_CONSUMER_SUSPENDED &&
++            !wayland_hwnd_dmabuf_surface_send_consumer_state(dmabuf_surface,
++                    HWND_DMABUF_RELEASE_CONSUMER_SUSPENDED))
++            dmabuf_surface->consumer_state = WAYLAND_HWNDDMABUF_CONSUMER_SUSPENDED;
++
++    if ((dmabuf_surface = surface->direct_dmabuf_surface) &&
++        dmabuf_surface->consumer_state != WAYLAND_HWNDDMABUF_CONSUMER_SUSPENDED &&
++        !wayland_hwnd_dmabuf_surface_send_consumer_state(dmabuf_surface,
++                HWND_DMABUF_RELEASE_CONSUMER_SUSPENDED))
++        dmabuf_surface->consumer_state = WAYLAND_HWNDDMABUF_CONSUMER_SUSPENDED;
++}
++
+ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
+ {
+     hwnd_dmabuf_frame_info_t stack_frames[16], *frames = stack_frames;
+@@ -3623,7 +3677,10 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
+     /* Producer children are composited for primary surfaces. */
+     if (!wayland_surface_is_toplevel(surface) && !wayland_surface_is_popup(surface) &&
+         !wayland_surface_is_layer(surface))
++    {
++        wayland_surface_suspend_hwnd_dmabuf_consumers(surface);
+         return;
++    }
+ 
+     /* Import is driven by producer wakes (WM_WAYLAND_DMABUF_FRAME) at the producer's
+      * self-paced rate, regardless of whether our toplevel is presented. We do not pace
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index 5289c11..6f4caf0 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -600,6 +600,7 @@ void wayland_surface_sync_window_regions(struct wayland_surface *surface,
+ BOOL wayland_surface_attach_transparent_carrier(struct wayland_surface *surface);
+ void wayland_surface_prepare_direct_dmabuf_shm_commit(struct wayland_surface *surface);
+ void wayland_surface_finish_direct_dmabuf_shm_commit(struct wayland_surface *surface);
++void wayland_surface_reannounce_hwnd_dmabuf_consumers(struct wayland_surface *surface);
+ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface);
+ void wayland_surface_coords_from_window(struct wayland_surface *surface,
+                                         int window_x, int window_y,
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index 504e124..639b1ef 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -34,6 +34,7 @@
+ #include "waylanddrv.h"
+ 
+ #include "wine/debug.h"
++#include "wine/hwnd_dmabuf.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
+ 
+@@ -1185,9 +1186,19 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+     case WM_WAYLAND_DMABUF_FRAME:
+     {
+         BOOL had_dmabuf_content = FALSE;
++        struct wayland_win_data *data;
+ 
+         if (window_surface_has_requested_configure(hwnd))
+             wayland_configure_window(hwnd);
++
++        if ((wp & HWND_DMABUF_WAKE_REANNOUNCE) &&
++            (data = wayland_win_data_get(hwnd)))
++        {
++            if (data->wayland_surface)
++                wayland_surface_reannounce_hwnd_dmabuf_consumers(data->wayland_surface);
++            wayland_win_data_release(data);
++        }
++
+         if (window_surface_configure_blocks_dmabuf(hwnd))
+             return 0;
+ 
+diff --git a/include/wine/hwnd_dmabuf.h b/include/wine/hwnd_dmabuf.h
+index ad9e1d8..0d7f10a 100644
+--- a/include/wine/hwnd_dmabuf.h
++++ b/include/wine/hwnd_dmabuf.h
+@@ -13,6 +13,13 @@
+ #define HWND_DMABUF_ALPHA_MODE_UNSPECIFIED     0
+ #define HWND_DMABUF_ALPHA_MODE_IGNORE          3
+ 
++#define HWND_DMABUF_HOST_CAP_CONSUMER_STATE    0x00000001
++
++enum hwnd_dmabuf_wake_flags
++{
++    HWND_DMABUF_WAKE_REANNOUNCE = 0x00000001,
++};
++
+ /* DRM fourcc values carried in hwnd_dmabuf_frame_desc_t.fourcc when
+  * HWND_DMABUF_FLAG_SHM is set. Consumers translate them to native shm
+  * protocol formats where needed. */
+@@ -38,6 +45,7 @@ typedef struct
+ typedef struct
+ {
+     unsigned int     format_modifier_count;
++    unsigned int     flags;
+ } hwnd_dmabuf_host_caps_t;
+ 
+ #define HWND_DMABUF_TRANCHE_FLAG_SCANOUT       0x1
+diff --git a/include/wine/server_protocol.h b/include/wine/server_protocol.h
+index ba4d9e6..3c0572d 100644
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -279,6 +279,9 @@ enum hwnd_dmabuf_status
+ #define HWND_DMABUF_RELEASE_ORPHANED      0x00000008
+ #define HWND_DMABUF_RELEASE_CACHED        0x00000010
+ 
++#define HWND_DMABUF_RELEASE_CONSUMER_ACTIVE    0x00000020
++#define HWND_DMABUF_RELEASE_CONSUMER_SUSPENDED 0x00000040
++
+ 
+ /* image_id names a dmabuf slot whose backing store stays valid until its release
+  * token returns. The consumer may cache and reuse the wl_buffer for that slot.
+diff --git a/server/protocol.def b/server/protocol.def
+index 334d340..609c615 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -294,6 +294,9 @@ enum hwnd_dmabuf_status
+ #define HWND_DMABUF_RELEASE_DROPPED       0x00000004
+ #define HWND_DMABUF_RELEASE_ORPHANED      0x00000008
+ #define HWND_DMABUF_RELEASE_CACHED        0x00000010
++/* Consumer state records use release_token 0 and apply to the channel. */
++#define HWND_DMABUF_RELEASE_CONSUMER_ACTIVE    0x00000020
++#define HWND_DMABUF_RELEASE_CONSUMER_SUSPENDED 0x00000040
+ 
+ /* hwnd_dmabuf_frame_desc_t.flags bits */
+ /* image_id names a dmabuf slot whose backing store stays valid until its release
+-- 
+2.55.0
+

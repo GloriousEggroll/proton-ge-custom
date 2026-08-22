@@ -1,0 +1,4349 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Fri, 26 Jun 2026 19:47:37 +0200
+Subject: [PATCH 16/49] wined3d/opengl32/win32u: Add GL HWND dmabuf bridge
+
+Export GL swapchain contents through the Wayland HWND dmabuf channel when
+NO_WINDOW_UPDATE is requested. Add the WGL dmabuf export helpers, channel
+producer plumbing, modifier negotiation and slot ownership/reclaim handling.
+---
+ dlls/opengl32/make_opengl              | 214 ++++++-
+ dlls/opengl32/opengl32.spec            |   8 +
+ dlls/opengl32/thunks.c                 |  80 +++
+ dlls/opengl32/unix_thunks.c            | 323 ++++++++++-
+ dlls/opengl32/unixlib.h                | 100 ++++
+ dlls/opengl32/wgl.c                    |  95 +++
+ dlls/win32u/d3dkmt.c                   |  84 ++-
+ dlls/win32u/hwnd_dmabuf.c              |  98 ++++
+ dlls/win32u/ntuser_private.h           |   5 +
+ dlls/win32u/opengl.c                   | 594 +++++++++++++++++++
+ dlls/win32u/vulkan.c                   |  49 +-
+ dlls/win32u/win32u.spec                |   5 +
+ dlls/win32u/win32u_private.h           |  24 +
+ dlls/wined3d/adapter_gl.c              |  13 +
+ dlls/wined3d/swapchain.c               | 761 ++++++++++++++++++++++++-
+ dlls/wined3d/wined3d.spec              |   1 +
+ dlls/wined3d/wined3d_gl.h              |  65 +++
+ dlls/wined3d/wined3d_private.h         |   1 +
+ dlls/winewayland.drv/opengl.c          | 145 ++++-
+ dlls/winewayland.drv/vulkan.c          |   7 -
+ dlls/winewayland.drv/wayland_surface.c |  83 ++-
+ dlls/wow64win/user.c                   |  46 ++
+ include/ntuser.h                       |   6 +
+ include/wine/hwnd_dmabuf.h             |  49 +-
+ include/wine/opengl_driver.h           |  37 +-
+ include/wine/server_protocol.h         |  19 +-
+ include/wine/wgl.h                     |  19 +
+ include/wine/wined3d.h                 |   4 +
+ server/protocol.def                    |   9 +
+ server/request_handlers.h              |   7 +
+ server/request_trace.h                 |  14 +
+ server/window.c                        | 180 +++++-
+ 32 files changed, 3046 insertions(+), 99 deletions(-)
+
+diff --git a/dlls/opengl32/make_opengl b/dlls/opengl32/make_opengl
+index 0eeaee4fc72..d7af61ab6a0 100755
+--- a/dlls/opengl32/make_opengl
++++ b/dlls/opengl32/make_opengl
+@@ -117,6 +117,7 @@ my %arg_types =
+      "HDC" =>                  [ "long",   "%p" ],
+      "HGLRC" =>                [ "long",   "%p" ],
+      "HPBUFFERARB" =>          [ "long",   "%p" ],
++     "HANDLE" =>               [ "long",   "%p" ],
+      "HENHMETAFILE" =>         [ "long",   "%p" ],
+      "LPGLYPHMETRICSFLOAT" =>  [ "ptr",    "%p" ],
+      "LPCSTR" =>               [ "str",    "wine_dbgstr_a(%s)" ],
+@@ -222,6 +223,34 @@ my %manual_unix_thunks =
+      "wglGetProcAddress" => 1,
+      "wglSwapBuffers" => 1,
+     );
++my @wine_export_funcs =
++    (
++     "wglWineCloseDmaBufWINE",
++     "wglWineDmaBufExportSupportedWINE",
++     "wglWineExportDmaBufWINE",
++     "wglWineHwndDmaBufOpenProducerWINE",
++     "wglWineHwndDmaBufGetCapsWINE",
++     "wglWineHwndDmaBufCloseProducerWINE",
++     "wglWineHwndDmaBufPublishWINE",
++     "wglWineHwndDmaBufDrainReleaseWINE",
++    );
++my @wine_unix_call_funcs =
++    (
++     "wglWineCloseDmaBufWINE",
++     "wglWineDmaBufExportSupportedWINE",
++     "wglWineExportDmaBufWINE",
++    );
++my %wine_unix_call_specs =
++    (
++     "wglWineCloseDmaBufWINE" => "long",
++     "wglWineDmaBufExportSupportedWINE" => "",
++     "wglWineExportDmaBufWINE" => "long long ptr ptr",
++     "wglWineHwndDmaBufOpenProducerWINE" => "ptr",
++     "wglWineHwndDmaBufGetCapsWINE" => "ptr ptr ptr long ptr",
++     "wglWineHwndDmaBufCloseProducerWINE" => "ptr long",
++     "wglWineHwndDmaBufPublishWINE" => "ptr long ptr long",
++     "wglWineHwndDmaBufDrainReleaseWINE" => "long ptr",
++    );
+ my %hide_default_fbo_thunks =
+     (
+      "glFramebufferRenderbuffer" => 1,
+@@ -493,6 +522,67 @@ sub generate_unix_thunk($$$$)
+     $ret .= "$prefix\_$name( void *args )\n";
+     $ret .= "{\n";
+ 
++    if ($is_wow64 && ($name eq "wglDXLockObjectsNV" || $name eq "wglDXUnlockObjectsNV"))
++    {
++        $ret .= "    struct\n";
++        $ret .= "    {\n";
++        $ret .= "        PTR32 teb;\n";
++        $ret .= "        PTR32 hDevice;\n";
++        $ret .= "        GLint count;\n";
++        $ret .= "        PTR32 hObjects;\n";
++        $ret .= "        BOOL ret;\n";
++        $ret .= "    } *params = args;\n";
++        $ret .= "    TEB *teb = get_teb64( params->teb );\n";
++        $ret .= "    const struct opengl_funcs *funcs = teb->glTable;\n";
++        $ret .= "    HANDLE *hObjects;\n";
++        $ret .= "    if (!funcs->p_$name) return STATUS_NOT_IMPLEMENTED;\n";
++        $ret .= "    hObjects = copy_wow64_ptr32s( params->hObjects, params->count );\n";
++        $ret .= "    params->ret = funcs->p_$name( ULongToPtr(params->hDevice), params->count, hObjects );\n";
++        $ret .= "    free( hObjects );\n";
++        $ret .= "    return STATUS_SUCCESS;\n";
++        $ret .= "}\n\n";
++        return $ret;
++    }
++
++    if ($is_wow64 && $name eq "wglDXOpenDeviceNV")
++    {
++        $ret .= "    struct\n";
++        $ret .= "    {\n";
++        $ret .= "        PTR32 teb;\n";
++        $ret .= "        PTR32 dxDevice;\n";
++        $ret .= "        PTR32 ret;\n";
++        $ret .= "    } *params = args;\n";
++        $ret .= "    TEB *teb = get_teb64( params->teb );\n";
++        $ret .= "    const struct opengl_funcs *funcs = teb->glTable;\n";
++        $ret .= "    if (!funcs->p_wglDXOpenDeviceNV) return STATUS_NOT_IMPLEMENTED;\n";
++        $ret .= "    params->ret = (UINT_PTR)funcs->p_wglDXOpenDeviceNV( ULongToPtr(params->dxDevice) );\n";
++        $ret .= "    return STATUS_SUCCESS;\n";
++        $ret .= "}\n\n";
++        return $ret;
++    }
++
++    if ($is_wow64 && $name eq "wglDXRegisterObjectNV")
++    {
++        $ret .= "    struct\n";
++        $ret .= "    {\n";
++        $ret .= "        PTR32 teb;\n";
++        $ret .= "        PTR32 hDevice;\n";
++        $ret .= "        PTR32 dxObject;\n";
++        $ret .= "        GLuint name;\n";
++        $ret .= "        GLenum type;\n";
++        $ret .= "        GLenum access;\n";
++        $ret .= "        PTR32 ret;\n";
++        $ret .= "    } *params = args;\n";
++        $ret .= "    TEB *teb = get_teb64( params->teb );\n";
++        $ret .= "    const struct opengl_funcs *funcs = teb->glTable;\n";
++        $ret .= "    if (!funcs->p_wglDXRegisterObjectNV) return STATUS_NOT_IMPLEMENTED;\n";
++        $ret .= "    params->ret = (UINT_PTR)funcs->p_wglDXRegisterObjectNV( ULongToPtr(params->hDevice),\n";
++        $ret .= "            ULongToPtr(params->dxObject), params->name, params->type, params->access );\n";
++        $ret .= "    return STATUS_SUCCESS;\n";
++        $ret .= "}\n\n";
++        return $ret;
++    }
++
+     # special case for functions that take an HDC as first parameter
+     $use_dc = @{$func->[1]} && get_arg_type( ${$func->[1]}[0] ) eq "HDC" && $name !~ /wglMake(Context)?Current/;
+ 
+@@ -817,6 +907,106 @@ sub generate_spec_entry($$)
+     return "@ stdcall $_($args)";
+ }
+ 
++sub print_wine_unix_call_params($)
++{
++    my $out = shift;
++
++    print $out "struct wglWineCloseDmaBufWINE_params\n";
++    print $out "{\n";
++    print $out "    int fd;\n";
++    print $out "};\n\n";
++    print $out "struct wglWineDmaBufExportSupportedWINE_params\n";
++    print $out "{\n";
++    print $out "    TEB *teb;\n";
++    print $out "    BOOL ret;\n";
++    print $out "};\n\n";
++    print $out "struct wglWineExportDmaBufWINE_params\n";
++    print $out "{\n";
++    print $out "    TEB *teb;\n";
++    print $out "    GLuint texture;\n";
++    print $out "    GLenum target;\n";
++    print $out "    struct wgl_dmabuf_desc *desc;\n";
++    print $out "    int *fd;\n";
++    print $out "    BOOL ret;\n";
++    print $out "};\n\n";
++}
++
++sub print_wine_unix_call_thunks($$)
++{
++    my ($out, $is_wow64) = @_;
++    my $prefix = $is_wow64 ? "wow64_" : "";
++
++    print $out "static NTSTATUS ${prefix}ext_wglWineCloseDmaBufWINE( void *args )\n";
++    print $out "{\n";
++    print $out "    struct\n" if $is_wow64;
++    print $out "    {\n" if $is_wow64;
++    print $out "        int fd;\n" if $is_wow64;
++    print $out "    } *params = args;\n" if $is_wow64;
++    print $out "    struct wglWineCloseDmaBufWINE_params *params = args;\n" unless $is_wow64;
++    print $out "\n";
++    print $out "    if (params->fd >= 0) close( params->fd );\n";
++    print $out "    return STATUS_SUCCESS;\n";
++    print $out "}\n\n";
++
++    print $out "static NTSTATUS ${prefix}ext_wglWineDmaBufExportSupportedWINE( void *args )\n";
++    print $out "{\n";
++    if ($is_wow64)
++    {
++        print $out "    struct\n";
++        print $out "    {\n";
++        print $out "        PTR32 teb;\n";
++        print $out "        BOOL ret;\n";
++        print $out "    } *params = args;\n";
++        print $out "    TEB *teb = get_teb64( params->teb );\n";
++    }
++    else
++    {
++        print $out "    struct wglWineDmaBufExportSupportedWINE_params *params = args;\n";
++        print $out "    TEB *teb = params->teb;\n";
++    }
++    print $out "    const struct opengl_funcs *funcs = teb->glTable;\n\n";
++    print $out "    params->ret = funcs && funcs->p_wglWineDmaBufExportSupportedWINE &&\n";
++    print $out "            funcs->p_wglWineDmaBufExportSupportedWINE();\n";
++    print $out "    return STATUS_SUCCESS;\n";
++    print $out "}\n\n";
++
++    print $out "static NTSTATUS ${prefix}ext_wglWineExportDmaBufWINE( void *args )\n";
++    print $out "{\n";
++    if ($is_wow64)
++    {
++        print $out "    struct\n";
++        print $out "    {\n";
++        print $out "        PTR32 teb;\n";
++        print $out "        GLuint texture;\n";
++        print $out "        GLenum target;\n";
++        print $out "        PTR32 desc;\n";
++        print $out "        PTR32 fd;\n";
++        print $out "        BOOL ret;\n";
++        print $out "    } *params = args;\n";
++        print $out "    TEB *teb = get_teb64( params->teb );\n";
++    }
++    else
++    {
++        print $out "    struct wglWineExportDmaBufWINE_params *params = args;\n";
++        print $out "    TEB *teb = params->teb;\n";
++    }
++    print $out "    const struct opengl_funcs *funcs = teb->glTable;\n\n";
++    print $out "    if (!funcs || !funcs->p_wglWineExportDmaBufWINE) return STATUS_NOT_IMPLEMENTED;\n";
++    if ($is_wow64)
++    {
++        print $out "    params->ret = funcs->p_wglWineExportDmaBufWINE( params->texture, params->target,\n";
++        print $out "            ULongToPtr(params->desc), ULongToPtr(params->fd) );\n";
++    }
++    else
++    {
++        print $out "    params->ret = funcs->p_wglWineExportDmaBufWINE( params->texture, params->target,\n";
++        print $out "            params->desc, params->fd );\n";
++    }
++    print $out "    return STATUS_SUCCESS;\n";
++    print $out "}\n\n";
++
++}
++
+ sub generate_func_params($$)
+ {
+     my ($name, $func) = @_;
+@@ -973,8 +1163,6 @@ my %unsupported_extensions =
+     "WGL_EXT_pixel_format" => 1,
+     "WGL_NV_copy_image" => 1,
+     "WGL_NV_delay_before_swap" => 1,
+-    "WGL_NV_DX_interop" => 1,
+-    "WGL_NV_DX_interop2" => 1,
+     "WGL_NV_gpu_affinity" => 1,
+     "WGL_NV_multigpu_context" => 1,
+     "WGL_NV_multisample_coverage" => 1,
+@@ -1339,6 +1527,10 @@ foreach (sort keys %wgl_functions)
+ {
+     printf SPEC "%s\n", generate_spec_entry( $_, $wgl_functions{$_} );
+ }
++foreach (@wine_export_funcs)
++{
++    printf SPEC "\@ stdcall %s(%s)\n", $_, $wine_unix_call_specs{$_};
++}
+ 
+ close(SPEC);
+ 
+@@ -1361,6 +1553,7 @@ print OUT "#include \"winternl.h\"\n";
+ print OUT "#include \"wingdi.h\"\n";
+ print OUT "#include \"ntuser.h\"\n\n";
+ print OUT "#include \"wine/wgl.h\"\n";
++print OUT "#include \"wine/opengl_driver.h\"\n";
+ print OUT "#include \"wine/unixlib.h\"\n\n";
+ 
+ print OUT "struct process_attach_params\n";
+@@ -1373,6 +1566,7 @@ foreach (sort keys %wgl_functions)
+     next if defined $manual_win_functions{$_};
+     print OUT generate_func_params($_, $wgl_functions{$_});
+ }
++print_wine_unix_call_params( \*OUT );
+ foreach (sort keys %norm_functions)
+ {
+     next if defined $manual_win_functions{$_};
+@@ -1417,6 +1611,10 @@ foreach (sort keys %ext_functions)
+     next if defined $manual_win_functions{$_};
+     printf OUT "    unix_%s,\n", $_;
+ }
++foreach (@wine_unix_call_funcs)
++{
++    printf OUT "    unix_%s,\n", $_;
++}
+ print OUT "    funcs_count\n";
+ print OUT "};\n\n";
+ 
+@@ -1558,6 +1756,7 @@ print OUT "#endif\n\n";
+ 
+ print OUT "#include <stdarg.h>\n";
+ print OUT "#include <stddef.h>\n\n";
++print OUT "#include <unistd.h>\n\n";
+ print OUT "#include <assert.h>\n\n";
+ 
+ print OUT "#include \"ntstatus.h\"\n";
+@@ -1571,7 +1770,6 @@ print OUT "#include \"unix_private.h\"\n\n";
+ print OUT "#include \"wine/debug.h\"\n\n";
+ 
+ print OUT "WINE_DEFAULT_DEBUG_CHANNEL(opengl);\n\n";
+-
+ print OUT "static GLboolean const_false;\n";
+ print OUT "static GLboolean const_true = 1;\n\n";
+ 
+@@ -1591,6 +1789,7 @@ foreach (sort keys %ext_functions)
+     next if defined $manual_win_functions{$_};
+     print OUT generate_unix_thunk($_, $ext_functions{$_}, 0, "ext");
+ }
++print_wine_unix_call_thunks( \*OUT, 0 );
+ 
+ print OUT "const unixlib_entry_t __wine_unix_call_funcs[] =\n";
+ print OUT "{\n";
+@@ -1614,6 +1813,10 @@ foreach (sort keys %ext_functions)
+     next if defined $manual_win_functions{$_};
+     printf OUT "    ext_%s,\n", $_;
+ }
++foreach (@wine_unix_call_funcs)
++{
++    printf OUT "    ext_%s,\n", $_;
++}
+ print OUT "};\n\n";
+ print OUT "C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == funcs_count);\n\n";
+ 
+@@ -1638,6 +1841,7 @@ foreach (sort keys %ext_functions)
+     next if defined $manual_win_functions{$_};
+     print OUT generate_unix_thunk($_, $ext_functions{$_}, 1, "ext");
+ }
++print_wine_unix_call_thunks( \*OUT, 1 );
+ 
+ print OUT "\nconst unixlib_entry_t __wine_unix_call_wow64_funcs[] =\n";
+ print OUT "{\n";
+@@ -1661,6 +1865,10 @@ foreach (sort keys %ext_functions)
+     next if defined $manual_win_functions{$_};
+     printf OUT "    wow64_ext_%s,\n", $_;
+ }
++foreach (@wine_unix_call_funcs)
++{
++    printf OUT "    wow64_ext_%s,\n", $_;
++}
+ print OUT "};\n\n";
+ print OUT "C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == funcs_count);\n\n";
+ 
+diff --git a/dlls/opengl32/opengl32.spec b/dlls/opengl32/opengl32.spec
+index 94a3dfd0757..cf50935bad6 100644
+--- a/dlls/opengl32/opengl32.spec
++++ b/dlls/opengl32/opengl32.spec
+@@ -359,3 +359,11 @@
+ @ stdcall wglUseFontBitmapsW(long long long long)
+ @ stdcall wglUseFontOutlinesA(long long long long float float long ptr)
+ @ stdcall wglUseFontOutlinesW(long long long long float float long ptr)
++@ stdcall wglWineCloseDmaBufWINE(long)
++@ stdcall wglWineDmaBufExportSupportedWINE()
++@ stdcall wglWineExportDmaBufWINE(long long ptr ptr)
++@ stdcall wglWineHwndDmaBufOpenProducerWINE(ptr)
++@ stdcall wglWineHwndDmaBufGetCapsWINE(ptr ptr ptr long ptr)
++@ stdcall wglWineHwndDmaBufCloseProducerWINE(ptr long)
++@ stdcall wglWineHwndDmaBufPublishWINE(ptr long ptr long)
++@ stdcall wglWineHwndDmaBufDrainReleaseWINE(long ptr)
+diff --git a/dlls/opengl32/thunks.c b/dlls/opengl32/thunks.c
+index b2a1290d12f..890f4d599d9 100644
+--- a/dlls/opengl32/thunks.c
++++ b/dlls/opengl32/thunks.c
+@@ -24744,6 +24744,78 @@ static HPBUFFERARB WINAPI wglCreatePbufferARB( HDC hDC, int iPixelFormat, int iW
+     return args.ret;
+ }
+ 
++static BOOL WINAPI wglDXCloseDeviceNV( HANDLE hDevice )
++{
++    struct wglDXCloseDeviceNV_params args = { .teb = NtCurrentTeb(), .hDevice = hDevice };
++    NTSTATUS status;
++    TRACE( "hDevice %p\n", hDevice );
++    if ((status = UNIX_CALL( wglDXCloseDeviceNV, &args ))) WARN( "wglDXCloseDeviceNV returned %#lx\n", status );
++    return args.ret;
++}
++
++static BOOL WINAPI wglDXLockObjectsNV( HANDLE hDevice, GLint count, HANDLE *hObjects )
++{
++    struct wglDXLockObjectsNV_params args = { .teb = NtCurrentTeb(), .hDevice = hDevice, .count = count, .hObjects = hObjects };
++    NTSTATUS status;
++    TRACE( "hDevice %p, count %d, hObjects %p\n", hDevice, count, hObjects );
++    if ((status = UNIX_CALL( wglDXLockObjectsNV, &args ))) WARN( "wglDXLockObjectsNV returned %#lx\n", status );
++    return args.ret;
++}
++
++static BOOL WINAPI wglDXObjectAccessNV( HANDLE hObject, GLenum access )
++{
++    struct wglDXObjectAccessNV_params args = { .teb = NtCurrentTeb(), .hObject = hObject, .access = access };
++    NTSTATUS status;
++    TRACE( "hObject %p, access %d\n", hObject, access );
++    if ((status = UNIX_CALL( wglDXObjectAccessNV, &args ))) WARN( "wglDXObjectAccessNV returned %#lx\n", status );
++    return args.ret;
++}
++
++static HANDLE WINAPI wglDXOpenDeviceNV( void *dxDevice )
++{
++    struct wglDXOpenDeviceNV_params args = { .teb = NtCurrentTeb(), .dxDevice = dxDevice };
++    NTSTATUS status;
++    TRACE( "dxDevice %p\n", dxDevice );
++    if ((status = UNIX_CALL( wglDXOpenDeviceNV, &args ))) WARN( "wglDXOpenDeviceNV returned %#lx\n", status );
++    return args.ret;
++}
++
++static HANDLE WINAPI wglDXRegisterObjectNV( HANDLE hDevice, void *dxObject, GLuint name, GLenum type, GLenum access )
++{
++    struct wglDXRegisterObjectNV_params args = { .teb = NtCurrentTeb(), .hDevice = hDevice, .dxObject = dxObject, .name = name, .type = type, .access = access };
++    NTSTATUS status;
++    TRACE( "hDevice %p, dxObject %p, name %d, type %d, access %d\n", hDevice, dxObject, name, type, access );
++    if ((status = UNIX_CALL( wglDXRegisterObjectNV, &args ))) WARN( "wglDXRegisterObjectNV returned %#lx\n", status );
++    return args.ret;
++}
++
++static BOOL WINAPI wglDXSetResourceShareHandleNV( void *dxObject, HANDLE shareHandle )
++{
++    struct wglDXSetResourceShareHandleNV_params args = { .teb = NtCurrentTeb(), .dxObject = dxObject, .shareHandle = shareHandle };
++    NTSTATUS status;
++    TRACE( "dxObject %p, shareHandle %p\n", dxObject, shareHandle );
++    if ((status = UNIX_CALL( wglDXSetResourceShareHandleNV, &args ))) WARN( "wglDXSetResourceShareHandleNV returned %#lx\n", status );
++    return args.ret;
++}
++
++static BOOL WINAPI wglDXUnlockObjectsNV( HANDLE hDevice, GLint count, HANDLE *hObjects )
++{
++    struct wglDXUnlockObjectsNV_params args = { .teb = NtCurrentTeb(), .hDevice = hDevice, .count = count, .hObjects = hObjects };
++    NTSTATUS status;
++    TRACE( "hDevice %p, count %d, hObjects %p\n", hDevice, count, hObjects );
++    if ((status = UNIX_CALL( wglDXUnlockObjectsNV, &args ))) WARN( "wglDXUnlockObjectsNV returned %#lx\n", status );
++    return args.ret;
++}
++
++static BOOL WINAPI wglDXUnregisterObjectNV( HANDLE hDevice, HANDLE hObject )
++{
++    struct wglDXUnregisterObjectNV_params args = { .teb = NtCurrentTeb(), .hDevice = hDevice, .hObject = hObject };
++    NTSTATUS status;
++    TRACE( "hDevice %p, hObject %p\n", hDevice, hObject );
++    if ((status = UNIX_CALL( wglDXUnregisterObjectNV, &args ))) WARN( "wglDXUnregisterObjectNV returned %#lx\n", status );
++    return args.ret;
++}
++
+ static BOOL WINAPI wglDestroyPbufferARB( HPBUFFERARB hPbuffer )
+ {
+     struct wglDestroyPbufferARB_params args = { .teb = NtCurrentTeb(), .hPbuffer = hPbuffer };
+@@ -27607,6 +27679,14 @@ const void *extension_procs[] =
+     wglChoosePixelFormatARB,
+     wglCreateContextAttribsARB,
+     wglCreatePbufferARB,
++    wglDXCloseDeviceNV,
++    wglDXLockObjectsNV,
++    wglDXObjectAccessNV,
++    wglDXOpenDeviceNV,
++    wglDXRegisterObjectNV,
++    wglDXSetResourceShareHandleNV,
++    wglDXUnlockObjectsNV,
++    wglDXUnregisterObjectNV,
+     wglDestroyPbufferARB,
+     wglFreeMemoryNV,
+     wglGetCurrentReadDCARB,
+diff --git a/dlls/opengl32/unix_thunks.c b/dlls/opengl32/unix_thunks.c
+index ec2779005c7..5b5353cd4d0 100644
+--- a/dlls/opengl32/unix_thunks.c
++++ b/dlls/opengl32/unix_thunks.c
+@@ -7,6 +7,8 @@
+ #include <stdarg.h>
+ #include <stddef.h>
+ 
++#include <unistd.h>
++
+ #include <assert.h>
+ 
+ #include "ntstatus.h"
+@@ -30552,6 +30554,78 @@ static NTSTATUS ext_wglCreatePbufferARB( void *args )
+     return STATUS_SUCCESS;
+ }
+ 
++static NTSTATUS ext_wglDXCloseDeviceNV( void *args )
++{
++    struct wglDXCloseDeviceNV_params *params = args;
++    const struct opengl_funcs *funcs = params->teb->glTable;
++    if (!funcs->p_wglDXCloseDeviceNV) return STATUS_NOT_IMPLEMENTED;
++    params->ret = funcs->p_wglDXCloseDeviceNV( params->hDevice );
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS ext_wglDXLockObjectsNV( void *args )
++{
++    struct wglDXLockObjectsNV_params *params = args;
++    const struct opengl_funcs *funcs = params->teb->glTable;
++    if (!funcs->p_wglDXLockObjectsNV) return STATUS_NOT_IMPLEMENTED;
++    params->ret = funcs->p_wglDXLockObjectsNV( params->hDevice, params->count, params->hObjects );
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS ext_wglDXObjectAccessNV( void *args )
++{
++    struct wglDXObjectAccessNV_params *params = args;
++    const struct opengl_funcs *funcs = params->teb->glTable;
++    if (!funcs->p_wglDXObjectAccessNV) return STATUS_NOT_IMPLEMENTED;
++    params->ret = funcs->p_wglDXObjectAccessNV( params->hObject, params->access );
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS ext_wglDXOpenDeviceNV( void *args )
++{
++    struct wglDXOpenDeviceNV_params *params = args;
++    const struct opengl_funcs *funcs = params->teb->glTable;
++    if (!funcs->p_wglDXOpenDeviceNV) return STATUS_NOT_IMPLEMENTED;
++    params->ret = funcs->p_wglDXOpenDeviceNV( params->dxDevice );
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS ext_wglDXRegisterObjectNV( void *args )
++{
++    struct wglDXRegisterObjectNV_params *params = args;
++    const struct opengl_funcs *funcs = params->teb->glTable;
++    if (!funcs->p_wglDXRegisterObjectNV) return STATUS_NOT_IMPLEMENTED;
++    params->ret = funcs->p_wglDXRegisterObjectNV( params->hDevice, params->dxObject, params->name, params->type, params->access );
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS ext_wglDXSetResourceShareHandleNV( void *args )
++{
++    struct wglDXSetResourceShareHandleNV_params *params = args;
++    const struct opengl_funcs *funcs = params->teb->glTable;
++    if (!funcs->p_wglDXSetResourceShareHandleNV) return STATUS_NOT_IMPLEMENTED;
++    params->ret = funcs->p_wglDXSetResourceShareHandleNV( params->dxObject, params->shareHandle );
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS ext_wglDXUnlockObjectsNV( void *args )
++{
++    struct wglDXUnlockObjectsNV_params *params = args;
++    const struct opengl_funcs *funcs = params->teb->glTable;
++    if (!funcs->p_wglDXUnlockObjectsNV) return STATUS_NOT_IMPLEMENTED;
++    params->ret = funcs->p_wglDXUnlockObjectsNV( params->hDevice, params->count, params->hObjects );
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS ext_wglDXUnregisterObjectNV( void *args )
++{
++    struct wglDXUnregisterObjectNV_params *params = args;
++    const struct opengl_funcs *funcs = params->teb->glTable;
++    if (!funcs->p_wglDXUnregisterObjectNV) return STATUS_NOT_IMPLEMENTED;
++    params->ret = funcs->p_wglDXUnregisterObjectNV( params->hDevice, params->hObject );
++    return STATUS_SUCCESS;
++}
++
+ static NTSTATUS ext_wglDestroyPbufferARB( void *args )
+ {
+     struct wglDestroyPbufferARB_params *params = args;
+@@ -30723,6 +30797,37 @@ static NTSTATUS ext_wglSwapIntervalEXT( void *args )
+     return STATUS_SUCCESS;
+ }
+ 
++static NTSTATUS ext_wglWineCloseDmaBufWINE( void *args )
++{
++    struct wglWineCloseDmaBufWINE_params *params = args;
++
++    if (params->fd >= 0) close( params->fd );
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS ext_wglWineDmaBufExportSupportedWINE( void *args )
++{
++    struct wglWineDmaBufExportSupportedWINE_params *params = args;
++    TEB *teb = params->teb;
++    const struct opengl_funcs *funcs = teb->glTable;
++
++    params->ret = funcs && funcs->p_wglWineDmaBufExportSupportedWINE &&
++            funcs->p_wglWineDmaBufExportSupportedWINE();
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS ext_wglWineExportDmaBufWINE( void *args )
++{
++    struct wglWineExportDmaBufWINE_params *params = args;
++    TEB *teb = params->teb;
++    const struct opengl_funcs *funcs = teb->glTable;
++
++    if (!funcs || !funcs->p_wglWineExportDmaBufWINE) return STATUS_NOT_IMPLEMENTED;
++    params->ret = funcs->p_wglWineExportDmaBufWINE( params->texture, params->target,
++            params->desc, params->fd );
++    return STATUS_SUCCESS;
++}
++
+ const unixlib_entry_t __wine_unix_call_funcs[] =
+ {
+     process_attach,
+@@ -33808,6 +33913,14 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
+     ext_wglChoosePixelFormatARB,
+     ext_wglCreateContextAttribsARB,
+     ext_wglCreatePbufferARB,
++    ext_wglDXCloseDeviceNV,
++    ext_wglDXLockObjectsNV,
++    ext_wglDXObjectAccessNV,
++    ext_wglDXOpenDeviceNV,
++    ext_wglDXRegisterObjectNV,
++    ext_wglDXSetResourceShareHandleNV,
++    ext_wglDXUnlockObjectsNV,
++    ext_wglDXUnregisterObjectNV,
+     ext_wglDestroyPbufferARB,
+     ext_wglFreeMemoryNV,
+     ext_wglGetExtensionsStringARB,
+@@ -33827,6 +33940,9 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
+     ext_wglSetPbufferAttribARB,
+     ext_wglSetPixelFormatWINE,
+     ext_wglSwapIntervalEXT,
++    ext_wglWineCloseDmaBufWINE,
++    ext_wglWineDmaBufExportSupportedWINE,
++    ext_wglWineExportDmaBufWINE,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == funcs_count);
+@@ -86986,6 +87102,144 @@ static NTSTATUS wow64_ext_wglCreatePbufferARB( void *args )
+     return STATUS_SUCCESS;
+ }
+ 
++static NTSTATUS wow64_ext_wglDXCloseDeviceNV( void *args )
++{
++    struct
++    {
++        PTR32 teb;
++        PTR32 hDevice;
++        BOOL ret;
++    } *params = args;
++    TEB *teb = get_teb64( params->teb );
++    const struct opengl_funcs *funcs = teb->glTable;
++    if (!funcs->p_wglDXCloseDeviceNV) return STATUS_NOT_IMPLEMENTED;
++    params->ret = funcs->p_wglDXCloseDeviceNV( ULongToPtr(params->hDevice) );
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS wow64_ext_wglDXLockObjectsNV( void *args )
++{
++    struct
++    {
++        PTR32 teb;
++        PTR32 hDevice;
++        GLint count;
++        PTR32 hObjects;
++        BOOL ret;
++    } *params = args;
++    TEB *teb = get_teb64( params->teb );
++    const struct opengl_funcs *funcs = teb->glTable;
++    HANDLE *hObjects;
++    if (!funcs->p_wglDXLockObjectsNV) return STATUS_NOT_IMPLEMENTED;
++    hObjects = copy_wow64_ptr32s( params->hObjects, params->count );
++    params->ret = funcs->p_wglDXLockObjectsNV( ULongToPtr(params->hDevice), params->count, hObjects );
++    free( hObjects );
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS wow64_ext_wglDXObjectAccessNV( void *args )
++{
++    struct
++    {
++        PTR32 teb;
++        PTR32 hObject;
++        GLenum access;
++        BOOL ret;
++    } *params = args;
++    TEB *teb = get_teb64( params->teb );
++    const struct opengl_funcs *funcs = teb->glTable;
++    if (!funcs->p_wglDXObjectAccessNV) return STATUS_NOT_IMPLEMENTED;
++    params->ret = funcs->p_wglDXObjectAccessNV( ULongToPtr(params->hObject), params->access );
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS wow64_ext_wglDXOpenDeviceNV( void *args )
++{
++    struct
++    {
++        PTR32 teb;
++        PTR32 dxDevice;
++        PTR32 ret;
++    } *params = args;
++    TEB *teb = get_teb64( params->teb );
++    const struct opengl_funcs *funcs = teb->glTable;
++    if (!funcs->p_wglDXOpenDeviceNV) return STATUS_NOT_IMPLEMENTED;
++    params->ret = (UINT_PTR)funcs->p_wglDXOpenDeviceNV( ULongToPtr(params->dxDevice) );
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS wow64_ext_wglDXRegisterObjectNV( void *args )
++{
++    struct
++    {
++        PTR32 teb;
++        PTR32 hDevice;
++        PTR32 dxObject;
++        GLuint name;
++        GLenum type;
++        GLenum access;
++        PTR32 ret;
++    } *params = args;
++    TEB *teb = get_teb64( params->teb );
++    const struct opengl_funcs *funcs = teb->glTable;
++    if (!funcs->p_wglDXRegisterObjectNV) return STATUS_NOT_IMPLEMENTED;
++    params->ret = (UINT_PTR)funcs->p_wglDXRegisterObjectNV( ULongToPtr(params->hDevice),
++            ULongToPtr(params->dxObject), params->name, params->type, params->access );
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS wow64_ext_wglDXSetResourceShareHandleNV( void *args )
++{
++    struct
++    {
++        PTR32 teb;
++        PTR32 dxObject;
++        PTR32 shareHandle;
++        BOOL ret;
++    } *params = args;
++    TEB *teb = get_teb64( params->teb );
++    const struct opengl_funcs *funcs = teb->glTable;
++    if (!funcs->p_wglDXSetResourceShareHandleNV) return STATUS_NOT_IMPLEMENTED;
++    params->ret = funcs->p_wglDXSetResourceShareHandleNV( ULongToPtr(params->dxObject), ULongToPtr(params->shareHandle) );
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS wow64_ext_wglDXUnlockObjectsNV( void *args )
++{
++    struct
++    {
++        PTR32 teb;
++        PTR32 hDevice;
++        GLint count;
++        PTR32 hObjects;
++        BOOL ret;
++    } *params = args;
++    TEB *teb = get_teb64( params->teb );
++    const struct opengl_funcs *funcs = teb->glTable;
++    HANDLE *hObjects;
++    if (!funcs->p_wglDXUnlockObjectsNV) return STATUS_NOT_IMPLEMENTED;
++    hObjects = copy_wow64_ptr32s( params->hObjects, params->count );
++    params->ret = funcs->p_wglDXUnlockObjectsNV( ULongToPtr(params->hDevice), params->count, hObjects );
++    free( hObjects );
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS wow64_ext_wglDXUnregisterObjectNV( void *args )
++{
++    struct
++    {
++        PTR32 teb;
++        PTR32 hDevice;
++        PTR32 hObject;
++        BOOL ret;
++    } *params = args;
++    TEB *teb = get_teb64( params->teb );
++    const struct opengl_funcs *funcs = teb->glTable;
++    if (!funcs->p_wglDXUnregisterObjectNV) return STATUS_NOT_IMPLEMENTED;
++    params->ret = funcs->p_wglDXUnregisterObjectNV( ULongToPtr(params->hDevice), ULongToPtr(params->hObject) );
++    return STATUS_SUCCESS;
++}
++
+ static NTSTATUS wow64_ext_wglDestroyPbufferARB( void *args )
+ {
+     struct
+@@ -87290,6 +87544,52 @@ static NTSTATUS wow64_ext_wglSwapIntervalEXT( void *args )
+     return STATUS_SUCCESS;
+ }
+ 
++static NTSTATUS wow64_ext_wglWineCloseDmaBufWINE( void *args )
++{
++    struct
++    {
++        int fd;
++    } *params = args;
++
++    if (params->fd >= 0) close( params->fd );
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS wow64_ext_wglWineDmaBufExportSupportedWINE( void *args )
++{
++    struct
++    {
++        PTR32 teb;
++        BOOL ret;
++    } *params = args;
++    TEB *teb = get_teb64( params->teb );
++    const struct opengl_funcs *funcs = teb->glTable;
++
++    params->ret = funcs && funcs->p_wglWineDmaBufExportSupportedWINE &&
++            funcs->p_wglWineDmaBufExportSupportedWINE();
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS wow64_ext_wglWineExportDmaBufWINE( void *args )
++{
++    struct
++    {
++        PTR32 teb;
++        GLuint texture;
++        GLenum target;
++        PTR32 desc;
++        PTR32 fd;
++        BOOL ret;
++    } *params = args;
++    TEB *teb = get_teb64( params->teb );
++    const struct opengl_funcs *funcs = teb->glTable;
++
++    if (!funcs || !funcs->p_wglWineExportDmaBufWINE) return STATUS_NOT_IMPLEMENTED;
++    params->ret = funcs->p_wglWineExportDmaBufWINE( params->texture, params->target,
++            ULongToPtr(params->desc), ULongToPtr(params->fd) );
++    return STATUS_SUCCESS;
++}
++
+ 
+ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
+ {
+@@ -90376,6 +90676,14 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
+     wow64_ext_wglChoosePixelFormatARB,
+     wow64_ext_wglCreateContextAttribsARB,
+     wow64_ext_wglCreatePbufferARB,
++    wow64_ext_wglDXCloseDeviceNV,
++    wow64_ext_wglDXLockObjectsNV,
++    wow64_ext_wglDXObjectAccessNV,
++    wow64_ext_wglDXOpenDeviceNV,
++    wow64_ext_wglDXRegisterObjectNV,
++    wow64_ext_wglDXSetResourceShareHandleNV,
++    wow64_ext_wglDXUnlockObjectsNV,
++    wow64_ext_wglDXUnregisterObjectNV,
+     wow64_ext_wglDestroyPbufferARB,
+     wow64_ext_wglFreeMemoryNV,
+     wow64_ext_wglGetExtensionsStringARB,
+@@ -90395,6 +90703,9 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
+     wow64_ext_wglSetPbufferAttribARB,
+     wow64_ext_wglSetPixelFormatWINE,
+     wow64_ext_wglSwapIntervalEXT,
++    wow64_ext_wglWineCloseDmaBufWINE,
++    wow64_ext_wglWineDmaBufExportSupportedWINE,
++    wow64_ext_wglWineExportDmaBufWINE,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == funcs_count);
+@@ -92168,8 +92479,8 @@ struct opengl_funcs null_opengl_funcs =
+     .p_glViewport = null_glViewport,
+ };
+ 
+-const int extension_registry_size = 2754;
+-const struct registry_entry extension_registry[2754] =
++const int extension_registry_size = 2762;
++const struct registry_entry extension_registry[2762] =
+ {
+     { "glAccumxOES", "GL_OES_fixed_point\0", offsetof(struct opengl_funcs, p_glAccumxOES) },
+     { "glAcquireKeyedMutexWin32EXT", "GL_EXT_win32_keyed_mutex\0", offsetof(struct opengl_funcs, p_glAcquireKeyedMutexWin32EXT) },
+@@ -94905,6 +95216,14 @@ const struct registry_entry extension_registry[2754] =
+     { "wglChoosePixelFormatARB", "WGL_ARB_pixel_format\0", offsetof(struct opengl_funcs, p_wglChoosePixelFormatARB) },
+     { "wglCreateContextAttribsARB", "WGL_ARB_create_context\0", offsetof(struct opengl_funcs, p_wglCreateContextAttribsARB) },
+     { "wglCreatePbufferARB", "WGL_ARB_pbuffer\0", offsetof(struct opengl_funcs, p_wglCreatePbufferARB) },
++    { "wglDXCloseDeviceNV", "WGL_NV_DX_interop\0", offsetof(struct opengl_funcs, p_wglDXCloseDeviceNV) },
++    { "wglDXLockObjectsNV", "WGL_NV_DX_interop\0", offsetof(struct opengl_funcs, p_wglDXLockObjectsNV) },
++    { "wglDXObjectAccessNV", "WGL_NV_DX_interop\0", offsetof(struct opengl_funcs, p_wglDXObjectAccessNV) },
++    { "wglDXOpenDeviceNV", "WGL_NV_DX_interop\0", offsetof(struct opengl_funcs, p_wglDXOpenDeviceNV) },
++    { "wglDXRegisterObjectNV", "WGL_NV_DX_interop\0", offsetof(struct opengl_funcs, p_wglDXRegisterObjectNV) },
++    { "wglDXSetResourceShareHandleNV", "WGL_NV_DX_interop\0", offsetof(struct opengl_funcs, p_wglDXSetResourceShareHandleNV) },
++    { "wglDXUnlockObjectsNV", "WGL_NV_DX_interop\0", offsetof(struct opengl_funcs, p_wglDXUnlockObjectsNV) },
++    { "wglDXUnregisterObjectNV", "WGL_NV_DX_interop\0", offsetof(struct opengl_funcs, p_wglDXUnregisterObjectNV) },
+     { "wglDestroyPbufferARB", "WGL_ARB_pbuffer\0", offsetof(struct opengl_funcs, p_wglDestroyPbufferARB) },
+     { "wglFreeMemoryNV", "WGL_NV_vertex_array_range\0", offsetof(struct opengl_funcs, p_wglFreeMemoryNV) },
+     { "wglGetCurrentReadDCARB", "WGL_ARB_make_current_read\0", offsetof(struct opengl_funcs, p_wglGetCurrentReadDCARB) },
+diff --git a/dlls/opengl32/unixlib.h b/dlls/opengl32/unixlib.h
+index 2791b007e22..17c6b783009 100644
+--- a/dlls/opengl32/unixlib.h
++++ b/dlls/opengl32/unixlib.h
+@@ -15,6 +15,7 @@
+ #include "ntuser.h"
+ 
+ #include "wine/wgl.h"
++#include "wine/opengl_driver.h"
+ #include "wine/unixlib.h"
+ 
+ struct process_attach_params
+@@ -91,6 +92,27 @@ struct wglSwapBuffers_params
+     BOOL ret;
+ };
+ 
++struct wglWineCloseDmaBufWINE_params
++{
++    int fd;
++};
++
++struct wglWineDmaBufExportSupportedWINE_params
++{
++    TEB *teb;
++    BOOL ret;
++};
++
++struct wglWineExportDmaBufWINE_params
++{
++    TEB *teb;
++    GLuint texture;
++    GLenum target;
++    struct wgl_dmabuf_desc *desc;
++    int *fd;
++    BOOL ret;
++};
++
+ struct glAccum_params
+ {
+     TEB *teb;
+@@ -25686,6 +25708,73 @@ struct wglCreatePbufferARB_params
+     HPBUFFERARB ret;
+ };
+ 
++struct wglDXCloseDeviceNV_params
++{
++    TEB *teb;
++    HANDLE hDevice;
++    BOOL ret;
++};
++
++struct wglDXLockObjectsNV_params
++{
++    TEB *teb;
++    HANDLE hDevice;
++    GLint count;
++    HANDLE *hObjects;
++    BOOL ret;
++};
++
++struct wglDXObjectAccessNV_params
++{
++    TEB *teb;
++    HANDLE hObject;
++    GLenum access;
++    BOOL ret;
++};
++
++struct wglDXOpenDeviceNV_params
++{
++    TEB *teb;
++    void *dxDevice;
++    HANDLE ret;
++};
++
++struct wglDXRegisterObjectNV_params
++{
++    TEB *teb;
++    HANDLE hDevice;
++    void *dxObject;
++    GLuint name;
++    GLenum type;
++    GLenum access;
++    HANDLE ret;
++};
++
++struct wglDXSetResourceShareHandleNV_params
++{
++    TEB *teb;
++    void *dxObject;
++    HANDLE shareHandle;
++    BOOL ret;
++};
++
++struct wglDXUnlockObjectsNV_params
++{
++    TEB *teb;
++    HANDLE hDevice;
++    GLint count;
++    HANDLE *hObjects;
++    BOOL ret;
++};
++
++struct wglDXUnregisterObjectNV_params
++{
++    TEB *teb;
++    HANDLE hDevice;
++    HANDLE hObject;
++    BOOL ret;
++};
++
+ struct wglDestroyPbufferARB_params
+ {
+     TEB *teb;
+@@ -28935,6 +29024,14 @@ enum unix_funcs
+     unix_wglChoosePixelFormatARB,
+     unix_wglCreateContextAttribsARB,
+     unix_wglCreatePbufferARB,
++    unix_wglDXCloseDeviceNV,
++    unix_wglDXLockObjectsNV,
++    unix_wglDXObjectAccessNV,
++    unix_wglDXOpenDeviceNV,
++    unix_wglDXRegisterObjectNV,
++    unix_wglDXSetResourceShareHandleNV,
++    unix_wglDXUnlockObjectsNV,
++    unix_wglDXUnregisterObjectNV,
+     unix_wglDestroyPbufferARB,
+     unix_wglFreeMemoryNV,
+     unix_wglGetExtensionsStringARB,
+@@ -28954,6 +29051,9 @@ enum unix_funcs
+     unix_wglSetPbufferAttribARB,
+     unix_wglSetPixelFormatWINE,
+     unix_wglSwapIntervalEXT,
++    unix_wglWineCloseDmaBufWINE,
++    unix_wglWineDmaBufExportSupportedWINE,
++    unix_wglWineExportDmaBufWINE,
+     funcs_count
+ };
+ 
+diff --git a/dlls/opengl32/wgl.c b/dlls/opengl32/wgl.c
+index 4075367a69a..c386e6f0d66 100644
+--- a/dlls/opengl32/wgl.c
++++ b/dlls/opengl32/wgl.c
+@@ -37,6 +37,7 @@
+ 
+ #include "wine/glu.h"
+ #include "wine/debug.h"
++#include "wine/hwnd_dmabuf.h"
+ #include "wine/opengl_driver.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(opengl);
+@@ -980,6 +981,100 @@ BOOL WINAPI DECLSPEC_HOTPATCH wglSwapBuffers( HDC hdc )
+     return args.ret;
+ }
+ 
++void WINAPI wglWineCloseDmaBufWINE( int fd )
++{
++    struct wglWineCloseDmaBufWINE_params args = { .fd = fd };
++    NTSTATUS status;
++
++    TRACE( "fd %d.\n", fd );
++
++    if ((status = UNIX_CALL( wglWineCloseDmaBufWINE, &args )))
++        WARN( "wglWineCloseDmaBufWINE returned %#lx\n", status );
++}
++
++BOOL WINAPI wglWineDmaBufExportSupportedWINE( void )
++{
++    struct wglWineDmaBufExportSupportedWINE_params args = { .teb = NtCurrentTeb() };
++    NTSTATUS status;
++
++    TRACE( "\n" );
++
++    if ((status = UNIX_CALL( wglWineDmaBufExportSupportedWINE, &args )))
++    {
++        WARN( "wglWineDmaBufExportSupportedWINE returned %#lx\n", status );
++        return FALSE;
++    }
++
++    return args.ret;
++}
++
++BOOL WINAPI wglWineExportDmaBufWINE( GLuint texture, GLenum target, struct wgl_dmabuf_desc *desc, int *fd )
++{
++    struct wglWineExportDmaBufWINE_params args =
++    {
++        .teb = NtCurrentTeb(),
++        .texture = texture,
++        .target = target,
++        .desc = desc,
++        .fd = fd,
++    };
++    NTSTATUS status;
++
++    TRACE( "texture %u, target %#x, desc %p, fd %p.\n", texture, target, desc, fd );
++
++    if ((status = UNIX_CALL( wglWineExportDmaBufWINE, &args )))
++    {
++        if (status != STATUS_NOT_IMPLEMENTED)
++            WARN( "wglWineExportDmaBufWINE returned %#lx\n", status );
++        return FALSE;
++    }
++
++    return args.ret;
++}
++
++int WINAPI wglWineHwndDmaBufOpenProducerWINE( HWND hwnd )
++{
++    TRACE( "hwnd %p.\n", hwnd );
++
++    return NtUserHwndDmaBufOpenProducer( hwnd );
++}
++
++UINT WINAPI wglWineHwndDmaBufGetCapsWINE( HWND hwnd, hwnd_dmabuf_host_caps_t *caps,
++        hwnd_dmabuf_format_modifier_t *format_modifiers, UINT max_format_modifiers,
++        UINT *format_modifier_count )
++{
++    TRACE( "hwnd %p, caps %p, format_modifiers %p, max_format_modifiers %u, format_modifier_count %p.\n",
++            hwnd, caps, format_modifiers, max_format_modifiers, format_modifier_count );
++
++    return NtUserHwndDmaBufGetCaps( hwnd, caps, format_modifiers,
++            max_format_modifiers, format_modifier_count );
++}
++
++void WINAPI wglWineHwndDmaBufCloseProducerWINE( HWND hwnd, int channel_fd )
++{
++    TRACE( "hwnd %p, channel_fd %d.\n", hwnd, channel_fd );
++
++    NtUserHwndDmaBufCloseProducer( hwnd, channel_fd );
++}
++
++int WINAPI wglWineHwndDmaBufPublishWINE( HWND hwnd, int channel_fd,
++        const hwnd_dmabuf_frame_desc_t *desc, int dmabuf_fd )
++{
++    TRACE( "hwnd %p, channel_fd %d, desc %p, dmabuf_fd %d.\n",
++            hwnd, channel_fd, desc, dmabuf_fd );
++
++    if (!desc) return HWND_DMABUF_CHANNEL_ERROR;
++    return NtUserHwndDmaBufPublish( hwnd, channel_fd, desc, dmabuf_fd );
++}
++
++int WINAPI wglWineHwndDmaBufDrainReleaseWINE( int channel_fd, hwnd_dmabuf_release_t *release )
++{
++    TRACE( "channel_fd %d, release %p.\n", channel_fd, release );
++
++    if (!release) return HWND_DMABUF_CHANNEL_ERROR;
++    return NtUserHwndDmaBufDrainRelease( channel_fd, release );
++}
++
+ /***********************************************************************
+  *		wglCreateLayerContext (OPENGL32.@)
+  */
+diff --git a/dlls/win32u/d3dkmt.c b/dlls/win32u/d3dkmt.c
+index d8b69ceea21..541d8c068e2 100644
+--- a/dlls/win32u/d3dkmt.c
++++ b/dlls/win32u/d3dkmt.c
+@@ -2090,6 +2090,62 @@ static void get_resource_global_keyed_mutex( struct d3dkmt_dxgi_desc *desc, D3DK
+     }
+ }
+ 
++static void d3dkmt_resource_desc_from_runtime_data( void *runtime_data, UINT runtime_size, struct d3dkmt_resource_desc *desc )
++{
++    const struct d3dkmt_dxgi_desc *dxgi = runtime_data;
++
++    memset( desc, 0, sizeof(*desc) );
++    desc->type = D3DKMT_RESOURCE_DESC_UNKNOWN;
++
++    if (!runtime_data || runtime_size < sizeof(*dxgi)) return;
++
++    desc->width = dxgi->width;
++    desc->height = dxgi->height;
++    desc->format = dxgi->format;
++    desc->keyed_mutex = dxgi->keyed_mutex;
++    desc->nt_shared = dxgi->nt_shared;
++
++    if (dxgi->size == sizeof(struct d3dkmt_d3d9_desc) && runtime_size >= sizeof(struct d3dkmt_d3d9_desc))
++    {
++        const struct d3dkmt_d3d9_desc *d3d9 = runtime_data;
++
++        if (d3d9->type == D3DRTYPE_TEXTURE)
++        {
++            desc->type = D3DKMT_RESOURCE_DESC_TEXTURE_2D;
++            desc->width = d3d9->texture.width;
++            desc->height = d3d9->texture.height;
++            desc->mip_levels = d3d9->texture.levels;
++            desc->array_size = 1;
++            desc->sample_count = 1;
++        }
++        else if (d3d9->type == D3DRTYPE_SURFACE)
++        {
++            desc->type = D3DKMT_RESOURCE_DESC_TEXTURE_2D;
++            desc->width = d3d9->surface.width;
++            desc->height = d3d9->surface.height;
++            desc->mip_levels = 1;
++            desc->array_size = 1;
++            desc->sample_count = 1;
++        }
++    }
++    else if (dxgi->size == sizeof(struct d3dkmt_d3d11_desc) && runtime_size >= sizeof(struct d3dkmt_d3d11_desc))
++    {
++        const struct d3dkmt_d3d11_desc *d3d11 = runtime_data;
++
++        if (d3d11->dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
++        {
++            desc->type = D3DKMT_RESOURCE_DESC_TEXTURE_2D;
++            desc->width = d3d11->d3d11_2d.Width;
++            desc->height = d3d11->d3d11_2d.Height;
++            desc->format = d3d11->d3d11_2d.Format;
++            desc->mip_levels = d3d11->d3d11_2d.MipLevels;
++            desc->array_size = d3d11->d3d11_2d.ArraySize;
++            desc->sample_count = d3d11->d3d11_2d.SampleDesc.Count;
++            desc->sample_quality = d3d11->d3d11_2d.SampleDesc.Quality;
++        }
++    }
++}
++
+ /* get a locally opened D3DKMT object host-specific fd */
+ int d3dkmt_object_get_fd( D3DKMT_HANDLE local )
+ {
+@@ -2136,7 +2192,8 @@ failed:
+ }
+ 
+ /* open a D3DKMT global or shared resource */
+-D3DKMT_HANDLE d3dkmt_open_resource( D3DKMT_HANDLE global, HANDLE shared, D3DKMT_HANDLE *mutex_local, D3DKMT_HANDLE *sync_local )
++D3DKMT_HANDLE d3dkmt_open_resource_with_desc( D3DKMT_HANDLE global, HANDLE shared,
++        D3DKMT_HANDLE *mutex_local, D3DKMT_HANDLE *sync_local, struct d3dkmt_resource_desc *desc )
+ {
+     struct d3dkmt_object *allocation = NULL, *mutex = NULL, *sync = NULL;
+     UINT runtime_size, mutex_size = 0, sync_size = 0;
+@@ -2147,6 +2204,9 @@ D3DKMT_HANDLE d3dkmt_open_resource( D3DKMT_HANDLE global, HANDLE shared, D3DKMT_
+ 
+     TRACE( "global %#x, shared %p\n", global, shared );
+ 
++    *mutex_local = *sync_local = 0;
++    if (desc) memset( desc, 0, sizeof(*desc) );
++
+     if ((status = d3dkmt_object_query( D3DKMT_RESOURCE, global, shared, &runtime_size ))) goto failed;
+     if (runtime_size && !(runtime_data = malloc( runtime_size ))) goto failed;
+ 
+@@ -2160,7 +2220,11 @@ D3DKMT_HANDLE d3dkmt_open_resource( D3DKMT_HANDLE global, HANDLE shared, D3DKMT_
+     resource->allocation = allocation->local;
+ 
+     if (!runtime_data || runtime_size <= sizeof(struct d3dkmt_dxgi_desc)) WARN( "Unsupported runtime data size %#x\n", runtime_size );
+-    else get_resource_global_keyed_mutex( runtime_data, &mutex_global, &sync_global );
++    else
++    {
++        if (desc) d3dkmt_resource_desc_from_runtime_data( runtime_data, runtime_size, desc );
++        get_resource_global_keyed_mutex( runtime_data, &mutex_global, &sync_global );
++    }
+ 
+     if (!d3dkmt_object_open( mutex, mutex_global, shared, NULL, &mutex_size ) &&
+         !d3dkmt_object_open( sync, sync_global, shared, NULL, &sync_size ))
+@@ -2188,6 +2252,22 @@ failed:
+     return 0;
+ }
+ 
++D3DKMT_HANDLE d3dkmt_open_resource( D3DKMT_HANDLE global, HANDLE shared, D3DKMT_HANDLE *mutex_local, D3DKMT_HANDLE *sync_local )
++{
++    return d3dkmt_open_resource_with_desc( global, shared, mutex_local, sync_local, NULL );
++}
++
++D3DKMT_HANDLE d3dkmt_open_shared_resource_with_desc( HANDLE shared, D3DKMT_HANDLE *mutex_local,
++        D3DKMT_HANDLE *sync_local, struct d3dkmt_resource_desc *desc )
++{
++    D3DKMT_HANDLE global = PtrToUlong( shared );
++
++    if (is_d3dkmt_global( global ))
++        return d3dkmt_open_resource_with_desc( global, NULL, mutex_local, sync_local, desc );
++
++    return d3dkmt_open_resource_with_desc( 0, shared, mutex_local, sync_local, desc );
++}
++
+ /* destroy a locally opened D3DKMT resource */
+ NTSTATUS d3dkmt_destroy_resource( D3DKMT_HANDLE local )
+ {
+diff --git a/dlls/win32u/hwnd_dmabuf.c b/dlls/win32u/hwnd_dmabuf.c
+index 1f49c4eecd7..fe9b4f46c28 100644
+--- a/dlls/win32u/hwnd_dmabuf.c
++++ b/dlls/win32u/hwnd_dmabuf.c
+@@ -38,6 +38,34 @@ int hwnd_dmabuf_open_channel( HWND hwnd )
+     return fd;
+ }
+ 
++/* Open an exclusive producer channel for cross-module GL publishers. */
++int hwnd_dmabuf_open_channel_exclusive( HWND hwnd )
++{
++    HANDLE handle = 0;
++    int fd = -1;
++
++    if (wine_hwnd_dmabuf_get_channel_exclusive( hwnd, &handle ) != HWND_DMABUF_OK || !handle)
++        return -1;
++    if (wine_server_handle_to_fd( handle, FILE_READ_DATA | FILE_WRITE_DATA, &fd, NULL ))
++    {
++        fd = -1;
++        wine_hwnd_dmabuf_release_channel( hwnd );
++    }
++    NtClose( handle );
++    return fd;
++}
++
++void hwnd_dmabuf_close_channel( HWND hwnd, int channel_fd )
++{
++    if (channel_fd >= 0) close( channel_fd );
++    wine_hwnd_dmabuf_release_channel( hwnd );
++}
++
++unsigned int hwnd_dmabuf_release_channel( HWND hwnd )
++{
++    return wine_hwnd_dmabuf_release_channel( hwnd );
++}
++
+ /* Send one frame. The caller must reclaim the slot on error. */
+ int hwnd_dmabuf_channel_send( int channel_fd, const void *desc, int dmabuf_fd )
+ {
+@@ -67,3 +95,73 @@ int hwnd_dmabuf_channel_send( int channel_fd, const void *desc, int dmabuf_fd )
+     if (dmabuf_fd >= 0) close( dmabuf_fd );
+     return n == sizeof(hwnd_dmabuf_frame_desc_t) ? 0 : n < 0 ? errno : EMSGSIZE;
+ }
++
++static int hwnd_dmabuf_channel_result_from_errno( int err )
++{
++    switch (err)
++    {
++        case EPIPE:
++        case ECONNRESET:
++        case ENOTCONN:
++        case ECONNABORTED:
++#ifdef ESHUTDOWN
++        case ESHUTDOWN:
++#endif
++        case EBADF:
++            return HWND_DMABUF_CHANNEL_CLOSED;
++        default:
++            return HWND_DMABUF_CHANNEL_ERROR;
++    }
++}
++
++int hwnd_dmabuf_channel_publish( HWND hwnd, int channel_fd, const void *desc, int dmabuf_fd )
++{
++    int send_fd, ret;
++
++    if (dmabuf_fd < 0) return HWND_DMABUF_CHANNEL_ERROR;
++    if ((send_fd = dup( dmabuf_fd )) < 0)
++        return hwnd_dmabuf_channel_result_from_errno( errno );
++
++    ret = hwnd_dmabuf_channel_send( channel_fd, desc, send_fd );
++    if (!ret) hwnd_dmabuf_post_wake( hwnd );
++    return ret ? hwnd_dmabuf_channel_result_from_errno( ret ) : HWND_DMABUF_CHANNEL_OK;
++}
++
++int hwnd_dmabuf_channel_recv_release( int channel_fd, void *release )
++{
++    ssize_t n;
++
++    do n = recv( channel_fd, release, sizeof(hwnd_dmabuf_release_t), MSG_DONTWAIT );
++    while (n < 0 && errno == EINTR);
++
++    if (n == sizeof(hwnd_dmabuf_release_t)) return HWND_DMABUF_CHANNEL_OK;
++#if EAGAIN == EWOULDBLOCK
++    if (n < 0 && errno == EAGAIN) return HWND_DMABUF_CHANNEL_EMPTY;
++#else
++    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return HWND_DMABUF_CHANNEL_EMPTY;
++#endif
++    if (!n) return HWND_DMABUF_CHANNEL_CLOSED;
++    return n < 0 ? hwnd_dmabuf_channel_result_from_errno( errno ) : HWND_DMABUF_CHANNEL_ERROR;
++}
++
++int WINAPI NtUserHwndDmaBufOpenProducer( HWND hwnd )
++{
++    return hwnd_dmabuf_open_channel_exclusive( hwnd );
++}
++
++void WINAPI NtUserHwndDmaBufCloseProducer( HWND hwnd, int channel_fd )
++{
++    hwnd_dmabuf_close_channel( hwnd, channel_fd );
++}
++
++int WINAPI NtUserHwndDmaBufPublish( HWND hwnd, int channel_fd, const void *desc, int dmabuf_fd )
++{
++    if (!desc) return HWND_DMABUF_CHANNEL_ERROR;
++    return hwnd_dmabuf_channel_publish( hwnd, channel_fd, desc, dmabuf_fd );
++}
++
++int WINAPI NtUserHwndDmaBufDrainRelease( int channel_fd, void *release )
++{
++    if (!release) return HWND_DMABUF_CHANNEL_ERROR;
++    return hwnd_dmabuf_channel_recv_release( channel_fd, release );
++}
+diff --git a/dlls/win32u/ntuser_private.h b/dlls/win32u/ntuser_private.h
+index 5910ed091b2..3298e939bea 100644
+--- a/dlls/win32u/ntuser_private.h
++++ b/dlls/win32u/ntuser_private.h
+@@ -247,7 +247,12 @@ extern struct vulkan_instance *vulkan_instance_create( const struct vulkan_insta
+ 
+ /* hwnd_dmabuf.c */
+ extern int hwnd_dmabuf_open_channel( HWND hwnd );
++extern int hwnd_dmabuf_open_channel_exclusive( HWND hwnd );
++extern void hwnd_dmabuf_close_channel( HWND hwnd, int channel_fd );
++extern unsigned int hwnd_dmabuf_release_channel( HWND hwnd );
+ extern int hwnd_dmabuf_channel_send( int channel_fd, const void *desc, int dmabuf_fd );
++extern int hwnd_dmabuf_channel_publish( HWND hwnd, int channel_fd, const void *desc, int dmabuf_fd );
++extern int hwnd_dmabuf_channel_recv_release( int channel_fd, void *release );
+ extern void hwnd_dmabuf_post_wake( HWND hwnd );
+ 
+ /* window.c */
+diff --git a/dlls/win32u/opengl.c b/dlls/win32u/opengl.c
+index 07fbeeae7a0..ab0d38ef454 100644
+--- a/dlls/win32u/opengl.c
++++ b/dlls/win32u/opengl.c
+@@ -34,6 +34,8 @@
+ #include "win32u_private.h"
+ #include "ntuser_private.h"
+ 
++#include <dxgi.h>
++
+ #include "wine/opengl_driver.h"
+ 
+ #include "dibdrv/dibdrv.h"
+@@ -1542,6 +1544,11 @@ static BOOL init_egl_platform( struct egl_platform *egl, const struct opengl_fun
+ 
+     egl->has_EGL_EXT_present_opaque = has_extension( extensions, "EGL_EXT_present_opaque" );
+     egl->has_EGL_EXT_pixel_format_float = has_extension( extensions, "EGL_EXT_pixel_format_float" );
++    egl->has_EGL_KHR_image_base = has_extension( extensions, "EGL_KHR_image_base" );
++    egl->has_EGL_KHR_gl_renderbuffer_image = has_extension( extensions, "EGL_KHR_gl_renderbuffer_image" );
++    egl->has_EGL_KHR_gl_texture_2D_image = has_extension( extensions, "EGL_KHR_gl_texture_2D_image" );
++    egl->has_EGL_KHR_image = has_extension( extensions, "EGL_KHR_image" );
++    egl->has_EGL_MESA_image_dma_buf_export = has_extension( extensions, "EGL_MESA_image_dma_buf_export" );
+     return TRUE;
+ }
+ 
+@@ -3334,6 +3341,565 @@ void win32u_glImportSemaphoreWin32NameEXT( GLuint semaphore, GLenum type, const
+     }
+ }
+ 
++#ifndef WGL_ACCESS_READ_ONLY_NV
++#define WGL_ACCESS_READ_ONLY_NV             0x0000
++#define WGL_ACCESS_READ_WRITE_NV            0x0001
++#define WGL_ACCESS_WRITE_DISCARD_NV         0x0002
++#endif
++
++struct wgl_dx_share_handle
++{
++    struct list entry;
++    void *dx_object;
++    HANDLE share_handle;
++};
++
++struct wgl_dx_object
++{
++    struct list entry;
++    HANDLE handle;
++    void *dx_object;
++    GLuint gl_name;
++    GLenum gl_type;
++    GLenum access;
++    BOOL locked;
++    GLuint memory;
++    UINT width;
++    UINT height;
++};
++
++struct wgl_dx_gl_format
++{
++    GLenum internal_format;
++    UINT bytes_per_pixel;
++    BOOL bgra_swizzle;
++};
++
++struct wgl_dx_device
++{
++    struct list entry;
++    HANDLE handle;
++    void *dx_device;
++    struct list objects;
++};
++
++static pthread_mutex_t wgl_dx_mutex = PTHREAD_MUTEX_INITIALIZER;
++static struct list wgl_dx_devices = LIST_INIT( wgl_dx_devices );
++static struct list wgl_dx_share_handles = LIST_INIT( wgl_dx_share_handles );
++static UINT_PTR wgl_dx_next_handle = 1;
++static BOOL wgl_dx_supported;
++
++static HANDLE wgl_dx_alloc_handle(void)
++{
++    return (HANDLE)(UINT_PTR)wgl_dx_next_handle++;
++}
++
++static BOOL wgl_dx_valid_access( GLenum access )
++{
++    return access == WGL_ACCESS_READ_ONLY_NV || access == WGL_ACCESS_READ_WRITE_NV ||
++           access == WGL_ACCESS_WRITE_DISCARD_NV;
++}
++
++static struct wgl_dx_device *wgl_dx_get_device_locked( HANDLE handle )
++{
++    struct wgl_dx_device *device;
++
++    LIST_FOR_EACH_ENTRY( device, &wgl_dx_devices, struct wgl_dx_device, entry )
++    {
++        if (device->handle == handle) return device;
++    }
++
++    return NULL;
++}
++
++static struct wgl_dx_object *wgl_dx_get_object_locked( struct wgl_dx_device *device, HANDLE handle )
++{
++    struct wgl_dx_object *object;
++
++    LIST_FOR_EACH_ENTRY( object, &device->objects, struct wgl_dx_object, entry )
++    {
++        if (object->handle == handle) return object;
++    }
++
++    return NULL;
++}
++
++static struct wgl_dx_share_handle *wgl_dx_get_share_handle_locked( void *dx_object )
++{
++    struct wgl_dx_share_handle *share;
++
++    LIST_FOR_EACH_ENTRY( share, &wgl_dx_share_handles, struct wgl_dx_share_handle, entry )
++    {
++        if (share->dx_object == dx_object) return share;
++    }
++
++    return NULL;
++}
++
++static void wgl_dx_remove_share_handle_locked( void *dx_object, HANDLE share_handle )
++{
++    struct wgl_dx_share_handle *share;
++
++    if ((share = wgl_dx_get_share_handle_locked( dx_object )) && share->share_handle == share_handle)
++    {
++        list_remove( &share->entry );
++        free( share );
++    }
++}
++
++static void wgl_dx_drain_gl_errors(void)
++{
++    unsigned int i;
++
++    for (i = 0; i < 16 && display_funcs.p_glGetError() != GL_NO_ERROR; ++i) {}
++}
++
++static BOOL wgl_dx_get_gl_format( UINT format, struct wgl_dx_gl_format *gl_format )
++{
++    switch (format)
++    {
++    case DXGI_FORMAT_R8G8B8A8_UNORM:
++        gl_format->internal_format = GL_RGBA8;
++        gl_format->bytes_per_pixel = 4;
++        gl_format->bgra_swizzle = FALSE;
++        return TRUE;
++    case DXGI_FORMAT_B8G8R8A8_UNORM:
++        gl_format->internal_format = GL_RGBA8;
++        gl_format->bytes_per_pixel = 4;
++        gl_format->bgra_swizzle = TRUE;
++        return TRUE;
++    default:
++        WARN( "Unsupported DXGI format %#x\n", format );
++        return FALSE;
++    }
++}
++
++static BOOL wgl_dx_validate_resource_desc( const struct d3dkmt_resource_desc *desc, GLenum gl_type,
++                                           struct wgl_dx_gl_format *gl_format, GLuint64 *size )
++{
++    if (gl_type != GL_TEXTURE_2D)
++    {
++        WARN( "Unsupported GL object type %#x\n", gl_type );
++        return FALSE;
++    }
++    if (desc->type != D3DKMT_RESOURCE_DESC_TEXTURE_2D)
++    {
++        WARN( "Unsupported D3DKMT resource type %#x\n", desc->type );
++        return FALSE;
++    }
++    if (!desc->width || !desc->height)
++    {
++        WARN( "Invalid resource dimensions %ux%u\n", desc->width, desc->height );
++        return FALSE;
++    }
++    if (desc->mip_levels != 1 || desc->array_size != 1 || desc->sample_count != 1)
++    {
++        WARN( "Unsupported resource shape mips %u array %u samples %u\n",
++              desc->mip_levels, desc->array_size, desc->sample_count );
++        return FALSE;
++    }
++    if (!wgl_dx_get_gl_format( desc->format, gl_format )) return FALSE;
++
++    *size = (GLuint64)desc->width * desc->height * gl_format->bytes_per_pixel;
++    return TRUE;
++}
++
++static GLuint64 wgl_dx_get_fd_size( int fd, GLuint64 min_size )
++{
++    off_t end;
++
++    if ((end = lseek( fd, 0, SEEK_END )) > 0)
++    {
++        lseek( fd, 0, SEEK_SET );
++        if ((GLuint64)end >= min_size) return end;
++
++        WARN( "Shared resource fd size %s is smaller than minimum image size %s\n",
++              wine_dbgstr_longlong( (ULONGLONG)end ), wine_dbgstr_longlong( min_size ) );
++        return 0;
++    }
++
++    WARN( "Failed to query shared resource fd size, using minimum image size %s\n",
++          wine_dbgstr_longlong( min_size ) );
++    return min_size;
++}
++
++static void wgl_dx_apply_bgra_swizzle(void)
++{
++    static const GLint swizzle[] = {GL_BLUE, GL_GREEN, GL_RED, GL_ALPHA};
++
++    display_funcs.p_glTexParameteriv( GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA, swizzle );
++}
++
++static void wgl_dx_delete_object( struct wgl_dx_object *object )
++{
++    if (object->memory && display_funcs.p_glDeleteMemoryObjectsEXT)
++    {
++        if (NtCurrentTeb()->glContext) display_funcs.p_glDeleteMemoryObjectsEXT( 1, &object->memory );
++        else WARN( "Skipping WGL/DX memory object delete without a current GL context\n" );
++    }
++    free( object );
++}
++
++static BOOL wgl_dx_import_texture( HANDLE share_handle, GLuint gl_name, GLenum gl_type, struct wgl_dx_object *object )
++{
++    D3DKMT_HANDLE local = 0, mutex = 0, sync = 0;
++    struct d3dkmt_resource_desc desc;
++    struct wgl_dx_gl_format gl_format;
++    GLenum err;
++    GLuint64 size;
++    GLuint memory = 0;
++    GLint previous = 0;
++    int fd;
++
++    local = d3dkmt_open_shared_resource_with_desc( share_handle, &mutex, &sync, &desc );
++    if (mutex) d3dkmt_destroy_mutex( mutex );
++    if (sync) d3dkmt_destroy_sync( sync );
++    if (!local)
++    {
++        WARN( "Failed to open shared D3DKMT resource for handle %p\n", share_handle );
++        return FALSE;
++    }
++
++    if (!wgl_dx_validate_resource_desc( &desc, gl_type, &gl_format, &size ))
++    {
++        d3dkmt_destroy_resource( local );
++        return FALSE;
++    }
++
++    fd = d3dkmt_object_get_fd( local );
++    d3dkmt_destroy_resource( local );
++    if (fd < 0)
++    {
++        WARN( "Failed to obtain shared resource fd\n" );
++        return FALSE;
++    }
++    if (!(size = wgl_dx_get_fd_size( fd, size )))
++    {
++        close( fd );
++        return FALSE;
++    }
++
++    wgl_dx_drain_gl_errors();
++    display_funcs.p_glCreateMemoryObjectsEXT( 1, &memory );
++    if ((err = display_funcs.p_glGetError()) || !memory)
++    {
++        WARN( "glCreateMemoryObjectsEXT failed with %#x\n", err );
++        if (memory) display_funcs.p_glDeleteMemoryObjectsEXT( 1, &memory );
++        close( fd );
++        return FALSE;
++    }
++
++    display_funcs.p_glImportMemoryFdEXT( memory, size, GL_HANDLE_TYPE_OPAQUE_FD_EXT, fd );
++    if ((err = display_funcs.p_glGetError()))
++    {
++        WARN( "glImportMemoryFdEXT failed with %#x\n", err );
++        close( fd );
++        display_funcs.p_glDeleteMemoryObjectsEXT( 1, &memory );
++        return FALSE;
++    }
++
++    display_funcs.p_glGetIntegerv( GL_TEXTURE_BINDING_2D, &previous );
++    display_funcs.p_glBindTexture( GL_TEXTURE_2D, gl_name );
++    if (gl_format.bgra_swizzle)
++    {
++        wgl_dx_apply_bgra_swizzle();
++        err = display_funcs.p_glGetError();
++    }
++    else err = GL_NO_ERROR;
++    if (!err)
++    {
++        display_funcs.p_glTexStorageMem2DEXT( GL_TEXTURE_2D, 1, gl_format.internal_format, desc.width, desc.height, memory, 0 );
++        err = display_funcs.p_glGetError();
++    }
++    display_funcs.p_glBindTexture( GL_TEXTURE_2D, previous );
++    if (err)
++    {
++        WARN( "Failed to initialize WGL/DX texture storage with %#x\n", err );
++        display_funcs.p_glDeleteMemoryObjectsEXT( 1, &memory );
++        return FALSE;
++    }
++
++    object->memory = memory;
++    object->width = desc.width;
++    object->height = desc.height;
++    return TRUE;
++}
++
++static BOOL wgl_dx_functions_supported(void)
++{
++    return display_funcs.p_glBindTexture && display_funcs.p_glCreateMemoryObjectsEXT &&
++           display_funcs.p_glDeleteMemoryObjectsEXT && display_funcs.p_glFinish &&
++           display_funcs.p_glGetError && display_funcs.p_glGetIntegerv &&
++           display_funcs.p_glImportMemoryFdEXT && display_funcs.p_glTexParameteriv &&
++           display_funcs.p_glTexStorageMem2DEXT;
++}
++
++static HANDLE win32u_wglDXOpenDeviceNV( void *dx_device )
++{
++    struct wgl_dx_device *device;
++
++    TRACE( "dx_device %p\n", dx_device );
++
++    if (!wgl_dx_supported || !dx_device) return NULL;
++    if (!(device = calloc( 1, sizeof(*device) ))) return NULL;
++
++    pthread_mutex_lock( &wgl_dx_mutex );
++    device->handle = wgl_dx_alloc_handle();
++    device->dx_device = dx_device;
++    list_init( &device->objects );
++    list_add_tail( &wgl_dx_devices, &device->entry );
++    pthread_mutex_unlock( &wgl_dx_mutex );
++
++    return device->handle;
++}
++
++static BOOL win32u_wglDXCloseDeviceNV( HANDLE handle )
++{
++    struct wgl_dx_object *object, *next;
++    struct list objects = LIST_INIT( objects );
++    struct wgl_dx_device *device;
++
++    TRACE( "handle %p\n", handle );
++
++    if (!wgl_dx_supported || !handle) return FALSE;
++
++    pthread_mutex_lock( &wgl_dx_mutex );
++    if (!(device = wgl_dx_get_device_locked( handle )))
++    {
++        pthread_mutex_unlock( &wgl_dx_mutex );
++        return FALSE;
++    }
++    list_remove( &device->entry );
++    list_move_tail( &objects, &device->objects );
++    pthread_mutex_unlock( &wgl_dx_mutex );
++
++    LIST_FOR_EACH_ENTRY_SAFE( object, next, &objects, struct wgl_dx_object, entry )
++    {
++        list_remove( &object->entry );
++        wgl_dx_delete_object( object );
++    }
++    free( device );
++    return TRUE;
++}
++
++static HANDLE win32u_wglDXRegisterObjectNV( HANDLE device_handle, void *dx_object,
++                                            GLuint name, GLenum type, GLenum access )
++{
++    struct wgl_dx_share_handle *share;
++    struct wgl_dx_device *device;
++    struct wgl_dx_object *object;
++    HANDLE share_handle;
++    BOOL remove_share_handle = FALSE;
++
++    TRACE( "device %p, dx_object %p, name %u, type %#x, access %#x\n",
++           device_handle, dx_object, name, type, access );
++
++    if (!wgl_dx_supported || !device_handle || !dx_object || !name || !wgl_dx_valid_access( access ))
++        return NULL;
++    if (!NtCurrentTeb()->glContext)
++    {
++        WARN( "No current GL context for WGL/DX registration\n" );
++        return NULL;
++    }
++    if (!(object = calloc( 1, sizeof(*object) ))) return NULL;
++
++    pthread_mutex_lock( &wgl_dx_mutex );
++    if (!(device = wgl_dx_get_device_locked( device_handle )))
++    {
++        pthread_mutex_unlock( &wgl_dx_mutex );
++        free( object );
++        return NULL;
++    }
++    if ((share = wgl_dx_get_share_handle_locked( dx_object )))
++    {
++        share_handle = share->share_handle;
++        remove_share_handle = TRUE;
++    }
++    else share_handle = dx_object;
++    pthread_mutex_unlock( &wgl_dx_mutex );
++
++    if (!wgl_dx_import_texture( share_handle, name, type, object ))
++    {
++        free( object );
++        return NULL;
++    }
++
++    pthread_mutex_lock( &wgl_dx_mutex );
++    if (!(device = wgl_dx_get_device_locked( device_handle )))
++    {
++        if (remove_share_handle) wgl_dx_remove_share_handle_locked( dx_object, share_handle );
++        pthread_mutex_unlock( &wgl_dx_mutex );
++        wgl_dx_delete_object( object );
++        return NULL;
++    }
++    object->handle = wgl_dx_alloc_handle();
++    object->dx_object = dx_object;
++    object->gl_name = name;
++    object->gl_type = type;
++    object->access = access;
++    list_add_tail( &device->objects, &object->entry );
++    if (remove_share_handle) wgl_dx_remove_share_handle_locked( dx_object, share_handle );
++    pthread_mutex_unlock( &wgl_dx_mutex );
++
++    return object->handle;
++}
++
++static BOOL win32u_wglDXUnregisterObjectNV( HANDLE device_handle, HANDLE object_handle )
++{
++    struct wgl_dx_device *device;
++    struct wgl_dx_object *object;
++
++    TRACE( "device %p, object %p\n", device_handle, object_handle );
++
++    if (!wgl_dx_supported || !device_handle || !object_handle) return FALSE;
++
++    pthread_mutex_lock( &wgl_dx_mutex );
++    if (!(device = wgl_dx_get_device_locked( device_handle )) ||
++        !(object = wgl_dx_get_object_locked( device, object_handle )) || object->locked)
++    {
++        pthread_mutex_unlock( &wgl_dx_mutex );
++        return FALSE;
++    }
++    list_remove( &object->entry );
++    pthread_mutex_unlock( &wgl_dx_mutex );
++
++    wgl_dx_delete_object( object );
++    return TRUE;
++}
++
++static BOOL win32u_wglDXObjectAccessNV( HANDLE object_handle, GLenum access )
++{
++    struct wgl_dx_device *device;
++    struct wgl_dx_object *object;
++
++    TRACE( "object %p, access %#x\n", object_handle, access );
++
++    if (!wgl_dx_supported || !object_handle || !wgl_dx_valid_access( access )) return FALSE;
++
++    pthread_mutex_lock( &wgl_dx_mutex );
++    LIST_FOR_EACH_ENTRY( device, &wgl_dx_devices, struct wgl_dx_device, entry )
++    {
++        if ((object = wgl_dx_get_object_locked( device, object_handle )))
++        {
++            if (object->locked)
++            {
++                pthread_mutex_unlock( &wgl_dx_mutex );
++                return FALSE;
++            }
++            object->access = access;
++            pthread_mutex_unlock( &wgl_dx_mutex );
++            return TRUE;
++        }
++    }
++    pthread_mutex_unlock( &wgl_dx_mutex );
++    return FALSE;
++}
++
++static BOOL win32u_wglDXLockObjectsNV( HANDLE device_handle, GLint count, HANDLE *handles )
++{
++    struct wgl_dx_device *device;
++    struct wgl_dx_object *object;
++    GLint i;
++
++    TRACE( "device %p, count %d, handles %p\n", device_handle, count, handles );
++
++    if (!wgl_dx_supported || !NtCurrentTeb()->glContext ||
++        !device_handle || count < 0 || (count && !handles))
++        return FALSE;
++
++    pthread_mutex_lock( &wgl_dx_mutex );
++    if (!(device = wgl_dx_get_device_locked( device_handle )))
++    {
++        pthread_mutex_unlock( &wgl_dx_mutex );
++        return FALSE;
++    }
++    for (i = 0; i < count; ++i)
++    {
++        if (!(object = wgl_dx_get_object_locked( device, handles[i] )) || object->locked)
++        {
++            pthread_mutex_unlock( &wgl_dx_mutex );
++            return FALSE;
++        }
++    }
++    for (i = 0; i < count; ++i)
++    {
++        object = wgl_dx_get_object_locked( device, handles[i] );
++        object->locked = TRUE;
++    }
++    pthread_mutex_unlock( &wgl_dx_mutex );
++    return TRUE;
++}
++
++static BOOL win32u_wglDXUnlockObjectsNV( HANDLE device_handle, GLint count, HANDLE *handles )
++{
++    struct wgl_dx_device *device;
++    struct wgl_dx_object *object;
++    GLint i;
++
++    TRACE( "device %p, count %d, handles %p\n", device_handle, count, handles );
++
++    if (!wgl_dx_supported || !NtCurrentTeb()->glContext ||
++        !device_handle || count < 0 || (count && !handles))
++        return FALSE;
++
++    pthread_mutex_lock( &wgl_dx_mutex );
++    if (!(device = wgl_dx_get_device_locked( device_handle )))
++    {
++        pthread_mutex_unlock( &wgl_dx_mutex );
++        return FALSE;
++    }
++    for (i = 0; i < count; ++i)
++    {
++        if (!(object = wgl_dx_get_object_locked( device, handles[i] )) || !object->locked)
++        {
++            pthread_mutex_unlock( &wgl_dx_mutex );
++            return FALSE;
++        }
++    }
++    display_funcs.p_glFinish();
++    for (i = 0; i < count; ++i)
++    {
++        object = wgl_dx_get_object_locked( device, handles[i] );
++        object->locked = FALSE;
++    }
++    pthread_mutex_unlock( &wgl_dx_mutex );
++
++    return TRUE;
++}
++
++static BOOL win32u_wglDXSetResourceShareHandleNV( void *dx_object, HANDLE share_handle )
++{
++    struct wgl_dx_share_handle *existing, *share;
++
++    TRACE( "dx_object %p, share_handle %p\n", dx_object, share_handle );
++
++    if (!wgl_dx_supported || !dx_object || !share_handle) return FALSE;
++
++    pthread_mutex_lock( &wgl_dx_mutex );
++    if ((share = wgl_dx_get_share_handle_locked( dx_object )))
++    {
++        share->share_handle = share_handle;
++        pthread_mutex_unlock( &wgl_dx_mutex );
++        return TRUE;
++    }
++    pthread_mutex_unlock( &wgl_dx_mutex );
++
++    if (!(share = calloc( 1, sizeof(*share) ))) return FALSE;
++    share->dx_object = dx_object;
++    share->share_handle = share_handle;
++
++    pthread_mutex_lock( &wgl_dx_mutex );
++    if ((existing = wgl_dx_get_share_handle_locked( dx_object )))
++    {
++        free( share );
++        existing->share_handle = share_handle;
++    }
++    else list_add_tail( &wgl_dx_share_handles, &share->entry );
++    pthread_mutex_unlock( &wgl_dx_mutex );
++
++    return TRUE;
++}
++
+ static void display_funcs_init(void)
+ {
+     struct egl_platform *egl, *next;
+@@ -3414,6 +3980,8 @@ static void display_funcs_init(void)
+     strcpy( wgl_extensions, driver_funcs->p_init_wgl_extensions( &display_funcs ) );
+     display_funcs.p_wglGetPixelFormat = win32u_wglGetPixelFormat;
+     display_funcs.p_wglSetPixelFormat = win32u_wglSetPixelFormat;
++    display_funcs.p_wglWineDmaBufExportSupportedWINE = driver_funcs->p_get_proc_address( "wglWineDmaBufExportSupportedWINE" );
++    display_funcs.p_wglWineExportDmaBufWINE = driver_funcs->p_get_proc_address( "wglWineExportDmaBufWINE" );
+ 
+     display_funcs.p_wglCreateContext = (void *)1; /* never called */
+     display_funcs.p_wglDeleteContext = (void *)1; /* never called */
+@@ -3476,6 +4044,32 @@ static void display_funcs_init(void)
+     display_funcs.p_wglSwapIntervalEXT = win32u_wglSwapIntervalEXT;
+     display_funcs.p_wglGetSwapIntervalEXT = win32u_wglGetSwapIntervalEXT;
+ 
++    wgl_dx_supported = wgl_dx_functions_supported();
++    if (wgl_dx_supported)
++    {
++        display_funcs.p_wglDXOpenDeviceNV             = win32u_wglDXOpenDeviceNV;
++        display_funcs.p_wglDXCloseDeviceNV            = win32u_wglDXCloseDeviceNV;
++        display_funcs.p_wglDXRegisterObjectNV         = win32u_wglDXRegisterObjectNV;
++        display_funcs.p_wglDXUnregisterObjectNV       = win32u_wglDXUnregisterObjectNV;
++        display_funcs.p_wglDXLockObjectsNV            = win32u_wglDXLockObjectsNV;
++        display_funcs.p_wglDXUnlockObjectsNV          = win32u_wglDXUnlockObjectsNV;
++        display_funcs.p_wglDXObjectAccessNV           = win32u_wglDXObjectAccessNV;
++        display_funcs.p_wglDXSetResourceShareHandleNV = win32u_wglDXSetResourceShareHandleNV;
++        register_extension( wgl_extensions, ARRAY_SIZE(wgl_extensions), "WGL_NV_DX_interop" );
++        register_extension( wgl_extensions, ARRAY_SIZE(wgl_extensions), "WGL_NV_DX_interop2" );
++    }
++    else
++    {
++        display_funcs.p_wglDXOpenDeviceNV = NULL;
++        display_funcs.p_wglDXCloseDeviceNV = NULL;
++        display_funcs.p_wglDXRegisterObjectNV = NULL;
++        display_funcs.p_wglDXUnregisterObjectNV = NULL;
++        display_funcs.p_wglDXLockObjectsNV = NULL;
++        display_funcs.p_wglDXUnlockObjectsNV = NULL;
++        display_funcs.p_wglDXObjectAccessNV = NULL;
++        display_funcs.p_wglDXSetResourceShareHandleNV = NULL;
++    }
++
+     if (display_funcs.p_glImportMemoryFdEXT)
+     {
+         display_funcs.p_glImportMemoryWin32HandleEXT = win32u_glImportMemoryWin32HandleEXT;
+diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+index 5912c61ef26..805ecaf600a 100644
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -83,6 +83,13 @@ static UINT hwnd_dmabuf_get_caps( HWND hwnd, void *caps, void *format_modifiers,
+                                                         max_format_modifiers, format_modifier_count );
+ }
+ 
++UINT WINAPI NtUserHwndDmaBufGetCaps( HWND hwnd, void *caps, void *format_modifiers,
++                                     UINT max_format_modifiers, UINT *format_modifier_count )
++{
++    return hwnd_dmabuf_get_caps( hwnd, caps, format_modifiers,
++                                 max_format_modifiers, format_modifier_count );
++}
++
+ #define ROUND_SIZE(size, mask) ((((SIZE_T)(size) + (mask)) & ~(SIZE_T)(mask)))
+ 
+ static BOOL use_external_memory(void)
+@@ -2756,11 +2763,12 @@ static BOOL vk_host_modifier_exportable( struct vulkan_device *device, VkFormat
+ }
+ 
+ /* Build the candidate modifier list = caps modifiers (matching fourcc) that the
+- * host can also export as a single-plane dmabuf. Returns the count placed in
++ * host can also export as a single-plane dmabuf. out_mods is what Vulkan gets,
++ * out_wire_mods is what the consumer must see. Returns the count placed in
+  * out_mods. 0 means no intersection -> caller falls back to the host swapchain. */
+ static uint32_t vk_select_managed_modifiers( struct vulkan_device *device, HWND hwnd, VkFormat format,
+                                              VkImageUsageFlags usage, BOOL opaque, unsigned int *fourcc_out,
+-                                             uint64_t *out_mods, uint32_t max_out )
++                                             uint64_t *out_mods, uint64_t *out_wire_mods, uint32_t max_out )
+ {
+     hwnd_dmabuf_format_modifier_t *caps_mods;
+     hwnd_dmabuf_host_caps_t caps = {0};
+@@ -2788,6 +2796,11 @@ static uint32_t vk_select_managed_modifiers( struct vulkan_device *device, HWND
+         free( caps_mods );
+         return 0;
+     }
++    if (!(caps_count = caps.format_modifier_count))
++    {
++        free( caps_mods );
++        return 0;
++    }
+ 
+     *fourcc_out = 0;
+     for (i = 0; i < caps_count && !*fourcc_out; i++)
+@@ -2799,7 +2812,8 @@ static uint32_t vk_select_managed_modifiers( struct vulkan_device *device, HWND
+ 
+     for (i = 0; i < caps_count && out_count < max_out; i++)
+     {
+-        uint64_t modifier = caps_mods[i].modifier;
++        uint64_t wire_modifier = caps_mods[i].modifier;
++        uint64_t modifier = wire_modifier;
+ 
+         if (caps_mods[i].fourcc != *fourcc_out) continue;
+         /* MOD_INVALID means "any/implicit". Let the host pick by offering LINEAR. */
+@@ -2813,7 +2827,9 @@ static uint32_t vk_select_managed_modifiers( struct vulkan_device *device, HWND
+             for (j = 0; j < out_count; j++) if (out_mods[j] == modifier) { dup = TRUE; break; }
+             if (dup) continue;
+         }
+-        out_mods[out_count++] = modifier;
++        out_mods[out_count] = modifier;
++        out_wire_mods[out_count] = wire_modifier;
++        out_count++;
+     }
+ 
+     free( caps_mods );
+@@ -2847,7 +2863,8 @@ static void managed_free( struct vulkan_device *device, struct wine_managed_swap
+ /* Create one exportable DRM-modifier image + dedicated exportable memory, export
+  * its dmabuf fd and cache the realized modifier + per-plane layouts. */
+ static VkResult managed_create_image( struct vulkan_device *device, struct wine_managed_swapchain *managed,
+-                                      const uint64_t *modifiers, uint32_t modifier_count,
++                                      const uint64_t *modifiers, const uint64_t *wire_modifiers,
++                                      uint32_t modifier_count,
+                                       struct wine_managed_image *image )
+ {
+     VkImageDrmFormatModifierListCreateInfoEXT mod_list =
+@@ -2896,6 +2913,7 @@ static VkResult managed_create_image( struct vulkan_device *device, struct wine_
+     struct vulkan_physical_device *physical_device = device->physical_device;
+     VkSubresourceLayout layout = {0};
+     uint32_t mem_type_index = ~0u, plane_count, i;
++    uint64_t wire_modifier;
+     int fd = -1;
+     VkResult res;
+ 
+@@ -2959,6 +2977,15 @@ static VkResult managed_create_image( struct vulkan_device *device, struct wine_
+      * image still publishes its own modifier/stride/offset below in case the
+      * host picks differently per image. */
+     managed->realized_modifier = mod_props.drmFormatModifier;
++    wire_modifier = mod_props.drmFormatModifier;
++    for (i = 0; i < modifier_count; i++)
++    {
++        if (modifiers[i] == mod_props.drmFormatModifier)
++        {
++            wire_modifier = wire_modifiers[i];
++            break;
++        }
++    }
+ 
+     /* Publish every plane of the realized modifier. A missing auxiliary plane
+      * (e.g. AMD DCC) makes the consumer-side dmabuf import fail fatally. */
+@@ -3000,7 +3027,7 @@ static VkResult managed_create_image( struct vulkan_device *device, struct wine_
+     image->desc.fourcc = managed->fourcc;
+     image->desc.stride = image->desc.plane_strides[0];
+     image->desc.offset = image->desc.plane_offsets[0];
+-    image->desc.modifier = mod_props.drmFormatModifier; /* this image's realized modifier */
++    image->desc.modifier = wire_modifier;
+     image->desc.alpha_mode = managed->alpha_mode;
+     image->desc.sync_fd_kind = 0; /* HWND_DMABUF_SYNC_NONE: consumer ignores acquire today */
+     image->desc.producer_unique_id = 0; /* set from the managed producer id at present */
+@@ -3022,6 +3049,7 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
+                                           struct wine_managed_swapchain **out )
+ {
+     uint64_t modifiers[WINE_VK_MANAGED_MAX_MODIFIERS];
++    uint64_t wire_modifiers[WINE_VK_MANAGED_MAX_MODIFIERS];
+     struct wine_managed_swapchain *managed;
+     BOOL opaque_alpha;
+     unsigned int fourcc = 0;
+@@ -3038,7 +3066,7 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
+      * host can export as a single-plane dmabuf, against the realized usage. */
+     modifier_count = vk_select_managed_modifiers( device, surface->hwnd, create_info->imageFormat,
+                                                   usage | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, opaque_alpha,
+-                                                  &fourcc, modifiers, ARRAY_SIZE(modifiers) );
++                                                  &fourcc, modifiers, wire_modifiers, ARRAY_SIZE(modifiers) );
+     if (!modifier_count)
+     {
+         TRACE( "no host-exportable modifier intersection for hwnd %p format %u, falling back to host swapchain\n",
+@@ -3052,9 +3080,9 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
+     managed->format = create_info->imageFormat;
+     managed->fourcc = fourcc;
+     /* If the chosen fourcc is the opaque X-variant, tell the compositor to ignore
+-     * alpha (DXGI_ALPHA_MODE_IGNORE == 3). Otherwise leave alpha as straight. */
++     * alpha. Otherwise leave alpha as straight. */
+     managed->alpha_mode = (fourcc == vk_format_to_drm_fourcc( create_info->imageFormat, TRUE ))
+-                          ? 3 /* DXGI_ALPHA_MODE_IGNORE */ : 0 /* DXGI_ALPHA_MODE_UNSPECIFIED */;
++                          ? HWND_DMABUF_ALPHA_MODE_IGNORE : HWND_DMABUF_ALPHA_MODE_UNSPECIFIED;
+     managed->extents = create_info->imageExtent;
+     managed->usage = usage;
+     managed->next_release_token = 0;
+@@ -3081,7 +3109,8 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
+ 
+     for (i = 0; i < count; i++)
+     {
+-        if ((res = managed_create_image( device, managed, modifiers, modifier_count, &managed->images[i] )))
++        if ((res = managed_create_image( device, managed, modifiers, wire_modifiers,
++                                         modifier_count, &managed->images[i] )))
+         {
+             WARN( "failed to create managed image %u, res %d, falling back to host swapchain\n", i, res );
+             managed->image_count = i;
+diff --git a/dlls/win32u/win32u.spec b/dlls/win32u/win32u.spec
+index 638e0ee6035..5cb723a52ef 100644
+--- a/dlls/win32u/win32u.spec
++++ b/dlls/win32u/win32u.spec
+@@ -1136,6 +1136,11 @@
+ @ stub -syscall NtUserHidePointerContactVisualization
+ @ stdcall -syscall NtUserHiliteMenuItem(long long long long)
+ @ stub -syscall NtUserHungWindowFromGhostWindow
++@ stdcall -syscall NtUserHwndDmaBufCloseProducer(long long)
++@ stdcall -syscall NtUserHwndDmaBufDrainRelease(long ptr)
++@ stdcall -syscall NtUserHwndDmaBufGetCaps(long ptr ptr long ptr)
++@ stdcall -syscall NtUserHwndDmaBufOpenProducer(long)
++@ stdcall -syscall NtUserHwndDmaBufPublish(long long ptr long)
+ @ stub -syscall NtUserHwndQueryRedirectionInfo
+ @ stub -syscall NtUserHwndSetRedirectionInfo
+ @ stub -syscall NtUserImpersonateDdeClientWindow
+diff --git a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+index ffc02e70e73..3167e20dd56 100644
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -225,7 +225,31 @@ extern NTSTATUS d3dkmt_destroy_mutex( D3DKMT_HANDLE local );
+ extern HANDLE open_shared_resource_from_name( const WCHAR *name );
+ extern HANDLE open_shared_semaphore_from_name( const WCHAR *name );
+ 
++enum d3dkmt_resource_desc_type
++{
++    D3DKMT_RESOURCE_DESC_UNKNOWN,
++    D3DKMT_RESOURCE_DESC_TEXTURE_2D,
++};
++
++struct d3dkmt_resource_desc
++{
++    enum d3dkmt_resource_desc_type type;
++    UINT width;
++    UINT height;
++    UINT format;
++    UINT mip_levels;
++    UINT array_size;
++    UINT sample_count;
++    UINT sample_quality;
++    BOOL keyed_mutex;
++    BOOL nt_shared;
++};
++
+ extern D3DKMT_HANDLE d3dkmt_create_resource( int fd, D3DKMT_HANDLE *global );
++extern D3DKMT_HANDLE d3dkmt_open_resource_with_desc( D3DKMT_HANDLE global, HANDLE shared,
++        D3DKMT_HANDLE *mutex_local, D3DKMT_HANDLE *sync_local, struct d3dkmt_resource_desc *desc );
++extern D3DKMT_HANDLE d3dkmt_open_shared_resource_with_desc( HANDLE shared, D3DKMT_HANDLE *mutex_local,
++        D3DKMT_HANDLE *sync_local, struct d3dkmt_resource_desc *desc );
+ extern D3DKMT_HANDLE d3dkmt_open_resource( D3DKMT_HANDLE global, HANDLE shared, D3DKMT_HANDLE *mutex_local, D3DKMT_HANDLE *sync_local );
+ extern NTSTATUS d3dkmt_destroy_resource( D3DKMT_HANDLE local );
+ 
+diff --git a/dlls/wined3d/adapter_gl.c b/dlls/wined3d/adapter_gl.c
+index e33e27b4cc3..34ee7c64fbb 100644
+--- a/dlls/wined3d/adapter_gl.c
++++ b/dlls/wined3d/adapter_gl.c
+@@ -5057,6 +5057,19 @@ static BOOL wined3d_adapter_gl_init(struct wined3d_adapter_gl *adapter_gl,
+ #undef USE_GL_FUNC
+         gl_info->gl_ops.wgl.p_wglSwapBuffers = (void *)GetProcAddress(mod_gl, "wglSwapBuffers");
+         gl_info->gl_ops.wgl.p_wglGetPixelFormat = (void *)GetProcAddress(mod_gl, "wglGetPixelFormat");
++        gl_info->p_wglWineCloseDmaBufWINE = (void *)GetProcAddress(mod_gl, "wglWineCloseDmaBufWINE");
++        gl_info->p_wglWineDmaBufExportSupportedWINE = (void *)GetProcAddress(mod_gl, "wglWineDmaBufExportSupportedWINE");
++        gl_info->p_wglWineExportDmaBufWINE = (void *)GetProcAddress(mod_gl, "wglWineExportDmaBufWINE");
++        gl_info->p_wglWineHwndDmaBufOpenProducerWINE =
++                (void *)GetProcAddress(mod_gl, "wglWineHwndDmaBufOpenProducerWINE");
++        gl_info->p_wglWineHwndDmaBufGetCapsWINE =
++                (void *)GetProcAddress(mod_gl, "wglWineHwndDmaBufGetCapsWINE");
++        gl_info->p_wglWineHwndDmaBufCloseProducerWINE =
++                (void *)GetProcAddress(mod_gl, "wglWineHwndDmaBufCloseProducerWINE");
++        gl_info->p_wglWineHwndDmaBufPublishWINE =
++                (void *)GetProcAddress(mod_gl, "wglWineHwndDmaBufPublishWINE");
++        gl_info->p_wglWineHwndDmaBufDrainReleaseWINE =
++                (void *)GetProcAddress(mod_gl, "wglWineHwndDmaBufDrainReleaseWINE");
+     }
+ 
+     gl_info->p_glEnableWINE = gl_info->gl_ops.gl.p_glEnable;
+diff --git a/dlls/wined3d/swapchain.c b/dlls/wined3d/swapchain.c
+index cf73b56d50a..7adae6b9c4c 100644
+--- a/dlls/wined3d/swapchain.c
++++ b/dlls/wined3d/swapchain.c
+@@ -23,10 +23,15 @@
+ #include "wined3d_private.h"
+ #include "wined3d_gl.h"
+ #include "wined3d_vk.h"
++#include "wine/hwnd_dmabuf.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(d3d);
+ WINE_DECLARE_DEBUG_CHANNEL(d3d_perf);
+ 
++static LONGLONG volatile wined3d_gl_hwnd_dmabuf_next_producer_id;
++
++static void wined3d_gl_hwnd_dmabuf_cleanup(struct wined3d_swapchain_gl *swapchain_gl);
++
+ static BOOL set_window_present_rect(HWND hwnd, UINT x, UINT y, UINT width, UINT height)
+ {
+     RECT rect = {x, y, x + width, y + height};
+@@ -101,8 +106,18 @@ void wined3d_swapchain_cleanup(struct wined3d_swapchain *swapchain)
+     }
+ }
+ 
++static void wined3d_swapchain_gl_destroy_object(void *object)
++{
++    wined3d_gl_hwnd_dmabuf_cleanup(object);
++}
++
+ void wined3d_swapchain_gl_cleanup(struct wined3d_swapchain_gl *swapchain_gl)
+ {
++    struct wined3d_cs *cs = swapchain_gl->s.device->cs;
++
++    wined3d_cs_destroy_object(cs, wined3d_swapchain_gl_destroy_object, swapchain_gl);
++    wined3d_cs_finish(cs, WINED3D_CS_QUEUE_DEFAULT);
++
+     wined3d_swapchain_cleanup(&swapchain_gl->s);
+ }
+ 
+@@ -172,7 +187,10 @@ ULONG CDECL wined3d_swapchain_decref(struct wined3d_swapchain *swapchain)
+         wined3d_cs_finish(device->cs, WINED3D_CS_QUEUE_DEFAULT);
+ 
+         if (swapchain->dc)
++        {
+             wined3d_release_dc(swapchain->win_handle, swapchain->dc);
++            swapchain->dc = NULL;
++        }
+ 
+         swapchain->parent_ops->wined3d_object_destroyed(swapchain->parent);
+         swapchain->device->adapter->adapter_ops->adapter_destroy_swapchain(swapchain);
+@@ -203,7 +221,10 @@ void CDECL wined3d_swapchain_set_window(struct wined3d_swapchain *swapchain, HWN
+     wined3d_cs_finish(swapchain->device->cs, WINED3D_CS_QUEUE_DEFAULT);
+ 
+     if (swapchain->dc)
++    {
+         wined3d_release_dc(swapchain->win_handle, swapchain->dc);
++        swapchain->dc = NULL;
++    }
+ 
+     swapchain->win_handle = window;
+ 
+@@ -222,8 +243,14 @@ HRESULT CDECL wined3d_swapchain_present(struct wined3d_swapchain *swapchain,
+             swapchain, wine_dbgstr_rect(src_rect), wine_dbgstr_rect(dst_rect),
+             dst_window_override, swap_interval, flags);
+ 
+-    if (flags)
+-        FIXME("Ignoring flags %#x.\n", flags);
++    if (flags & ~WINED3D_PRESENT_NO_WINDOW_UPDATE)
++        FIXME("Ignoring flags %#x.\n", flags & ~WINED3D_PRESENT_NO_WINDOW_UPDATE);
++    if ((flags & WINED3D_PRESENT_NO_WINDOW_UPDATE)
++            && !wined3d_swapchain_supports_hwnd_dmabuf(swapchain))
++    {
++        TRACE("HWND dmabuf unsupported, updating the window.\n");
++        flags &= ~WINED3D_PRESENT_NO_WINDOW_UPDATE;
++    }
+ 
+     wined3d_mutex_lock();
+ 
+@@ -278,6 +305,16 @@ HRESULT CDECL wined3d_swapchain_get_front_buffer_data(const struct wined3d_swapc
+             swapchain->front_buffer, 0, &src_rect, 0, NULL, WINED3D_TEXF_POINT);
+ }
+ 
++BOOL CDECL wined3d_swapchain_supports_hwnd_dmabuf(const struct wined3d_swapchain *swapchain)
++{
++    TRACE("swapchain %p.\n", swapchain);
++
++    if (!swapchain || !swapchain->swapchain_ops->swapchain_supports_hwnd_dmabuf)
++        return FALSE;
++
++    return swapchain->swapchain_ops->swapchain_supports_hwnd_dmabuf(swapchain);
++}
++
+ struct wined3d_texture * CDECL wined3d_swapchain_get_back_buffer(const struct wined3d_swapchain *swapchain,
+         UINT back_buffer_idx)
+ {
+@@ -580,6 +617,649 @@ static void wined3d_swapchain_gl_rotate(struct wined3d_swapchain *swapchain, str
+     device_invalidate_state(swapchain->device, STATE_FRAMEBUFFER);
+ }
+ 
++static void wined3d_gl_hwnd_dmabuf_close_fd(struct wined3d_gl_hwnd_dmabuf_ring *ring, int *fd)
++{
++    if (*fd < 0)
++        return;
++
++    if (ring->p_wglWineCloseDmaBufWINE)
++        ring->p_wglWineCloseDmaBufWINE(*fd);
++    else
++        ERR("Leaking HWND dmabuf fd %d, no close helper.\n", *fd);
++
++    *fd = -1;
++}
++
++static enum wined3d_gl_hwnd_dmabuf_support wined3d_gl_hwnd_dmabuf_get_support(
++        const struct wined3d_gl_hwnd_dmabuf_ring *ring)
++{
++    return InterlockedCompareExchange((LONG volatile *)&ring->support,
++            WINED3D_GL_HWND_DMABUF_SUPPORT_UNKNOWN, WINED3D_GL_HWND_DMABUF_SUPPORT_UNKNOWN);
++}
++
++static bool wined3d_gl_hwnd_dmabuf_probe_support(struct wined3d_gl_hwnd_dmabuf_ring *ring,
++        const struct wined3d_gl_info *gl_info)
++{
++    enum wined3d_gl_hwnd_dmabuf_support support = wined3d_gl_hwnd_dmabuf_get_support(ring);
++
++    if (support == WINED3D_GL_HWND_DMABUF_SUPPORT_YES)
++        return true;
++    if (support == WINED3D_GL_HWND_DMABUF_SUPPORT_NO)
++        return false;
++
++    if (!gl_info->p_wglWineCloseDmaBufWINE || !gl_info->p_wglWineDmaBufExportSupportedWINE
++            || !gl_info->p_wglWineExportDmaBufWINE || !gl_info->p_wglWineHwndDmaBufGetCapsWINE)
++    {
++        InterlockedExchange(&ring->support, WINED3D_GL_HWND_DMABUF_SUPPORT_NO);
++        return false;
++    }
++    if (!gl_info->p_wglWineDmaBufExportSupportedWINE())
++        return false;
++
++    ring->p_wglWineCloseDmaBufWINE = gl_info->p_wglWineCloseDmaBufWINE;
++    ring->p_wglWineHwndDmaBufGetCapsWINE = gl_info->p_wglWineHwndDmaBufGetCapsWINE;
++    InterlockedExchange(&ring->support, WINED3D_GL_HWND_DMABUF_SUPPORT_YES);
++    return true;
++}
++
++static void wined3d_gl_hwnd_dmabuf_clear_caps(struct wined3d_gl_hwnd_dmabuf_ring *ring)
++{
++    free(ring->format_modifiers);
++    ring->format_modifiers = NULL;
++    ring->format_modifier_count = 0;
++    ring->logged_implicit_modifier = false;
++    ring->logged_opaque_fourcc = false;
++    ring->logged_unsupported_modifier = false;
++}
++
++static bool wined3d_gl_hwnd_dmabuf_query_caps(struct wined3d_gl_hwnd_dmabuf_ring *ring,
++        HWND hwnd)
++{
++    hwnd_dmabuf_format_modifier_t *format_modifiers;
++    hwnd_dmabuf_host_caps_t caps = {0};
++    UINT count = 0;
++
++    wined3d_gl_hwnd_dmabuf_clear_caps(ring);
++
++    if (!ring->p_wglWineHwndDmaBufGetCapsWINE)
++        return false;
++    if (ring->p_wglWineHwndDmaBufGetCapsWINE(hwnd, &caps, NULL, 0, &count) != HWND_DMABUF_OK
++            || !count)
++        return false;
++    if (!(format_modifiers = calloc(count, sizeof(*format_modifiers))))
++        return false;
++
++    memset(&caps, 0, sizeof(caps));
++    if (ring->p_wglWineHwndDmaBufGetCapsWINE(hwnd, &caps, format_modifiers,
++            count, &count) != HWND_DMABUF_OK || !caps.format_modifier_count)
++    {
++        free(format_modifiers);
++        return false;
++    }
++
++    ring->format_modifiers = format_modifiers;
++    ring->format_modifier_count = caps.format_modifier_count;
++    return true;
++}
++
++static bool wined3d_gl_hwnd_dmabuf_hwnd_has_caps(const struct wined3d_gl_hwnd_dmabuf_ring *ring,
++        HWND hwnd)
++{
++    hwnd_dmabuf_host_caps_t caps = {0};
++    UINT count = 0;
++
++    if (!hwnd || hwnd == GetDesktopWindow() || !ring->p_wglWineHwndDmaBufGetCapsWINE)
++        return false;
++
++    return ring->p_wglWineHwndDmaBufGetCapsWINE(hwnd, &caps, NULL, 0, &count) == HWND_DMABUF_OK
++            && count;
++}
++
++static bool wined3d_gl_hwnd_dmabuf_modifier_supported(const struct wined3d_gl_hwnd_dmabuf_ring *ring,
++        UINT fourcc, UINT64 modifier)
++{
++    unsigned int i;
++
++    for (i = 0; i < ring->format_modifier_count; ++i)
++    {
++        if (ring->format_modifiers[i].fourcc == fourcc &&
++                ring->format_modifiers[i].modifier == modifier)
++            return true;
++    }
++    return false;
++}
++
++static UINT wined3d_gl_hwnd_dmabuf_opaque_fourcc(UINT fourcc)
++{
++    switch (fourcc)
++    {
++        case WINEMAKEFOURCC('A','B','2','4'):
++            return WINEMAKEFOURCC('X','B','2','4');
++        case WINEMAKEFOURCC('A','R','2','4'):
++            return WINEMAKEFOURCC('X','R','2','4');
++        default:
++            return 0;
++    }
++}
++
++static bool wined3d_gl_hwnd_dmabuf_negotiate_format(struct wined3d_gl_hwnd_dmabuf_ring *ring,
++        struct wgl_dmabuf_desc *desc, UINT fourcc)
++{
++    if (wined3d_gl_hwnd_dmabuf_modifier_supported(ring, fourcc, desc->modifier))
++    {
++        desc->fourcc = fourcc;
++        return true;
++    }
++
++    if (desc->modifier == HWND_DMABUF_MOD_LINEAR &&
++            wined3d_gl_hwnd_dmabuf_modifier_supported(ring, fourcc, HWND_DMABUF_MOD_INVALID))
++    {
++        if (!ring->logged_implicit_modifier)
++        {
++            TRACE("Using implicit HWND dmabuf modifier for fourcc %s.\n",
++                    debugstr_fourcc(fourcc));
++            ring->logged_implicit_modifier = true;
++        }
++        desc->fourcc = fourcc;
++        desc->modifier = HWND_DMABUF_MOD_INVALID;
++        return true;
++    }
++
++    return false;
++}
++
++static void wined3d_gl_hwnd_dmabuf_negotiate_desc(struct wined3d_gl_hwnd_dmabuf_ring *ring,
++        struct wgl_dmabuf_desc *desc)
++{
++    UINT exported_fourcc = desc->fourcc;
++    UINT opaque_fourcc;
++
++    if (wined3d_gl_hwnd_dmabuf_negotiate_format(ring, desc, exported_fourcc))
++        return;
++
++    if ((opaque_fourcc = wined3d_gl_hwnd_dmabuf_opaque_fourcc(exported_fourcc)) &&
++            wined3d_gl_hwnd_dmabuf_negotiate_format(ring, desc, opaque_fourcc))
++    {
++        if (!ring->logged_opaque_fourcc)
++        {
++            TRACE("Using opaque HWND dmabuf fourcc %s for alpha fourcc %s.\n",
++                    debugstr_fourcc(opaque_fourcc), debugstr_fourcc(exported_fourcc));
++            ring->logged_opaque_fourcc = true;
++        }
++        return;
++    }
++
++    if (!ring->logged_unsupported_modifier)
++    {
++        TRACE("HWND dmabuf export fourcc %s modifier 0x%08x%08x missing from cached caps; "
++                "publishing for consumer validation.\n", debugstr_fourcc(exported_fourcc),
++                (unsigned int)(desc->modifier >> 32), (unsigned int)desc->modifier);
++        ring->logged_unsupported_modifier = true;
++    }
++}
++
++static void wined3d_gl_hwnd_dmabuf_clear_busy(struct wined3d_gl_hwnd_dmabuf_image *image)
++{
++    image->busy_producer_unique_id = 0;
++}
++
++static void wined3d_gl_hwnd_dmabuf_release_token(struct wined3d_gl_hwnd_dmabuf_ring *ring,
++        UINT64 release_token, UINT release_flags)
++{
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(ring->images); ++i)
++    {
++        struct wined3d_gl_hwnd_dmabuf_image *image = &ring->images[i];
++
++        if (image->release_token != release_token)
++            continue;
++
++        wined3d_gl_hwnd_dmabuf_clear_busy(image);
++        if (release_flags & (HWND_DMABUF_RELEASE_FAILED | HWND_DMABUF_RELEASE_ORPHANED))
++            image->valid = false;
++        return;
++    }
++}
++
++static unsigned int wined3d_gl_hwnd_dmabuf_reclaim_channel_slots(
++        struct wined3d_gl_hwnd_dmabuf_ring *ring, uint64_t producer_unique_id)
++{
++    unsigned int count = 0, i;
++
++    if (!producer_unique_id)
++        return 0;
++
++    for (i = 0; i < ARRAY_SIZE(ring->images); ++i)
++    {
++        struct wined3d_gl_hwnd_dmabuf_image *image = &ring->images[i];
++
++        if (image->busy_producer_unique_id != producer_unique_id)
++            continue;
++
++        wined3d_gl_hwnd_dmabuf_clear_busy(image);
++        image->valid = false;
++        ++count;
++    }
++
++    if (count)
++        TRACE("Reclaimed %u HWND dmabuf channel slot(s) for producer %s.\n",
++                count, wine_dbgstr_longlong(producer_unique_id));
++    return count;
++}
++
++static void wined3d_gl_hwnd_dmabuf_close_channel(struct wined3d_gl_hwnd_dmabuf_ring *ring)
++{
++    uint64_t producer_unique_id;
++
++    if (ring->channel_fd < 0)
++    {
++        wined3d_gl_hwnd_dmabuf_clear_caps(ring);
++        return;
++    }
++
++    producer_unique_id = ring->producer_unique_id;
++    TRACE("Closing HWND dmabuf channel fd %d hwnd %p producer %s.\n",
++            ring->channel_fd, ring->channel_hwnd, wine_dbgstr_longlong(producer_unique_id));
++
++    if (ring->p_wglWineHwndDmaBufCloseProducerWINE)
++        ring->p_wglWineHwndDmaBufCloseProducerWINE(ring->channel_hwnd, ring->channel_fd);
++    else
++        ERR("Leaking HWND dmabuf channel fd %d, no close helper.\n", ring->channel_fd);
++
++    wined3d_gl_hwnd_dmabuf_reclaim_channel_slots(ring, producer_unique_id);
++    ring->channel_fd = -1;
++    ring->channel_hwnd = NULL;
++    ring->producer_unique_id = 0;
++    wined3d_gl_hwnd_dmabuf_clear_caps(ring);
++}
++
++static void wined3d_gl_hwnd_dmabuf_drain_channel(struct wined3d_gl_hwnd_dmabuf_ring *ring)
++{
++    hwnd_dmabuf_release_t release;
++    int ret;
++
++    if (ring->channel_fd < 0 || !ring->p_wglWineHwndDmaBufDrainReleaseWINE)
++        return;
++
++    for (;;)
++    {
++        ret = ring->p_wglWineHwndDmaBufDrainReleaseWINE(ring->channel_fd, &release);
++        if (ret == HWND_DMABUF_CHANNEL_OK)
++        {
++            if (release.producer_unique_id != ring->producer_unique_id)
++                continue;
++            wined3d_gl_hwnd_dmabuf_release_token(ring, release.release_token, release.flags);
++            continue;
++        }
++        if (ret == HWND_DMABUF_CHANNEL_EMPTY)
++            return;
++
++        WARN("HWND dmabuf channel release drain failed, ret %d.\n", ret);
++        wined3d_gl_hwnd_dmabuf_close_channel(ring);
++        return;
++    }
++}
++
++static BOOL wined3d_gl_hwnd_dmabuf_ensure_channel(struct wined3d_swapchain_gl *swapchain_gl,
++        const struct wined3d_gl_info *gl_info)
++{
++    struct wined3d_gl_hwnd_dmabuf_ring *ring = &swapchain_gl->hwnd_dmabuf;
++    HWND hwnd = swapchain_gl->s.win_handle;
++    LONGLONG producer_id;
++    int channel_fd;
++
++    if (!hwnd || hwnd == GetDesktopWindow())
++        return FALSE;
++    if (!gl_info->p_wglWineHwndDmaBufOpenProducerWINE
++            || !gl_info->p_wglWineHwndDmaBufGetCapsWINE
++            || !gl_info->p_wglWineHwndDmaBufCloseProducerWINE
++            || !gl_info->p_wglWineHwndDmaBufPublishWINE
++            || !gl_info->p_wglWineHwndDmaBufDrainReleaseWINE)
++        return FALSE;
++
++    if (ring->channel_fd >= 0 && ring->channel_hwnd == hwnd)
++        return TRUE;
++    wined3d_gl_hwnd_dmabuf_close_channel(ring);
++
++    if (!wined3d_gl_hwnd_dmabuf_query_caps(ring, hwnd))
++        return FALSE;
++
++    channel_fd = gl_info->p_wglWineHwndDmaBufOpenProducerWINE(hwnd);
++    if (channel_fd < 0)
++    {
++        wined3d_gl_hwnd_dmabuf_clear_caps(ring);
++        return FALSE;
++    }
++
++    producer_id = InterlockedIncrement64(&wined3d_gl_hwnd_dmabuf_next_producer_id);
++    if (!producer_id)
++        producer_id = InterlockedIncrement64(&wined3d_gl_hwnd_dmabuf_next_producer_id);
++
++    ring->channel_fd = channel_fd;
++    ring->channel_hwnd = hwnd;
++    ring->producer_unique_id = producer_id;
++    ring->p_wglWineHwndDmaBufCloseProducerWINE = gl_info->p_wglWineHwndDmaBufCloseProducerWINE;
++    ring->p_wglWineHwndDmaBufPublishWINE = gl_info->p_wglWineHwndDmaBufPublishWINE;
++    ring->p_wglWineHwndDmaBufDrainReleaseWINE = gl_info->p_wglWineHwndDmaBufDrainReleaseWINE;
++    TRACE("Opened HWND dmabuf channel fd %d hwnd %p producer %s.\n",
++            ring->channel_fd, ring->channel_hwnd, wine_dbgstr_longlong(ring->producer_unique_id));
++
++    return TRUE;
++}
++
++static void wined3d_gl_hwnd_dmabuf_desc_from_image(const struct wined3d_gl_hwnd_dmabuf_ring *ring,
++        const struct wined3d_gl_hwnd_dmabuf_image *image, hwnd_dmabuf_frame_desc_t *desc)
++{
++    memset(desc, 0, sizeof(*desc));
++    desc->version = HWND_DMABUF_DESC_VERSION_V1;
++    desc->width = image->width;
++    desc->height = image->height;
++    desc->fourcc = image->dmabuf_desc.fourcc;
++    desc->stride = image->dmabuf_desc.stride;
++    desc->offset = image->dmabuf_desc.offset;
++    desc->frame_seq = (UINT)image->present_count;
++    desc->image_id = image->image_id - 1;
++    desc->modifier = image->dmabuf_desc.modifier;
++    desc->alpha_mode = HWND_DMABUF_ALPHA_MODE_IGNORE;
++    desc->producer_unique_id = ring->producer_unique_id;
++    desc->release_token = image->release_token;
++    desc->plane_count = 1;
++    desc->plane_offsets[0] = image->dmabuf_desc.offset;
++    desc->plane_strides[0] = image->dmabuf_desc.stride;
++}
++
++static void wined3d_gl_hwnd_dmabuf_publish_channel(struct wined3d_gl_hwnd_dmabuf_ring *ring,
++        struct wined3d_gl_hwnd_dmabuf_image *image)
++{
++    hwnd_dmabuf_frame_desc_t desc;
++    int ret;
++
++    if (ring->channel_fd < 0 || !ring->p_wglWineHwndDmaBufPublishWINE)
++        return;
++
++    wined3d_gl_hwnd_dmabuf_desc_from_image(ring, image, &desc);
++    image->busy_producer_unique_id = ring->producer_unique_id;
++    ret = ring->p_wglWineHwndDmaBufPublishWINE(ring->channel_hwnd, ring->channel_fd,
++            &desc, image->dmabuf_fd);
++    if (!ret)
++        return;
++
++    wined3d_gl_hwnd_dmabuf_clear_busy(image);
++    TRACE("Failed to publish HWND dmabuf frame, ret %d.\n", ret);
++    if (ret == HWND_DMABUF_CHANNEL_CLOSED)
++        wined3d_gl_hwnd_dmabuf_close_channel(ring);
++}
++
++static void wined3d_gl_hwnd_dmabuf_probe_support_cs(void *object)
++{
++    struct wined3d_swapchain_gl *swapchain_gl = object;
++    struct wined3d_gl_hwnd_dmabuf_ring *ring = &swapchain_gl->hwnd_dmabuf;
++    struct wined3d_context_gl *context_gl;
++    struct wined3d_context *context;
++
++    if (wined3d_gl_hwnd_dmabuf_get_support(ring) != WINED3D_GL_HWND_DMABUF_SUPPORT_UNKNOWN
++            || !swapchain_gl->s.front_buffer)
++        return;
++
++    context = context_acquire(swapchain_gl->s.device, swapchain_gl->s.front_buffer, 0);
++    context_gl = wined3d_context_gl(context);
++    wined3d_gl_hwnd_dmabuf_probe_support(ring, context_gl->gl_info);
++    context_release(context);
++}
++
++static void wined3d_gl_hwnd_dmabuf_destroy_image(struct wined3d_gl_hwnd_dmabuf_ring *ring,
++        struct wined3d_gl_hwnd_dmabuf_image *image, struct wined3d_context_gl *context_gl)
++{
++    const struct wined3d_gl_info *gl_info = context_gl->gl_info;
++
++    wined3d_gl_hwnd_dmabuf_close_fd(ring, &image->dmabuf_fd);
++
++    if (image->fbo)
++    {
++        /* Deleting a bound FBO reverts the GL binding to 0; keep wined3d's
++         * cached binding in sync so a later context that reuses this GL id is
++         * not skipped by the bind_fbo cache (which short-circuits on a match). */
++        if (context_gl->fbo_read_binding == image->fbo)
++            context_gl->fbo_read_binding = 0;
++        if (context_gl->fbo_draw_binding == image->fbo)
++            context_gl->fbo_draw_binding = 0;
++        gl_info->fbo_ops.glDeleteFramebuffers(1, &image->fbo);
++        image->fbo = 0;
++    }
++    if (image->texture)
++    {
++        gl_info->gl_ops.gl.p_glDeleteTextures(1, &image->texture);
++        image->texture = 0;
++    }
++
++    image->valid = false;
++    wined3d_gl_hwnd_dmabuf_clear_busy(image);
++    image->width = 0;
++    image->height = 0;
++    image->present_count = 0;
++    image->release_token = 0;
++    memset(&image->dmabuf_desc, 0, sizeof(image->dmabuf_desc));
++}
++
++static void wined3d_gl_hwnd_dmabuf_cleanup(struct wined3d_swapchain_gl *swapchain_gl)
++{
++    struct wined3d_gl_hwnd_dmabuf_ring *ring = &swapchain_gl->hwnd_dmabuf;
++    struct wined3d_context_gl *context_gl;
++    struct wined3d_context *context;
++    unsigned int i;
++
++    wined3d_gl_hwnd_dmabuf_close_channel(ring);
++
++    for (i = 0; i < ARRAY_SIZE(ring->images); ++i)
++        wined3d_gl_hwnd_dmabuf_close_fd(ring, &ring->images[i].dmabuf_fd);
++
++    if (!swapchain_gl->s.front_buffer)
++        return;
++
++    context = context_acquire(swapchain_gl->s.device, swapchain_gl->s.front_buffer, 0);
++    context_gl = wined3d_context_gl(context);
++    if (context_gl->valid)
++    {
++        for (i = 0; i < ARRAY_SIZE(ring->images); ++i)
++            wined3d_gl_hwnd_dmabuf_destroy_image(ring, &ring->images[i], context_gl);
++    }
++    context_release(context);
++}
++
++static bool wined3d_gl_hwnd_dmabuf_ensure_image(struct wined3d_swapchain_gl *swapchain_gl,
++        struct wined3d_gl_hwnd_dmabuf_image *image, struct wined3d_context_gl *context_gl,
++        unsigned int width, unsigned int height)
++{
++    const struct wined3d_gl_info *gl_info = context_gl->gl_info;
++    struct wined3d_gl_hwnd_dmabuf_ring *ring = &swapchain_gl->hwnd_dmabuf;
++    GLenum status;
++
++    if (image->texture && image->width == width && image->height == height)
++        return true;
++
++    if (image->busy_producer_unique_id)
++        return false;
++
++    if (image->texture || image->fbo)
++        wined3d_gl_hwnd_dmabuf_destroy_image(ring, image, context_gl);
++
++    gl_info->gl_ops.gl.p_glGenTextures(1, &image->texture);
++    wined3d_context_gl_bind_texture(context_gl, GL_TEXTURE_2D, image->texture);
++    gl_info->gl_ops.gl.p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    gl_info->gl_ops.gl.p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    gl_info->gl_ops.gl.p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++    gl_info->gl_ops.gl.p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++    gl_info->gl_ops.gl.p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0,
++            GL_RGBA, GL_UNSIGNED_BYTE, NULL);
++    checkGLcall("create HWND dmabuf texture");
++
++    gl_info->fbo_ops.glGenFramebuffers(1, &image->fbo);
++    gl_info->fbo_ops.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, image->fbo);
++    context_gl->fbo_draw_binding = image->fbo;
++    gl_info->fbo_ops.glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++            GL_TEXTURE_2D, image->texture, 0);
++    gl_info->gl_ops.gl.p_glDrawBuffer(GL_COLOR_ATTACHMENT0);
++    status = gl_info->fbo_ops.glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
++    if (status != GL_FRAMEBUFFER_COMPLETE)
++    {
++        WARN("Failed to create HWND dmabuf FBO, status %#x.\n", status);
++        wined3d_gl_hwnd_dmabuf_destroy_image(ring, image, context_gl);
++        device_invalidate_state(swapchain_gl->s.device, STATE_FRAMEBUFFER);
++        return false;
++    }
++
++    image->width = width;
++    image->height = height;
++    device_invalidate_state(swapchain_gl->s.device, STATE_FRAMEBUFFER);
++    return true;
++}
++
++static void wined3d_gl_hwnd_dmabuf_capture(struct wined3d_swapchain *swapchain,
++        struct wined3d_context *context)
++{
++    struct wined3d_swapchain_gl *swapchain_gl = wined3d_swapchain_gl(swapchain);
++    struct wined3d_gl_hwnd_dmabuf_ring *ring = &swapchain_gl->hwnd_dmabuf;
++    struct wined3d_texture *back_buffer = swapchain->back_buffers[0];
++    struct wined3d_gl_hwnd_dmabuf_image *image = NULL;
++    const struct wined3d_gl_info *gl_info;
++    struct wined3d_context_gl *context_gl;
++    struct wined3d_texture_sub_resource *sub_resource;
++    struct wgl_dmabuf_desc dmabuf_desc;
++    bool preserve_last;
++    GLenum read_buffer = GL_COLOR_ATTACHMENT0;
++    RECT src_rect;
++    unsigned int width, height, i, idx;
++    DWORD src_location;
++    int dmabuf_fd = -1;
++
++    context_gl = wined3d_context_gl(context);
++    gl_info = context_gl->gl_info;
++    if (!wined3d_gl_hwnd_dmabuf_probe_support(ring, gl_info))
++        return;
++    if (wined3d_gl_hwnd_dmabuf_ensure_channel(swapchain_gl, gl_info))
++        wined3d_gl_hwnd_dmabuf_drain_channel(ring);
++
++    preserve_last = ring->images[ring->last_image].valid;
++    for (i = 0; i < ARRAY_SIZE(ring->images); ++i)
++    {
++        idx = (ring->next_image + i) % ARRAY_SIZE(ring->images);
++        if (preserve_last && idx == ring->last_image)
++            continue;
++        if (!ring->images[idx].busy_producer_unique_id)
++        {
++            image = &ring->images[idx];
++            break;
++        }
++    }
++    if (!image)
++    {
++        TRACE("No free HWND dmabuf image for present %s.\n",
++                wine_dbgstr_longlong(ring->present_count));
++        return;
++    }
++
++    width = back_buffer->resource.width;
++    height = back_buffer->resource.height;
++    if (!width || !height)
++        return;
++
++    if (!wined3d_gl_hwnd_dmabuf_ensure_image(swapchain_gl, image, context_gl, width, height))
++        return;
++
++    SetRect(&src_rect, 0, 0, width, height);
++    sub_resource = &back_buffer->sub_resources[0];
++    src_location = back_buffer->resource.multisample_type ? WINED3D_LOCATION_RB_RESOLVED
++            : WINED3D_LOCATION_TEXTURE_RGB;
++    if (sub_resource->locations & back_buffer->resource.draw_binding)
++        src_location = back_buffer->resource.draw_binding;
++    wined3d_texture_load_location(back_buffer, 0, context, src_location);
++
++    wined3d_context_gl_apply_fbo_state_explicit(context_gl, GL_READ_FRAMEBUFFER,
++            &back_buffer->resource, 0, NULL, 0, src_location);
++    if (src_location == WINED3D_LOCATION_DRAWABLE)
++    {
++        read_buffer = wined3d_texture_get_gl_buffer(back_buffer);
++        wined3d_texture_translate_drawable_coords(back_buffer, context_gl->window, &src_rect);
++    }
++    gl_info->gl_ops.gl.p_glReadBuffer(read_buffer);
++
++    gl_info->fbo_ops.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, image->fbo);
++    context_gl->fbo_draw_binding = image->fbo;
++    gl_info->gl_ops.gl.p_glDrawBuffer(GL_COLOR_ATTACHMENT0);
++
++    gl_info->gl_ops.gl.p_glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++    context_invalidate_state(context, STATE_BLEND);
++
++    gl_info->gl_ops.gl.p_glDisable(GL_SCISSOR_TEST);
++    context_invalidate_state(context, STATE_RASTERIZER);
++
++    gl_info->fbo_ops.glBlitFramebuffer(src_rect.left, src_rect.top, src_rect.right, src_rect.bottom,
++            0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
++
++    /* SYNC_NONE consumers need the copy complete before fd export. */
++    gl_info->gl_ops.gl.p_glFinish();
++    checkGLcall("copy HWND dmabuf image");
++
++    memset(&dmabuf_desc, 0, sizeof(dmabuf_desc));
++    if (!gl_info->p_wglWineExportDmaBufWINE(image->texture, GL_TEXTURE_2D,
++            &dmabuf_desc, &dmabuf_fd) || dmabuf_fd < 0)
++    {
++        wined3d_gl_hwnd_dmabuf_close_fd(ring, &dmabuf_fd);
++        wined3d_gl_hwnd_dmabuf_close_fd(ring, &image->dmabuf_fd);
++        memset(&image->dmabuf_desc, 0, sizeof(image->dmabuf_desc));
++        image->present_count = 0;
++        image->release_token = 0;
++        image->valid = false;
++        wined3d_gl_hwnd_dmabuf_clear_busy(image);
++        return;
++    }
++    wined3d_gl_hwnd_dmabuf_negotiate_desc(ring, &dmabuf_desc);
++
++    wined3d_gl_hwnd_dmabuf_close_fd(ring, &image->dmabuf_fd);
++    image->dmabuf_desc = dmabuf_desc;
++    image->dmabuf_fd = dmabuf_fd;
++    image->present_count = ring->present_count;
++    image->release_token = ++ring->next_release_token;
++    if (!image->release_token)
++        image->release_token = ++ring->next_release_token;
++    image->valid = true;
++    wined3d_gl_hwnd_dmabuf_clear_busy(image);
++    ring->last_image = idx;
++    ring->next_image = (idx + 1) % ARRAY_SIZE(ring->images);
++    wined3d_gl_hwnd_dmabuf_publish_channel(ring, image);
++
++    device_invalidate_state(swapchain->device, STATE_FRAMEBUFFER);
++}
++
++static BOOL swapchain_gl_supports_hwnd_dmabuf(const struct wined3d_swapchain *swapchain)
++{
++    const struct wined3d_swapchain_gl *swapchain_gl = wined3d_swapchain_gl_const(swapchain);
++    const struct wined3d_gl_hwnd_dmabuf_ring *ring = &swapchain_gl->hwnd_dmabuf;
++    enum wined3d_gl_hwnd_dmabuf_support support = wined3d_gl_hwnd_dmabuf_get_support(ring);
++
++    if (support == WINED3D_GL_HWND_DMABUF_SUPPORT_UNKNOWN)
++    {
++        /* Cold cache fill emits a CS callback. */
++        wined3d_mutex_lock();
++        if (wined3d_gl_hwnd_dmabuf_get_support(ring) == WINED3D_GL_HWND_DMABUF_SUPPORT_UNKNOWN)
++        {
++            wined3d_cs_init_object(swapchain->device->cs, wined3d_gl_hwnd_dmabuf_probe_support_cs,
++                    (void *)swapchain_gl);
++            wined3d_cs_finish(swapchain->device->cs, WINED3D_CS_QUEUE_DEFAULT);
++        }
++        support = wined3d_gl_hwnd_dmabuf_get_support(ring);
++        wined3d_mutex_unlock();
++    }
++
++    if (support != WINED3D_GL_HWND_DMABUF_SUPPORT_YES)
++        return FALSE;
++    if (ring->channel_fd >= 0 && ring->channel_hwnd == swapchain_gl->s.win_handle
++            && ring->format_modifier_count)
++        return TRUE;
++    return wined3d_gl_hwnd_dmabuf_hwnd_has_caps(ring, swapchain_gl->s.win_handle);
++}
++
+ static bool swapchain_present_is_partial_copy(struct wined3d_swapchain *swapchain, const RECT *dst_rect)
+ {
+     enum wined3d_swap_effect swap_effect = swapchain->state.desc.swap_effect;
+@@ -630,31 +1310,47 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
+ 
+     TRACE("Presenting DC %p.\n", context_gl->dc);
+ 
+-    pixel_format = &wined3d_adapter_gl(swapchain->device->adapter)->pixel_formats[context_gl->pixel_format];
+-    if (context_gl->dc == wined3d_device_gl(swapchain->device)->backup_dc
+-            || (pixel_format->swap_method != WGL_SWAP_COPY_ARB
+-            && swapchain_present_is_partial_copy(swapchain, dst_rect)))
++    /* The gated dmabuf path captures below without updating the window. */
++    if (flags & WINED3D_PRESENT_NO_WINDOW_UPDATE)
+     {
+-        swapchain_blit_gdi(swapchain, context, src_rect, dst_rect);
++        TRACE("Skipping window update.\n");
+     }
+     else
+     {
+-        gl_info = context_gl->gl_info;
++        pixel_format = &wined3d_adapter_gl(swapchain->device->adapter)->pixel_formats[context_gl->pixel_format];
++        if (context_gl->dc == wined3d_device_gl(swapchain->device)->backup_dc
++                || (pixel_format->swap_method != WGL_SWAP_COPY_ARB
++                && swapchain_present_is_partial_copy(swapchain, dst_rect)))
++        {
++            swapchain_blit_gdi(swapchain, context, src_rect, dst_rect);
++        }
++        else
++        {
++            gl_info = context_gl->gl_info;
+ 
+-        swapchain_gl_set_swap_interval(swapchain, context_gl, swap_interval);
++            swapchain_gl_set_swap_interval(swapchain, context_gl, swap_interval);
+ 
+-        wined3d_texture_load_location(back_buffer, 0, context, back_buffer->resource.draw_binding);
++            wined3d_texture_load_location(back_buffer, 0, context, back_buffer->resource.draw_binding);
+ 
+-        swapchain_blit(swapchain, context, src_rect, dst_rect);
++            swapchain_blit(swapchain, context, src_rect, dst_rect);
+ 
+-        if (swapchain->device->context_count > 1)
+-        {
+-            WARN_(d3d_perf)("Multiple contexts, calling glFinish() to enforce ordering.\n");
+-            gl_info->gl_ops.gl.p_glFinish();
++            if (swapchain->device->context_count > 1)
++            {
++                WARN_(d3d_perf)("Multiple contexts, calling glFinish() to enforce ordering.\n");
++                gl_info->gl_ops.gl.p_glFinish();
++            }
++
++            /* call wglSwapBuffers through the gl table to avoid confusing the Steam overlay */
++            gl_info->gl_ops.wgl.p_wglSwapBuffers(context_gl->dc);
+         }
++    }
+ 
+-        /* call wglSwapBuffers through the gl table to avoid confusing the Steam overlay */
+-        gl_info->gl_ops.wgl.p_wglSwapBuffers(context_gl->dc);
++    {
++        struct wined3d_gl_hwnd_dmabuf_ring *ring = &wined3d_swapchain_gl(swapchain)->hwnd_dmabuf;
++
++        /* Capture before rotating the back buffer out. */
++        ++ring->present_count;
++        wined3d_gl_hwnd_dmabuf_capture(swapchain, context);
+     }
+ 
+     if (context->d3d_info->fences)
+@@ -664,8 +1360,11 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
+ 
+     TRACE("SwapBuffers called, Starting new frame\n");
+ 
+-    wined3d_texture_validate_location(swapchain->front_buffer, 0, WINED3D_LOCATION_DRAWABLE);
+-    wined3d_texture_invalidate_location(swapchain->front_buffer, 0, ~WINED3D_LOCATION_DRAWABLE);
++    if (!(flags & WINED3D_PRESENT_NO_WINDOW_UPDATE))
++    {
++        wined3d_texture_validate_location(swapchain->front_buffer, 0, WINED3D_LOCATION_DRAWABLE);
++        wined3d_texture_invalidate_location(swapchain->front_buffer, 0, ~WINED3D_LOCATION_DRAWABLE);
++    }
+ 
+     context_release(context);
+ }
+@@ -685,6 +1384,7 @@ static const struct wined3d_swapchain_ops swapchain_gl_ops =
+ {
+     swapchain_gl_present,
+     swapchain_frontbuffer_updated,
++    swapchain_gl_supports_hwnd_dmabuf,
+ };
+ 
+ static bool wined3d_swapchain_vk_present_mode_supported(struct wined3d_swapchain_vk *swapchain_vk,
+@@ -1259,6 +1959,7 @@ static void swapchain_vk_present(struct wined3d_swapchain *swapchain, const RECT
+     VkResult vr;
+     HRESULT hr;
+ 
++    (void)flags;
+     context_vk = wined3d_context_vk(context_acquire(swapchain->device, back_buffer, 0));
+ 
+     if (!swapchain_vk->vk_swapchain || swapchain_present_is_partial_copy(swapchain, dst_rect))
+@@ -1351,6 +2052,7 @@ static void swapchain_gdi_present(struct wined3d_swapchain *swapchain,
+     void *heap_memory;
+     HDC dc;
+ 
++    (void)flags;
+     front = &swapchain->front_buffer->dc_info[0];
+     back = &swapchain->back_buffers[0]->dc_info[0];
+ 
+@@ -1726,7 +2428,10 @@ err:
+     }
+ 
+     if (swapchain->dc)
++    {
+         wined3d_release_dc(swapchain->win_handle, swapchain->dc);
++        swapchain->dc = NULL;
++    }
+ 
+     wined3d_swapchain_state_cleanup(&swapchain->state);
+     wined3d_mutex_unlock();
+@@ -1749,11 +2454,24 @@ HRESULT wined3d_swapchain_gl_init(struct wined3d_swapchain_gl *swapchain_gl, str
+         const struct wined3d_swapchain_desc *desc, struct wined3d_swapchain_state_parent *state_parent,
+         void *parent, const struct wined3d_parent_ops *parent_ops)
+ {
++    HRESULT hr;
++    unsigned int i;
++
+     TRACE("swapchain_gl %p, device %p, desc %p, state_parent %p, parent %p, parent_ops %p.\n",
+             swapchain_gl, device, desc, state_parent, parent, parent_ops);
+ 
+-    return wined3d_swapchain_init(&swapchain_gl->s, device, desc, state_parent, parent,
+-            parent_ops, &swapchain_gl_ops);
++    if (FAILED(hr = wined3d_swapchain_init(&swapchain_gl->s, device, desc, state_parent, parent,
++            parent_ops, &swapchain_gl_ops)))
++        return hr;
++
++    swapchain_gl->hwnd_dmabuf.channel_fd = -1;
++    for (i = 0; i < ARRAY_SIZE(swapchain_gl->hwnd_dmabuf.images); ++i)
++    {
++        swapchain_gl->hwnd_dmabuf.images[i].image_id = i + 1;
++        swapchain_gl->hwnd_dmabuf.images[i].dmabuf_fd = -1;
++    }
++
++    return WINED3D_OK;
+ }
+ 
+ HRESULT wined3d_swapchain_vk_init(struct wined3d_swapchain_vk *swapchain_vk, struct wined3d_device *device,
+@@ -1835,6 +2553,7 @@ static struct wined3d_context_gl *wined3d_swapchain_gl_create_context(struct win
+         free(context_gl);
+         return NULL;
+     }
++    wined3d_gl_hwnd_dmabuf_probe_support(&swapchain_gl->hwnd_dmabuf, context_gl->gl_info);
+ 
+     if (!device_context_add(device, &context_gl->c))
+     {
+diff --git a/dlls/wined3d/wined3d.spec b/dlls/wined3d/wined3d.spec
+index dc86887c251..66d5c6b4763 100644
+--- a/dlls/wined3d/wined3d.spec
++++ b/dlls/wined3d/wined3d.spec
+@@ -312,6 +312,7 @@
+ @ cdecl wined3d_swapchain_set_gamma_ramp(ptr long ptr)
+ @ cdecl wined3d_swapchain_set_palette(ptr ptr)
+ @ cdecl wined3d_swapchain_set_window(ptr ptr)
++@ cdecl wined3d_swapchain_supports_hwnd_dmabuf(ptr)
+ 
+ @ cdecl wined3d_swapchain_state_create(ptr ptr ptr ptr ptr)
+ @ cdecl wined3d_swapchain_state_destroy(ptr)
+diff --git a/dlls/wined3d/wined3d_gl.h b/dlls/wined3d/wined3d_gl.h
+index 00c82c7ac0a..46aa0b33c8d 100644
+--- a/dlls/wined3d/wined3d_gl.h
++++ b/dlls/wined3d/wined3d_gl.h
+@@ -30,6 +30,8 @@
+ #include <stdint.h>
+ 
+ #include "wine/wgl.h"
++#include "wine/opengl_driver.h"
++#include "wine/hwnd_dmabuf.h"
+ 
+ struct wined3d_swapchain_gl;
+ struct wined3d_texture_gl;
+@@ -372,6 +374,14 @@ struct wined3d_gl_info
+     struct wined3d_gl_funcs gl_ops;
+     struct wined3d_fbo_ops fbo_ops;
+ 
++    PFN_wglWineCloseDmaBufWINE p_wglWineCloseDmaBufWINE;
++    PFN_wglWineDmaBufExportSupportedWINE p_wglWineDmaBufExportSupportedWINE;
++    PFN_wglWineExportDmaBufWINE p_wglWineExportDmaBufWINE;
++    PFN_wglWineHwndDmaBufOpenProducerWINE p_wglWineHwndDmaBufOpenProducerWINE;
++    PFN_wglWineHwndDmaBufGetCapsWINE p_wglWineHwndDmaBufGetCapsWINE;
++    PFN_wglWineHwndDmaBufCloseProducerWINE p_wglWineHwndDmaBufCloseProducerWINE;
++    PFN_wglWineHwndDmaBufPublishWINE p_wglWineHwndDmaBufPublishWINE;
++    PFN_wglWineHwndDmaBufDrainReleaseWINE p_wglWineHwndDmaBufDrainReleaseWINE;
+     void (WINE_GLAPI *p_glDisableWINE)(GLenum cap);
+     void (WINE_GLAPI *p_glEnableWINE)(GLenum cap);
+ };
+@@ -1138,9 +1148,58 @@ HRESULT wined3d_unordered_access_view_gl_init(struct wined3d_unordered_access_vi
+ void wined3d_unordered_access_view_gl_update(struct wined3d_unordered_access_view_gl *uav_gl,
+         struct wined3d_context_gl *context_gl);
+ 
++/* Produced by GL presents and drained by the HWND dmabuf API. */
++struct wined3d_gl_hwnd_dmabuf_image
++{
++    struct wgl_dmabuf_desc dmabuf_desc;
++    GLuint texture;
++    GLuint fbo;
++    int dmabuf_fd;
++    unsigned int width;
++    unsigned int height;
++    uint64_t present_count;
++    uint64_t release_token;
++    unsigned int image_id;
++    bool valid;
++    uint64_t busy_producer_unique_id;
++};
++
++#define WINED3D_GL_HWND_DMABUF_RING_SIZE 4
++
++enum wined3d_gl_hwnd_dmabuf_support
++{
++    WINED3D_GL_HWND_DMABUF_SUPPORT_UNKNOWN,
++    WINED3D_GL_HWND_DMABUF_SUPPORT_NO,
++    WINED3D_GL_HWND_DMABUF_SUPPORT_YES,
++};
++
++struct wined3d_gl_hwnd_dmabuf_ring
++{
++    struct wined3d_gl_hwnd_dmabuf_image images[WINED3D_GL_HWND_DMABUF_RING_SIZE];
++    hwnd_dmabuf_format_modifier_t *format_modifiers;
++    unsigned int next_image;
++    unsigned int last_image;
++    unsigned int format_modifier_count;
++    uint64_t present_count;
++    uint64_t next_release_token;
++    volatile LONG support;
++    HWND channel_hwnd;
++    int channel_fd;
++    uint64_t producer_unique_id;
++    bool logged_implicit_modifier;
++    bool logged_opaque_fourcc;
++    bool logged_unsupported_modifier;
++    PFN_wglWineCloseDmaBufWINE p_wglWineCloseDmaBufWINE;
++    PFN_wglWineHwndDmaBufGetCapsWINE p_wglWineHwndDmaBufGetCapsWINE;
++    PFN_wglWineHwndDmaBufCloseProducerWINE p_wglWineHwndDmaBufCloseProducerWINE;
++    PFN_wglWineHwndDmaBufPublishWINE p_wglWineHwndDmaBufPublishWINE;
++    PFN_wglWineHwndDmaBufDrainReleaseWINE p_wglWineHwndDmaBufDrainReleaseWINE;
++};
++
+ struct wined3d_swapchain_gl
+ {
+     struct wined3d_swapchain s;
++    struct wined3d_gl_hwnd_dmabuf_ring hwnd_dmabuf;
+ };
+ 
+ static inline struct wined3d_swapchain_gl *wined3d_swapchain_gl(struct wined3d_swapchain *swapchain)
+@@ -1148,6 +1207,12 @@ static inline struct wined3d_swapchain_gl *wined3d_swapchain_gl(struct wined3d_s
+     return CONTAINING_RECORD(swapchain, struct wined3d_swapchain_gl, s);
+ }
+ 
++static inline const struct wined3d_swapchain_gl *wined3d_swapchain_gl_const(
++        const struct wined3d_swapchain *swapchain)
++{
++    return CONTAINING_RECORD(swapchain, struct wined3d_swapchain_gl, s);
++}
++
+ void wined3d_swapchain_gl_cleanup(struct wined3d_swapchain_gl *swapchain_gl);
+ struct wined3d_context_gl *wined3d_swapchain_gl_get_context(struct wined3d_swapchain_gl *swapchain_gl);
+ HRESULT wined3d_swapchain_gl_init(struct wined3d_swapchain_gl *swapchain_gl, struct wined3d_device *device,
+diff --git a/dlls/wined3d/wined3d_private.h b/dlls/wined3d/wined3d_private.h
+index 1aed310f86c..56763cfbf2c 100644
+--- a/dlls/wined3d/wined3d_private.h
++++ b/dlls/wined3d/wined3d_private.h
+@@ -4101,6 +4101,7 @@ struct wined3d_swapchain_ops
+     void (*swapchain_present)(struct wined3d_swapchain *swapchain,
+             const RECT *src_rect, const RECT *dst_rect, unsigned int swap_interval, uint32_t flags);
+     void (*swapchain_frontbuffer_updated)(struct wined3d_swapchain *swapchain);
++    BOOL (*swapchain_supports_hwnd_dmabuf)(const struct wined3d_swapchain *swapchain);
+ };
+ 
+ struct wined3d_swapchain
+diff --git a/dlls/winewayland.drv/opengl.c b/dlls/winewayland.drv/opengl.c
+index 80b0ec716ef..72384bd654d 100644
+--- a/dlls/winewayland.drv/opengl.c
++++ b/dlls/winewayland.drv/opengl.c
+@@ -26,8 +26,10 @@
+ 
+ #include <assert.h>
+ #include <dlfcn.h>
++#include <pthread.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <unistd.h>
+ 
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+@@ -46,6 +48,68 @@ static const struct egl_platform *egl;
+ static const struct opengl_funcs *funcs;
+ static const struct opengl_drawable_funcs wayland_drawable_funcs;
+ 
++/* Original (win32u) driver proc-address resolver, chained from
++ * wayland_get_proc_address so that names other than the WINE dmabuf-export
++ * extension keep their previous behavior. */
++static void *(*prev_get_proc_address)(const char *);
++
++/* dmabuf export leaf (GL texture/renderbuffer -> Linux dmabuf via
++ * EGL_MESA_image_dma_buf_export). Resolved lazily and gated behind the
++ * runtime extension check below. */
++static PFN_eglCreateImageKHR pfn_eglCreateImageKHR;
++static PFN_eglDestroyImageKHR pfn_eglDestroyImageKHR;
++static PFN_eglExportDMABUFImageMESA pfn_eglExportDMABUFImageMESA;
++static PFN_eglExportDMABUFImageQueryMESA pfn_eglExportDMABUFImageQueryMESA;
++
++static pthread_once_t dmabuf_export_init_once = PTHREAD_ONCE_INIT;
++static BOOL dmabuf_export_supported;
++
++static BOOL dmabuf_export_type_supported(GLenum type)
++{
++    if (!egl) return FALSE;
++    switch (type)
++    {
++    case GL_TEXTURE_2D:
++    case GL_RENDERBUFFER:
++        return TRUE;
++    default:
++        return FALSE;
++    }
++}
++
++static void dmabuf_export_init_support(void)
++{
++    const char *extensions;
++
++    if (!egl || !funcs || !funcs->p_eglGetProcAddress || !funcs->p_eglQueryString ||
++        !funcs->p_eglGetCurrentContext)
++        return;
++    if (!(extensions = funcs->p_eglQueryString(egl->display, EGL_EXTENSIONS))) return;
++    if (!strstr(extensions, "EGL_KHR_image_base") && !strstr(extensions, "EGL_KHR_image"))
++        return;
++    if (!strstr(extensions, "EGL_MESA_image_dma_buf_export"))
++        return;
++    if (!dmabuf_export_type_supported(GL_TEXTURE_2D))
++        return;
++
++    pfn_eglCreateImageKHR = (void *)funcs->p_eglGetProcAddress("eglCreateImageKHR");
++    pfn_eglDestroyImageKHR = (void *)funcs->p_eglGetProcAddress("eglDestroyImageKHR");
++    pfn_eglExportDMABUFImageMESA = (void *)funcs->p_eglGetProcAddress("eglExportDMABUFImageMESA");
++    pfn_eglExportDMABUFImageQueryMESA = (void *)funcs->p_eglGetProcAddress("eglExportDMABUFImageQueryMESA");
++
++    if (!pfn_eglCreateImageKHR || !pfn_eglDestroyImageKHR || !pfn_eglExportDMABUFImageMESA ||
++        !pfn_eglExportDMABUFImageQueryMESA)
++        return;
++
++    dmabuf_export_supported = TRUE;
++}
++
++static BOOL dmabuf_export_bridge_supported(void)
++{
++    pthread_once(&dmabuf_export_init_once, dmabuf_export_init_support);
++    return dmabuf_export_supported;
++}
++
+ struct wayland_gl_drawable
+ {
+     struct opengl_drawable base;
+@@ -262,6 +326,84 @@ static UINT wayland_pbuffer_bind(HDC hdc, struct opengl_drawable *base, GLenum b
+     return -1; /* use default implementation */
+ }
+ 
++static BOOL GLAPIENTRY wayland_wglWineExportDmaBufWINE(GLuint texture, GLenum target,
++        struct wgl_dmabuf_desc *desc, int *fd)
++{
++    const EGLint image_attribs[] = {EGL_NONE};
++    EGLuint64KHR modifiers[4] = {0};
++    EGLint offsets[4] = {0}, strides[4] = {0};
++    EGLImageKHR image = EGL_NO_IMAGE_KHR;
++    EGLClientBuffer client;
++    int export_fd = -1;
++    int fourcc = 0, planes = 0;
++    EGLenum egl_target;
++
++    TRACE("texture %u, target %#x, desc %p, fd %p.\n", texture, target, desc, fd);
++
++    if (!desc || !fd) return FALSE;
++    memset(desc, 0, sizeof(*desc));
++    *fd = -1;
++
++    if (!texture || !dmabuf_export_bridge_supported() || !dmabuf_export_type_supported(target))
++        return FALSE;
++
++    switch (target)
++    {
++    case GL_TEXTURE_2D:
++        egl_target = EGL_GL_TEXTURE_2D;
++        break;
++    case GL_RENDERBUFFER:
++        egl_target = EGL_GL_RENDERBUFFER;
++        break;
++    default:
++        return FALSE;
++    }
++
++    client = (EGLClientBuffer)(uintptr_t)texture;
++    image = pfn_eglCreateImageKHR(egl->display, funcs->p_eglGetCurrentContext(),
++            egl_target, client, image_attribs);
++    if (image == EGL_NO_IMAGE_KHR)
++        return FALSE;
++
++    /* The export path currently supports only single-plane RGB buffers. */
++    if (!pfn_eglExportDMABUFImageQueryMESA(egl->display, image, &fourcc, &planes, modifiers)
++            || planes != 1)
++        goto done;
++
++    if (!pfn_eglExportDMABUFImageMESA(egl->display, image, &export_fd, strides, offsets)
++            || export_fd < 0)
++        goto done;
++
++    desc->fourcc = fourcc;
++    desc->stride = strides[0];
++    desc->offset = offsets[0];
++    desc->modifier = modifiers[0];
++    *fd = export_fd;
++    export_fd = -1;
++
++done:
++    if (image != EGL_NO_IMAGE_KHR)
++        pfn_eglDestroyImageKHR(egl->display, image);
++    if (export_fd >= 0)
++        close(export_fd);
++    return *fd >= 0;
++}
++
++static BOOL GLAPIENTRY wayland_wglWineDmaBufExportSupportedWINE(void)
++{
++    return dmabuf_export_bridge_supported();
++}
++
++static void *wayland_get_proc_address(const char *name)
++{
++    if (!strcmp(name, "wglWineDmaBufExportSupportedWINE"))
++        return wayland_wglWineDmaBufExportSupportedWINE;
++    if (!strcmp(name, "wglWineExportDmaBufWINE"))
++        return dmabuf_export_bridge_supported() ? (void *)wayland_wglWineExportDmaBufWINE : NULL;
++
++    return prev_get_proc_address ? prev_get_proc_address(name) : NULL;
++}
++
+ static struct opengl_driver_funcs wayland_driver_funcs =
+ {
+     .p_init_egl_platform = wayland_init_egl_platform,
+@@ -293,7 +435,8 @@ UINT WAYLAND_OpenGLInit(UINT version, const struct opengl_funcs *opengl_funcs, c
+     if (!opengl_funcs->egl_handle) return STATUS_NOT_SUPPORTED;
+     funcs = opengl_funcs;
+ 
+-    wayland_driver_funcs.p_get_proc_address = (*driver_funcs)->p_get_proc_address;
++    prev_get_proc_address = (*driver_funcs)->p_get_proc_address;
++    wayland_driver_funcs.p_get_proc_address = wayland_get_proc_address;
+     wayland_driver_funcs.p_init_pixel_formats = (*driver_funcs)->p_init_pixel_formats;
+     wayland_driver_funcs.p_describe_pixel_format = (*driver_funcs)->p_describe_pixel_format;
+     wayland_driver_funcs.p_init_wgl_extensions = (*driver_funcs)->p_init_wgl_extensions;
+diff --git a/dlls/winewayland.drv/vulkan.c b/dlls/winewayland.drv/vulkan.c
+index ce525805b30..88736785f26 100644
+--- a/dlls/winewayland.drv/vulkan.c
++++ b/dlls/winewayland.drv/vulkan.c
+@@ -225,19 +225,12 @@ static UINT wayland_vulkan_get_hwnd_dmabuf_caps(HWND hwnd, void *caps_ptr, void
+         count++;
+ 
+     memset(caps, 0, sizeof(*caps));
+-    caps->version = HWND_DMABUF_HOST_CAPS_VERSION_V2;
+-    caps->feedback_gen = 1;
+-    caps->dmabuf_protocol_version = zwp_linux_dmabuf_v1_get_version(process_wayland.zwp_linux_dmabuf_v1);
+-    caps->format_modifiers = format_modifiers;
+-
+     wl_list_for_each(entry, &process_wayland.dmabuf_formats, link)
+     {
+         if (copied >= max_format_modifiers)
+             break;
+         format_modifiers[copied].fourcc = entry->format;
+         format_modifiers[copied].modifier = entry->modifier;
+-        if (entry->modifier == DRM_FORMAT_MOD_INVALID)
+-            caps->caps_flags |= HWND_DMABUF_CAPS_HAS_MOD_INVALID;
+         copied++;
+     }
+ 
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 15bc684d121..71335ab5835 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -235,6 +235,8 @@ struct wayland_hwnd_dmabuf_surface
+     struct wl_list buffers;
+     UINT frame_seq;
+     BOOL current_committed;
++    BOOL logged_first_attach;
++    BOOL logged_first_import;
+     BOOL seen;
+     BOOL direct;
+     BOOL linked;
+@@ -2301,7 +2303,7 @@ static void wayland_hwnd_dmabuf_surface_set_opaque(struct wayland_hwnd_dmabuf_su
+ {
+     struct wl_region *region = NULL;
+ 
+-    if (surface->current && surface->current->alpha_mode == DXGI_ALPHA_MODE_IGNORE &&
++    if (surface->current && surface->current->alpha_mode == HWND_DMABUF_ALPHA_MODE_IGNORE &&
+         (region = wl_compositor_create_region(process_wayland.wl_compositor)))
+     {
+         wl_region_add(region, 0, 0, width, height);
+@@ -2555,6 +2557,11 @@ static struct wayland_hwnd_dmabuf_buffer *wayland_hwnd_dmabuf_create_buffer(
+     zwp_linux_buffer_params_v1_destroy(params);
+     if (!buffer->wl_buffer)
+     {
++        WARN("hwnd=%p failed to create dmabuf buffer size=%ux%u fourcc=%#x "
++             "modifier=0x%08x%08x stride=%u alpha=%u\n",
++             surface->hwnd, desc->width, desc->height, desc->fourcc,
++             (unsigned int)(desc->modifier >> 32), (unsigned int)desc->modifier,
++             desc->stride, desc->alpha_mode);
+         free(buffer);
+         return NULL;
+     }
+@@ -2597,6 +2604,13 @@ static void wayland_hwnd_dmabuf_attach_current(struct wayland_hwnd_dmabuf_surfac
+     struct wayland_hwnd_dmabuf_buffer *buffer = surface->current;
+ 
+     if (!buffer) return;
++    if (!surface->logged_first_attach)
++    {
++        TRACE("hwnd=%p attaching dmabuf slot=%u size=%dx%d fourcc=%#x alpha=%u\n",
++              surface->hwnd, buffer->image_id, buffer->width, buffer->height,
++              buffer->fourcc, buffer->alpha_mode);
++        surface->logged_first_attach = TRUE;
++    }
+     buffer->release_flags = HWND_DMABUF_RELEASE_PRESENTED;
+     wl_surface_attach(surface->wl_surface, buffer->wl_buffer, 0, 0);
+     wl_surface_damage_buffer(surface->wl_surface, 0, 0, buffer->width, buffer->height);
+@@ -2654,11 +2668,7 @@ static struct wayland_hwnd_dmabuf_buffer *wayland_hwnd_dmabuf_cache_slot(
+     }
+ 
+     if (buffer)
+-    {
+-        TRACE("hwnd=%p cache-hit slot=%u gen=%u frame_seq=%u\n",
+-              surface->hwnd, desc->image_id, desc->ring_generation, desc->frame_seq);
+         return buffer;
+-    }
+     if (fd < 0)
+     {
+         TRACE("hwnd=%p cache-miss-no-fd slot=%u (awaiting fd resend)\n",
+@@ -2692,6 +2702,12 @@ static void wayland_hwnd_dmabuf_retire_frame(struct wayland_hwnd_dmabuf_surface
+                                      flags, desc->image_id, desc->ring_generation);
+ }
+ 
++static BOOL wayland_hwnd_dmabuf_desc_is_valid(const hwnd_dmabuf_frame_desc_t *desc)
++{
++    return desc->version == HWND_DMABUF_DESC_VERSION_V1 && desc->width && desc->height &&
++           desc->stride && desc->fourcc && desc->release_token;
++}
++
+ /* Drain the channel, importing every fd-bearing slot so none is lost, then show the newest
+  * frame. Stable-slot producers send a slot's fd once and fd-less references after. The fd
+  * is dup'd + passed via SCM_RIGHTS once per slot, not once per frame. created_buffer reports
+@@ -2714,12 +2730,22 @@ static struct wayland_hwnd_dmabuf_buffer *wayland_hwnd_dmabuf_surface_import_buf
+ 
+     while ((r = wayland_hwnd_dmabuf_channel_recv_one(surface->channel_fd, &desc, &fd)) > 0)
+     {
+-        if (desc.version != HWND_DMABUF_DESC_VERSION_V1 || !desc.width || !desc.height ||
+-            !desc.stride || !desc.fourcc || !desc.release_token ||
+-            !wayland_dmabuf_format_supported(desc.fourcc, desc.modifier))
++        BOOL desc_valid = wayland_hwnd_dmabuf_desc_is_valid(&desc);
++        BOOL format_supported = desc_valid &&
++                wayland_dmabuf_format_supported(desc.fourcc, desc.modifier);
++
++        if (!desc_valid || !format_supported)
+         {
+-            WARN("hwnd=%p import rejected info_seq=%u desc_seq=%u fourcc=%#x\n",
+-                 surface->hwnd, info->frame_seq, desc.frame_seq, desc.fourcc);
++            WARN("hwnd=%p import rejected info_seq=%u desc_seq=%u version=%u "
++                 "size=%ux%u stride=%u offset=%u fourcc=%#x (%c%c%c%c) "
++                 "modifier=0x%08x%08x token=0x%08x%08x supported=%u\n",
++                 surface->hwnd, info->frame_seq, desc.frame_seq, desc.version,
++                 desc.width, desc.height, desc.stride, desc.offset, desc.fourcc,
++                 desc.fourcc & 0xff, (desc.fourcc >> 8) & 0xff,
++                 (desc.fourcc >> 16) & 0xff, (desc.fourcc >> 24) & 0xff,
++                 (unsigned int)(desc.modifier >> 32), (unsigned int)desc.modifier,
++                 (unsigned int)(desc.release_token >> 32),
++                 (unsigned int)desc.release_token, format_supported);
+             if (fd >= 0) close(fd);
+             if (desc.release_token)
+                 wayland_hwnd_dmabuf_send_release(surface, desc.producer_unique_id, desc.release_token,
+@@ -2740,7 +2766,19 @@ static struct wayland_hwnd_dmabuf_buffer *wayland_hwnd_dmabuf_surface_import_buf
+     if (pdesc.flags & HWND_DMABUF_FLAG_STABLE_SLOT)
+         buffer = wayland_hwnd_dmabuf_cache_slot(surface, &pdesc, pfd, created_buffer);
+     else if ((buffer = wayland_hwnd_dmabuf_create_buffer(surface, &pdesc, pfd, FALSE)))
++    {
+         *created_buffer = TRUE;
++        if (!surface->logged_first_import)
++        {
++            TRACE("hwnd=%p imported dmabuf seq=%u slot=%u size=%ux%u "
++                  "fourcc=%#x modifier=0x%08x%08x alpha=%u flags=%#x\n",
++                  surface->hwnd, pdesc.frame_seq, pdesc.image_id,
++                  pdesc.width, pdesc.height, pdesc.fourcc,
++                  (unsigned int)(pdesc.modifier >> 32),
++                  (unsigned int)pdesc.modifier, pdesc.alpha_mode, pdesc.flags);
++            surface->logged_first_import = TRUE;
++        }
++    }
+ 
+     if (pfd >= 0) close(pfd);
+ 
+@@ -2939,7 +2977,7 @@ static BOOL wayland_surface_update_direct_dmabuf(struct wayland_surface *surface
+     if (!direct->current) return TRUE;
+ 
+ commit_current:
+-    if (direct->current->alpha_mode != DXGI_ALPHA_MODE_IGNORE)
++    if (direct->current->alpha_mode != HWND_DMABUF_ALPHA_MODE_IGNORE)
+     {
+         wayland_hwnd_dmabuf_drop_current_frame(direct, HWND_DMABUF_RELEASE_DROPPED);
+         wayland_surface_clear_direct_dmabuf(surface, data);
+@@ -2987,9 +3025,10 @@ BOOL wayland_surface_has_hwnd_dmabuf_content(struct wayland_surface *surface)
+ {
+     struct wayland_hwnd_dmabuf_surface *dmabuf_surface;
+ 
+-    if (surface->direct_dmabuf_surface) return TRUE;
++    if (surface->direct_dmabuf_surface && surface->direct_dmabuf_surface->current_committed)
++        return TRUE;
+     wl_list_for_each(dmabuf_surface, &surface->hwnd_dmabuf_surfaces, link)
+-        if (dmabuf_surface->current)
++        if (dmabuf_surface->current_committed)
+             return TRUE;
+     return FALSE;
+ }
+@@ -3094,8 +3133,6 @@ static void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
+         if (status != HWND_DMABUF_OK) count = 0;
+     }
+ 
+-    TRACE("hwnd=%p listed total=%u count=%u\n", surface->hwnd, total, count);
+-
+     data = wayland_win_data_get_nolock(surface->hwnd);
+     if (wayland_surface_update_direct_dmabuf(surface, data, frames, count, now))
+     {
+@@ -3122,6 +3159,22 @@ static void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
+ 
+         TRACE("hwnd=%p child=%p frame_seq=%u opened=%u\n",
+               surface->hwnd, hwnd, frames[i].frame_seq, frames[i].opened);
++        if (!frames[i].opened)
++        {
++            if ((dmabuf_surface = wayland_hwnd_dmabuf_surface_get(surface, hwnd)))
++            {
++                dmabuf_surface->seen = TRUE;
++                dmabuf_surface->last_seen_ms = now;
++                if (dmabuf_surface->current &&
++                    wayland_hwnd_dmabuf_surface_configure(surface, dmabuf_surface, &frames[i], above))
++                {
++                    wl_surface_commit(dmabuf_surface->wl_surface);
++                    above = dmabuf_surface->wl_surface;
++                    any_new = TRUE;
++                }
++            }
++            continue;
++        }
+ 
+         if (!(dmabuf_surface = wayland_hwnd_dmabuf_surface_get(surface, hwnd)) &&
+             !(dmabuf_surface = wayland_hwnd_dmabuf_surface_create(surface, hwnd)))
+diff --git a/dlls/wow64win/user.c b/dlls/wow64win/user.c
+index f4fc84837cb..8bb35d2d3a3 100644
+--- a/dlls/wow64win/user.c
++++ b/dlls/wow64win/user.c
+@@ -3283,6 +3283,52 @@ NTSTATUS WINAPI wow64_NtUserHiliteMenuItem( UINT *args )
+     return NtUserHiliteMenuItem( hwnd, handle, item, hilite );
+ }
+ 
++NTSTATUS WINAPI wow64_NtUserHwndDmaBufCloseProducer( UINT *args )
++{
++    HWND hwnd = get_handle( &args );
++    int channel_fd = get_ulong( &args );
++
++    NtUserHwndDmaBufCloseProducer( hwnd, channel_fd );
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS WINAPI wow64_NtUserHwndDmaBufDrainRelease( UINT *args )
++{
++    int channel_fd = get_ulong( &args );
++    void *release = get_ptr( &args );
++
++    return NtUserHwndDmaBufDrainRelease( channel_fd, release );
++}
++
++NTSTATUS WINAPI wow64_NtUserHwndDmaBufGetCaps( UINT *args )
++{
++    HWND hwnd = get_handle( &args );
++    void *caps = get_ptr( &args );
++    void *format_modifiers = get_ptr( &args );
++    UINT max_format_modifiers = get_ulong( &args );
++    UINT *format_modifier_count = get_ptr( &args );
++
++    return NtUserHwndDmaBufGetCaps( hwnd, caps, format_modifiers,
++            max_format_modifiers, format_modifier_count );
++}
++
++NTSTATUS WINAPI wow64_NtUserHwndDmaBufOpenProducer( UINT *args )
++{
++    HWND hwnd = get_handle( &args );
++
++    return NtUserHwndDmaBufOpenProducer( hwnd );
++}
++
++NTSTATUS WINAPI wow64_NtUserHwndDmaBufPublish( UINT *args )
++{
++    HWND hwnd = get_handle( &args );
++    int channel_fd = get_ulong( &args );
++    const void *desc = get_ptr( &args );
++    int dmabuf_fd = get_ulong( &args );
++
++    return NtUserHwndDmaBufPublish( hwnd, channel_fd, desc, dmabuf_fd );
++}
++
+ NTSTATUS WINAPI wow64_NtUserInitializeClientPfnArrays( UINT *args )
+ {
+     const ntuser_client_func_ptr *procsA = get_ptr( &args );
+diff --git a/include/ntuser.h b/include/ntuser.h
+index 3e2b7543980..941fb6491cf 100644
+--- a/include/ntuser.h
++++ b/include/ntuser.h
+@@ -923,6 +923,12 @@ W32KAPI BOOL    WINAPI NtUserGetWindowDisplayAffinity( HWND hwnd, DWORD *affinit
+ W32KAPI BOOL    WINAPI NtUserGetWindowPlacement( HWND hwnd, WINDOWPLACEMENT *placement );
+ W32KAPI int     WINAPI NtUserGetWindowRgnEx( HWND hwnd, HRGN hrgn, UINT unk );
+ W32KAPI BOOL    WINAPI NtUserHideCaret( HWND hwnd );
++W32KAPI void    WINAPI NtUserHwndDmaBufCloseProducer( HWND hwnd, int channel_fd );
++W32KAPI int     WINAPI NtUserHwndDmaBufDrainRelease( int channel_fd, void *release );
++W32KAPI UINT    WINAPI NtUserHwndDmaBufGetCaps( HWND hwnd, void *caps, void *format_modifiers,
++                                                UINT max_format_modifiers, UINT *format_modifier_count );
++W32KAPI int     WINAPI NtUserHwndDmaBufOpenProducer( HWND hwnd );
++W32KAPI int     WINAPI NtUserHwndDmaBufPublish( HWND hwnd, int channel_fd, const void *desc, int dmabuf_fd );
+ W32KAPI BOOL    WINAPI NtUserHiliteMenuItem( HWND hwnd, HMENU handle, UINT item, UINT hilite );
+ W32KAPI NTSTATUS WINAPI NtUserInitializeClientPfnArrays( const ntuser_client_func_ptr *client_procsA,
+                                                          const ntuser_client_func_ptr *client_procsW,
+diff --git a/include/wine/hwnd_dmabuf.h b/include/wine/hwnd_dmabuf.h
+index 6d7c1f31338..4546786de88 100644
+--- a/include/wine/hwnd_dmabuf.h
++++ b/include/wine/hwnd_dmabuf.h
+@@ -5,10 +5,20 @@
+ 
+ #include <wine/server.h>
+ 
+-#define HWND_DMABUF_HOST_CAPS_VERSION_V1       1
+-#define HWND_DMABUF_HOST_CAPS_VERSION_V2       2
++#define HWND_DMABUF_MOD_LINEAR                 0
++#define HWND_DMABUF_MOD_INVALID                0x00ffffffffffffffull
+ 
+-#define HWND_DMABUF_CAPS_HAS_MOD_INVALID       0x00000004
++/* DXGI alpha-mode values carried over the hwnd-dmabuf wire protocol. */
++#define HWND_DMABUF_ALPHA_MODE_UNSPECIFIED     0
++#define HWND_DMABUF_ALPHA_MODE_IGNORE          3
++
++enum hwnd_dmabuf_channel_result
++{
++    HWND_DMABUF_CHANNEL_OK = 0,
++    HWND_DMABUF_CHANNEL_EMPTY = 1,
++    HWND_DMABUF_CHANNEL_ERROR = 2,
++    HWND_DMABUF_CHANNEL_CLOSED = 3,
++};
+ 
+ typedef struct
+ {
+@@ -20,17 +30,7 @@ typedef struct
+ 
+ typedef struct
+ {
+-    unsigned int     version;
+-    unsigned int     feedback_gen;
+-    unsigned int     dmabuf_protocol_version;
+-    unsigned int     caps_source;
+-    unsigned int     caps_flags;
+-    unsigned int     has_drm_syncobj;
+-    unsigned int     has_zwp_explicit_sync;
+-    unsigned int     main_device_major;
+-    unsigned int     main_device_minor;
+     unsigned int     format_modifier_count;
+-    const hwnd_dmabuf_format_modifier_t *format_modifiers;
+ } hwnd_dmabuf_host_caps_t;
+ 
+ /* Release token sent from the consumer back to the producer over the channel. */
+@@ -97,6 +97,29 @@ static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_get_channel( HWND hwnd, H
+     return status;
+ }
+ 
++static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_get_channel_exclusive( HWND hwnd,
++                                                                              HANDLE *channel_handle )
++{
++    enum hwnd_dmabuf_status status = HWND_DMABUF_INVALID_ARGS;
++
++    if (!channel_handle) return status;
++    *channel_handle = 0;
++
++    SERVER_START_REQ( hwnd_dmabuf_get_channel_exclusive )
++    {
++        req->hwnd = wine_server_user_handle( hwnd );
++        if (!wine_server_call_err( req ))
++        {
++            status = reply->status;
++            if (status == HWND_DMABUF_OK)
++                *channel_handle = wine_server_ptr_handle( reply->channel_handle );
++        }
++    }
++    SERVER_END_REQ;
++
++    return status;
++}
++
+ static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_claim_channel( HWND hwnd, HANDLE *channel_handle )
+ {
+     enum hwnd_dmabuf_status status = HWND_DMABUF_INVALID_ARGS;
+diff --git a/include/wine/opengl_driver.h b/include/wine/opengl_driver.h
+index a5f4ad65c02..3c3feacb73d 100644
+--- a/include/wine/opengl_driver.h
++++ b/include/wine/opengl_driver.h
+@@ -59,12 +59,32 @@ struct wgl_pixel_format
+     int float_components;
+ };
+ 
++struct wgl_dmabuf_desc
++{
++    UINT fourcc;
++    UINT stride;
++    UINT offset;
++    UINT64 modifier;
++};
++
++typedef BOOL (GLAPIENTRY *PFN_wglWineExportDmaBufWINE)( GLuint texture, GLenum target,
++        struct wgl_dmabuf_desc *desc, int *fd );
++typedef void (GLAPIENTRY *PFN_wglWineCloseDmaBufWINE)( int fd );
++typedef BOOL (GLAPIENTRY *PFN_wglWineDmaBufExportSupportedWINE)( void );
++typedef int (GLAPIENTRY *PFN_wglWineHwndDmaBufOpenProducerWINE)( HWND hwnd );
++typedef UINT (GLAPIENTRY *PFN_wglWineHwndDmaBufGetCapsWINE)( HWND hwnd, void *caps,
++        void *format_modifiers, UINT max_format_modifiers, UINT *format_modifier_count );
++typedef void (GLAPIENTRY *PFN_wglWineHwndDmaBufCloseProducerWINE)( HWND hwnd, int channel_fd );
++typedef int (GLAPIENTRY *PFN_wglWineHwndDmaBufPublishWINE)( HWND hwnd, int channel_fd,
++        const void *desc, int dmabuf_fd );
++typedef int (GLAPIENTRY *PFN_wglWineHwndDmaBufDrainReleaseWINE)( int channel_fd, void *release );
++
+ #ifdef WINE_UNIX_LIB
+ 
+ #include "wine/gdi_driver.h"
+ 
+ /* Wine internal opengl driver version, needs to be bumped upon opengl_funcs changes. */
+-#define WINE_OPENGL_DRIVER_VERSION 37
++#define WINE_OPENGL_DRIVER_VERSION 38
+ 
+ struct opengl_drawable;
+ struct wgl_context;
+@@ -130,6 +150,14 @@ struct opengl_funcs
+     BOOL       (*p_wglChoosePixelFormatARB)( HDC hdc, const int *piAttribIList, const FLOAT *pfAttribFList, UINT nMaxFormats, int *piFormats, UINT *nNumFormats );
+     struct wgl_context * (*p_wglCreateContextAttribsARB)( HDC hDC, struct wgl_context * hShareContext, const int *attribList );
+     struct wgl_pbuffer * (*p_wglCreatePbufferARB)( HDC hDC, int iPixelFormat, int iWidth, int iHeight, const int *piAttribList );
++    BOOL       (*p_wglDXCloseDeviceNV)( HANDLE hDevice );
++    BOOL       (*p_wglDXLockObjectsNV)( HANDLE hDevice, GLint count, HANDLE *hObjects );
++    BOOL       (*p_wglDXObjectAccessNV)( HANDLE hObject, GLenum access );
++    HANDLE     (*p_wglDXOpenDeviceNV)( void *dxDevice );
++    HANDLE     (*p_wglDXRegisterObjectNV)( HANDLE hDevice, void *dxObject, GLuint name, GLenum type, GLenum access );
++    BOOL       (*p_wglDXSetResourceShareHandleNV)( void *dxObject, HANDLE shareHandle );
++    BOOL       (*p_wglDXUnlockObjectsNV)( HANDLE hDevice, GLint count, HANDLE *hObjects );
++    BOOL       (*p_wglDXUnregisterObjectNV)( HANDLE hDevice, HANDLE hObject );
+     BOOL       (*p_wglDestroyPbufferARB)( struct wgl_pbuffer * hPbuffer );
+     void       (*p_wglFreeMemoryNV)( void *pointer );
+     HDC        (*p_wglGetCurrentReadDCARB)(void);
+@@ -150,6 +178,8 @@ struct opengl_funcs
+     BOOL       (*p_wglSetPbufferAttribARB)( struct wgl_pbuffer * hPbuffer, const int *piAttribList );
+     BOOL       (*p_wglSetPixelFormatWINE)( HDC hdc, int format );
+     BOOL       (*p_wglSwapIntervalEXT)( int interval );
++    PFN_wglWineDmaBufExportSupportedWINE p_wglWineDmaBufExportSupportedWINE;
++    PFN_wglWineExportDmaBufWINE p_wglWineExportDmaBufWINE;
+ #define USE_GL_FUNC(x) PFN_##x p_##x;
+     ALL_EGL_FUNCS
+     ALL_EGL_EXT_FUNCS
+@@ -175,6 +205,11 @@ struct egl_platform
+     EGLConfig           *configs;
+     BOOL                 has_EGL_EXT_present_opaque;
+     BOOL                 has_EGL_EXT_pixel_format_float;
++    BOOL                 has_EGL_KHR_image_base;
++    BOOL                 has_EGL_KHR_gl_renderbuffer_image;
++    BOOL                 has_EGL_KHR_gl_texture_2D_image;
++    BOOL                 has_EGL_KHR_image;
++    BOOL                 has_EGL_MESA_image_dma_buf_export;
+ 
+     /* WGL_WINE_query_renderer info */
+     UINT                 device_id;
+diff --git a/include/wine/server_protocol.h b/include/wine/server_protocol.h
+index 87c9fe7773b..00e43231f93 100644
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -6397,6 +6397,20 @@ struct hwnd_dmabuf_get_channel_reply
+ 
+ 
+ 
++struct hwnd_dmabuf_get_channel_exclusive_request
++{
++    struct request_header __header;
++    user_handle_t  hwnd;
++};
++struct hwnd_dmabuf_get_channel_exclusive_reply
++{
++    struct reply_header __header;
++    unsigned int   status;
++    obj_handle_t   channel_handle;
++};
++
++
++
+ struct hwnd_dmabuf_claim_channel_request
+ {
+     struct request_header __header;
+@@ -6726,6 +6740,7 @@ enum request
+     REQ_fsync_free_shm_idx,
+     REQ_hwnd_list_dmabuf_frames,
+     REQ_hwnd_dmabuf_get_channel,
++    REQ_hwnd_dmabuf_get_channel_exclusive,
+     REQ_hwnd_dmabuf_claim_channel,
+     REQ_NB_REQUESTS
+ };
+@@ -7048,6 +7063,7 @@ union generic_request
+     struct fsync_free_shm_idx_request fsync_free_shm_idx_request;
+     struct hwnd_list_dmabuf_frames_request hwnd_list_dmabuf_frames_request;
+     struct hwnd_dmabuf_get_channel_request hwnd_dmabuf_get_channel_request;
++    struct hwnd_dmabuf_get_channel_exclusive_request hwnd_dmabuf_get_channel_exclusive_request;
+     struct hwnd_dmabuf_claim_channel_request hwnd_dmabuf_claim_channel_request;
+ };
+ union generic_reply
+@@ -7368,9 +7384,10 @@ union generic_reply
+     struct fsync_free_shm_idx_reply fsync_free_shm_idx_reply;
+     struct hwnd_list_dmabuf_frames_reply hwnd_list_dmabuf_frames_reply;
+     struct hwnd_dmabuf_get_channel_reply hwnd_dmabuf_get_channel_reply;
++    struct hwnd_dmabuf_get_channel_exclusive_reply hwnd_dmabuf_get_channel_exclusive_reply;
+     struct hwnd_dmabuf_claim_channel_reply hwnd_dmabuf_claim_channel_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 931
++#define SERVER_PROTOCOL_VERSION 933
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+diff --git a/include/wine/wgl.h b/include/wine/wgl.h
+index c9fbfdef254..3a834203517 100644
+--- a/include/wine/wgl.h
++++ b/include/wine/wgl.h
+@@ -5806,6 +5806,9 @@ typedef unsigned int GLhandleARB;
+ #define GL_ZOOM_Y                                                     0x0D17
+ #define GL_Z_EXT                                                      0x87D7
+ #define WGL_ACCELERATION_ARB                                          0x2003
++#define WGL_ACCESS_READ_ONLY_NV                                       0x00000000
++#define WGL_ACCESS_READ_WRITE_NV                                      0x00000001
++#define WGL_ACCESS_WRITE_DISCARD_NV                                   0x00000002
+ #define WGL_ACCUM_ALPHA_BITS_ARB                                      0x2021
+ #define WGL_ACCUM_BITS_ARB                                            0x201D
+ #define WGL_ACCUM_BLUE_BITS_ARB                                       0x2020
+@@ -9520,6 +9523,14 @@ typedef BOOL       (GLAPIENTRY *PFN_wglBindTexImageARB)( HPBUFFERARB hPbuffer, i
+ typedef BOOL       (GLAPIENTRY *PFN_wglChoosePixelFormatARB)( HDC hdc, const int *piAttribIList, const FLOAT *pfAttribFList, UINT nMaxFormats, int *piFormats, UINT *nNumFormats );
+ typedef HGLRC      (GLAPIENTRY *PFN_wglCreateContextAttribsARB)( HDC hDC, HGLRC hShareContext, const int *attribList );
+ typedef HPBUFFERARB (GLAPIENTRY *PFN_wglCreatePbufferARB)( HDC hDC, int iPixelFormat, int iWidth, int iHeight, const int *piAttribList );
++typedef BOOL       (GLAPIENTRY *PFN_wglDXCloseDeviceNV)( HANDLE hDevice );
++typedef BOOL       (GLAPIENTRY *PFN_wglDXLockObjectsNV)( HANDLE hDevice, GLint count, HANDLE *hObjects );
++typedef BOOL       (GLAPIENTRY *PFN_wglDXObjectAccessNV)( HANDLE hObject, GLenum access );
++typedef HANDLE     (GLAPIENTRY *PFN_wglDXOpenDeviceNV)( void *dxDevice );
++typedef HANDLE     (GLAPIENTRY *PFN_wglDXRegisterObjectNV)( HANDLE hDevice, void *dxObject, GLuint name, GLenum type, GLenum access );
++typedef BOOL       (GLAPIENTRY *PFN_wglDXSetResourceShareHandleNV)( void *dxObject, HANDLE shareHandle );
++typedef BOOL       (GLAPIENTRY *PFN_wglDXUnlockObjectsNV)( HANDLE hDevice, GLint count, HANDLE *hObjects );
++typedef BOOL       (GLAPIENTRY *PFN_wglDXUnregisterObjectNV)( HANDLE hDevice, HANDLE hObject );
+ typedef BOOL       (GLAPIENTRY *PFN_wglDestroyPbufferARB)( HPBUFFERARB hPbuffer );
+ typedef void       (GLAPIENTRY *PFN_wglFreeMemoryNV)( void *pointer );
+ typedef HDC        (GLAPIENTRY *PFN_wglGetCurrentReadDCARB)(void);
+@@ -9573,6 +9584,14 @@ typedef BOOL       (GLAPIENTRY *PFN_wglSwapIntervalEXT)( int interval );
+     USE_GL_FUNC(wglChoosePixelFormatARB) \
+     USE_GL_FUNC(wglCreateContextAttribsARB) \
+     USE_GL_FUNC(wglCreatePbufferARB) \
++    USE_GL_FUNC(wglDXCloseDeviceNV) \
++    USE_GL_FUNC(wglDXLockObjectsNV) \
++    USE_GL_FUNC(wglDXObjectAccessNV) \
++    USE_GL_FUNC(wglDXOpenDeviceNV) \
++    USE_GL_FUNC(wglDXRegisterObjectNV) \
++    USE_GL_FUNC(wglDXSetResourceShareHandleNV) \
++    USE_GL_FUNC(wglDXUnlockObjectsNV) \
++    USE_GL_FUNC(wglDXUnregisterObjectNV) \
+     USE_GL_FUNC(wglDestroyPbufferARB) \
+     USE_GL_FUNC(wglFreeMemoryNV) \
+     USE_GL_FUNC(wglGetCurrentReadDCARB) \
+diff --git a/include/wine/wined3d.h b/include/wine/wined3d.h
+index c8750b7a216..dfd8d45d442 100644
+--- a/include/wine/wined3d.h
++++ b/include/wine/wined3d.h
+@@ -2907,6 +2907,7 @@ HRESULT __cdecl wined3d_swapchain_get_front_buffer_data(const struct wined3d_swa
+         struct wined3d_texture *dst_texture, unsigned int sub_resource_idx);
+ HRESULT __cdecl wined3d_swapchain_get_gamma_ramp(const struct wined3d_swapchain *swapchain,
+         struct wined3d_gamma_ramp *ramp);
++BOOL __cdecl wined3d_swapchain_supports_hwnd_dmabuf(const struct wined3d_swapchain *swapchain);
+ void * __cdecl wined3d_swapchain_get_parent(const struct wined3d_swapchain *swapchain);
+ void __cdecl wined3d_swapchain_get_desc(const struct wined3d_swapchain *swapchain,
+         struct wined3d_swapchain_desc *desc);
+@@ -2914,6 +2915,9 @@ HRESULT __cdecl wined3d_swapchain_get_raster_status(const struct wined3d_swapcha
+         struct wined3d_raster_status *raster_status);
+ struct wined3d_swapchain_state * __cdecl wined3d_swapchain_get_state(struct wined3d_swapchain *swapchain);
+ ULONG __cdecl wined3d_swapchain_incref(struct wined3d_swapchain *swapchain);
++
++#define WINED3D_PRESENT_NO_WINDOW_UPDATE 0x80000000u
++
+ HRESULT __cdecl wined3d_swapchain_present(struct wined3d_swapchain *swapchain, const RECT *src_rect,
+         const RECT *dst_rect, HWND dst_window_override, unsigned int swap_interval, uint32_t flags);
+ HRESULT __cdecl wined3d_swapchain_resize_buffers(struct wined3d_swapchain *swapchain, unsigned int buffer_count,
+diff --git a/server/protocol.def b/server/protocol.def
+index 1ae0f3ffbfd..5802c50999e 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -4466,6 +4466,15 @@ enum fsync_type
+ @END
+ 
+ 
++/* Producer: mint the channel only if no producer is already active. */
++@REQ(hwnd_dmabuf_get_channel_exclusive)
++    user_handle_t  hwnd;                /* child HWND being produced for */
++@REPLY
++    unsigned int   status;              /* enum hwnd_dmabuf_status */
++    obj_handle_t   channel_handle;      /* producer end of the socketpair */
++@END
++
++
+ /* Consumer: claim the consumer end of the channel minted for hwnd, if any. */
+ @REQ(hwnd_dmabuf_claim_channel)
+     user_handle_t  hwnd;                /* child HWND owned by the caller */
+diff --git a/server/request_handlers.h b/server/request_handlers.h
+index 9caf56915f6..ef98edfca0d 100644
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -321,6 +321,7 @@ DECL_HANDLER(d3dkmt_mutex_release);
+ DECL_HANDLER(fsync_free_shm_idx);
+ DECL_HANDLER(hwnd_list_dmabuf_frames);
+ DECL_HANDLER(hwnd_dmabuf_get_channel);
++DECL_HANDLER(hwnd_dmabuf_get_channel_exclusive);
+ DECL_HANDLER(hwnd_dmabuf_claim_channel);
+ 
+ typedef void (*req_handler)( const void *req, void *reply );
+@@ -640,6 +641,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+     (req_handler)req_fsync_free_shm_idx,
+     (req_handler)req_hwnd_list_dmabuf_frames,
+     (req_handler)req_hwnd_dmabuf_get_channel,
++    (req_handler)req_hwnd_dmabuf_get_channel_exclusive,
+     (req_handler)req_hwnd_dmabuf_claim_channel,
+ };
+ 
+@@ -2438,6 +2440,11 @@ C_ASSERT( sizeof(struct hwnd_dmabuf_get_channel_request) == 16 );
+ C_ASSERT( offsetof(struct hwnd_dmabuf_get_channel_reply, status) == 8 );
+ C_ASSERT( offsetof(struct hwnd_dmabuf_get_channel_reply, channel_handle) == 12 );
+ C_ASSERT( sizeof(struct hwnd_dmabuf_get_channel_reply) == 16 );
++C_ASSERT( offsetof(struct hwnd_dmabuf_get_channel_exclusive_request, hwnd) == 12 );
++C_ASSERT( sizeof(struct hwnd_dmabuf_get_channel_exclusive_request) == 16 );
++C_ASSERT( offsetof(struct hwnd_dmabuf_get_channel_exclusive_reply, status) == 8 );
++C_ASSERT( offsetof(struct hwnd_dmabuf_get_channel_exclusive_reply, channel_handle) == 12 );
++C_ASSERT( sizeof(struct hwnd_dmabuf_get_channel_exclusive_reply) == 16 );
+ C_ASSERT( offsetof(struct hwnd_dmabuf_claim_channel_request, hwnd) == 12 );
+ C_ASSERT( sizeof(struct hwnd_dmabuf_claim_channel_request) == 16 );
+ C_ASSERT( offsetof(struct hwnd_dmabuf_claim_channel_reply, status) == 8 );
+diff --git a/server/request_trace.h b/server/request_trace.h
+index 8c7a513cc6f..345e814b9e5 100644
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -3606,6 +3606,17 @@ static void dump_hwnd_dmabuf_get_channel_reply( const struct hwnd_dmabuf_get_cha
+     fprintf( stderr, ", channel_handle=%04x", req->channel_handle );
+ }
+ 
++static void dump_hwnd_dmabuf_get_channel_exclusive_request( const struct hwnd_dmabuf_get_channel_exclusive_request *req )
++{
++    fprintf( stderr, " hwnd=%08x", req->hwnd );
++}
++
++static void dump_hwnd_dmabuf_get_channel_exclusive_reply( const struct hwnd_dmabuf_get_channel_exclusive_reply *req )
++{
++    fprintf( stderr, " status=%08x", req->status );
++    fprintf( stderr, ", channel_handle=%04x", req->channel_handle );
++}
++
+ static void dump_hwnd_dmabuf_claim_channel_request( const struct hwnd_dmabuf_claim_channel_request *req )
+ {
+     fprintf( stderr, " hwnd=%08x", req->hwnd );
+@@ -3935,6 +3946,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_fsync_free_shm_idx_request,
+     (dump_func)dump_hwnd_list_dmabuf_frames_request,
+     (dump_func)dump_hwnd_dmabuf_get_channel_request,
++    (dump_func)dump_hwnd_dmabuf_get_channel_exclusive_request,
+     (dump_func)dump_hwnd_dmabuf_claim_channel_request,
+ };
+ 
+@@ -4254,6 +4266,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+     NULL,
+     (dump_func)dump_hwnd_list_dmabuf_frames_reply,
+     (dump_func)dump_hwnd_dmabuf_get_channel_reply,
++    (dump_func)dump_hwnd_dmabuf_get_channel_exclusive_reply,
+     (dump_func)dump_hwnd_dmabuf_claim_channel_reply,
+ };
+ 
+@@ -4573,6 +4586,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
+     "fsync_free_shm_idx",
+     "hwnd_list_dmabuf_frames",
+     "hwnd_dmabuf_get_channel",
++    "hwnd_dmabuf_get_channel_exclusive",
+     "hwnd_dmabuf_claim_channel",
+ };
+ 
+diff --git a/server/window.c b/server/window.c
+index e5c229de151..d23608ba5f3 100644
+--- a/server/window.c
++++ b/server/window.c
+@@ -102,6 +102,9 @@ struct window
+     window_shm_t    *shared;          /* window in session shared memory */
+     struct object   *dmabuf_channel_producer; /* producer end of the frame socket */
+     struct object   *dmabuf_channel_consumer; /* consumer end of the frame socket */
++    unsigned int     dmabuf_pending_count;    /* swapchain creation in progress */
++    unsigned int     dmabuf_producer_count;   /* active users of the frame socket */
++    unsigned int     dmabuf_exclusive_count;  /* producer count from exclusive opens */
+ };
+ 
+ static void window_dump( struct object *obj, int verbose );
+@@ -692,6 +695,9 @@ static struct window *create_window( struct window *parent, struct window *owner
+     win->shared         = NULL;
+     win->dmabuf_channel_producer = NULL;
+     win->dmabuf_channel_consumer = NULL;
++    win->dmabuf_pending_count = 0;
++    win->dmabuf_producer_count = 0;
++    win->dmabuf_exclusive_count = 0;
+     win->window_rect = win->visible_rect = win->surface_rect = win->client_rect = empty_rect;
+     list_init( &win->children );
+     list_init( &win->unlinked );
+@@ -1294,12 +1300,29 @@ static void hwnd_dmabuf_frame_info_from_window( struct window *host, struct wind
+     info->style = win->style;
+     info->ex_style = win->ex_style;
+     info->dpi = get_window_dpi( win );
++    info->opened = win->dmabuf_producer_count != 0;
+ }
+ 
+-/* A window is a composited dmabuf child when it owns a frame socket. */
+-static int hwnd_dmabuf_is_producer( struct window *win )
++static void hwnd_dmabuf_release_server_channel( struct window *win )
+ {
+-    return win->dmabuf_channel_producer != NULL;
++    if (win->dmabuf_channel_producer)
++    {
++        release_object( win->dmabuf_channel_producer );
++        win->dmabuf_channel_producer = NULL;
++    }
++    if (win->dmabuf_channel_consumer)
++    {
++        release_object( win->dmabuf_channel_consumer );
++        win->dmabuf_channel_consumer = NULL;
++    }
++    win->dmabuf_exclusive_count = 0;
++}
++
++/* Pending producers are also listed so parents do not snapshot their GDI host
++ * while the producer is still allocating its first exportable images. */
++static int hwnd_dmabuf_is_listed( struct window *win )
++{
++    return win->dmabuf_producer_count || win->dmabuf_pending_count;
+ }
+ 
+ static unsigned int hwnd_dmabuf_count_frames( struct window *win )
+@@ -1307,7 +1330,7 @@ static unsigned int hwnd_dmabuf_count_frames( struct window *win )
+     struct window *child;
+     unsigned int count = 0;
+ 
+-    if (hwnd_dmabuf_is_producer( win ) && is_visible( win )) count++;
++    if (hwnd_dmabuf_is_listed( win ) && is_visible( win )) count++;
+     LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
+         count += hwnd_dmabuf_count_frames( child );
+     return count;
+@@ -1319,7 +1342,7 @@ static void hwnd_dmabuf_fill_frame_info( struct window *host, struct window *win
+ {
+     struct window *child;
+ 
+-    if (hwnd_dmabuf_is_producer( win ) && is_visible( win ))
++    if (hwnd_dmabuf_is_listed( win ) && is_visible( win ))
+     {
+         if (*count < max_count)
+             hwnd_dmabuf_frame_info_from_window( host, win, &frames[*count] );
+@@ -3058,6 +3081,24 @@ DECL_HANDLER(hwnd_list_dmabuf_frames)
+ }
+ 
+ 
++/* Mark a child HWND as having a dmabuf producer under construction. */
++DECL_HANDLER(hwnd_dmabuf_set_pending)
++{
++    struct window *win = get_window( req->hwnd );
++
++    reply->status = HWND_DMABUF_INVALID_ARGS;
++    if (!win) return;
++
++    if (req->pending)
++        win->dmabuf_pending_count++;
++    else if (win->dmabuf_pending_count)
++        win->dmabuf_pending_count--;
++    if (!win->dmabuf_pending_count && !win->dmabuf_producer_count)
++        hwnd_dmabuf_release_server_channel( win );
++    reply->status = HWND_DMABUF_OK;
++}
++
++
+ /* Wrap a server-owned unix fd as a handle-passable object (fd consumed on failure). */
+ static struct object *hwnd_dmabuf_wrap_fd( int unix_fd )
+ {
+@@ -3070,41 +3111,115 @@ static struct object *hwnd_dmabuf_wrap_fd( int unix_fd )
+     return obj;
+ }
+ 
+-/* Hand the producer its end of the frame socket, minted once and retained. A
+- * resize (new swapchain) re-grants the same socket so the consumer keeps reading. */
+-DECL_HANDLER(hwnd_dmabuf_get_channel)
++static int hwnd_dmabuf_create_server_channel( struct window *win )
+ {
+-    struct window *win = get_window( req->hwnd );
+     int fds[2];
+ 
+-    reply->status = HWND_DMABUF_INVALID_ARGS;
+-    reply->channel_handle = 0;
+-    if (!win) return;
++    if (win->dmabuf_channel_producer) return 1;
++
++    if (socketpair( PF_UNIX, SOCK_SEQPACKET, 0, fds ) == -1)
++        return 0;
+ 
+-    if (!win->dmabuf_channel_producer)
+     {
+         struct object *producer_end, *consumer_end;
+ 
+-        if (socketpair( PF_UNIX, SOCK_SEQPACKET, 0, fds ) == -1)
+-        {
+-            reply->status = HWND_DMABUF_NOT_FOUND;
+-            return;
+-        }
+         producer_end = hwnd_dmabuf_wrap_fd( fds[0] );
+         consumer_end = hwnd_dmabuf_wrap_fd( fds[1] );
+         if (!producer_end || !consumer_end)
+         {
+             if (producer_end) release_object( producer_end );
+             if (consumer_end) release_object( consumer_end );
+-            return;
++            return 0;
+         }
+         win->dmabuf_channel_producer = producer_end;
+         win->dmabuf_channel_consumer = consumer_end;
+     }
+ 
+-    reply->channel_handle = alloc_handle_no_access_check( current->process, win->dmabuf_channel_producer,
+-                                                          GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, 0 );
+-    if (!reply->channel_handle) return;
++    return 1;
++}
++
++static int hwnd_dmabuf_alloc_producer_handle( struct window *win, obj_handle_t *handle )
++{
++    *handle = alloc_handle_no_access_check( current->process, win->dmabuf_channel_producer,
++                                            GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, 0 );
++    return *handle != 0;
++}
++
++static void hwnd_dmabuf_commit_producer_open( struct window *win, int exclusive )
++{
++    win->dmabuf_producer_count++;
++    if (exclusive)
++        win->dmabuf_exclusive_count++;
++    if (win->dmabuf_pending_count)
++        win->dmabuf_pending_count--;
++}
++
++/* Hand the producer its end of the frame socket, minted once and retained. A
++ * resize (new swapchain) re-grants the same socket so the consumer keeps reading. */
++DECL_HANDLER(hwnd_dmabuf_get_channel)
++{
++    struct window *win = get_window( req->hwnd );
++    int had_channel;
++
++    reply->status = HWND_DMABUF_INVALID_ARGS;
++    reply->channel_handle = 0;
++    if (!win) return;
++
++    if (win->dmabuf_exclusive_count)
++    {
++        reply->status = HWND_DMABUF_BUSY;
++        return;
++    }
++
++    had_channel = win->dmabuf_channel_producer != NULL;
++    if (!hwnd_dmabuf_create_server_channel( win ))
++    {
++        reply->status = HWND_DMABUF_NOT_FOUND;
++        return;
++    }
++
++    if (!hwnd_dmabuf_alloc_producer_handle( win, &reply->channel_handle ))
++    {
++        if (!had_channel && !win->dmabuf_producer_count && !win->dmabuf_pending_count)
++            hwnd_dmabuf_release_server_channel( win );
++        return;
++    }
++    hwnd_dmabuf_commit_producer_open( win, 0 );
++    reply->status = HWND_DMABUF_OK;
++}
++
++/* GL capture owns the channel exclusively. Other users keep the shared request
++ * above so resize handoff can reuse an existing producer socket. */
++DECL_HANDLER(hwnd_dmabuf_get_channel_exclusive)
++{
++    struct window *win = get_window( req->hwnd );
++    int had_channel;
++
++    reply->status = HWND_DMABUF_INVALID_ARGS;
++    reply->channel_handle = 0;
++    if (!win) return;
++
++    if (win->dmabuf_producer_count || win->dmabuf_pending_count)
++    {
++        reply->status = HWND_DMABUF_BUSY;
++        return;
++    }
++
++    had_channel = win->dmabuf_channel_producer != NULL;
++    if (!hwnd_dmabuf_create_server_channel( win ))
++    {
++        reply->status = HWND_DMABUF_NOT_FOUND;
++        return;
++    }
++
++    if (!hwnd_dmabuf_alloc_producer_handle( win, &reply->channel_handle ))
++    {
++        if (!had_channel && !win->dmabuf_producer_count && !win->dmabuf_pending_count)
++            hwnd_dmabuf_release_server_channel( win );
++        return;
++    }
++
++    hwnd_dmabuf_commit_producer_open( win, 1 );
+     reply->status = HWND_DMABUF_OK;
+ }
+ 
+@@ -3116,7 +3231,7 @@ DECL_HANDLER(hwnd_dmabuf_claim_channel)
+     reply->status = HWND_DMABUF_NOT_FOUND;
+     reply->channel_handle = 0;
+     if (!win) return;
+-    if (!win->dmabuf_channel_consumer)
++    if (!win->dmabuf_producer_count || !win->dmabuf_channel_consumer)
+     {
+         reply->status = HWND_DMABUF_NO_FRAME;
+         return;
+@@ -3133,6 +3248,25 @@ DECL_HANDLER(hwnd_dmabuf_claim_channel)
+ }
+ 
+ 
++/* Drop one active producer reference. Keep the retained socket through a pending
++ * recreate so the consumer fd survives resize handoff; release it when idle. */
++DECL_HANDLER(hwnd_dmabuf_release_channel)
++{
++    struct window *win = get_window( req->hwnd );
++
++    reply->status = HWND_DMABUF_INVALID_ARGS;
++    if (!win) return;
++
++    if (win->dmabuf_producer_count)
++        win->dmabuf_producer_count--;
++    if (win->dmabuf_exclusive_count)
++        win->dmabuf_exclusive_count--;
++    if (!win->dmabuf_producer_count && !win->dmabuf_pending_count)
++        hwnd_dmabuf_release_server_channel( win );
++    reply->status = HWND_DMABUF_OK;
++}
++
++
+ /* get a window update region */
+ DECL_HANDLER(get_update_region)
+ {

@@ -1,0 +1,2102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Sun, 5 Jul 2026 17:22:32 +0200
+Subject: [PATCH 28/49] winewayland: Preserve GDI pixels above self-presenting
+ children.
+
+Punch-through compositing clears self-presenting child regions from the
+parent window surface. This also clears GDI pixels from child windows
+that are painted into the parent surface above those producers.
+
+Track the server-computed region where GDI-only children cover producer
+holes and publish the painted parent pixels as a small SHM producer.
+Composite it above the producer content so those GDI pixels keep their
+z-order.
+---
+ dlls/win32u/clipping.c                 |   5 +-
+ dlls/win32u/dce.c                      |  98 +++-
+ dlls/win32u/dibdrv/dc.c                |   4 +-
+ dlls/win32u/dibdrv/dibdrv.h            |   1 +
+ dlls/win32u/ntgdi_private.h            |   5 +-
+ dlls/win32u/window.c                   |  25 +-
+ dlls/winewayland.drv/wayland_surface.c |  81 +++-
+ dlls/winewayland.drv/waylanddrv.h      |   1 +
+ dlls/winewayland.drv/window.c          |   1 +
+ dlls/winewayland.drv/window_surface.c  | 612 ++++++++++++++++++++++++-
+ include/wine/gdi_driver.h              |   4 +
+ include/wine/hwnd_dmabuf.h             | 100 +++-
+ include/wine/server_protocol.h         |  51 ++-
+ server/protocol.def                    |  27 ++
+ server/request_handlers.h              |  20 +-
+ server/request_trace.h                 |  30 ++
+ server/window.c                        | 202 +++++++-
+ 17 files changed, 1226 insertions(+), 41 deletions(-)
+
+diff --git a/dlls/win32u/clipping.c b/dlls/win32u/clipping.c
+index f70c8bff35d..eece4048ad4 100644
+--- a/dlls/win32u/clipping.c
++++ b/dlls/win32u/clipping.c
+@@ -215,7 +215,8 @@ INT WINAPI NtGdiExtSelectClipRgn( HDC hdc, HRGN rgn, INT mode )
+  *           set_visible_region
+  */
+ void set_visible_region( HDC hdc, HRGN hrgn, const RECT *vis_rect, const RECT *device_rect,
+-                         struct window_surface *surface, UINT dpi_from, UINT dpi_to )
++                         struct window_surface *surface, BOOL gdi_over_source,
++                         UINT dpi_from, UINT dpi_to )
+ {
+     DC * dc;
+ 
+@@ -235,7 +236,7 @@ void set_visible_region( HDC hdc, HRGN hrgn, const RECT *vis_rect, const RECT *d
+     dc->dpi_from = dpi_from;
+     dc->dpi_to = dpi_to;
+ 
+-    dibdrv_set_window_surface( dc, surface );
++    dibdrv_set_window_surface( dc, surface, gdi_over_source );
+     DC_UpdateXforms( dc );
+     update_dc_clipping( dc );
+     release_dc_ptr( dc );
+diff --git a/dlls/win32u/dce.c b/dlls/win32u/dce.c
+index 216ae9fa7f6..4a02495853f 100644
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -1004,6 +1004,8 @@ W32KAPI void window_surface_release( struct window_surface *surface )
+     {
+         if (surface != &dummy_surface) pthread_mutex_destroy( &surface->mutex );
+         if (surface->clip_region) NtGdiDeleteObjectApp( surface->clip_region );
++        if (surface->gdi_over_producer_region) NtGdiDeleteObjectApp( surface->gdi_over_producer_region );
++        if (surface->gdi_over_paint_region) NtGdiDeleteObjectApp( surface->gdi_over_paint_region );
+         if (surface->color_bitmap) NtGdiDeleteObjectApp( surface->color_bitmap );
+         if (surface->shape_bitmap) NtGdiDeleteObjectApp( surface->shape_bitmap );
+         surface->funcs->destroy( surface );
+@@ -1089,12 +1091,46 @@ W32KAPI void window_surface_flush( struct window_surface *surface )
+ 
+         if (surface->funcs->flush( surface, &surface->rect, &dirty, color_info, color_bits,
+                                    shape_changed, shape_info, shape_bits ))
++        {
+             reset_bounds( &surface->bounds );
++            if (surface->gdi_over_paint_region)
++            {
++                NtGdiDeleteObjectApp( surface->gdi_over_paint_region );
++                surface->gdi_over_paint_region = 0;
++            }
++        }
+     }
+ 
+     window_surface_unlock( surface );
+ }
+ 
++W32KAPI void window_surface_add_gdi_over_paint_rect( struct window_surface *surface, const RECT *rect )
++{
++    HRGN rect_region, clipped_region;
++    int type;
++
++    if (!surface->gdi_over_producer_region || IsRectEmpty( rect )) return;
++    if (!(rect_region = NtGdiCreateRectRgn( rect->left, rect->top, rect->right, rect->bottom ))) return;
++    if (!(clipped_region = NtGdiCreateRectRgn( 0, 0, 0, 0 )))
++    {
++        NtGdiDeleteObjectApp( rect_region );
++        return;
++    }
++
++    type = NtGdiCombineRgn( clipped_region, rect_region, surface->gdi_over_producer_region, RGN_AND );
++    if (type != ERROR && type != NULLREGION)
++    {
++        if (!surface->gdi_over_paint_region)
++            surface->gdi_over_paint_region = NtGdiCreateRectRgn( 0, 0, 0, 0 );
++        if (surface->gdi_over_paint_region)
++            NtGdiCombineRgn( surface->gdi_over_paint_region, surface->gdi_over_paint_region,
++                             clipped_region, RGN_OR );
++    }
++
++    NtGdiDeleteObjectApp( clipped_region );
++    NtGdiDeleteObjectApp( rect_region );
++}
++
+ W32KAPI void window_surface_set_layered( struct window_surface *surface, COLORREF color_key, UINT alpha_bits, UINT alpha_mask )
+ {
+     char color_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
+@@ -1157,6 +1193,56 @@ W32KAPI void window_surface_set_clip( struct window_surface *surface, HRGN clip_
+     window_surface_unlock( surface );
+ }
+ 
++W32KAPI void window_surface_set_gdi_over_producer_region( struct window_surface *surface, HRGN region )
++{
++    BOOL changed = FALSE;
++
++    window_surface_lock( surface );
++
++    if (!region && surface->gdi_over_producer_region)
++    {
++        TRACE( "hwnd %p, surface %p %s, clearing GDI-over-producer region\n", surface->hwnd, surface,
++               wine_dbgstr_rect( &surface->rect ) );
++
++        NtGdiDeleteObjectApp( surface->gdi_over_producer_region );
++        surface->gdi_over_producer_region = 0;
++        if (surface->gdi_over_paint_region)
++        {
++            NtGdiDeleteObjectApp( surface->gdi_over_paint_region );
++            surface->gdi_over_paint_region = 0;
++        }
++        surface->bounds = surface->rect;
++        changed = TRUE;
++    }
++    else if (region && !NtGdiEqualRgn( region, surface->gdi_over_producer_region ))
++    {
++        RECT box;
++
++        if (!surface->gdi_over_producer_region)
++            surface->gdi_over_producer_region = NtGdiCreateRectRgn( 0, 0, 0, 0 );
++        NtGdiCombineRgn( surface->gdi_over_producer_region, region, 0, RGN_COPY );
++        if (surface->gdi_over_paint_region)
++        {
++            if (NtGdiCombineRgn( surface->gdi_over_paint_region, surface->gdi_over_paint_region,
++                                 surface->gdi_over_producer_region, RGN_AND ) == NULLREGION)
++            {
++                NtGdiDeleteObjectApp( surface->gdi_over_paint_region );
++                surface->gdi_over_paint_region = 0;
++            }
++        }
++
++        NtGdiGetRgnBox( region, &box );
++        TRACE( "hwnd %p, surface %p %s, setting GDI-over-producer region %s\n", surface->hwnd,
++               surface, wine_dbgstr_rect( &surface->rect ), wine_dbgstr_rect( &box ) );
++        surface->bounds = surface->rect;
++        changed = TRUE;
++    }
++
++    window_surface_unlock( surface );
++
++    if (changed) window_surface_flush( surface );
++}
++
+ W32KAPI void window_surface_set_shape( struct window_surface *surface, HRGN shape_region )
+ {
+     window_surface_lock( surface );
+@@ -1350,8 +1436,12 @@ static void update_visible_region( struct dce *dce )
+ 
+     if (surface)
+     {
++        BOOL gdi_over_source = !foreign && (dce->hwnd != top_win) &&
++            (get_window_long( dce->hwnd, GWL_EXSTYLE ) & WS_EX_TRANSPARENT) &&
++            !(paint_flags & (SET_WINPOS_PIXEL_FORMAT | SET_WINPOS_CLIP_CLIENT));
++
+         user_driver->pGetDC( dce->hdc, dce->hwnd, top_win, &win_rect, &top_rect, flags );
+-        set_visible_region( dce->hdc, vis_rgn, &win_rect, &top_rect, surface, 0, 0 );
++        set_visible_region( dce->hdc, vis_rgn, &win_rect, &top_rect, surface, gdi_over_source, 0, 0 );
+         window_surface_release( surface );
+     }
+     else
+@@ -1366,7 +1456,7 @@ static void update_visible_region( struct dce *dce )
+         if (foreign_surface)
+         {
+             user_driver->pGetDC( dce->hdc, dce->hwnd, top_win, &win_rect, &win_rect, flags );
+-            set_visible_region( dce->hdc, vis_rgn, &win_rect, &win_rect, foreign_surface, 0, 0 );
++            set_visible_region( dce->hdc, vis_rgn, &win_rect, &win_rect, foreign_surface, FALSE, 0, 0 );
+             window_surface_release( foreign_surface );
+             return;
+         }
+@@ -1379,7 +1469,7 @@ static void update_visible_region( struct dce *dce )
+         user_driver->pGetDC( dce->hdc, dce->hwnd, top_win, &window_rect, &toplevel_rect, flags );
+ 
+         SetRectEmpty( &top_rect );
+-        set_visible_region( dce->hdc, vis_rgn, &win_rect, &top_rect, NULL, dpi, raw_dpi );
++        set_visible_region( dce->hdc, vis_rgn, &win_rect, &top_rect, NULL, FALSE, dpi, raw_dpi );
+     }
+ }
+ 
+@@ -1390,7 +1480,7 @@ static void release_dce( struct dce *dce )
+ {
+     if (!dce->hwnd) return;  /* already released */
+ 
+-    set_visible_region( dce->hdc, 0, &dummy_surface.rect, &dummy_surface.rect, &dummy_surface, 0, 0 );
++    set_visible_region( dce->hdc, 0, &dummy_surface.rect, &dummy_surface.rect, &dummy_surface, FALSE, 0, 0 );
+     user_driver->pReleaseDC( dce->hwnd, dce->hdc );
+ 
+     if (dce->clip_rgn) NtGdiDeleteObjectApp( dce->clip_rgn );
+diff --git a/dlls/win32u/dibdrv/dc.c b/dlls/win32u/dibdrv/dc.c
+index d80173c8f51..8682859fc5f 100644
+--- a/dlls/win32u/dibdrv/dc.c
++++ b/dlls/win32u/dibdrv/dc.c
+@@ -317,6 +317,7 @@ void add_clipped_bounds( dibdrv_physdev *dev, const RECT *rect, HRGN clip )
+     if (IsRectEmpty( &rc )) return;
+     OffsetRect( &rc, dev->dib.rect.left, dev->dib.rect.top );
+     add_bounds_rect( dev->bounds, &rc );
++    if (dev->gdi_over_surface) window_surface_add_gdi_over_paint_rect( dev->gdi_over_surface, &rc );
+ }
+ 
+ /**********************************************************************
+@@ -557,7 +558,7 @@ static void unlock_windrv_bits( struct gdi_image_bits *bits )
+     unlock_surface( bits->param );
+ }
+ 
+-void dibdrv_set_window_surface( DC *dc, struct window_surface *surface )
++void dibdrv_set_window_surface( DC *dc, struct window_surface *surface, BOOL gdi_over_source )
+ {
+     PHYSDEV windev;
+     struct windrv_physdev *physdev;
+@@ -600,6 +601,7 @@ void dibdrv_set_window_surface( DC *dc, struct window_surface *surface )
+         dibdrv->dib.rect = dc->attr->vis_rect;
+         OffsetRect( &dibdrv->dib.rect, -dc->device_rect.left, -dc->device_rect.top );
+         dibdrv->bounds = &surface->bounds;
++        dibdrv->gdi_over_surface = (gdi_over_source && surface != &dummy_surface) ? surface : NULL;
+         DC_InitDC( dc );
+     }
+     else if (windev)
+diff --git a/dlls/win32u/dibdrv/dibdrv.h b/dlls/win32u/dibdrv/dibdrv.h
+index bf85d1dd24a..ffcdc4cc465 100644
+--- a/dlls/win32u/dibdrv/dibdrv.h
++++ b/dlls/win32u/dibdrv/dibdrv.h
+@@ -99,6 +99,7 @@ typedef struct dibdrv_physdev
+ 
+     HRGN clip;
+     RECT *bounds;
++    struct window_surface *gdi_over_surface;
+     struct cached_font *font;
+ 
+     /* pen */
+diff --git a/dlls/win32u/ntgdi_private.h b/dlls/win32u/ntgdi_private.h
+index 72b36ec7e93..56022d3f678 100644
+--- a/dlls/win32u/ntgdi_private.h
++++ b/dlls/win32u/ntgdi_private.h
+@@ -167,7 +167,8 @@ extern void free_brush_pattern( struct brush_pattern *pattern );
+ extern BOOL clip_device_rect( DC *dc, RECT *dst, const RECT *src );
+ extern BOOL clip_visrect( DC *dc, RECT *dst, const RECT *src );
+ extern void set_visible_region( HDC hdc, HRGN hrgn, const RECT *vis_rect, const RECT *device_rect,
+-                                struct window_surface *surface, UINT dpi_from, UINT dpi_to );
++                                struct window_surface *surface, BOOL gdi_over_source,
++                                UINT dpi_from, UINT dpi_to );
+ extern void update_dc_clipping( DC * dc );
+ 
+ /* Return the total DC region (if any) */
+@@ -225,7 +226,7 @@ extern UINT get_dib_dc_color_table( HDC hdc, UINT startpos, UINT entries,
+                                     RGBQUAD *colors );
+ extern UINT set_dib_dc_color_table( HDC hdc, UINT startpos, UINT entries,
+                                     const RGBQUAD *colors );
+-extern void dibdrv_set_window_surface( DC *dc, struct window_surface *surface );
++extern void dibdrv_set_window_surface( DC *dc, struct window_surface *surface, BOOL gdi_over_source );
+ 
+ /* driver.c */
+ extern const struct gdi_dc_funcs null_driver;
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index 9776a9d033c..b0e0ab6beaf 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -1967,7 +1967,14 @@ static BOOL get_window_info( HWND hwnd, WINDOWINFO *info )
+     return TRUE;
+ }
+ 
+-static NTSTATUS get_window_region( HWND hwnd, BOOL surface, HRGN *region, RECT *visible )
++enum window_region_type
++{
++    WINDOW_REGION_SHAPE,
++    WINDOW_REGION_SURFACE,
++    WINDOW_REGION_GDI_OVER_PRODUCER,
++};
++
++static NTSTATUS get_window_region( HWND hwnd, enum window_region_type type, HRGN *region, RECT *visible )
+ {
+     NTSTATUS status;
+     RGNDATA *data;
+@@ -1981,7 +1988,7 @@ static NTSTATUS get_window_region( HWND hwnd, BOOL surface, HRGN *region, RECT *
+         SERVER_START_REQ( get_window_region )
+         {
+             req->window = wine_server_user_handle( hwnd );
+-            req->surface = surface;
++            req->surface = type;
+             wine_server_set_reply( req, data->Buffer, size );
+             if (!(status = wine_server_call( req )))
+             {
+@@ -2018,7 +2025,7 @@ static void update_surface_region( HWND hwnd )
+     if (!win || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return;
+     if (!win->surface) goto done;
+ 
+-    if (get_window_region( hwnd, FALSE, &shape, &visible )) goto done;
++    if (get_window_region( hwnd, WINDOW_REGION_SHAPE, &shape, &visible )) goto done;
+     if (shape)
+     {
+         region = NtGdiCreateRectRgn( 0, 0, visible.right - visible.left, visible.bottom - visible.top );
+@@ -2028,7 +2035,7 @@ static void update_surface_region( HWND hwnd )
+     }
+     window_surface_set_shape( win->surface, shape );
+ 
+-    if (get_window_region( hwnd, TRUE, &region, &visible )) goto done;
++    if (get_window_region( hwnd, WINDOW_REGION_SURFACE, &region, &visible )) goto done;
+     if (!region) window_surface_set_clip( win->surface, shape );
+     else
+     {
+@@ -2038,6 +2045,16 @@ static void update_surface_region( HWND hwnd )
+         NtGdiDeleteObjectApp( region );
+     }
+ 
++    if (get_window_region( hwnd, WINDOW_REGION_GDI_OVER_PRODUCER, &region, &visible )) goto done;
++    if (region)
++    {
++        NtGdiOffsetRgn( region, -visible.left, -visible.top );
++        if (shape) NtGdiCombineRgn( region, region, shape, RGN_AND );
++        window_surface_set_gdi_over_producer_region( win->surface, region );
++        NtGdiDeleteObjectApp( region );
++    }
++    else window_surface_set_gdi_over_producer_region( win->surface, 0 );
++
+ done:
+     if (shape) NtGdiDeleteObjectApp( shape );
+     release_win_ptr( win );
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 09e5489f16f..c2c660d5595 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -45,7 +45,7 @@ static LONG wayland_surface_serial_counter;
+ 
+ static void wayland_surface_clear_direct_dmabuf(struct wayland_surface *surface,
+                                                 struct wayland_win_data *data);
+-static void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface);
++void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface);
+ static BOOL wayland_surface_try_direct_dmabuf(HWND hwnd);
+ 
+ static const char *wayland_child_visibility_str(enum wayland_child_visibility visibility)
+@@ -215,6 +215,8 @@ struct wayland_hwnd_dmabuf_buffer
+     unsigned int stride;
+     unsigned int offset;
+     unsigned int alpha_mode;
++    unsigned int dirty_count;
++    unsigned short dirty_rects[HWND_DMABUF_MAX_DIRTY_RECTS][4];
+     int width;
+     int height;
+     LONG ref;          /* owner ref + one ref per outstanding compositor commit */
+@@ -240,6 +242,7 @@ struct wayland_hwnd_dmabuf_surface
+     BOOL logged_first_attach;
+     BOOL logged_first_import;
+     BOOL seen;
++    BOOL gdi_overlay;
+     BOOL direct;
+     BOOL linked;
+     unsigned long long last_seen_ms; /* tick when last present in the producer list */
+@@ -1946,17 +1949,17 @@ static BOOL wayland_surface_reconfigure_client(struct wayland_surface *surface,
+ }
+ 
+ static struct wayland_hwnd_dmabuf_surface *wayland_hwnd_dmabuf_surface_get(struct wayland_surface *parent,
+-                                                                           HWND hwnd)
++                                                                           HWND hwnd, BOOL gdi_overlay)
+ {
+     struct wayland_hwnd_dmabuf_surface *surface;
+ 
+     wl_list_for_each(surface, &parent->hwnd_dmabuf_surfaces, link)
+-        if (surface->hwnd == hwnd) return surface;
++        if (surface->hwnd == hwnd && surface->gdi_overlay == gdi_overlay) return surface;
+     return NULL;
+ }
+ 
+ static struct wayland_hwnd_dmabuf_surface *wayland_hwnd_dmabuf_surface_create(struct wayland_surface *parent,
+-                                                                              HWND hwnd)
++                                                                              HWND hwnd, BOOL gdi_overlay)
+ {
+     struct wayland_hwnd_dmabuf_surface *surface;
+     struct wl_region *empty_region;
+@@ -1964,6 +1967,7 @@ static struct wayland_hwnd_dmabuf_surface *wayland_hwnd_dmabuf_surface_create(st
+     if (!(surface = calloc(1, sizeof(*surface)))) return NULL;
+     surface->hwnd = hwnd;
+     surface->parent = parent;
++    surface->gdi_overlay = gdi_overlay;
+     surface->channel_fd = -1;
+     wl_list_init(&surface->buffers);
+     wl_list_init(&surface->link);
+@@ -2126,6 +2130,24 @@ static BOOL wayland_hwnd_dmabuf_surface_compute_geometry(struct wayland_surface
+     struct wayland_child_visibility_info visibility;
+     int rect_width, rect_height;
+ 
++    if (surface->gdi_overlay)
++    {
++        int width = parent->window.rect.right - parent->window.rect.left;
++        int height = parent->window.rect.bottom - parent->window.rect.top;
++
++        if (width <= 0 || height <= 0) return FALSE;
++        geometry->source_x = 0;
++        geometry->source_y = 0;
++        geometry->source_width = max(1, min(width, surface->current->width));
++        geometry->source_height = max(1, min(height, surface->current->height));
++        wayland_surface_coords_from_window(parent, 0, 0, &geometry->x, &geometry->y);
++        wayland_surface_coords_from_window(parent, width, height,
++                                           &geometry->width, &geometry->height);
++        geometry->width = max(1, geometry->width);
++        geometry->height = max(1, geometry->height);
++        return TRUE;
++    }
++
+     rect_width = rect.right - rect.left;
+     rect_height = rect.bottom - rect.top;
+     if (rect_width <= 0 || rect_height <= 0) return FALSE;
+@@ -2207,13 +2229,19 @@ static void wayland_hwnd_dmabuf_surface_claim_channel(struct wayland_hwnd_dmabuf
+     int fd = -1;
+ 
+     if (surface->channel_fd >= 0) return;
+-    if (wine_hwnd_dmabuf_claim_channel(surface->hwnd, &handle) != HWND_DMABUF_OK || !handle)
++    if (surface->gdi_overlay)
++    {
++        if (wine_hwnd_dmabuf_claim_gdi_overlay_channel(surface->hwnd, &handle) != HWND_DMABUF_OK || !handle)
++            return;
++    }
++    else if (wine_hwnd_dmabuf_claim_channel(surface->hwnd, &handle) != HWND_DMABUF_OK || !handle)
+         return;
+     if (wine_server_handle_to_fd(handle, FILE_READ_DATA | FILE_WRITE_DATA, &fd, NULL))
+         fd = -1;
+     NtClose(handle);
+     surface->channel_fd = fd;
+-    if (fd >= 0) TRACE("hwnd=%p claimed dmabuf socket channel fd %d\n", surface->hwnd, fd);
++    if (fd >= 0) TRACE("hwnd=%p claimed %s socket channel fd %d\n", surface->hwnd,
++                       surface->gdi_overlay ? "gdi overlay" : "dmabuf", fd);
+ }
+ 
+ /* Receive one frame. Returns 1 on success, 0 if empty, -1 on EOF. */
+@@ -2370,6 +2398,8 @@ static void wayland_hwnd_dmabuf_set_frame(struct wayland_hwnd_dmabuf_surface *su
+     if (wayland_hwnd_dmabuf_buffer_exchange_release_token(buffer, desc->release_token))
+         WARN("hwnd=%p slot=%u overwrote an unreleased token\n", surface->hwnd, desc->image_id);
+     buffer->alpha_mode = desc->alpha_mode;
++    buffer->dirty_count = min(desc->dirty_count, HWND_DMABUF_MAX_DIRTY_RECTS);
++    memcpy(buffer->dirty_rects, desc->dirty_rects, sizeof(buffer->dirty_rects));
+     buffer->release_flags = HWND_DMABUF_RELEASE_ORPHANED;
+     surface->current = buffer;
+     surface->frame_seq = desc->frame_seq;
+@@ -2390,9 +2420,24 @@ static void wayland_hwnd_dmabuf_attach_current(struct wayland_hwnd_dmabuf_surfac
+     }
+     buffer->release_flags = HWND_DMABUF_RELEASE_PRESENTED;
+     wl_surface_attach(surface->wl_surface, buffer->wl_buffer, 0, 0);
+-    wl_surface_damage_buffer(surface->wl_surface, 0, 0, buffer->width, buffer->height);
+-    wp_viewport_set_source(surface->wp_viewport, 0, 0,
+-                           wl_fixed_from_int(buffer->width), wl_fixed_from_int(buffer->height));
++    if (surface->gdi_overlay && buffer->dirty_count)
++    {
++        unsigned int i;
++
++        for (i = 0; i < buffer->dirty_count; i++)
++        {
++            int left = buffer->dirty_rects[i][0], top = buffer->dirty_rects[i][1];
++            int right = buffer->dirty_rects[i][2], bottom = buffer->dirty_rects[i][3];
++
++            if (right <= left || bottom <= top) continue;
++            wl_surface_damage_buffer(surface->wl_surface, left, top, right - left, bottom - top);
++        }
++    }
++    else
++        wl_surface_damage_buffer(surface->wl_surface, 0, 0, buffer->width, buffer->height);
++    if (!surface->gdi_overlay)
++        wp_viewport_set_source(surface->wp_viewport, 0, 0,
++                               wl_fixed_from_int(buffer->width), wl_fixed_from_int(buffer->height));
+ }
+ 
+ static void wayland_hwnd_dmabuf_drop_current_frame(struct wayland_hwnd_dmabuf_surface *surface,
+@@ -2520,8 +2565,9 @@ retry:
+         BOOL desc_valid = wayland_hwnd_dmabuf_desc_is_valid(&desc);
+         BOOL format_supported = desc_valid &&
+                 wayland_hwnd_dmabuf_desc_format_supported(&desc);
++        BOOL overlay_frame = (desc.flags & HWND_DMABUF_FLAG_GDI_OVERLAY) != 0;
+ 
+-        if (!desc_valid || !format_supported)
++        if (!desc_valid || !format_supported || overlay_frame != surface->gdi_overlay)
+         {
+             WARN("hwnd=%p import rejected info_seq=%u desc_seq=%u version=%u "
+                  "size=%ux%u stride=%u offset=%u fourcc=%#x (%c%c%c%c) "
+@@ -2621,6 +2667,7 @@ static BOOL wayland_surface_direct_dmabuf_candidate(struct wayland_surface *surf
+ {
+     if (count != 1) return FALSE;
+     if (!wayland_surface_is_toplevel(surface)) return FALSE;
++    if (frames[0].opened & HWND_DMABUF_FRAME_GDI_OVERLAY) return FALSE;
+     if (!data || data->client_surface) return FALSE;
+     if (data->window_contents) return FALSE;
+     if (wayland_surface_has_region_constraints(surface))
+@@ -2851,7 +2898,7 @@ BOOL wayland_surface_has_hwnd_dmabuf_content(struct wayland_surface *surface)
+     if (surface->direct_dmabuf_surface && surface->direct_dmabuf_surface->current_committed)
+         return TRUE;
+     wl_list_for_each(dmabuf_surface, &surface->hwnd_dmabuf_surfaces, link)
+-        if (dmabuf_surface->current_committed)
++        if (!dmabuf_surface->gdi_overlay && dmabuf_surface->current_committed)
+             return TRUE;
+     return FALSE;
+ }
+@@ -2916,7 +2963,7 @@ static BOOL wayland_surface_try_direct_dmabuf(HWND hwnd)
+     return ret;
+ }
+ 
+-static void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
++void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
+ {
+     hwnd_dmabuf_frame_info_t stack_frames[16], *frames = stack_frames;
+     unsigned int total = 0, count = 0, i;
+@@ -2968,11 +3015,12 @@ static void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
+     for (i = 0; i < count; i++)
+     {
+         HWND hwnd = (HWND)(UINT_PTR)frames[i].hwnd;
++        BOOL gdi_overlay = (frames[i].opened & HWND_DMABUF_FRAME_GDI_OVERLAY) != 0;
+         BOOL created_buffer, attached_frame;
+ 
+         if (!frames[i].opened)
+         {
+-            if ((dmabuf_surface = wayland_hwnd_dmabuf_surface_get(surface, hwnd)))
++            if ((dmabuf_surface = wayland_hwnd_dmabuf_surface_get(surface, hwnd, FALSE)))
+             {
+                 dmabuf_surface->seen = TRUE;
+                 dmabuf_surface->last_seen_ms = now;
+@@ -2987,8 +3035,8 @@ static void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
+             continue;
+         }
+ 
+-        if (!(dmabuf_surface = wayland_hwnd_dmabuf_surface_get(surface, hwnd)) &&
+-            !(dmabuf_surface = wayland_hwnd_dmabuf_surface_create(surface, hwnd)))
++        if (!(dmabuf_surface = wayland_hwnd_dmabuf_surface_get(surface, hwnd, gdi_overlay)) &&
++            !(dmabuf_surface = wayland_hwnd_dmabuf_surface_create(surface, hwnd, gdi_overlay)))
+             continue;
+ 
+         dmabuf_surface->seen = TRUE;
+@@ -3039,7 +3087,8 @@ static void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
+     wl_list_for_each_safe(dmabuf_surface, next, &surface->hwnd_dmabuf_surfaces, link)
+     {
+         if (dmabuf_surface->seen) continue;
+-        if (now - dmabuf_surface->last_seen_ms > WAYLAND_DMABUF_SURFACE_GRACE_MS)
++        if (dmabuf_surface->gdi_overlay ||
++            now - dmabuf_surface->last_seen_ms > WAYLAND_DMABUF_SURFACE_GRACE_MS)
+         {
+             wayland_hwnd_dmabuf_surface_destroy(dmabuf_surface);
+             any_new = TRUE;
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index e59ea23f60e..474ff05106c 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -595,6 +595,7 @@ void wayland_surface_sync_window_regions(struct wayland_surface *surface,
+                                          struct window_surface *window_surface);
+ void wayland_surface_prepare_direct_dmabuf_shm_commit(struct wayland_surface *surface);
+ void wayland_surface_finish_direct_dmabuf_shm_commit(struct wayland_surface *surface);
++void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface);
+ void wayland_surface_coords_from_window(struct wayland_surface *surface,
+                                         int window_x, int window_y,
+                                         int *surface_x, int *surface_y);
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index d12cf8c5732..f39dc246f75 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -1555,6 +1555,7 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
+             wl_surface_commit(wayland_surface->wl_surface);
+             wayland_surface_finish_direct_dmabuf_shm_commit(wayland_surface);
+             wayland_surface->ensured_contents = WAYLAND_SURFACE_ENSURED_FLUSH;
++            wayland_surface_update_hwnd_dmabufs(wayland_surface);
+             committed = TRUE;
+         }
+         else
+diff --git a/dlls/winewayland.drv/window_surface.c b/dlls/winewayland.drv/window_surface.c
+index a0399588b97..22324c9b8eb 100644
+--- a/dlls/winewayland.drv/window_surface.c
++++ b/dlls/winewayland.drv/window_surface.c
+@@ -24,14 +24,24 @@
+ 
+ #include "config.h"
+ 
++#include <errno.h>
+ #include <limits.h>
+ #include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <unistd.h>
+ 
+ #include "waylanddrv.h"
+ #include "wine/debug.h"
++#include "wine/hwnd_dmabuf.h"
++#include "wine/server.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
+ 
++#define GDI_OVERLAY_RING_SIZE 3
++
++RGNDATA *get_region_data(HRGN region);
++
+ struct wayland_buffer_queue
+ {
+     struct wl_event_queue *wl_event_queue;
+@@ -41,20 +51,604 @@ struct wayland_buffer_queue
+     uint32_t format;
+ };
+ 
++struct wayland_gdi_overlay_slot
++{
++    HANDLE section;
++    void *bits;
++    int fd;
++    UINT64 release_token;
++    unsigned int image_id;
++    BOOL busy;
++};
++
++struct wayland_gdi_overlay_producer
++{
++    int channel_fd;
++    UINT64 producer_unique_id;
++    UINT64 next_release_token;
++    unsigned int frame_seq;
++    unsigned int ring_generation;
++    int width, height, stride, size;
++    void *master_bits;
++    HRGN region;
++    HRGN pending_region;
++    BOOL lost, slots_created;
++    struct wayland_gdi_overlay_slot slots[GDI_OVERLAY_RING_SIZE];
++};
++
+ struct wayland_window_surface
+ {
+     struct window_surface header;
+     struct wayland_buffer_queue *wayland_buffer_queue;
++    struct wayland_gdi_overlay_producer gdi_overlay;
+     BOOL layered;
+     BOOL occlusion_clipped;
+ };
+ 
++static LONGLONG volatile gdi_overlay_next_producer_id;
++
+ static struct wayland_window_surface *wayland_window_surface_cast(
+     struct window_surface *window_surface)
+ {
+     return (struct wayland_window_surface *)window_surface;
+ }
+ 
++static void wayland_gdi_overlay_slot_destroy(struct wayland_gdi_overlay_slot *slot)
++{
++    if (slot->fd >= 0) close(slot->fd);
++    if (slot->bits) NtUnmapViewOfSection(GetCurrentProcess(), slot->bits);
++    if (slot->section) NtClose(slot->section);
++    memset(slot, 0, sizeof(*slot));
++    slot->fd = -1;
++}
++
++static void wayland_gdi_overlay_destroy_slots(struct wayland_gdi_overlay_producer *producer)
++{
++    unsigned int i;
++
++    for (i = 0; i < GDI_OVERLAY_RING_SIZE; i++)
++        wayland_gdi_overlay_slot_destroy(&producer->slots[i]);
++    free(producer->master_bits);
++    producer->master_bits = NULL;
++    if (producer->pending_region)
++    {
++        NtGdiDeleteObjectApp(producer->pending_region);
++        producer->pending_region = 0;
++    }
++    producer->slots_created = FALSE;
++}
++
++static void wayland_gdi_overlay_clear_region(struct wayland_gdi_overlay_producer *producer)
++{
++    if (producer->region)
++    {
++        NtGdiDeleteObjectApp(producer->region);
++        producer->region = 0;
++    }
++}
++
++static BOOL wayland_gdi_overlay_slot_create(struct wayland_gdi_overlay_slot *slot,
++                                            unsigned int image_id, int size)
++{
++    LARGE_INTEGER section_size;
++    SIZE_T view_size = 0;
++    NTSTATUS status;
++
++    memset(slot, 0, sizeof(*slot));
++    slot->fd = -1;
++    slot->image_id = image_id;
++
++    section_size.QuadPart = size;
++    status = NtCreateSection(&slot->section, GENERIC_READ | SECTION_MAP_READ | SECTION_MAP_WRITE,
++                             NULL, &section_size, PAGE_READWRITE, SEC_COMMIT, 0);
++    if (status)
++    {
++        WARN("failed to create GDI overlay shm section status %#lx\n", status);
++        return FALSE;
++    }
++
++    status = NtMapViewOfSection(slot->section, GetCurrentProcess(), &slot->bits, 0, 0, NULL,
++                                &view_size, ViewUnmap, 0, PAGE_READWRITE);
++    if (status)
++    {
++        WARN("failed to map GDI overlay shm section status %#lx\n", status);
++        wayland_gdi_overlay_slot_destroy(slot);
++        return FALSE;
++    }
++
++    status = wine_server_handle_to_fd(slot->section, FILE_READ_DATA, &slot->fd, NULL);
++    if (status)
++    {
++        WARN("failed to export GDI overlay shm section status %#lx\n", status);
++        wayland_gdi_overlay_slot_destroy(slot);
++        return FALSE;
++    }
++
++    return TRUE;
++}
++
++static BOOL wayland_gdi_overlay_ensure_slots(struct wayland_gdi_overlay_producer *producer,
++                                             int width, int height)
++{
++    unsigned int i;
++
++    if (width <= 0 || height <= 0) return FALSE;
++    if (width > INT_MAX / 4 || height > INT_MAX / (width * 4)) return FALSE;
++
++    if (producer->slots_created && producer->width == width && producer->height == height)
++        return TRUE;
++
++    wayland_gdi_overlay_destroy_slots(producer);
++    producer->width = width;
++    producer->height = height;
++    producer->stride = width * 4;
++    producer->size = producer->stride * height;
++    producer->ring_generation++;
++    if (!producer->ring_generation) producer->ring_generation++;
++
++    if (!(producer->master_bits = calloc(1, producer->size)))
++        return FALSE;
++
++    for (i = 0; i < GDI_OVERLAY_RING_SIZE; i++)
++        if (!wayland_gdi_overlay_slot_create(&producer->slots[i], i, producer->size))
++        {
++            while (i--) wayland_gdi_overlay_slot_destroy(&producer->slots[i]);
++            free(producer->master_bits);
++            producer->master_bits = NULL;
++            return FALSE;
++        }
++
++    producer->slots_created = TRUE;
++    TRACE("gdi_overlay allocated %u shm slots size=%d generation=%u\n",
++          GDI_OVERLAY_RING_SIZE, producer->size, producer->ring_generation);
++    return TRUE;
++}
++
++static void wayland_gdi_overlay_close_channel(HWND hwnd, struct wayland_gdi_overlay_producer *producer)
++{
++    if (producer->channel_fd >= 0)
++    {
++        close(producer->channel_fd);
++        producer->channel_fd = -1;
++        wine_hwnd_dmabuf_release_gdi_overlay_channel(hwnd);
++    }
++}
++
++static BOOL wayland_gdi_overlay_ensure_channel(HWND hwnd, struct wayland_gdi_overlay_producer *producer)
++{
++    HANDLE handle = 0;
++    LONGLONG producer_id;
++    int fd = -1;
++
++    if (producer->lost) return FALSE;
++    if (producer->channel_fd >= 0) return TRUE;
++
++    if (wine_hwnd_dmabuf_get_gdi_overlay_channel(hwnd, &handle) != HWND_DMABUF_OK || !handle)
++    {
++        producer->lost = TRUE;
++        TRACE("gdi_overlay hwnd=%p failed to open producer channel\n", hwnd);
++        return FALSE;
++    }
++
++    if (wine_server_handle_to_fd(handle, FILE_READ_DATA | FILE_WRITE_DATA, &fd, NULL))
++        fd = -1;
++    NtClose(handle);
++    if (fd < 0)
++    {
++        wine_hwnd_dmabuf_release_gdi_overlay_channel(hwnd);
++        producer->lost = TRUE;
++        return FALSE;
++    }
++
++    producer_id = InterlockedIncrement64(&gdi_overlay_next_producer_id);
++    if (!producer_id) producer_id = InterlockedIncrement64(&gdi_overlay_next_producer_id);
++    producer->producer_unique_id = producer_id;
++    producer->channel_fd = fd;
++    TRACE("gdi_overlay hwnd=%p opened producer channel fd=%d producer=%s\n",
++          hwnd, fd, wine_dbgstr_longlong(producer->producer_unique_id));
++    return TRUE;
++}
++
++static int wayland_gdi_overlay_channel_result_from_errno(int err)
++{
++    switch (err)
++    {
++    case EPIPE:
++    case ECONNRESET:
++    case ENOTCONN:
++    case ECONNABORTED:
++#ifdef ESHUTDOWN
++    case ESHUTDOWN:
++#endif
++    case EBADF:
++        return HWND_DMABUF_CHANNEL_CLOSED;
++    default:
++        return HWND_DMABUF_CHANNEL_ERROR;
++    }
++}
++
++static int wayland_gdi_overlay_channel_send(int channel_fd, const hwnd_dmabuf_frame_desc_t *desc, int fd)
++{
++    char control[CMSG_SPACE(sizeof(int))];
++    struct msghdr msg = {0};
++    struct iovec iov;
++    ssize_t n;
++    int send_fd;
++
++    if ((send_fd = dup(fd)) < 0)
++        return wayland_gdi_overlay_channel_result_from_errno(errno);
++
++    iov.iov_base = (void *)desc;
++    iov.iov_len = sizeof(*desc);
++    msg.msg_iov = &iov;
++    msg.msg_iovlen = 1;
++    msg.msg_control = control;
++    msg.msg_controllen = sizeof(control);
++
++    {
++        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
++        cmsg->cmsg_level = SOL_SOCKET;
++        cmsg->cmsg_type = SCM_RIGHTS;
++        cmsg->cmsg_len = CMSG_LEN(sizeof(int));
++        memcpy(CMSG_DATA(cmsg), &send_fd, sizeof(int));
++    }
++
++    do n = sendmsg(channel_fd, &msg, MSG_NOSIGNAL | MSG_DONTWAIT);
++    while (n < 0 && errno == EINTR);
++    close(send_fd);
++    return n == sizeof(*desc) ? HWND_DMABUF_CHANNEL_OK :
++           n < 0 ? wayland_gdi_overlay_channel_result_from_errno(errno) : HWND_DMABUF_CHANNEL_ERROR;
++}
++
++static int wayland_gdi_overlay_channel_recv_release(int channel_fd, hwnd_dmabuf_release_t *release)
++{
++    ssize_t n;
++
++    do n = recv(channel_fd, release, sizeof(*release), MSG_DONTWAIT);
++    while (n < 0 && errno == EINTR);
++
++    if (n == sizeof(*release)) return HWND_DMABUF_CHANNEL_OK;
++#if EAGAIN == EWOULDBLOCK
++    if (n < 0 && errno == EAGAIN) return HWND_DMABUF_CHANNEL_EMPTY;
++#else
++    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return HWND_DMABUF_CHANNEL_EMPTY;
++#endif
++    if (!n) return HWND_DMABUF_CHANNEL_CLOSED;
++    return n < 0 ? wayland_gdi_overlay_channel_result_from_errno(errno) : HWND_DMABUF_CHANNEL_ERROR;
++}
++
++static void wayland_gdi_overlay_drain_releases(HWND hwnd, struct wayland_gdi_overlay_producer *producer)
++{
++    hwnd_dmabuf_release_t rel;
++    int ret;
++
++    if (producer->channel_fd < 0) return;
++    while ((ret = wayland_gdi_overlay_channel_recv_release(producer->channel_fd, &rel)) == HWND_DMABUF_CHANNEL_OK)
++    {
++        struct wayland_gdi_overlay_slot *slot;
++
++        if (rel.producer_unique_id != producer->producer_unique_id) continue;
++        if (rel.ring_generation != producer->ring_generation) continue;
++        if (rel.image_id >= GDI_OVERLAY_RING_SIZE) continue;
++
++        slot = &producer->slots[rel.image_id];
++        if (!slot->release_token || slot->release_token != rel.release_token) continue;
++
++        slot->busy = FALSE;
++        slot->release_token = 0;
++        TRACE("gdi_overlay hwnd=%p released slot=%u flags=%#x\n", hwnd, rel.image_id, rel.flags);
++    }
++
++    if (ret == HWND_DMABUF_CHANNEL_CLOSED)
++    {
++        producer->lost = TRUE;
++        wayland_gdi_overlay_close_channel(hwnd, producer);
++    }
++}
++
++static struct wayland_gdi_overlay_slot *wayland_gdi_overlay_get_free_slot(
++        HWND hwnd, struct wayland_gdi_overlay_producer *producer)
++{
++    unsigned int i;
++
++    wayland_gdi_overlay_drain_releases(hwnd, producer);
++    for (i = 0; i < GDI_OVERLAY_RING_SIZE; i++)
++        if (!producer->slots[i].busy)
++            return &producer->slots[i];
++    return NULL;
++}
++
++static UINT64 wayland_gdi_overlay_next_release_token(struct wayland_gdi_overlay_producer *producer)
++{
++    UINT64 token = ++producer->next_release_token;
++
++    if (!token) token = ++producer->next_release_token;
++    return token;
++}
++
++static BOOL wayland_gdi_overlay_master_copy_region(struct wayland_gdi_overlay_producer *producer,
++                                                   struct wayland_shm_buffer *src, HRGN region)
++{
++    RECT buffer_rect = {0, 0, src->width, src->height};
++    RECT *rgn_rect, *rgn_rect_end;
++    RGNDATA *rgndata;
++    BOOL copied = FALSE;
++
++    if (!producer->master_bits || !region) return FALSE;
++    if (!(rgndata = get_region_data(region))) return FALSE;
++
++    rgn_rect = (RECT *)rgndata->Buffer;
++    rgn_rect_end = rgn_rect + rgndata->rdh.nCount;
++
++    for (; rgn_rect < rgn_rect_end; rgn_rect++)
++    {
++        RECT rect;
++        int y;
++
++        if (!intersect_rect(&rect, rgn_rect, &buffer_rect)) continue;
++        for (y = rect.top; y < rect.bottom; y++)
++        {
++            const char *src_row = (const char *)src->map_data + (size_t)y * src->width * 4;
++            char *dst_row = (char *)producer->master_bits + (size_t)y * producer->stride;
++
++            memcpy(dst_row + (size_t)rect.left * 4, src_row + (size_t)rect.left * 4,
++                   (size_t)(rect.right - rect.left) * 4);
++            copied = TRUE;
++        }
++    }
++    free(rgndata);
++    return copied;
++}
++
++static void wayland_gdi_overlay_master_clear_region(struct wayland_gdi_overlay_producer *producer,
++                                                    HRGN region)
++{
++    RECT buffer_rect = {0, 0, producer->width, producer->height};
++    RECT *rgn_rect, *rgn_rect_end;
++    RGNDATA *rgndata;
++
++    if (!producer->master_bits || !region) return;
++    if (!(rgndata = get_region_data(region))) return;
++
++    rgn_rect = (RECT *)rgndata->Buffer;
++    rgn_rect_end = rgn_rect + rgndata->rdh.nCount;
++
++    for (; rgn_rect < rgn_rect_end; rgn_rect++)
++    {
++        RECT rect;
++        int y;
++
++        if (!intersect_rect(&rect, rgn_rect, &buffer_rect)) continue;
++        for (y = rect.top; y < rect.bottom; y++)
++            memset((char *)producer->master_bits + (size_t)y * producer->stride + (size_t)rect.left * 4,
++                   0, (size_t)(rect.right - rect.left) * 4);
++    }
++
++    free(rgndata);
++}
++
++static void wayland_gdi_overlay_union_pending(struct wayland_gdi_overlay_producer *producer,
++                                              HRGN region)
++{
++    if (!region) return;
++    if (!producer->pending_region)
++        producer->pending_region = NtGdiCreateRectRgn(0, 0, 0, 0);
++    if (producer->pending_region)
++        NtGdiCombineRgn(producer->pending_region, producer->pending_region, region, RGN_OR);
++}
++
++static BOOL wayland_gdi_overlay_update_region(struct wayland_gdi_overlay_producer *producer,
++                                              HRGN region)
++{
++    HRGN old_region = 0, removed_region = 0;
++    int type;
++
++    if (!region)
++    {
++        wayland_gdi_overlay_clear_region(producer);
++        return FALSE;
++    }
++
++    if (producer->region && NtGdiEqualRgn(region, producer->region)) return FALSE;
++
++    if (!producer->region)
++        producer->region = NtGdiCreateRectRgn(0, 0, 0, 0);
++    if (!producer->region) return FALSE;
++
++    if ((old_region = NtGdiCreateRectRgn(0, 0, 0, 0)) &&
++        (removed_region = NtGdiCreateRectRgn(0, 0, 0, 0)))
++    {
++        NtGdiCombineRgn(old_region, producer->region, 0, RGN_COPY);
++        type = NtGdiCombineRgn(removed_region, old_region, region, RGN_DIFF);
++        if (type != ERROR && type != NULLREGION && producer->master_bits)
++        {
++            wayland_gdi_overlay_master_clear_region(producer, removed_region);
++            wayland_gdi_overlay_union_pending(producer, removed_region);
++        }
++    }
++    if (old_region) NtGdiDeleteObjectApp(old_region);
++    if (removed_region) NtGdiDeleteObjectApp(removed_region);
++
++    NtGdiCombineRgn(producer->region, region, 0, RGN_COPY);
++    return TRUE;
++}
++
++static void wayland_gdi_overlay_fill_full_dirty(hwnd_dmabuf_frame_desc_t *desc)
++{
++    desc->dirty_count = 1;
++    desc->dirty_rects[0][0] = 0;
++    desc->dirty_rects[0][1] = 0;
++    desc->dirty_rects[0][2] = min(desc->width, 0xffff);
++    desc->dirty_rects[0][3] = min(desc->height, 0xffff);
++}
++
++static void wayland_gdi_overlay_fill_region_dirty(hwnd_dmabuf_frame_desc_t *desc, HRGN region)
++{
++    RGNDATA *rgndata;
++    RECT *rects;
++    unsigned int i, count;
++
++    if (!region)
++    {
++        wayland_gdi_overlay_fill_full_dirty(desc);
++        return;
++    }
++
++    if (!(rgndata = get_region_data(region)))
++    {
++        wayland_gdi_overlay_fill_full_dirty(desc);
++        return;
++    }
++
++    if (rgndata->rdh.nCount > HWND_DMABUF_MAX_DIRTY_RECTS)
++    {
++        wayland_gdi_overlay_fill_full_dirty(desc);
++        free(rgndata);
++        return;
++    }
++
++    rects = (RECT *)rgndata->Buffer;
++    count = rgndata->rdh.nCount;
++    for (i = 0; i < count; i++)
++    {
++        RECT rect = rects[i];
++
++        rect.left = max(0, min(rect.left, (LONG)desc->width));
++        rect.top = max(0, min(rect.top, (LONG)desc->height));
++        rect.right = max(rect.left, min(rect.right, (LONG)desc->width));
++        rect.bottom = max(rect.top, min(rect.bottom, (LONG)desc->height));
++        if (rect.left >= rect.right || rect.top >= rect.bottom) continue;
++
++        desc->dirty_rects[desc->dirty_count][0] = min(rect.left, 0xffff);
++        desc->dirty_rects[desc->dirty_count][1] = min(rect.top, 0xffff);
++        desc->dirty_rects[desc->dirty_count][2] = min(rect.right, 0xffff);
++        desc->dirty_rects[desc->dirty_count][3] = min(rect.bottom, 0xffff);
++        desc->dirty_count++;
++    }
++    if (!desc->dirty_count) wayland_gdi_overlay_fill_full_dirty(desc);
++    free(rgndata);
++}
++
++static BOOL wayland_gdi_overlay_publish(HWND hwnd, struct wayland_gdi_overlay_producer *producer,
++                                        HRGN dirty_region)
++{
++    hwnd_dmabuf_frame_desc_t desc;
++    struct wayland_gdi_overlay_slot *slot;
++    int ret;
++
++    if (!wayland_gdi_overlay_ensure_channel(hwnd, producer)) return TRUE;
++    if (!producer->slots_created) return FALSE;
++    if (!(slot = wayland_gdi_overlay_get_free_slot(hwnd, producer)))
++    {
++        TRACE("gdi_overlay hwnd=%p no free shm slot\n", hwnd);
++        return FALSE;
++    }
++
++    memcpy(slot->bits, producer->master_bits, producer->size);
++
++    memset(&desc, 0, sizeof(desc));
++    desc.version = HWND_DMABUF_DESC_VERSION_V1;
++    desc.flags = HWND_DMABUF_FLAG_SHM | HWND_DMABUF_FLAG_STABLE_SLOT | HWND_DMABUF_FLAG_GDI_OVERLAY;
++    desc.width = producer->width;
++    desc.height = producer->height;
++    desc.fourcc = HWND_DMABUF_SHM_FORMAT_ARGB8888;
++    desc.stride = producer->stride;
++    desc.frame_seq = ++producer->frame_seq;
++    desc.ring_generation = producer->ring_generation;
++    desc.image_id = slot->image_id;
++    desc.modifier = HWND_DMABUF_MOD_LINEAR;
++    desc.producer_unique_id = producer->producer_unique_id;
++    desc.release_token = wayland_gdi_overlay_next_release_token(producer);
++    desc.alpha_mode = HWND_DMABUF_ALPHA_MODE_UNSPECIFIED;
++    desc.plane_count = 1;
++    desc.plane_offsets[0] = 0;
++    desc.plane_strides[0] = producer->stride;
++    wayland_gdi_overlay_fill_region_dirty(&desc, dirty_region);
++
++    slot->busy = TRUE;
++    slot->release_token = desc.release_token;
++    ret = wayland_gdi_overlay_channel_send(producer->channel_fd, &desc, slot->fd);
++    if (ret == HWND_DMABUF_CHANNEL_OK)
++    {
++        RECT box = {0};
++        if (dirty_region) NtGdiGetRgnBox(dirty_region, &box);
++        TRACE("gdi_overlay hwnd=%p published shm slot=%u seq=%u size=%ux%u region=%s token=%s\n",
++              hwnd, slot->image_id, desc.frame_seq, desc.width, desc.height,
++              dirty_region ? wine_dbgstr_rect(&box) : "(clear)",
++              wine_dbgstr_longlong(desc.release_token));
++        return TRUE;
++    }
++
++    slot->busy = FALSE;
++    slot->release_token = 0;
++    WARN("gdi_overlay hwnd=%p failed to publish shm slot=%u ret=%d\n", hwnd, slot->image_id, ret);
++    if (ret == HWND_DMABUF_CHANNEL_CLOSED)
++    {
++        producer->lost = TRUE;
++        wayland_gdi_overlay_close_channel(hwnd, producer);
++        return TRUE;
++    }
++    return FALSE;
++}
++
++static BOOL wayland_gdi_overlay_update(HWND hwnd, struct wayland_gdi_overlay_producer *producer,
++                                       struct wayland_shm_buffer *src, const RECT *dirty,
++                                       HRGN gdi_over_producer_region, HRGN gdi_over_paint_region)
++{
++    HRGN dirty_region, copy_region;
++    int type;
++
++    if (!gdi_over_producer_region)
++    {
++        if (producer->channel_fd >= 0)
++            wayland_gdi_overlay_close_channel(hwnd, producer);
++        wayland_gdi_overlay_destroy_slots(producer);
++        wayland_gdi_overlay_clear_region(producer);
++        producer->lost = FALSE;
++        return TRUE;
++    }
++
++    if ((gdi_over_paint_region || producer->pending_region || producer->slots_created) &&
++        !wayland_gdi_overlay_ensure_slots(producer, src->width, src->height))
++        return !gdi_over_paint_region;
++    wayland_gdi_overlay_update_region(producer, gdi_over_producer_region);
++    if (!gdi_over_paint_region && !producer->pending_region) return TRUE;
++
++    if (!(dirty_region = NtGdiCreateRectRgn(dirty->left, dirty->top, dirty->right, dirty->bottom)))
++        return !gdi_over_paint_region;
++    if (!(copy_region = NtGdiCreateRectRgn(0, 0, 0, 0)))
++    {
++        NtGdiDeleteObjectApp(dirty_region);
++        return !gdi_over_paint_region;
++    }
++
++    if (gdi_over_paint_region)
++    {
++        type = NtGdiCombineRgn(copy_region, dirty_region, gdi_over_producer_region, RGN_AND);
++        if (type != ERROR && type != NULLREGION)
++            type = NtGdiCombineRgn(copy_region, copy_region, gdi_over_paint_region, RGN_AND);
++        if (type != ERROR && type != NULLREGION &&
++            wayland_gdi_overlay_master_copy_region(producer, src, copy_region))
++            wayland_gdi_overlay_union_pending(producer, copy_region);
++    }
++
++    if (producer->pending_region)
++    {
++        if (!wayland_gdi_overlay_publish(hwnd, producer, producer->pending_region))
++        {
++            NtGdiDeleteObjectApp(copy_region);
++            NtGdiDeleteObjectApp(dirty_region);
++            return FALSE;
++        }
++        NtGdiDeleteObjectApp(producer->pending_region);
++        producer->pending_region = 0;
++    }
++
++    NtGdiDeleteObjectApp(copy_region);
++    NtGdiDeleteObjectApp(dirty_region);
++    return TRUE;
++}
++
+ static BOOL window_surface_has_occlusion_clip(struct window_surface *window_surface)
+ {
+     if (!window_surface->clip_region) return FALSE;
+@@ -478,6 +1072,7 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface,
+     struct wayland_window_surface *wws = wayland_window_surface_cast(window_surface);
+     struct wayland_shm_buffer *shm_buffer = NULL, *latest_buffer;
+     BOOL flushed = FALSE;
++    BOOL overlay_flushed;
+     HRGN surface_damage_region = NULL;
+     HRGN copy_from_window_region;
+     uint32_t buffer_format;
+@@ -545,6 +1140,9 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface,
+     wayland_shm_buffer_copy_data(shm_buffer, color_bits, &surface_rect, copy_from_window_region,
+                                  (shape_bits || wws->occlusion_clipped) && !wws->layered);
+     if (shape_bits) wayland_shm_buffer_copy_shape(shm_buffer, rect, shape_info, shape_bits);
++    overlay_flushed = wayland_gdi_overlay_update(window_surface->hwnd, &wws->gdi_overlay, shm_buffer, dirty,
++                                                 window_surface->gdi_over_producer_region,
++                                                 window_surface->gdi_over_paint_region);
+     if (wws->occlusion_clipped)
+         wayland_shm_buffer_clear_outside_clip(shm_buffer, dirty, window_surface->clip_region);
+ 
+@@ -552,7 +1150,11 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface,
+ 
+     if (shape_changed) wayland_window_surface_sync_regions(window_surface);
+ 
+-    flushed = set_window_surface_contents(window_surface->hwnd, shm_buffer, surface_damage_region);
++    /* Keep the parent surface and GDI overlay in lock-step. If the overlay
++     * cannot publish yet, leave the surface dirty so the next idle flush
++     * retries both together. */
++    if (overlay_flushed)
++        flushed = set_window_surface_contents(window_surface->hwnd, shm_buffer, surface_damage_region);
+     wl_display_flush(process_wayland.wl_display);
+ 
+ done:
+@@ -569,6 +1171,9 @@ static void wayland_window_surface_destroy(struct window_surface *window_surface
+ 
+     TRACE("surface=%p\n", wws);
+ 
++    wayland_gdi_overlay_close_channel(window_surface->hwnd, &wws->gdi_overlay);
++    wayland_gdi_overlay_destroy_slots(&wws->gdi_overlay);
++    wayland_gdi_overlay_clear_region(&wws->gdi_overlay);
+     wayland_buffer_queue_destroy(wws->wayland_buffer_queue);
+ }
+ 
+@@ -606,10 +1211,15 @@ static struct window_surface *wayland_window_surface_create(HWND hwnd, const REC
+     if ((window_surface = window_surface_create(sizeof(*wws), &wayland_window_surface_funcs, hwnd, rect, info, 0)))
+     {
+         struct wayland_window_surface *wws = wayland_window_surface_cast(window_surface);
++        unsigned int i;
++
+         wws->wayland_buffer_queue =
+             wayland_buffer_queue_create(width, height,
+                                         layered ? WL_SHM_FORMAT_ARGB8888 :
+                                                   WL_SHM_FORMAT_XRGB8888);
++        wws->gdi_overlay.channel_fd = -1;
++        for (i = 0; i < GDI_OVERLAY_RING_SIZE; i++)
++            wws->gdi_overlay.slots[i].fd = -1;
+         wws->layered = layered;
+     }
+ 
+diff --git a/include/wine/gdi_driver.h b/include/wine/gdi_driver.h
+index 4e3c3d04d03..ac9a2c8d350 100644
+--- a/include/wine/gdi_driver.h
++++ b/include/wine/gdi_driver.h
+@@ -312,6 +312,8 @@ struct window_surface
+     UINT                               alpha_bits;   /* layered window global alpha bits, invalid if -1 */
+     UINT                               alpha_mask;   /* layered window per-pixel alpha mask, invalid if 0 */
+     HRGN                               shape_region; /* shape of the window surface, unshaped if 0 */
++    HRGN                               gdi_over_producer_region; /* GDI pixels that must appear over child producers */
++    HRGN                               gdi_over_paint_region; /* actual GDI paints to carry over child producers */
+     HBITMAP                            shape_bitmap; /* bitmap for the surface shape (1bpp) */
+     HBITMAP                            color_bitmap; /* bitmap for the surface colors */
+     /* driver-specific fields here */
+@@ -325,8 +327,10 @@ W32KAPI void window_surface_lock( struct window_surface *surface );
+ W32KAPI void window_surface_unlock( struct window_surface *surface );
+ W32KAPI void window_surface_set_layered( struct window_surface *surface, COLORREF color_key, UINT alpha_bits, UINT alpha_mask );
+ W32KAPI void window_surface_flush( struct window_surface *surface );
++W32KAPI void window_surface_add_gdi_over_paint_rect( struct window_surface *surface, const RECT *rect );
+ W32KAPI void window_surface_set_clip( struct window_surface *surface, HRGN clip_region );
+ W32KAPI void window_surface_set_shape( struct window_surface *surface, HRGN shape_region );
++W32KAPI void window_surface_set_gdi_over_producer_region( struct window_surface *surface, HRGN region );
+ W32KAPI struct window_surface *window_surface_get( HWND hwnd );
+ 
+ /* display manager interface, used to initialize display device registry data */
+diff --git a/include/wine/hwnd_dmabuf.h b/include/wine/hwnd_dmabuf.h
+index 25ce5fefa23..92e1b9ff8a3 100644
+--- a/include/wine/hwnd_dmabuf.h
++++ b/include/wine/hwnd_dmabuf.h
+@@ -83,6 +83,22 @@ static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_list( HWND host_hwnd,
+     return status;
+ }
+ 
++static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_set_pending( HWND hwnd, BOOL pending )
++{
++    enum hwnd_dmabuf_status status = HWND_DMABUF_INVALID_ARGS;
++
++    SERVER_START_REQ( hwnd_dmabuf_set_pending )
++    {
++        req->hwnd = wine_server_user_handle( hwnd );
++        req->pending = pending;
++        if (!wine_server_call_err( req ))
++            status = reply->status;
++    }
++    SERVER_END_REQ;
++
++    return status;
++}
++
+ static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_get_channel( HWND hwnd, HANDLE *channel_handle )
+ {
+     enum hwnd_dmabuf_status status = HWND_DMABUF_INVALID_ARGS;
+@@ -93,6 +109,31 @@ static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_get_channel( HWND hwnd, H
+     SERVER_START_REQ( hwnd_dmabuf_get_channel )
+     {
+         req->hwnd = wine_server_user_handle( hwnd );
++        req->flags = 0;
++        if (!wine_server_call_err( req ))
++        {
++            status = reply->status;
++            if (status == HWND_DMABUF_OK)
++                *channel_handle = wine_server_ptr_handle( reply->channel_handle );
++        }
++    }
++    SERVER_END_REQ;
++
++    return status;
++}
++
++static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_get_gdi_overlay_channel( HWND hwnd,
++                                                                                HANDLE *channel_handle )
++{
++    enum hwnd_dmabuf_status status = HWND_DMABUF_INVALID_ARGS;
++
++    if (!channel_handle) return status;
++    *channel_handle = 0;
++
++    SERVER_START_REQ( hwnd_dmabuf_get_channel )
++    {
++        req->hwnd = wine_server_user_handle( hwnd );
++        req->flags = HWND_DMABUF_CHANNEL_GDI_OVERLAY;
+         if (!wine_server_call_err( req ))
+         {
+             status = reply->status;
+@@ -138,6 +179,7 @@ static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_claim_channel( HWND hwnd,
+     SERVER_START_REQ( hwnd_dmabuf_claim_channel )
+     {
+         req->hwnd = wine_server_user_handle( hwnd );
++        req->flags = 0;
+         if (!wine_server_call_err( req ))
+         {
+             status = reply->status;
+@@ -150,4 +192,60 @@ static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_claim_channel( HWND hwnd,
+     return status;
+ }
+ 
+-#endif /* __WINE_HWND_DMABUF_H */
+\ No newline at end of file
++static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_claim_gdi_overlay_channel( HWND hwnd,
++                                                                                  HANDLE *channel_handle )
++{
++    enum hwnd_dmabuf_status status = HWND_DMABUF_INVALID_ARGS;
++
++    if (!channel_handle) return status;
++    *channel_handle = 0;
++
++    SERVER_START_REQ( hwnd_dmabuf_claim_channel )
++    {
++        req->hwnd = wine_server_user_handle( hwnd );
++        req->flags = HWND_DMABUF_CHANNEL_GDI_OVERLAY;
++        if (!wine_server_call_err( req ))
++        {
++            status = reply->status;
++            if (status == HWND_DMABUF_OK)
++                *channel_handle = wine_server_ptr_handle( reply->channel_handle );
++        }
++    }
++    SERVER_END_REQ;
++
++    return status;
++}
++
++static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_release_channel( HWND hwnd )
++{
++    enum hwnd_dmabuf_status status = HWND_DMABUF_INVALID_ARGS;
++
++    SERVER_START_REQ( hwnd_dmabuf_release_channel )
++    {
++        req->hwnd = wine_server_user_handle( hwnd );
++        req->flags = 0;
++        if (!wine_server_call_err( req ))
++            status = reply->status;
++    }
++    SERVER_END_REQ;
++
++    return status;
++}
++
++static inline enum hwnd_dmabuf_status wine_hwnd_dmabuf_release_gdi_overlay_channel( HWND hwnd )
++{
++    enum hwnd_dmabuf_status status = HWND_DMABUF_INVALID_ARGS;
++
++    SERVER_START_REQ( hwnd_dmabuf_release_channel )
++    {
++        req->hwnd = wine_server_user_handle( hwnd );
++        req->flags = HWND_DMABUF_CHANNEL_GDI_OVERLAY;
++        if (!wine_server_call_err( req ))
++            status = reply->status;
++    }
++    SERVER_END_REQ;
++
++    return status;
++}
++
++#endif /* __WINE_HWND_DMABUF_H */
+diff --git a/include/wine/server_protocol.h b/include/wine/server_protocol.h
+index 431f7870231..ba39031e99f 100644
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -287,6 +287,13 @@ enum hwnd_dmabuf_status
+ #define HWND_DMABUF_FLAG_STABLE_SLOT      0x00000001
+ /* Frame fd is a wl_shm-compatible shared-memory buffer, not a dma-buf. */
+ #define HWND_DMABUF_FLAG_SHM              0x00000002
++/* Frame is a GDI overlay carried above normal self-presenting producers. */
++#define HWND_DMABUF_FLAG_GDI_OVERLAY      0x00000004
++
++#define HWND_DMABUF_FRAME_OPENED          0x00000001
++#define HWND_DMABUF_FRAME_GDI_OVERLAY     0x00000002
++
++#define HWND_DMABUF_CHANNEL_GDI_OVERLAY   0x00000001
+ 
+ typedef struct
+ {
+@@ -6386,10 +6393,28 @@ struct hwnd_list_dmabuf_frames_reply
+ 
+ 
+ 
++struct hwnd_dmabuf_set_pending_request
++{
++    struct request_header __header;
++    user_handle_t  hwnd;
++    unsigned int   pending;
++    char __pad_20[4];
++};
++struct hwnd_dmabuf_set_pending_reply
++{
++    struct reply_header __header;
++    unsigned int   status;
++    char __pad_12[4];
++};
++
++
++
+ struct hwnd_dmabuf_get_channel_request
+ {
+     struct request_header __header;
+     user_handle_t  hwnd;
++    unsigned int   flags;
++    char __pad_20[4];
+ };
+ struct hwnd_dmabuf_get_channel_reply
+ {
+@@ -6418,6 +6443,8 @@ struct hwnd_dmabuf_claim_channel_request
+ {
+     struct request_header __header;
+     user_handle_t  hwnd;
++    unsigned int   flags;
++    char __pad_20[4];
+ };
+ struct hwnd_dmabuf_claim_channel_reply
+ {
+@@ -6427,6 +6454,22 @@ struct hwnd_dmabuf_claim_channel_reply
+ };
+ 
+ 
++
++struct hwnd_dmabuf_release_channel_request
++{
++    struct request_header __header;
++    user_handle_t  hwnd;
++    unsigned int   flags;
++    char __pad_20[4];
++};
++struct hwnd_dmabuf_release_channel_reply
++{
++    struct reply_header __header;
++    unsigned int   status;
++    char __pad_12[4];
++};
++
++
+ enum request
+ {
+     REQ_new_process,
+@@ -6742,9 +6785,11 @@ enum request
+     REQ_d3dkmt_mutex_release,
+     REQ_fsync_free_shm_idx,
+     REQ_hwnd_list_dmabuf_frames,
++    REQ_hwnd_dmabuf_set_pending,
+     REQ_hwnd_dmabuf_get_channel,
+     REQ_hwnd_dmabuf_get_channel_exclusive,
+     REQ_hwnd_dmabuf_claim_channel,
++    REQ_hwnd_dmabuf_release_channel,
+     REQ_NB_REQUESTS
+ };
+ 
+@@ -7065,9 +7110,11 @@ union generic_request
+     struct d3dkmt_mutex_release_request d3dkmt_mutex_release_request;
+     struct fsync_free_shm_idx_request fsync_free_shm_idx_request;
+     struct hwnd_list_dmabuf_frames_request hwnd_list_dmabuf_frames_request;
++    struct hwnd_dmabuf_set_pending_request hwnd_dmabuf_set_pending_request;
+     struct hwnd_dmabuf_get_channel_request hwnd_dmabuf_get_channel_request;
+     struct hwnd_dmabuf_get_channel_exclusive_request hwnd_dmabuf_get_channel_exclusive_request;
+     struct hwnd_dmabuf_claim_channel_request hwnd_dmabuf_claim_channel_request;
++    struct hwnd_dmabuf_release_channel_request hwnd_dmabuf_release_channel_request;
+ };
+ union generic_reply
+ {
+@@ -7386,11 +7433,13 @@ union generic_reply
+     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
+     struct fsync_free_shm_idx_reply fsync_free_shm_idx_reply;
+     struct hwnd_list_dmabuf_frames_reply hwnd_list_dmabuf_frames_reply;
++    struct hwnd_dmabuf_set_pending_reply hwnd_dmabuf_set_pending_reply;
+     struct hwnd_dmabuf_get_channel_reply hwnd_dmabuf_get_channel_reply;
+     struct hwnd_dmabuf_get_channel_exclusive_reply hwnd_dmabuf_get_channel_exclusive_reply;
+     struct hwnd_dmabuf_claim_channel_reply hwnd_dmabuf_claim_channel_reply;
++    struct hwnd_dmabuf_release_channel_reply hwnd_dmabuf_release_channel_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 933
++#define SERVER_PROTOCOL_VERSION 934
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+diff --git a/server/protocol.def b/server/protocol.def
+index 6cae5633b63..ef3ff4215ba 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -303,6 +303,13 @@ enum hwnd_dmabuf_status
+ #define HWND_DMABUF_FLAG_STABLE_SLOT      0x00000001
+ /* Frame fd is a wl_shm-compatible shared-memory buffer, not a dma-buf. */
+ #define HWND_DMABUF_FLAG_SHM              0x00000002
++/* Frame is a GDI overlay carried above normal self-presenting producers. */
++#define HWND_DMABUF_FLAG_GDI_OVERLAY      0x00000004
++
++#define HWND_DMABUF_FRAME_OPENED          0x00000001
++#define HWND_DMABUF_FRAME_GDI_OVERLAY     0x00000002
++
++#define HWND_DMABUF_CHANNEL_GDI_OVERLAY   0x00000001
+ 
+ typedef struct
+ {
+@@ -4460,9 +4467,19 @@ enum fsync_type
+ @END
+ 
+ 
++/* Producer: mark an HWND as about to become a dmabuf producer. */
++@REQ(hwnd_dmabuf_set_pending)
++    user_handle_t  hwnd;                /* child HWND being produced for */
++    unsigned int   pending;             /* nonzero increments, zero decrements */
++@REPLY
++    unsigned int   status;              /* enum hwnd_dmabuf_status */
++@END
++
++
+ /* Producer: mint and return the producer end of hwnd's private frame socket. */
+ @REQ(hwnd_dmabuf_get_channel)
+     user_handle_t  hwnd;                /* child HWND being produced for */
++    unsigned int   flags;               /* HWND_DMABUF_CHANNEL_* */
+ @REPLY
+     unsigned int   status;              /* enum hwnd_dmabuf_status */
+     obj_handle_t   channel_handle;      /* producer end of the socketpair */
+@@ -4481,7 +4498,17 @@ enum fsync_type
+ /* Consumer: claim the consumer end of the channel minted for hwnd, if any. */
+ @REQ(hwnd_dmabuf_claim_channel)
+     user_handle_t  hwnd;                /* child HWND owned by the caller */
++    unsigned int   flags;               /* HWND_DMABUF_CHANNEL_* */
+ @REPLY
+     unsigned int   status;              /* enum hwnd_dmabuf_status */
+     obj_handle_t   channel_handle;      /* consumer end or zero if none */
+ @END
++
++
++/* Producer: release one active producer reference for hwnd's frame socket. */
++@REQ(hwnd_dmabuf_release_channel)
++    user_handle_t  hwnd;                /* child HWND being produced for */
++    unsigned int   flags;               /* HWND_DMABUF_CHANNEL_* */
++@REPLY
++    unsigned int   status;              /* enum hwnd_dmabuf_status */
++@END
+diff --git a/server/request_handlers.h b/server/request_handlers.h
+index ef98edfca0d..e5652a5c7da 100644
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -320,9 +320,11 @@ DECL_HANDLER(d3dkmt_mutex_acquire);
+ DECL_HANDLER(d3dkmt_mutex_release);
+ DECL_HANDLER(fsync_free_shm_idx);
+ DECL_HANDLER(hwnd_list_dmabuf_frames);
++DECL_HANDLER(hwnd_dmabuf_set_pending);
+ DECL_HANDLER(hwnd_dmabuf_get_channel);
+ DECL_HANDLER(hwnd_dmabuf_get_channel_exclusive);
+ DECL_HANDLER(hwnd_dmabuf_claim_channel);
++DECL_HANDLER(hwnd_dmabuf_release_channel);
+ 
+ typedef void (*req_handler)( const void *req, void *reply );
+ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+@@ -640,9 +642,11 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+     (req_handler)req_d3dkmt_mutex_release,
+     (req_handler)req_fsync_free_shm_idx,
+     (req_handler)req_hwnd_list_dmabuf_frames,
++    (req_handler)req_hwnd_dmabuf_set_pending,
+     (req_handler)req_hwnd_dmabuf_get_channel,
+     (req_handler)req_hwnd_dmabuf_get_channel_exclusive,
+     (req_handler)req_hwnd_dmabuf_claim_channel,
++    (req_handler)req_hwnd_dmabuf_release_channel,
+ };
+ 
+ C_ASSERT( sizeof(abstime_t) == 8 );
+@@ -2435,8 +2439,14 @@ C_ASSERT( sizeof(struct hwnd_list_dmabuf_frames_request) == 16 );
+ C_ASSERT( offsetof(struct hwnd_list_dmabuf_frames_reply, status) == 8 );
+ C_ASSERT( offsetof(struct hwnd_list_dmabuf_frames_reply, count) == 12 );
+ C_ASSERT( sizeof(struct hwnd_list_dmabuf_frames_reply) == 16 );
++C_ASSERT( offsetof(struct hwnd_dmabuf_set_pending_request, hwnd) == 12 );
++C_ASSERT( offsetof(struct hwnd_dmabuf_set_pending_request, pending) == 16 );
++C_ASSERT( sizeof(struct hwnd_dmabuf_set_pending_request) == 24 );
++C_ASSERT( offsetof(struct hwnd_dmabuf_set_pending_reply, status) == 8 );
++C_ASSERT( sizeof(struct hwnd_dmabuf_set_pending_reply) == 16 );
+ C_ASSERT( offsetof(struct hwnd_dmabuf_get_channel_request, hwnd) == 12 );
+-C_ASSERT( sizeof(struct hwnd_dmabuf_get_channel_request) == 16 );
++C_ASSERT( offsetof(struct hwnd_dmabuf_get_channel_request, flags) == 16 );
++C_ASSERT( sizeof(struct hwnd_dmabuf_get_channel_request) == 24 );
+ C_ASSERT( offsetof(struct hwnd_dmabuf_get_channel_reply, status) == 8 );
+ C_ASSERT( offsetof(struct hwnd_dmabuf_get_channel_reply, channel_handle) == 12 );
+ C_ASSERT( sizeof(struct hwnd_dmabuf_get_channel_reply) == 16 );
+@@ -2446,7 +2456,13 @@ C_ASSERT( offsetof(struct hwnd_dmabuf_get_channel_exclusive_reply, status) == 8
+ C_ASSERT( offsetof(struct hwnd_dmabuf_get_channel_exclusive_reply, channel_handle) == 12 );
+ C_ASSERT( sizeof(struct hwnd_dmabuf_get_channel_exclusive_reply) == 16 );
+ C_ASSERT( offsetof(struct hwnd_dmabuf_claim_channel_request, hwnd) == 12 );
+-C_ASSERT( sizeof(struct hwnd_dmabuf_claim_channel_request) == 16 );
++C_ASSERT( offsetof(struct hwnd_dmabuf_claim_channel_request, flags) == 16 );
++C_ASSERT( sizeof(struct hwnd_dmabuf_claim_channel_request) == 24 );
+ C_ASSERT( offsetof(struct hwnd_dmabuf_claim_channel_reply, status) == 8 );
+ C_ASSERT( offsetof(struct hwnd_dmabuf_claim_channel_reply, channel_handle) == 12 );
+ C_ASSERT( sizeof(struct hwnd_dmabuf_claim_channel_reply) == 16 );
++C_ASSERT( offsetof(struct hwnd_dmabuf_release_channel_request, hwnd) == 12 );
++C_ASSERT( offsetof(struct hwnd_dmabuf_release_channel_request, flags) == 16 );
++C_ASSERT( sizeof(struct hwnd_dmabuf_release_channel_request) == 24 );
++C_ASSERT( offsetof(struct hwnd_dmabuf_release_channel_reply, status) == 8 );
++C_ASSERT( sizeof(struct hwnd_dmabuf_release_channel_reply) == 16 );
+diff --git a/server/request_trace.h b/server/request_trace.h
+index 345e814b9e5..6d2e64baa31 100644
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -3595,9 +3595,21 @@ static void dump_hwnd_list_dmabuf_frames_reply( const struct hwnd_list_dmabuf_fr
+     dump_varargs_bytes( ", frames=", cur_size );
+ }
+ 
++static void dump_hwnd_dmabuf_set_pending_request( const struct hwnd_dmabuf_set_pending_request *req )
++{
++    fprintf( stderr, " hwnd=%08x", req->hwnd );
++    fprintf( stderr, ", pending=%08x", req->pending );
++}
++
++static void dump_hwnd_dmabuf_set_pending_reply( const struct hwnd_dmabuf_set_pending_reply *req )
++{
++    fprintf( stderr, " status=%08x", req->status );
++}
++
+ static void dump_hwnd_dmabuf_get_channel_request( const struct hwnd_dmabuf_get_channel_request *req )
+ {
+     fprintf( stderr, " hwnd=%08x", req->hwnd );
++    fprintf( stderr, ", flags=%08x", req->flags );
+ }
+ 
+ static void dump_hwnd_dmabuf_get_channel_reply( const struct hwnd_dmabuf_get_channel_reply *req )
+@@ -3620,6 +3632,7 @@ static void dump_hwnd_dmabuf_get_channel_exclusive_reply( const struct hwnd_dmab
+ static void dump_hwnd_dmabuf_claim_channel_request( const struct hwnd_dmabuf_claim_channel_request *req )
+ {
+     fprintf( stderr, " hwnd=%08x", req->hwnd );
++    fprintf( stderr, ", flags=%08x", req->flags );
+ }
+ 
+ static void dump_hwnd_dmabuf_claim_channel_reply( const struct hwnd_dmabuf_claim_channel_reply *req )
+@@ -3628,6 +3641,17 @@ static void dump_hwnd_dmabuf_claim_channel_reply( const struct hwnd_dmabuf_claim
+     fprintf( stderr, ", channel_handle=%04x", req->channel_handle );
+ }
+ 
++static void dump_hwnd_dmabuf_release_channel_request( const struct hwnd_dmabuf_release_channel_request *req )
++{
++    fprintf( stderr, " hwnd=%08x", req->hwnd );
++    fprintf( stderr, ", flags=%08x", req->flags );
++}
++
++static void dump_hwnd_dmabuf_release_channel_reply( const struct hwnd_dmabuf_release_channel_reply *req )
++{
++    fprintf( stderr, " status=%08x", req->status );
++}
++
+ typedef void (*dump_func)( const void *req );
+ 
+ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
+@@ -3945,9 +3969,11 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
+     (dump_func)dump_d3dkmt_mutex_release_request,
+     (dump_func)dump_fsync_free_shm_idx_request,
+     (dump_func)dump_hwnd_list_dmabuf_frames_request,
++    (dump_func)dump_hwnd_dmabuf_set_pending_request,
+     (dump_func)dump_hwnd_dmabuf_get_channel_request,
+     (dump_func)dump_hwnd_dmabuf_get_channel_exclusive_request,
+     (dump_func)dump_hwnd_dmabuf_claim_channel_request,
++    (dump_func)dump_hwnd_dmabuf_release_channel_request,
+ };
+ 
+ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+@@ -4265,9 +4291,11 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+     NULL,
+     NULL,
+     (dump_func)dump_hwnd_list_dmabuf_frames_reply,
++    (dump_func)dump_hwnd_dmabuf_set_pending_reply,
+     (dump_func)dump_hwnd_dmabuf_get_channel_reply,
+     (dump_func)dump_hwnd_dmabuf_get_channel_exclusive_reply,
+     (dump_func)dump_hwnd_dmabuf_claim_channel_reply,
++    (dump_func)dump_hwnd_dmabuf_release_channel_reply,
+ };
+ 
+ static const char * const req_names[REQ_NB_REQUESTS] =
+@@ -4585,9 +4613,11 @@ static const char * const req_names[REQ_NB_REQUESTS] =
+     "d3dkmt_mutex_release",
+     "fsync_free_shm_idx",
+     "hwnd_list_dmabuf_frames",
++    "hwnd_dmabuf_set_pending",
+     "hwnd_dmabuf_get_channel",
+     "hwnd_dmabuf_get_channel_exclusive",
+     "hwnd_dmabuf_claim_channel",
++    "hwnd_dmabuf_release_channel",
+ };
+ 
+ static const struct
+diff --git a/server/window.c b/server/window.c
+index 1f092f6d478..3dfae38a704 100644
+--- a/server/window.c
++++ b/server/window.c
+@@ -102,8 +102,11 @@ struct window
+     window_shm_t    *shared;          /* window in session shared memory */
+     struct object   *dmabuf_channel_producer; /* producer end of the frame socket */
+     struct object   *dmabuf_channel_consumer; /* consumer end of the frame socket */
++    struct object   *gdi_overlay_channel_producer; /* GDI overlay producer socket */
++    struct object   *gdi_overlay_channel_consumer; /* GDI overlay consumer socket */
+     unsigned int     dmabuf_pending_count;    /* swapchain creation in progress */
+     unsigned int     dmabuf_producer_count;   /* active users of the frame socket */
++    unsigned int     gdi_overlay_producer_count; /* active GDI overlay producers */
+     unsigned int     dmabuf_exclusive_count;  /* producer count from exclusive opens */
+ };
+ 
+@@ -180,6 +183,8 @@ static void window_destroy( struct object *obj )
+ 
+     if (win->dmabuf_channel_producer) release_object( win->dmabuf_channel_producer );
+     if (win->dmabuf_channel_consumer) release_object( win->dmabuf_channel_consumer );
++    if (win->gdi_overlay_channel_producer) release_object( win->gdi_overlay_channel_producer );
++    if (win->gdi_overlay_channel_consumer) release_object( win->gdi_overlay_channel_consumer );
+ 
+     if (win->parent)
+     {
+@@ -709,8 +714,11 @@ static struct window *create_window( struct window *parent, struct window *owner
+     win->shared         = NULL;
+     win->dmabuf_channel_producer = NULL;
+     win->dmabuf_channel_consumer = NULL;
++    win->gdi_overlay_channel_producer = NULL;
++    win->gdi_overlay_channel_consumer = NULL;
+     win->dmabuf_pending_count = 0;
+     win->dmabuf_producer_count = 0;
++    win->gdi_overlay_producer_count = 0;
+     win->dmabuf_exclusive_count = 0;
+     win->window_rect = win->visible_rect = win->surface_rect = win->client_rect = empty_rect;
+     list_init( &win->children );
+@@ -1314,7 +1322,8 @@ static void hwnd_dmabuf_frame_info_from_window( struct window *host, struct wind
+     info->style = win->style;
+     info->ex_style = win->ex_style;
+     info->dpi = get_window_dpi( win );
+-    info->opened = win->dmabuf_producer_count != 0;
++    if (win->dmabuf_producer_count) info->opened |= HWND_DMABUF_FRAME_OPENED;
++    if (win->gdi_overlay_producer_count) info->opened |= HWND_DMABUF_FRAME_GDI_OVERLAY;
+ }
+ 
+ static void hwnd_dmabuf_release_server_channel( struct window *win )
+@@ -1332,11 +1341,25 @@ static void hwnd_dmabuf_release_server_channel( struct window *win )
+     win->dmabuf_exclusive_count = 0;
+ }
+ 
++static void hwnd_dmabuf_release_gdi_overlay_server_channel( struct window *win )
++{
++    if (win->gdi_overlay_channel_producer)
++    {
++        release_object( win->gdi_overlay_channel_producer );
++        win->gdi_overlay_channel_producer = NULL;
++    }
++    if (win->gdi_overlay_channel_consumer)
++    {
++        release_object( win->gdi_overlay_channel_consumer );
++        win->gdi_overlay_channel_consumer = NULL;
++    }
++}
++
+ /* Pending producers are also listed so parents do not snapshot their GDI host
+  * while the producer is still allocating its first exportable images. */
+ static int hwnd_dmabuf_is_listed( struct window *win )
+ {
+-    return win->dmabuf_producer_count || win->dmabuf_pending_count;
++    return win->dmabuf_producer_count || win->dmabuf_pending_count || win->gdi_overlay_producer_count;
+ }
+ 
+ static unsigned int hwnd_dmabuf_count_frames( struct window *win )
+@@ -1477,6 +1500,7 @@ static int add_window_coverage( struct window *win, struct region *clip,
+  * self-presenting and must show through the parent surface. */
+ static int collect_punch_through_holes( struct window *win, struct region *parent_clip,
+                                         struct region *holes, struct region *covered,
++                                        struct region *transparent_above, struct region *gdi_over,
+                                         int offset_x, int offset_y )
+ {
+     struct window *ptr;
+@@ -1493,11 +1517,24 @@ static int collect_punch_through_holes( struct window *win, struct region *paren
+     LIST_FOR_EACH_ENTRY( ptr, &win->children, struct window, entry )
+     {
+         if (!(ptr->style & WS_VISIBLE)) continue;
+-        if (ptr->ex_style & WS_EX_TRANSPARENT) continue;
++        if (ptr->ex_style & WS_EX_TRANSPARENT)
++        {
++            /* WS_EX_TRANSPARENT affects sibling paint ordering, not whether
++             * the window may draw pixels. Track these pixels separately so
++             * punch-through can preserve them above lower producer holes. */
++            if (transparent_above && !window_has_self_presenting_content( ptr ) &&
++                set_window_rect_region( visible, ptr, &ptr->visible_rect, client_clip,
++                                        offset_x + win->client_rect.left,
++                                        offset_y + win->client_rect.top ) &&
++                !union_region( transparent_above, transparent_above, visible ))
++                goto done;
++            continue;
++        }
+ 
+         if (window_has_punch_through_content( ptr ))
+         {
+             if (!collect_punch_through_holes( ptr, client_clip, holes, covered,
++                                              transparent_above, gdi_over,
+                                               offset_x + win->client_rect.left,
+                                               offset_y + win->client_rect.top ))
+                 goto done;
+@@ -1512,6 +1549,11 @@ static int collect_punch_through_holes( struct window *win, struct region *paren
+     {
+         if (!subtract_region( tmp, client_clip, covered )) goto done;
+         if (!union_region( holes, holes, tmp )) goto done;
++        if (transparent_above && gdi_over)
++        {
++            if (!intersect_region( tmp, tmp, transparent_above )) goto done;
++            if (!union_region( gdi_over, gdi_over, tmp )) goto done;
++        }
+     }
+ 
+     if (!add_window_coverage( win, parent_clip, covered, visible, offset_x, offset_y )) goto done;
+@@ -1544,7 +1586,7 @@ static struct region *get_surface_region( struct window *win )
+     set_region_rect( clip, &win->visible_rect );
+     if (win->win_region && !intersect_window_region( clip, win )) goto error;
+ 
+-    if (!collect_punch_through_holes( win, clip, holes, covered, 0, 0 )) goto error;
++    if (!collect_punch_through_holes( win, clip, holes, covered, NULL, NULL, 0, 0 )) goto error;
+     if (!subtract_region( region, region, holes )) goto error;
+ 
+     free_region( covered );
+@@ -1561,6 +1603,39 @@ error:
+ }
+ 
+ 
++/* compute the GDI pixels that must be carried above self-presenting children */
++static struct region *get_gdi_over_producer_region( struct window *win )
++{
++    struct region *region, *clip = NULL, *holes = NULL, *covered = NULL, *transparent_above = NULL;
++
++    if (!(region = create_empty_region())) return NULL;
++    if (!(clip = create_empty_region())) goto error;
++    if (!(holes = create_empty_region())) goto error;
++    if (!(covered = create_empty_region())) goto error;
++    if (!(transparent_above = create_empty_region())) goto error;
++
++    set_region_rect( clip, &win->visible_rect );
++    if (win->win_region && !intersect_window_region( clip, win )) goto error;
++
++    if (!collect_punch_through_holes( win, clip, holes, covered, transparent_above, region, 0, 0 ))
++        goto error;
++
++    free_region( transparent_above );
++    free_region( covered );
++    free_region( holes );
++    free_region( clip );
++    return region;
++
++error:
++    if (transparent_above) free_region( transparent_above );
++    if (covered) free_region( covered );
++    if (holes) free_region( holes );
++    if (clip) free_region( clip );
++    free_region( region );
++    return NULL;
++}
++
++
+ /* get the window class of a window */
+ struct window_class* get_window_class( user_handle_t window )
+ {
+@@ -3045,6 +3120,12 @@ DECL_HANDLER(get_visible_region)
+ /* get the window regions */
+ DECL_HANDLER(get_window_region)
+ {
++    enum
++    {
++        WINDOW_REGION_SHAPE,
++        WINDOW_REGION_SURFACE,
++        WINDOW_REGION_GDI_OVER_PRODUCER
++    };
+     struct rectangle *data;
+     struct region *region;
+     struct window *win = get_window( req->window );
+@@ -3052,11 +3133,16 @@ DECL_HANDLER(get_window_region)
+     if (!win) return;
+ 
+     reply->visible_rect = win->visible_rect;
+-    if (req->surface)
++    if (req->surface == WINDOW_REGION_SURFACE || req->surface == WINDOW_REGION_GDI_OVER_PRODUCER)
+     {
+         if (!is_visible( win )) return;
+ 
+-        if ((region = get_surface_region( win )))
++        if (req->surface == WINDOW_REGION_GDI_OVER_PRODUCER)
++            region = get_gdi_over_producer_region( win );
++        else
++            region = get_surface_region( win );
++
++        if (region)
+         {
+             struct rectangle *data = get_region_data_and_free( region, get_reply_max_size(), &reply->total_size );
+             if (data) set_reply_data_ptr( data, reply->total_size );
+@@ -3191,6 +3277,33 @@ static int hwnd_dmabuf_create_server_channel( struct window *win )
+     return 1;
+ }
+ 
++static int hwnd_dmabuf_create_gdi_overlay_server_channel( struct window *win )
++{
++    int fds[2];
++
++    if (win->gdi_overlay_channel_producer) return 1;
++
++    if (socketpair( PF_UNIX, SOCK_SEQPACKET, 0, fds ) == -1)
++        return 0;
++
++    {
++        struct object *producer_end, *consumer_end;
++
++        producer_end = hwnd_dmabuf_wrap_fd( fds[0] );
++        consumer_end = hwnd_dmabuf_wrap_fd( fds[1] );
++        if (!producer_end || !consumer_end)
++        {
++            if (producer_end) release_object( producer_end );
++            if (consumer_end) release_object( consumer_end );
++            return 0;
++        }
++        win->gdi_overlay_channel_producer = producer_end;
++        win->gdi_overlay_channel_consumer = consumer_end;
++    }
++
++    return 1;
++}
++
+ static int hwnd_dmabuf_alloc_producer_handle( struct window *win, obj_handle_t *handle )
+ {
+     *handle = alloc_handle_no_access_check( current->process, win->dmabuf_channel_producer,
+@@ -3198,6 +3311,13 @@ static int hwnd_dmabuf_alloc_producer_handle( struct window *win, obj_handle_t *
+     return *handle != 0;
+ }
+ 
++static int hwnd_dmabuf_alloc_gdi_overlay_producer_handle( struct window *win, obj_handle_t *handle )
++{
++    *handle = alloc_handle_no_access_check( current->process, win->gdi_overlay_channel_producer,
++                                            GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, 0 );
++    return *handle != 0;
++}
++
+ static void hwnd_dmabuf_commit_producer_open( struct window *win, int exclusive )
+ {
+     if (!window_has_self_presenting_content( win )) update_clip_client_flags( win );
+@@ -3208,6 +3328,11 @@ static void hwnd_dmabuf_commit_producer_open( struct window *win, int exclusive
+         win->dmabuf_pending_count--;
+ }
+ 
++static void hwnd_dmabuf_commit_gdi_overlay_producer_open( struct window *win )
++{
++    win->gdi_overlay_producer_count++;
++}
++
+ /* Hand the producer its end of the frame socket, minted once and retained. A
+  * resize (new swapchain) re-grants the same socket so the consumer keeps reading. */
+ DECL_HANDLER(hwnd_dmabuf_get_channel)
+@@ -3219,6 +3344,38 @@ DECL_HANDLER(hwnd_dmabuf_get_channel)
+     reply->channel_handle = 0;
+     if (!win) return;
+ 
++    if (req->flags & HWND_DMABUF_CHANNEL_GDI_OVERLAY)
++    {
++        if (win->dmabuf_producer_count || win->dmabuf_pending_count)
++        {
++            reply->status = HWND_DMABUF_BUSY;
++            return;
++        }
++
++        had_channel = win->gdi_overlay_channel_producer != NULL;
++        if (!hwnd_dmabuf_create_gdi_overlay_server_channel( win ))
++        {
++            reply->status = HWND_DMABUF_NOT_FOUND;
++            return;
++        }
++
++        if (!hwnd_dmabuf_alloc_gdi_overlay_producer_handle( win, &reply->channel_handle ))
++        {
++            if (!had_channel && !win->gdi_overlay_producer_count)
++                hwnd_dmabuf_release_gdi_overlay_server_channel( win );
++            return;
++        }
++        hwnd_dmabuf_commit_gdi_overlay_producer_open( win );
++        reply->status = HWND_DMABUF_OK;
++        return;
++    }
++
++    if (win->gdi_overlay_producer_count)
++    {
++        reply->status = HWND_DMABUF_BUSY;
++        return;
++    }
++
+     if (win->dmabuf_exclusive_count)
+     {
+         reply->status = HWND_DMABUF_BUSY;
+@@ -3253,7 +3410,8 @@ DECL_HANDLER(hwnd_dmabuf_get_channel_exclusive)
+     reply->channel_handle = 0;
+     if (!win) return;
+ 
+-    if (win->dmabuf_producer_count || win->dmabuf_pending_count)
++    if (win->dmabuf_producer_count || win->dmabuf_pending_count ||
++        win->gdi_overlay_producer_count)
+     {
+         reply->status = HWND_DMABUF_BUSY;
+         return;
+@@ -3285,6 +3443,26 @@ DECL_HANDLER(hwnd_dmabuf_claim_channel)
+     reply->status = HWND_DMABUF_NOT_FOUND;
+     reply->channel_handle = 0;
+     if (!win) return;
++    if (req->flags & HWND_DMABUF_CHANNEL_GDI_OVERLAY)
++    {
++        if (!win->gdi_overlay_producer_count || !win->gdi_overlay_channel_consumer)
++        {
++            reply->status = HWND_DMABUF_NO_FRAME;
++            return;
++        }
++
++        reply->channel_handle = alloc_handle_no_access_check( current->process,
++                                                              win->gdi_overlay_channel_consumer,
++                                                              GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, 0 );
++        if (!reply->channel_handle)
++        {
++            reply->status = HWND_DMABUF_INVALID_ARGS;
++            return;
++        }
++        reply->status = HWND_DMABUF_OK;
++        return;
++    }
++
+     if (!win->dmabuf_producer_count || !win->dmabuf_channel_consumer)
+     {
+         reply->status = HWND_DMABUF_NO_FRAME;
+@@ -3311,6 +3489,16 @@ DECL_HANDLER(hwnd_dmabuf_release_channel)
+     reply->status = HWND_DMABUF_INVALID_ARGS;
+     if (!win) return;
+ 
++    if (req->flags & HWND_DMABUF_CHANNEL_GDI_OVERLAY)
++    {
++        if (win->gdi_overlay_producer_count)
++            win->gdi_overlay_producer_count--;
++        if (!win->gdi_overlay_producer_count)
++            hwnd_dmabuf_release_gdi_overlay_server_channel( win );
++        reply->status = HWND_DMABUF_OK;
++        return;
++    }
++
+     if (win->dmabuf_producer_count)
+         win->dmabuf_producer_count--;
+     if (win->dmabuf_exclusive_count)

@@ -12,6 +12,12 @@ too early to start the layer's worker thread and can recursively crash and
 respawn Wine desktop helpers. Waiting for display-driver initialization keeps
 the hook process-local and skips service/null-driver processes.
 
+Do not bootstrap D3DKMT while the process is already initializing Vulkan.
+Vulkan initialization loads the display driver to map its WSI extensions, so
+recursively creating the D3DKMT instance there waits on the same pthread_once
+and deadlocks. The application's Vulkan instance will load the implicit layer
+itself; only non-Vulkan processes need the bootstrap instance.
+
 --- a/dlls/win32u/d3dkmt.c
 +++ b/dlls/win32u/d3dkmt.c
 @@ -500,7 +500,7 @@ static void d3dkmt_init_vulkan(void)
@@ -25,14 +31,41 @@ the hook process-local and skips service/null-driver processes.
      pthread_once( &once, d3dkmt_init_vulkan );
 --- a/dlls/win32u/ntuser_private.h
 +++ b/dlls/win32u/ntuser_private.h
-@@ -245,6 +245,7 @@ extern void release_opengl_drawables( struct list *drawables );
+@@ -245,6 +245,8 @@ extern void release_opengl_drawables( struct list *drawables );
  
  /* vulkan.c */
  extern struct vulkan_instance *vulkan_instance_create( const struct vulkan_instance_extensions *extensions );
 +extern struct vulkan_instance *get_d3dkmt_vulkan_instance( void );
++extern BOOL vulkan_init_in_progress( void );
  
  /* window.c */
  HANDLE alloc_user_handle( void *ptr, unsigned short type );
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -6336,6 +6336,13 @@ static void vulkan_init_once(void)
+     free( properties );
+ }
+ 
++static LONG vulkan_init_active;
++
++BOOL vulkan_init_in_progress(void)
++{
++    return ReadAcquire( &vulkan_init_active ) != 0;
++}
++
+ /***********************************************************************
+  *      __wine_get_vulkan_driver  (win32u.so)
+  */
+@@ -6349,7 +6356,9 @@ const struct vulkan_funcs *__wine_get_vulkan_driver( UINT version )
+         return NULL;
+     }
+ 
++    InterlockedIncrement( &vulkan_init_active );
+     pthread_once( &init_once, vulkan_init_once );
++    InterlockedDecrement( &vulkan_init_active );
+     if (!vulkan_handle) return NULL;
+     return &vulkan_funcs;
+ }
 --- a/dlls/win32u/driver.c
 +++ b/dlls/win32u/driver.c
 @@ -23,6 +23,7 @@
@@ -53,7 +86,7 @@ the hook process-local and skips service/null-driver processes.
 +    if (user_driver == &null_user_driver) return;
 +
 +    env = getenv( "WINE_WAYLAND_STEAM_OVERLAY_LAYER" );
-+    if (env && atoi( env ) &&
++    if (env && atoi( env ) && !vulkan_init_in_progress() &&
 +        (!(env = getenv( "DISABLE_WINE_WAYLAND_STEAM_OVERLAY_LAYER" )) || !atoi( env )))
 +        (void)get_d3dkmt_vulkan_instance();
  }

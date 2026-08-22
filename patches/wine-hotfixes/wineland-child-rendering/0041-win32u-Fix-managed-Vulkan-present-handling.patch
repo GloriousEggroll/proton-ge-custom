@@ -1,0 +1,289 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Thu, 16 Jul 2026 09:57:56 +0200
+Subject: [PATCH 41/49] win32u: Fix managed Vulkan present handling.
+
+Repack per-swapchain present pNext structs when forwarding only
+the host swapchain subset and use the managed present fence to
+consume waits for all-managed presents instead of idling the device.
+---
+ dlls/win32u/vulkan.c | 185 +++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 177 insertions(+), 8 deletions(-)
+
+diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+index 5629ef08dfb..b7aea890c0e 100644
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -3327,7 +3327,8 @@ static void managed_drain_releases( struct wine_managed_swapchain *managed )
+ 
+ /* Publish one managed image over the dmabuf channel. */
+ static VkResult managed_present( struct vulkan_device *device, struct vulkan_queue *queue,
+-                                 struct swapchain *swapchain, uint32_t image_index )
++                                 struct swapchain *swapchain, uint32_t image_index,
++                                 BOOL present_waits_consumed )
+ {
+     struct wine_managed_swapchain *managed = swapchain->managed;
+     struct surface *surface = swapchain->surface;
+@@ -3362,8 +3363,17 @@ static VkResult managed_present( struct vulkan_device *device, struct vulkan_que
+         return VK_ERROR_OUT_OF_DATE_KHR;
+     }
+ 
+-    /* The caller consumed present waits. Idle before exporting the fd. */
+-    device->p_vkDeviceWaitIdle( device->host.device );
++    /* With an all-managed present, the present wait semaphores were consumed
++     * before publishing. Mixed host/managed presents still rely on the old
++     * conservative idle because the host present owns the wait semaphores. */
++    if (!present_waits_consumed)
++        res = device->p_vkDeviceWaitIdle( device->host.device );
++    if (res < VK_SUCCESS)
++    {
++        pthread_mutex_unlock( &managed->lock );
++        pthread_mutex_unlock( &producer_device_lock );
++        return res;
++    }
+ 
+     /* Assign a fresh release token (never 0: consumer rejects token 0). */
+     release_token = ++managed->next_release_token;
+@@ -4211,10 +4221,12 @@ static VkResult record_compute_cmd( struct vulkan_device *device, struct swapcha
+ 
+ /* Consume present waits once before all managed presents. */
+ static VkResult managed_present_consume_waits( struct vulkan_device *device, struct vulkan_queue *queue,
++                                               struct wine_managed_swapchain *managed,
+                                                const VkSemaphore *semaphores, uint32_t count )
+ {
+     VkPipelineStageFlags stack_stages[16], *stages = stack_stages;
+     VkSubmitInfo submit = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO };
++    VkFence fence = VK_NULL_HANDLE;
+     VkResult res;
+     uint32_t i;
+ 
+@@ -4225,14 +4237,159 @@ static VkResult managed_present_consume_waits( struct vulkan_device *device, str
+     submit.waitSemaphoreCount = count;
+     submit.pWaitSemaphores = semaphores;
+     submit.pWaitDstStageMask = stages;
++    if (managed && managed->present_fence && managed->p_vkWaitForFences && managed->p_vkResetFences)
++        fence = managed->present_fence;
++
+     pthread_mutex_lock( &producer_device_lock );
+-    res = device->p_vkQueueSubmit( queue->host.queue, 1, &submit, VK_NULL_HANDLE );
+-    if (res == VK_SUCCESS) res = device->p_vkDeviceWaitIdle( device->host.device );
++    res = device->p_vkQueueSubmit( queue->host.queue, 1, &submit, fence );
++    if (res == VK_SUCCESS && !fence) res = device->p_vkDeviceWaitIdle( device->host.device );
+     pthread_mutex_unlock( &producer_device_lock );
++    if (res == VK_SUCCESS && fence)
++    {
++        res = managed->p_vkWaitForFences( device->host.device, 1, &fence, VK_TRUE, UINT64_MAX );
++        if (res == VK_SUCCESS) res = managed->p_vkResetFences( device->host.device, 1, &fence );
++    }
+     if (stages != stack_stages) free( stages );
+     return res;
+ }
+ 
++static void append_present_pnext( const void ***tail, void *entry )
++{
++    VkBaseInStructure *header = entry;
++
++    header->pNext = NULL;
++    **tail = header;
++    *tail = (const void **)&header->pNext;
++}
++
++static VkResult repack_present_pnext( struct mempool *pool, VkPresentInfoKHR *host_info,
++                                      const VkPresentInfoKHR *present_info,
++                                      const uint32_t *host_indices, uint32_t host_count )
++{
++    const VkBaseInStructure *header;
++    const void **tail = &host_info->pNext;
++    uint32_t i;
++
++    host_info->pNext = NULL;
++    for (header = present_info->pNext; header; header = header->pNext)
++    {
++        switch (header->sType)
++        {
++        case VK_STRUCTURE_TYPE_DEVICE_GROUP_PRESENT_INFO_KHR:
++        {
++            const VkDeviceGroupPresentInfoKHR *src = (const VkDeviceGroupPresentInfoKHR *)header;
++            VkDeviceGroupPresentInfoKHR *dst;
++
++            if (!(dst = mem_alloc( pool, sizeof(*dst) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
++            *dst = *src;
++            dst->swapchainCount = host_count;
++            if (src->pDeviceMasks)
++            {
++                uint32_t *masks;
++
++                if (!(masks = mem_alloc( pool, host_count * sizeof(*masks) )))
++                    return VK_ERROR_OUT_OF_HOST_MEMORY;
++                dst->pDeviceMasks = masks;
++                for (i = 0; i < host_count; i++) masks[i] = src->pDeviceMasks[host_indices[i]];
++            }
++            append_present_pnext( &tail, dst );
++            break;
++        }
++        case VK_STRUCTURE_TYPE_PRESENT_ID_KHR:
++        {
++            const VkPresentIdKHR *src = (const VkPresentIdKHR *)header;
++            VkPresentIdKHR *dst;
++
++            if (!(dst = mem_alloc( pool, sizeof(*dst) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
++            *dst = *src;
++            dst->swapchainCount = host_count;
++            if (src->pPresentIds)
++            {
++                uint64_t *ids;
++
++                if (!(ids = mem_alloc( pool, host_count * sizeof(*ids) )))
++                    return VK_ERROR_OUT_OF_HOST_MEMORY;
++                dst->pPresentIds = ids;
++                for (i = 0; i < host_count; i++) ids[i] = src->pPresentIds[host_indices[i]];
++            }
++            append_present_pnext( &tail, dst );
++            break;
++        }
++        case VK_STRUCTURE_TYPE_PRESENT_REGIONS_KHR:
++        {
++            const VkPresentRegionsKHR *src = (const VkPresentRegionsKHR *)header;
++            VkPresentRegionsKHR *dst;
++
++            if (!(dst = mem_alloc( pool, sizeof(*dst) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
++            *dst = *src;
++            dst->swapchainCount = host_count;
++            if (src->pRegions)
++            {
++                VkPresentRegionKHR *regions;
++
++                if (!(regions = mem_alloc( pool, host_count * sizeof(*regions) )))
++                    return VK_ERROR_OUT_OF_HOST_MEMORY;
++                dst->pRegions = regions;
++                for (i = 0; i < host_count; i++) regions[i] = src->pRegions[host_indices[i]];
++            }
++            append_present_pnext( &tail, dst );
++            break;
++        }
++        case VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR:
++        {
++            const VkSwapchainPresentFenceInfoKHR *src = (const VkSwapchainPresentFenceInfoKHR *)header;
++            VkSwapchainPresentFenceInfoKHR *dst;
++
++            if (!(dst = mem_alloc( pool, sizeof(*dst) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
++            *dst = *src;
++            dst->swapchainCount = host_count;
++            if (src->pFences)
++            {
++                VkFence *fences;
++
++                if (!(fences = mem_alloc( pool, host_count * sizeof(*fences) )))
++                    return VK_ERROR_OUT_OF_HOST_MEMORY;
++                dst->pFences = fences;
++                for (i = 0; i < host_count; i++) fences[i] = src->pFences[host_indices[i]];
++            }
++            append_present_pnext( &tail, dst );
++            break;
++        }
++        case VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_KHR:
++        {
++            const VkSwapchainPresentModeInfoKHR *src = (const VkSwapchainPresentModeInfoKHR *)header;
++            VkSwapchainPresentModeInfoKHR *dst;
++
++            if (!(dst = mem_alloc( pool, sizeof(*dst) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
++            *dst = *src;
++            dst->swapchainCount = host_count;
++            if (src->pPresentModes)
++            {
++                VkPresentModeKHR *modes;
++
++                if (!(modes = mem_alloc( pool, host_count * sizeof(*modes) )))
++                    return VK_ERROR_OUT_OF_HOST_MEMORY;
++                dst->pPresentModes = modes;
++                for (i = 0; i < host_count; i++) modes[i] = src->pPresentModes[host_indices[i]];
++            }
++            append_present_pnext( &tail, dst );
++            break;
++        }
++        default:
++        {
++            static int once;
++
++            if (!once++)
++                WARN( "dropping unhandled VkPresentInfoKHR pNext sType %u for host-only present\n",
++                      header->sType );
++            break;
++        }
++        }
++    }
++
++    return VK_SUCCESS;
++}
++
+ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentInfoKHR *client_present_info )
+ {
+     VkPresentInfoKHR *present_info = (VkPresentInfoKHR *)client_present_info; /* cast away const, it has been copied in the thunks */
+@@ -4244,8 +4401,10 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
+     uint32_t host_indices_buffer[16], *host_indices = host_indices_buffer;
+     VkSemaphore *host_wait_semaphores;
+     const VkSwapchainPresentFenceInfoKHR *present_fence_info = NULL;
++    struct wine_managed_swapchain *first_managed = NULL;
+     uint32_t host_count = 0;
+     BOOL skip_managed = FALSE;
++    BOOL managed_present_waits_consumed = FALSE;
+     VkCommandBuffer *blit_cmds;
+     struct mempool pool = {0};
+     uint32_t blit_count = 0;
+@@ -4296,7 +4455,11 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
+     for (uint32_t i = 0; i < present_info->swapchainCount; i++)
+     {
+         struct swapchain *swapchain = swapchain_from_handle( present_info->pSwapchains[i] );
+-        if (swapchain->managed) continue;
++        if (swapchain->managed)
++        {
++            if (!first_managed) first_managed = swapchain->managed;
++            continue;
++        }
+         swapchains[host_count] = swapchain->obj.host.swapchain;
+         host_indices[host_count] = i;
+         host_count++;
+@@ -4351,6 +4514,9 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
+         {
+             host_info.swapchainCount = host_count;
+             host_info.pSwapchains = swapchains;
++            if (host_count != present_info->swapchainCount &&
++                (res = repack_present_pnext( &pool, &host_info, present_info, host_indices, host_count )))
++                goto host_present_done;
+             if (present_info->pResults)
+             {
+                 host_results = host_count <= ARRAY_SIZE(host_results_buffer) ? host_results_buffer
+@@ -4367,6 +4533,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
+             res = device->p_vkQueuePresentKHR( queue->host.queue, &host_info );
+             pthread_mutex_unlock( &producer_device_lock );
+ 
++host_present_done:
+             if (image_indices != image_indices_buffer) free( image_indices );
+             if (host_results)
+             {
+@@ -4388,13 +4555,14 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
+     /* All-managed presents consume the live wait array once here. */
+     if (!host_count && present_info->waitSemaphoreCount)
+     {
+-        VkResult cres = managed_present_consume_waits( device, queue, present_info->pWaitSemaphores,
++        VkResult cres = managed_present_consume_waits( device, queue, first_managed, present_info->pWaitSemaphores,
+                                                        present_info->waitSemaphoreCount );
+         if (cres < VK_SUCCESS)
+         {
+             res = cres;
+             skip_managed = TRUE;
+         }
++        else managed_present_waits_consumed = TRUE;
+     }
+ 
+     /* Present each managed swapchain after the present waits are consumed. */
+@@ -4411,7 +4579,8 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
+             continue;
+         }
+ 
+-        managed_res = managed_present( device, queue, swapchain, present_info->pImageIndices[i] );
++        managed_res = managed_present( device, queue, swapchain, present_info->pImageIndices[i],
++                                       managed_present_waits_consumed );
+ 
+         /* Managed swapchains have no host present to signal this fence. */
+         if (present_fence_info && i < present_fence_info->swapchainCount && present_fence_info->pFences[i])

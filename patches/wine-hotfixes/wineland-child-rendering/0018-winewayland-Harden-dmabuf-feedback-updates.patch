@@ -1,0 +1,167 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Fri, 26 Jun 2026 22:41:08 +0200
+Subject: [PATCH 18/49] winewayland: Harden dmabuf feedback updates
+
+---
+ dlls/win32u/vulkan.c              | 73 +++++++++++++++++++------------
+ dlls/winewayland.drv/wayland.c    | 13 ++++++
+ dlls/winewayland.drv/waylanddrv.h |  1 +
+ 3 files changed, 60 insertions(+), 27 deletions(-)
+
+diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+index 805ecaf600a..82da0851b71 100644
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -2762,6 +2762,41 @@ static BOOL vk_host_modifier_exportable( struct vulkan_device *device, VkFormat
+     return TRUE;
+ }
+ 
++static uint32_t vk_collect_managed_modifiers( struct vulkan_device *device, VkFormat format,
++                                              VkImageUsageFlags usage,
++                                              const hwnd_dmabuf_format_modifier_t *caps_mods,
++                                              UINT caps_count, unsigned int fourcc,
++                                              uint64_t *out_mods, uint64_t *out_wire_mods,
++                                              uint32_t max_out )
++{
++    UINT i;
++    uint32_t out_count = 0;
++
++    for (i = 0; i < caps_count && out_count < max_out; i++)
++    {
++        uint64_t wire_modifier = caps_mods[i].modifier;
++        uint64_t modifier = wire_modifier;
++
++        if (caps_mods[i].fourcc != fourcc) continue;
++        /* MOD_INVALID means "any/implicit". Let the host pick by offering LINEAR. */
++        if (modifier == WINE_VK_DRM_FORMAT_MOD_INVALID)
++            modifier = 0 /* DRM_FORMAT_MOD_LINEAR */;
++        if (!vk_host_modifier_exportable( device, format, usage, modifier )) continue;
++        /* dedupe */
++        {
++            uint32_t j;
++            BOOL dup = FALSE;
++            for (j = 0; j < out_count; j++) if (out_mods[j] == modifier) { dup = TRUE; break; }
++            if (dup) continue;
++        }
++        out_mods[out_count] = modifier;
++        out_wire_mods[out_count] = wire_modifier;
++        out_count++;
++    }
++
++    return out_count;
++}
++
+ /* Build the candidate modifier list = caps modifiers (matching fourcc) that the
+  * host can also export as a single-plane dmabuf. out_mods is what Vulkan gets,
+  * out_wire_mods is what the consumer must see. Returns the count placed in
+@@ -2773,7 +2808,7 @@ static uint32_t vk_select_managed_modifiers( struct vulkan_device *device, HWND
+     hwnd_dmabuf_format_modifier_t *caps_mods;
+     hwnd_dmabuf_host_caps_t caps = {0};
+     unsigned int fourcc_first, fourcc_second;
+-    UINT caps_count = 0, i;
++    UINT caps_count = 0;
+     uint32_t out_count = 0;
+ 
+     /* The fourcc must match compositeAlpha: opaque swapchains use the X-variant
+@@ -2803,33 +2838,17 @@ static uint32_t vk_select_managed_modifiers( struct vulkan_device *device, HWND
+     }
+ 
+     *fourcc_out = 0;
+-    for (i = 0; i < caps_count && !*fourcc_out; i++)
+-        if (fourcc_first && caps_mods[i].fourcc == fourcc_first) *fourcc_out = fourcc_first;
+-    if (!*fourcc_out)
+-        for (i = 0; i < caps_count && !*fourcc_out; i++)
+-            if (fourcc_second && caps_mods[i].fourcc == fourcc_second) *fourcc_out = fourcc_second;
+-    if (!*fourcc_out) { free( caps_mods ); return 0; }
+-
+-    for (i = 0; i < caps_count && out_count < max_out; i++)
++    if (fourcc_first)
+     {
+-        uint64_t wire_modifier = caps_mods[i].modifier;
+-        uint64_t modifier = wire_modifier;
+-
+-        if (caps_mods[i].fourcc != *fourcc_out) continue;
+-        /* MOD_INVALID means "any/implicit". Let the host pick by offering LINEAR. */
+-        if (modifier == WINE_VK_DRM_FORMAT_MOD_INVALID)
+-            modifier = 0 /* DRM_FORMAT_MOD_LINEAR */;
+-        if (!vk_host_modifier_exportable( device, format, usage, modifier )) continue;
+-        /* dedupe */
+-        {
+-            uint32_t j;
+-            BOOL dup = FALSE;
+-            for (j = 0; j < out_count; j++) if (out_mods[j] == modifier) { dup = TRUE; break; }
+-            if (dup) continue;
+-        }
+-        out_mods[out_count] = modifier;
+-        out_wire_mods[out_count] = wire_modifier;
+-        out_count++;
++        out_count = vk_collect_managed_modifiers( device, format, usage, caps_mods, caps_count,
++                                                  fourcc_first, out_mods, out_wire_mods, max_out );
++        if (out_count) *fourcc_out = fourcc_first;
++    }
++    if (!out_count && fourcc_second)
++    {
++        out_count = vk_collect_managed_modifiers( device, format, usage, caps_mods, caps_count,
++                                                  fourcc_second, out_mods, out_wire_mods, max_out );
++        if (out_count) *fourcc_out = fourcc_second;
+     }
+ 
+     free( caps_mods );
+diff --git a/dlls/winewayland.drv/wayland.c b/dlls/winewayland.drv/wayland.c
+index 8013f50664d..7eab49b90a7 100644
+--- a/dlls/winewayland.drv/wayland.c
++++ b/dlls/winewayland.drv/wayland.c
+@@ -232,6 +232,14 @@ static void zwp_linux_dmabuf_feedback_v1_handle_done(void *data,
+     struct wayland_dmabuf_format *entry, *next;
+     unsigned int count = 0;
+ 
++    if (!state->valid)
++    {
++        wayland_dmabuf_clear_format_list(&state->pending_formats);
++        state->tranche_index = 0;
++        state->tranche_flags = 0;
++        return;
++    }
++
+     pthread_mutex_lock(&process_wayland.dmabuf_mutex);
+     wayland_dmabuf_clear_format_list(&process_wayland.dmabuf_formats);
+     wl_list_for_each_safe(entry, next, &state->pending_formats, link)
+@@ -258,6 +266,7 @@ static void zwp_linux_dmabuf_feedback_v1_handle_format_table(void *data,
+     free(state->format_table);
+     state->format_table = NULL;
+     state->format_table_count = 0;
++    state->valid = FALSE;
+ 
+     if (!size || size % sizeof(*state->format_table))
+     {
+@@ -279,6 +288,7 @@ static void zwp_linux_dmabuf_feedback_v1_handle_format_table(void *data,
+         memcpy(table, map, size);
+         state->format_table = table;
+         state->format_table_count = size / sizeof(*state->format_table);
++        state->valid = TRUE;
+     }
+     munmap(map, size);
+ }
+@@ -315,6 +325,9 @@ static void zwp_linux_dmabuf_feedback_v1_handle_tranche_formats(void *data,
+     struct wayland_dmabuf_feedback *state = data;
+     uint16_t *index;
+ 
++    if (!state->valid)
++        return;
++
+     if (indices->size % sizeof(*index))
+     {
+         WARN("Ignoring invalid dmabuf feedback tranche index list size %zu.\n", indices->size);
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index 9aaad18d28a..ee7dd381100 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -274,6 +274,7 @@ struct wayland_dmabuf_feedback
+     struct wl_list pending_formats;
+     uint32_t tranche_index;
+     uint32_t tranche_flags;
++    BOOL valid;
+ };
+ 
+ struct wayland

@@ -1,0 +1,150 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Tue, 14 Jul 2026 02:12:57 +0200
+Subject: [PATCH 32/49] wined3d: Gate HWND dmabuf capture on window caps.
+
+Use the HWND dmabuf capability query to distinguish regular local
+GL swapchains from windows consumed through the dmabuf bridge. Keep
+normal wined3d GL presents on the WGL path, while preserving capture
+for cross-process HWND dmabuf producers.
+---
+ dlls/wined3d/swapchain.c  | 52 ++++++++++++++++++++++++++++++++++-----
+ dlls/wined3d/wined3d_gl.h |  2 ++
+ 2 files changed, 48 insertions(+), 6 deletions(-)
+
+diff --git a/dlls/wined3d/swapchain.c b/dlls/wined3d/swapchain.c
+index 7adae6b9c4c..2fd564b2ff7 100644
+--- a/dlls/wined3d/swapchain.c
++++ b/dlls/wined3d/swapchain.c
+@@ -667,6 +667,8 @@ static void wined3d_gl_hwnd_dmabuf_clear_caps(struct wined3d_gl_hwnd_dmabuf_ring
+     free(ring->format_modifiers);
+     ring->format_modifiers = NULL;
+     ring->format_modifier_count = 0;
++    ring->caps_hwnd = NULL;
++    ring->hwnd_has_caps = false;
+     ring->logged_implicit_modifier = false;
+     ring->logged_opaque_fourcc = false;
+     ring->logged_unsupported_modifier = false;
+@@ -715,6 +717,18 @@ static bool wined3d_gl_hwnd_dmabuf_hwnd_has_caps(const struct wined3d_gl_hwnd_dm
+             && count;
+ }
+ 
++static bool wined3d_gl_hwnd_dmabuf_cached_hwnd_has_caps(struct wined3d_gl_hwnd_dmabuf_ring *ring,
++        HWND hwnd)
++{
++    if (ring->caps_hwnd != hwnd)
++    {
++        ring->caps_hwnd = hwnd;
++        ring->hwnd_has_caps = wined3d_gl_hwnd_dmabuf_hwnd_has_caps(ring, hwnd);
++    }
++
++    return ring->hwnd_has_caps;
++}
++
+ static bool wined3d_gl_hwnd_dmabuf_modifier_supported(const struct wined3d_gl_hwnd_dmabuf_ring *ring,
+         UINT fourcc, UINT64 modifier)
+ {
+@@ -1137,8 +1151,9 @@ static void wined3d_gl_hwnd_dmabuf_capture(struct wined3d_swapchain *swapchain,
+     gl_info = context_gl->gl_info;
+     if (!wined3d_gl_hwnd_dmabuf_probe_support(ring, gl_info))
+         return;
+-    if (wined3d_gl_hwnd_dmabuf_ensure_channel(swapchain_gl, gl_info))
+-        wined3d_gl_hwnd_dmabuf_drain_channel(ring);
++    if (!wined3d_gl_hwnd_dmabuf_ensure_channel(swapchain_gl, gl_info))
++        return;
++    wined3d_gl_hwnd_dmabuf_drain_channel(ring);
+ 
+     preserve_last = ring->images[ring->last_image].valid;
+     for (i = 0; i < ARRAY_SIZE(ring->images); ++i)
+@@ -1232,6 +1247,28 @@ static void wined3d_gl_hwnd_dmabuf_capture(struct wined3d_swapchain *swapchain,
+     device_invalidate_state(swapchain->device, STATE_FRAMEBUFFER);
+ }
+ 
++static bool wined3d_gl_hwnd_dmabuf_should_present(struct wined3d_swapchain_gl *swapchain_gl,
++        const struct wined3d_gl_info *gl_info, uint32_t flags)
++{
++    struct wined3d_gl_hwnd_dmabuf_ring *ring = &swapchain_gl->hwnd_dmabuf;
++    HWND hwnd = swapchain_gl->s.win_handle;
++    bool no_window_update = flags & WINED3D_PRESENT_NO_WINDOW_UPDATE;
++
++    if (ring->channel_fd >= 0 && ring->channel_hwnd == hwnd)
++        return true;
++
++    if (!wined3d_gl_hwnd_dmabuf_probe_support(ring, gl_info))
++        return false;
++
++    if (!no_window_update && !wined3d_gl_hwnd_dmabuf_cached_hwnd_has_caps(ring, hwnd))
++        return false;
++
++    if (wined3d_gl_hwnd_dmabuf_ensure_channel(swapchain_gl, gl_info))
++        return true;
++
++    return no_window_update;
++}
++
+ static BOOL swapchain_gl_supports_hwnd_dmabuf(const struct wined3d_swapchain *swapchain)
+ {
+     const struct wined3d_swapchain_gl *swapchain_gl = wined3d_swapchain_gl_const(swapchain);
+@@ -1297,6 +1334,7 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
+     const struct wined3d_pixel_format *pixel_format;
+     const struct wined3d_gl_info *gl_info;
+     struct wined3d_context_gl *context_gl;
++    bool hwnd_dmabuf_present;
+     struct wined3d_context *context;
+ 
+     context = context_acquire(swapchain->device, swapchain->front_buffer, 0);
+@@ -1309,9 +1347,12 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
+     }
+ 
+     TRACE("Presenting DC %p.\n", context_gl->dc);
++    gl_info = context_gl->gl_info;
++    hwnd_dmabuf_present = wined3d_gl_hwnd_dmabuf_should_present(wined3d_swapchain_gl(swapchain),
++            gl_info, flags);
+ 
+     /* The gated dmabuf path captures below without updating the window. */
+-    if (flags & WINED3D_PRESENT_NO_WINDOW_UPDATE)
++    if (hwnd_dmabuf_present)
+     {
+         TRACE("Skipping window update.\n");
+     }
+@@ -1326,8 +1367,6 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
+         }
+         else
+         {
+-            gl_info = context_gl->gl_info;
+-
+             swapchain_gl_set_swap_interval(swapchain, context_gl, swap_interval);
+ 
+             wined3d_texture_load_location(back_buffer, 0, context, back_buffer->resource.draw_binding);
+@@ -1345,6 +1384,7 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
+         }
+     }
+ 
++    if (hwnd_dmabuf_present)
+     {
+         struct wined3d_gl_hwnd_dmabuf_ring *ring = &wined3d_swapchain_gl(swapchain)->hwnd_dmabuf;
+ 
+@@ -1360,7 +1400,7 @@ static void swapchain_gl_present(struct wined3d_swapchain *swapchain,
+ 
+     TRACE("SwapBuffers called, Starting new frame\n");
+ 
+-    if (!(flags & WINED3D_PRESENT_NO_WINDOW_UPDATE))
++    if (!hwnd_dmabuf_present)
+     {
+         wined3d_texture_validate_location(swapchain->front_buffer, 0, WINED3D_LOCATION_DRAWABLE);
+         wined3d_texture_invalidate_location(swapchain->front_buffer, 0, ~WINED3D_LOCATION_DRAWABLE);
+diff --git a/dlls/wined3d/wined3d_gl.h b/dlls/wined3d/wined3d_gl.h
+index 46aa0b33c8d..820104c964a 100644
+--- a/dlls/wined3d/wined3d_gl.h
++++ b/dlls/wined3d/wined3d_gl.h
+@@ -1183,8 +1183,10 @@ struct wined3d_gl_hwnd_dmabuf_ring
+     uint64_t present_count;
+     uint64_t next_release_token;
+     volatile LONG support;
++    HWND caps_hwnd;
+     HWND channel_hwnd;
+     int channel_fd;
++    bool hwnd_has_caps;
+     uint64_t producer_unique_id;
+     bool logged_implicit_modifier;
+     bool logged_opaque_fourcc;

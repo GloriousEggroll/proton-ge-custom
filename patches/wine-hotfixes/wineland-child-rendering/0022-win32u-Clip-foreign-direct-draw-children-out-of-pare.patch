@@ -1,0 +1,312 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Thu, 2 Jul 2026 00:08:55 +0200
+Subject: [PATCH 22/49] win32u: Clip foreign direct-draw children out of parent
+ surfaces.
+
+Some applications host CEF child windows that present directly from another
+process. Under X11 the drawing process can fall back to using the toplevel
+drawable, while the parent still owns an offscreen window surface. Full
+parent surface flushes may then repaint stale backing-store contents over
+the child, causing white or flickering client areas.
+
+Add a dedicated SET_WINPOS_CLIP_CLIENT paint flag for windows whose client
+area must be excluded from parent surfaces, and extend the existing pixel
+format child clipping path to use it. Route the flag through an internal
+message so foreign drawing processes can mark the owner window.
+
+Mark X11 foreign direct draw child windows when GetDC() uses the toplevel
+drawable, letting the parent surface clip out the child while the child
+continues to present directly.
+
+Fixes battle.net login window flickering / white window content under x11.
+---
+ dlls/win32u/dce.c              |  5 +++--
+ dlls/win32u/message.c          |  3 +++
+ dlls/win32u/ntuser_private.h   |  1 +
+ dlls/win32u/win32u_private.h   |  1 +
+ dlls/win32u/window.c           | 19 ++++++++++++++++
+ dlls/winex11.drv/window.c      | 10 +++++++++
+ include/ntuser.h               |  1 +
+ include/wine/server_protocol.h |  1 +
+ server/protocol.def            |  1 +
+ server/window.c                | 40 +++++++++++++++++++---------------
+ 10 files changed, 62 insertions(+), 20 deletions(-)
+
+diff --git a/dlls/win32u/dce.c b/dlls/win32u/dce.c
+index eccbcca2aa4..1f58163fc52 100644
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -897,8 +897,9 @@ static void update_visible_region( struct dce *dce )
+     if (dce->clip_rgn) NtGdiCombineRgn( vis_rgn, vis_rgn, dce->clip_rgn,
+                                         (flags & DCX_INTERSECTRGN) ? RGN_AND : RGN_DIFF );
+ 
+-    /* don't use a surface to paint the client area of OpenGL windows */
+-    if (!(paint_flags & SET_WINPOS_PIXEL_FORMAT && user_driver->dc_funcs.pPutImage) || (flags & DCX_WINDOW)
++    /* don't use a parent surface to paint client areas that are clipped out */
++    if (!((paint_flags & (SET_WINPOS_PIXEL_FORMAT | SET_WINPOS_CLIP_CLIENT)) && user_driver->dc_funcs.pPutImage) ||
++        (flags & DCX_WINDOW)
+         || (NtUserGetLayeredWindowAttributes( dce->hwnd, NULL, NULL, &layered_flags ) && layered_flags & LWA_COLORKEY)
+         || force_present_to_surface( &win_rect ))
+     {
+diff --git a/dlls/win32u/message.c b/dlls/win32u/message.c
+index bc80f6805bb..f3e8cdbda2e 100644
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -2278,6 +2278,9 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
+     case WM_WINE_SETPIXELFORMAT:
+         set_window_pixel_format( hwnd, wparam, lparam );
+         return 0;
++    case WM_WINE_SETWINDOWSURFACECLIP:
++        set_window_surface_clip( hwnd );
++        return 0;
+     case WM_WINE_TRACKMOUSEEVENT:
+     {
+         TRACKMOUSEEVENT info;
+diff --git a/dlls/win32u/ntuser_private.h b/dlls/win32u/ntuser_private.h
+index 3298e939bea..8f61a6b54ab 100644
+--- a/dlls/win32u/ntuser_private.h
++++ b/dlls/win32u/ntuser_private.h
+@@ -74,6 +74,7 @@ typedef struct tagWND
+     int                swap_interval; /* OpenGL surface swap interval */
+     int                pixel_format;  /* Pixel format set by the graphics driver */
+     int                clip_clients;  /* Has client surfaces that needs to be clipped out */
++    int                clip_from_parent; /* Client area is clipped out of parent surfaces */
+     int                cbWndExtra;    /* class cbWndExtra at window creation */
+     DWORD_PTR          userdata;      /* User private data */
+     DWORD              wExtra[1];     /* Window extra bytes */
+diff --git a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+index 3167e20dd56..a3a3afc94b5 100644
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -321,6 +321,7 @@ extern BOOL is_window_unicode( HWND hwnd );
+ extern BOOL is_window_visible( HWND hwnd );
+ extern BOOL is_zoomed( HWND hwnd );
+ extern BOOL set_window_pixel_format( HWND hwnd, int format, BOOL internal );
++extern BOOL set_window_surface_clip( HWND hwnd );
+ extern int get_window_pixel_format( HWND hwnd );
+ extern DWORD get_window_long( HWND hwnd, INT offset );
+ extern ULONG_PTR get_window_long_ptr( HWND hwnd, INT offset, BOOL ansi );
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index 1eafe1be0a4..09bd02423a9 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -1631,6 +1631,24 @@ BOOL set_window_pixel_format( HWND hwnd, int format, BOOL internal )
+     return TRUE;
+ }
+ 
++BOOL set_window_surface_clip( HWND hwnd )
++{
++    WND *win = get_win_ptr( hwnd );
++    BOOL changed = FALSE;
++
++    if (!win || win == WND_DESKTOP || win == WND_OTHER_PROCESS)
++    {
++        NtUserPostMessage( hwnd, WM_WINE_SETWINDOWSURFACECLIP, 0, 0 );
++        return FALSE;
++    }
++
++    if (!win->clip_from_parent) changed = win->clip_from_parent = TRUE;
++    release_win_ptr( win );
++
++    if (changed) update_window_state( hwnd );
++    return TRUE;
++}
++
+ int get_window_pixel_format( HWND hwnd )
+ {
+     WND *win = get_win_ptr( hwnd );
+@@ -2390,6 +2408,7 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
+         if (new_surface) req->paint_flags |= SET_WINPOS_PAINT_SURFACE;
+         if (is_layered) req->paint_flags |= SET_WINPOS_LAYERED_WINDOW;
+         else if (win->clip_clients) req->paint_flags |= SET_WINPOS_PIXEL_FORMAT;
++        if (win->clip_from_parent) req->paint_flags |= SET_WINPOS_CLIP_CLIENT;
+ 
+         if ((ret = !wine_server_call( req )))
+         {
+diff --git a/dlls/winex11.drv/window.c b/dlls/winex11.drv/window.c
+index f8cfca52581..8def0e82f20 100644
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -49,6 +49,7 @@
+ 
+ #include "x11drv.h"
+ #include "wingdi.h"
++#include "ntuser.h"
+ #include "winuser.h"
+ 
+ #include "wine/debug.h"
+@@ -57,6 +58,14 @@
+ WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
+ WINE_DECLARE_DEBUG_CHANNEL(systray);
+ 
++static void mark_direct_draw_child( HWND hwnd, HWND top )
++{
++    if (!hwnd || hwnd == top) return;
++
++    /* The owner process latches the flag, so repeated posts from foreign drawing processes are harmless. */
++    NtUserPostMessage( hwnd, WM_WINE_SETWINDOWSURFACECLIP, 0, 0 );
++}
++
+ #define _NET_WM_MOVERESIZE_SIZE_TOPLEFT      0
+ #define _NET_WM_MOVERESIZE_SIZE_TOP          1
+ #define _NET_WM_MOVERESIZE_SIZE_TOPRIGHT     2
+@@ -3435,6 +3444,7 @@ void X11DRV_GetDC( HDC hdc, HWND hwnd, HWND top, const RECT *win_rect,
+     {
+         escape.drawable = X11DRV_get_whole_window( top );
+         escape.visual = default_visual; /* FIXME: use the right visual for other process window */
++        if (escape.drawable) mark_direct_draw_child( hwnd, top );
+     }
+ 
+     if (!escape.drawable) return; /* don't create a GC for foreign windows */
+diff --git a/include/ntuser.h b/include/ntuser.h
+index 941fb6491cf..aa71363c1f5 100644
+--- a/include/ntuser.h
++++ b/include/ntuser.h
+@@ -655,6 +655,7 @@ enum wine_internal_message
+     WM_WINE_GETSCROLLINFO,
+     WM_WINE_SETSCROLLINFO,
+     WM_WINE_MAP_NOTIFY_ICON_POINT,
++    WM_WINE_SETWINDOWSURFACECLIP,
+     WM_WINE_FIRST_DRIVER_MSG = 0x80001000,  /* range of messages reserved for the USER driver */
+     WM_WINE_CLIPCURSOR = 0x80001ff0, /* internal driver notification messages */
+     WM_WINE_SETCURSOR,
+diff --git a/include/wine/server_protocol.h b/include/wine/server_protocol.h
+index 00e43231f93..b735b8e7591 100644
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -3850,6 +3850,7 @@ struct set_window_pos_reply
+ #define SET_WINPOS_PAINT_SURFACE    0x01
+ #define SET_WINPOS_PIXEL_FORMAT     0x02
+ #define SET_WINPOS_LAYERED_WINDOW   0x04
++#define SET_WINPOS_CLIP_CLIENT      0x08
+ 
+ 
+ struct get_window_rectangles_request
+diff --git a/server/protocol.def b/server/protocol.def
+index 5802c50999e..e94a5cef374 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -2892,6 +2892,7 @@ enum message_type
+ #define SET_WINPOS_PAINT_SURFACE    0x01  /* window has a paintable surface */
+ #define SET_WINPOS_PIXEL_FORMAT     0x02  /* window has a custom pixel format */
+ #define SET_WINPOS_LAYERED_WINDOW   0x04  /* window is drawn with UpdateLayeredWindow */
++#define SET_WINPOS_CLIP_CLIENT      0x08  /* window client is clipped out of parent surfaces */
+ 
+ /* Get the window and client rectangles of a window */
+ @REQ(get_window_rectangles)
+diff --git a/server/window.c b/server/window.c
+index d23608ba5f3..b460ee1b90c 100644
+--- a/server/window.c
++++ b/server/window.c
+@@ -139,13 +139,15 @@ static const struct object_ops window_ops =
+ #define PAINT_HAS_SURFACE          SET_WINPOS_PAINT_SURFACE
+ #define PAINT_HAS_PIXEL_FORMAT     SET_WINPOS_PIXEL_FORMAT
+ #define PAINT_HAS_LAYERED_SURFACE  SET_WINPOS_LAYERED_WINDOW
+-#define PAINT_CLIENT_FLAGS         (PAINT_HAS_SURFACE | PAINT_HAS_PIXEL_FORMAT | PAINT_HAS_LAYERED_SURFACE)
++#define PAINT_CLIP_CLIENT          SET_WINPOS_CLIP_CLIENT
++#define PAINT_CLIENT_FLAGS         (PAINT_HAS_SURFACE | PAINT_HAS_PIXEL_FORMAT | \
++                                    PAINT_HAS_LAYERED_SURFACE | PAINT_CLIP_CLIENT)
+ /* flags only manipulated by the server */
+ #define PAINT_INTERNAL           0x0010  /* internal WM_PAINT pending */
+ #define PAINT_ERASE              0x0020  /* needs WM_ERASEBKGND */
+ #define PAINT_NONCLIENT          0x0040  /* needs WM_NCPAINT */
+ #define PAINT_DELAYED_ERASE      0x0080  /* still needs erase after WM_ERASEBKGND */
+-#define PAINT_PIXEL_FORMAT_CHILD 0x0100  /* at least one child has a custom pixel format */
++#define PAINT_CLIP_CLIENT_CHILD 0x0100  /* at least one child is clipped out of parent surfaces */
+ 
+ /* growable array of user handles */
+ struct user_handle_array
+@@ -249,12 +251,12 @@ static inline struct window *get_last_child( struct window *win )
+     return ptr ? LIST_ENTRY( ptr, struct window, entry ) : NULL;
+ }
+ 
+-/* set the PAINT_PIXEL_FORMAT_CHILD flag on all the parents */
++/* set the PAINT_CLIP_CLIENT_CHILD flag on all the parents */
+ /* note: we never reset the flag, it's just a heuristic */
+-static inline void update_pixel_format_flags( struct window *win )
++static inline void update_clip_client_flags( struct window *win )
+ {
+     for (win = win->parent; win && win->parent; win = win->parent)
+-        win->paint_flags |= PAINT_PIXEL_FORMAT_CHILD;
++        win->paint_flags |= PAINT_CLIP_CLIENT_CHILD;
+ }
+ 
+ static struct rectangle monitors_get_union_rect( struct winstation *winstation, int is_raw )
+@@ -448,8 +450,8 @@ static int set_parent_window( struct window *win, struct window *parent )
+         if (parent->thread && parent->thread != win->thread && !is_desktop_window(parent))
+             attach_thread_input( win->thread, parent->thread );
+ 
+-        if (win->paint_flags & (PAINT_HAS_PIXEL_FORMAT | PAINT_PIXEL_FORMAT_CHILD))
+-            update_pixel_format_flags( win );
++        if (win->paint_flags & (PAINT_HAS_PIXEL_FORMAT | PAINT_CLIP_CLIENT | PAINT_CLIP_CLIENT_CHILD))
++            update_clip_client_flags( win );
+     }
+     else  /* move it to parent unlinked list */
+     {
+@@ -1433,9 +1435,9 @@ error:
+ }
+ 
+ 
+-/* clip all children with a custom pixel format out of the visible region */
+-static struct region *clip_pixel_format_children( struct window *parent, struct region *parent_clip,
+-                                                  struct region *region, int offset_x, int offset_y )
++/* clip all children that draw outside of the parent surface out of the visible region */
++static struct region *clip_client_children( struct window *parent, struct region *parent_clip,
++                                            struct region *region, int offset_x, int offset_y )
+ {
+     struct window *ptr;
+     struct region *clip = create_empty_region();
+@@ -1453,18 +1455,19 @@ static struct region *clip_pixel_format_children( struct window *parent, struct
+         offset_region( clip, offset_x, offset_y );
+         if (!intersect_region( clip, clip, parent_clip )) break;
+         if (!union_region( region, region, clip )) break;
+-        if (!(ptr->paint_flags & (PAINT_HAS_PIXEL_FORMAT | PAINT_PIXEL_FORMAT_CHILD))) continue;
++        if (!(ptr->paint_flags & (PAINT_HAS_PIXEL_FORMAT | PAINT_CLIP_CLIENT | PAINT_CLIP_CLIENT_CHILD))) continue;
+ 
+-        /* subtract the client rect if it uses a custom pixel format */
++        /* subtract the client rect if it draws outside of the parent surface */
+         set_region_rect( clip, &ptr->client_rect );
+         if (ptr->win_region && !intersect_window_region( clip, ptr )) break;
+         offset_region( clip, offset_x, offset_y );
+         if (!intersect_region( clip, clip, parent_clip )) break;
+-        if ((ptr->paint_flags & PAINT_HAS_PIXEL_FORMAT) && !subtract_region( region, region, clip ))
++        if ((ptr->paint_flags & (PAINT_HAS_PIXEL_FORMAT | PAINT_CLIP_CLIENT)) &&
++            !subtract_region( region, region, clip ))
+             break;
+ 
+-        if (!clip_pixel_format_children( ptr, clip, region, offset_x + ptr->client_rect.left,
+-                                         offset_y + ptr->client_rect.top ))
++        if (!clip_client_children( ptr, clip, region, offset_x + ptr->client_rect.left,
++                                   offset_y + ptr->client_rect.top ))
+             break;
+     }
+     free_region( clip );
+@@ -1487,7 +1490,8 @@ static struct region *get_surface_region( struct window *win )
+     set_region_rect( clip, &win->client_rect );
+     if (win->win_region && !intersect_window_region( clip, win )) goto error;
+ 
+-    if ((win->paint_flags & PAINT_HAS_PIXEL_FORMAT) && !subtract_region( region, region, clip ))
++    if ((win->paint_flags & (PAINT_HAS_PIXEL_FORMAT | PAINT_CLIP_CLIENT)) &&
++        !subtract_region( region, region, clip ))
+         goto error;
+ 
+     /* clip children */
+@@ -1499,7 +1503,7 @@ static struct region *get_surface_region( struct window *win )
+     }
+     else offset_x = offset_y = 0;
+ 
+-    if (!clip_pixel_format_children( win, clip, region, offset_x, offset_y )) goto error;
++    if (!clip_client_children( win, clip, region, offset_x, offset_y )) goto error;
+ 
+     free_region( clip );
+     return region;
+@@ -2829,7 +2833,7 @@ DECL_HANDLER(set_window_pos)
+     }
+ 
+     win->paint_flags = (win->paint_flags & ~PAINT_CLIENT_FLAGS) | (req->paint_flags & PAINT_CLIENT_FLAGS);
+-    if (win->paint_flags & PAINT_HAS_PIXEL_FORMAT) update_pixel_format_flags( win );
++    if (win->paint_flags & (PAINT_HAS_PIXEL_FORMAT | PAINT_CLIP_CLIENT)) update_clip_client_flags( win );
+ 
+     win->monitor_dpi = req->monitor_dpi;
+     old_style = win->style;

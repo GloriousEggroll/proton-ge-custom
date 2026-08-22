@@ -89,8 +89,21 @@ apply_all_in_dir() {
     echo "WINE: -CUSTOM- ETAASH WINE-WAYLAND+ PATCHES"
    apply_all_in_dir "../patches/wine-hotfixes/wine-wayland/"
 
+    echo "WINE: -CUSTOM- ETAASH WINE-WAYLAND+ SNI SUPPORT"
+    apply_patch "../patches/wine-hotfixes/em-fixups/0001-winewayland-add-SNI-tray-icons-and-native-context-me.patch"
+
+    # Original work by Erhan Bilgili:
+    # https://github.com/nanomatters/wine-wineland/commits/wineland_20260713-reorg/
+    echo "WINE: -CUSTOM- WINELAND CROSS-PROCESS CHILD RENDERING"
+    apply_all_in_dir "../patches/wine-hotfixes/wineland-child-rendering/"
+
     echo "WINE: -CUSTOM- ETAASH WINE-WAYLAND+ FIXUPS"
-    apply_all_in_dir "../patches/wine-hotfixes/em-fixups/"
+    for patch in ../patches/wine-hotfixes/em-fixups/*.patch; do
+        case "$patch" in
+            */0001-winewayland-add-SNI-tray-icons-and-native-context-me.patch) ;;
+            *) apply_patch "$patch" ;;
+        esac
+    done
 
 ### END EM-10/WINE-WAYLAND PATCH SECTION ###
 
@@ -233,8 +246,8 @@ apply_all_in_dir() {
     echo "WINE: -GAME FIXES- add TBH: Task Bar Hero fixes"
     apply_patch "../patches/game-patches/layered-overlay-wine.patch"
 
-    echo "WINE: -GAME FIXES- use X11 for cross-process launcher UIs under winewayland"
-    apply_patch "../patches/game-patches/multi-process-launcher-x11-fallback.patch"
+    # multi-process-launcher-x11-fallback.patch is intentionally disabled.
+    # Wine-Wayland now renders cross-process launcher windows directly.
 
     echo "WINE: -GAME FIXES- add fixes Guilty Gear Accent Core Plus R intro video (win32u related)"
     apply_patch "../patches/game-patches/0001-win32u-Avoid-zero-WM_ACTIVATEAPP-lparam-on-first-for.patch"

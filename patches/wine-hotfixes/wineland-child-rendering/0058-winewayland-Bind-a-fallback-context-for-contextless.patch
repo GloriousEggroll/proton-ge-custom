@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Sat, 22 Aug 2026 18:30:00 -0600
+Subject: [PATCH 58/58] winewayland: Bind a fallback context for contextless
+ swaps.
+
+Some Chromium renderers release their WGL context before calling
+SwapBuffers(). EGL requires a context to be current on the calling thread,
+so Mesa rejects these presents with EGL_BAD_CONTEXT/EGL_BAD_SURFACE and the
+Wayland child window remains transparent.
+
+Mirror the fallback-context handling Wine uses for X11 EGL drawables. Bind a
+configless context only for the native swap, then release it again so the
+application's WGL ownership is unchanged.
+
+Based on Wine commit de44bd7234b2c6a755b2d69c5b55ea8660708d89 by
+Paul Gofman <pgofman@codeweavers.com>.
+---
+ dlls/winewayland.drv/opengl.c | 36 +++++++++++++++++++++++++++++++++++-
+ 1 file changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/winewayland.drv/opengl.c b/dlls/winewayland.drv/opengl.c
+index 424c1eb..97ff871 100644
+--- a/dlls/winewayland.drv/opengl.c
++++ b/dlls/winewayland.drv/opengl.c
+@@ -46,6 +46,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
+ static const struct egl_platform *egl;
+ static const struct opengl_funcs *funcs;
+ static const struct opengl_drawable_funcs wayland_drawable_funcs;
++static EGLContext egl_fallback_context;
+ 
+ /* Original (win32u) driver proc-address resolver, chained from
+  * wayland_get_proc_address so that names other than the WINE dmabuf-export
+@@ -315,6 +316,7 @@ static BOOL wayland_drawable_swap(struct opengl_drawable *base)
+     struct wayland_client_surface *surface = impl_from_client_surface(base->client);
+     struct wl_callback *callback;
+     LONG attachment_generation;
++    BOOL fallback_bound = FALSE;
+     EGLint error;
+ 
+     client_surface_present(base->client);
+@@ -328,6 +330,30 @@ static BOOL wayland_drawable_swap(struct opengl_drawable *base)
+         gl->attachment_generation = attachment_generation;
+     }
+ 
++    if (!funcs->p_eglGetCurrentContext())
++    {
++        if (!egl_fallback_context)
++        {
++            egl_fallback_context = funcs->p_eglCreateContext(egl->display, EGL_NO_CONFIG_KHR,
++                                                             EGL_NO_CONTEXT, NULL);
++            if (!egl_fallback_context)
++            {
++                ERR("Failed to create fallback EGL context with error %#x.\n",
++                    funcs->p_eglGetError());
++                return TRUE;
++            }
++        }
++
++        if (!funcs->p_eglMakeCurrent(egl->display, gl->base.surface,
++                                     gl->base.surface, egl_fallback_context))
++        {
++            ERR("Failed to bind fallback EGL context with error %#x.\n",
++                funcs->p_eglGetError());
++            return TRUE;
++        }
++        fallback_bound = TRUE;
++    }
++
+     if (!gl->swap_interval_initialized)
+     {
+         gl->manual_frame_throttle = funcs->p_eglSwapInterval(egl->display, 0);
+@@ -362,12 +385,21 @@ static BOOL wayland_drawable_swap(struct opengl_drawable *base)
+         if (error == EGL_BAD_SURFACE && wayland_gl_drawable_recreate_egl_surface(gl))
+         {
+             gl->attachment_generation = ReadAcquire(&surface->attachment_generation);
+-            if (funcs->p_eglSwapBuffers(egl->display, gl->base.surface)) return TRUE;
++            if (funcs->p_eglSwapBuffers(egl->display, gl->base.surface)) goto done;
+             error = funcs->p_eglGetError();
+         }
+         ERR("eglSwapBuffers failed with error %#x.\n", error);
+     }
+ 
++done:
++    if (fallback_bound &&
++        !funcs->p_eglMakeCurrent(egl->display, EGL_NO_SURFACE,
++                                 EGL_NO_SURFACE, EGL_NO_CONTEXT))
++    {
++        WARN("Failed to release fallback EGL context with error %#x.\n",
++             funcs->p_eglGetError());
++    }
++
+     return TRUE;
+ }
+ 
+-- 
+2.51.0

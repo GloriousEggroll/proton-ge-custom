@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Thu, 25 Jun 2026 08:02:03 +0200
+Subject: [PATCH 15/49] wined3d: Support GL contexts without a window device
+ context.
+
+Let GL context (re)binding proceed when a swapchain has no window DC by
+falling back to a device backup DC, and guard the NULL-DC paths so a
+context can be made current for offscreen/dmabuf work. Also fix
+keep-mapped handling for GL_CLIENT_STORAGE_BIT buffer objects.
+---
+ dlls/wined3d/context_gl.c | 61 ++++++++++++++++++++++++++++++++-------
+ 1 file changed, 50 insertions(+), 11 deletions(-)
+
+diff --git a/dlls/wined3d/context_gl.c b/dlls/wined3d/context_gl.c
+index fc480f5a440..830ff95ad40 100644
+--- a/dlls/wined3d/context_gl.c
++++ b/dlls/wined3d/context_gl.c
+@@ -1170,6 +1170,9 @@ static BOOL wined3d_context_gl_set_pixel_format(struct wined3d_context_gl *conte
+     HDC dc = context_gl->dc;
+     int current;
+ 
++    if (!dc)
++        return FALSE;
++
+     if (private && context_gl->dc_has_format)
+         return TRUE;
+ 
+@@ -1292,19 +1295,36 @@ static void context_restore_gl_context(const struct wined3d_gl_info *gl_info, HD
+ 
+ static void wined3d_context_gl_update_window(struct wined3d_context_gl *context_gl)
+ {
+-    if (!context_gl->c.swapchain)
++    struct wined3d_swapchain *swapchain = context_gl->c.swapchain;
++    HDC dc;
++    BOOL private = FALSE;
++
++    if (!swapchain)
+         return;
+ 
+-    if (context_gl->window == context_gl->c.swapchain->win_handle &&
+-        context_gl->dc == context_gl->c.swapchain->dc)
++    dc = swapchain->dc;
++    if (!dc)
++    {
++        TRACE("Swapchain %p has no device context, using backup DC.\n", swapchain);
++
++        if (!(dc = wined3d_device_gl_get_backup_dc(wined3d_device_gl(context_gl->c.device))))
++        {
++            context_gl->valid = 0;
++            return;
++        }
++        private = TRUE;
++    }
++
++    if (context_gl->window == swapchain->win_handle && context_gl->dc == dc
++            && context_gl->dc_is_private == private)
+         return;
+ 
+-    TRACE("Updating context %p window from %p to %p.\n",
+-            context_gl, context_gl->window, context_gl->c.swapchain->win_handle);
++    TRACE("Updating context %p window from %p to %p, dc from %p to %p.\n",
++            context_gl, context_gl->window, swapchain->win_handle, context_gl->dc, dc);
+ 
+-    context_gl->window = context_gl->c.swapchain->win_handle;
+-    context_gl->dc = context_gl->c.swapchain->dc;
+-    context_gl->dc_is_private = FALSE;
++    context_gl->window = swapchain->win_handle;
++    context_gl->dc = dc;
++    context_gl->dc_is_private = private;
+     context_gl->dc_has_format = FALSE;
+     context_gl->needs_set = 1;
+     context_gl->valid = 1;
+@@ -1627,7 +1647,15 @@ static void wined3d_context_gl_enter(struct wined3d_context_gl *context_gl, bool
+         }
+         else if (!context_gl->needs_set && !(context_gl->dc_is_private && context_gl->dc_has_format))
+         {
+-            int current = context_gl->gl_info->gl_ops.wgl.p_wglGetPixelFormat(context_gl->dc);
++            int current;
++
++            if (!context_gl->dc)
++            {
++                context_gl->needs_set = 1;
++                return;
++            }
++
++            current = context_gl->gl_info->gl_ops.wgl.p_wglGetPixelFormat(context_gl->dc);
+ 
+             if ((current && current != context_gl->pixel_format) || (!current && !context_gl->internal_format_set))
+                 context_gl->needs_set = 1;
+@@ -2847,12 +2875,23 @@ map:
+     return bo->b.map_ptr;
+ }
+ 
++static bool wined3d_bo_gl_should_keep_mapped(const struct wined3d_bo_gl *bo,
++        const struct wined3d_context_gl *context_gl)
++{
++    if (!context_gl->c.d3d_info->persistent_map)
++        return false;
++
++    if (bo->flags & GL_CLIENT_STORAGE_BIT)
++        return true;
++
++    return context_gl->c.device->adapter->mapped_size <= MAX_PERSISTENT_MAPPED_BYTES;
++}
++
+ static void wined3d_bo_gl_unmap(struct wined3d_bo_gl *bo, struct wined3d_context_gl *context_gl)
+ {
+     const struct wined3d_gl_info *gl_info = context_gl->gl_info;
+ 
+-    if (context_gl->c.d3d_info->persistent_map
+-            && context_gl->c.device->adapter->mapped_size <= MAX_PERSISTENT_MAPPED_BYTES)
++    if (wined3d_bo_gl_should_keep_mapped(bo, context_gl))
+     {
+         TRACE("Not unmapping BO %p.\n", bo);
+         return;

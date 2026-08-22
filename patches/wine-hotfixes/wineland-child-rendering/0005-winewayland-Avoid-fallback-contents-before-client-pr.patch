@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Mon, 22 Jun 2026 20:01:31 +0200
+Subject: [PATCH 05/49] winewayland: Avoid fallback contents before client
+ presents
+
+---
+ dlls/winewayland.drv/wayland_surface.c | 28 +++++++++-----------------
+ dlls/winewayland.drv/window.c          | 20 +++++++++---------
+ 2 files changed, 20 insertions(+), 28 deletions(-)
+
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 3cb43a0d524..ad39bcfd229 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -2911,20 +2911,10 @@ static BOOL is_client_visible(HWND hwnd)
+ static void wayland_client_surface_update(struct client_surface *client)
+ {
+     struct wayland_client_surface *surface = impl_from_client_surface(client);
+-    HWND hwnd = client->hwnd, toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
+-    struct wayland_win_data *data;
+-    BOOL visible = FALSE;
+ 
+     TRACE("%s\n", debugstr_client_surface(client));
+-    if (toplevel) visible = is_client_visible(hwnd);
+-    if (!(data = wayland_win_data_get(hwnd))) return;
+-
+-    if (toplevel && visible)
+-        wayland_client_surface_attach(surface, toplevel);
+-    else
+-        wayland_client_surface_attach(surface, NULL);
+ 
+-    wayland_win_data_release(data);
++    set_client_surface(client->hwnd, surface);
+ }
+ 
+ static BOOL wayland_client_surface_is_hwnd_dmabuf_producer(struct wayland_client_surface *surface)
+@@ -3008,13 +2998,15 @@ void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
+         if ((old_client = data->client_surface))
+             wayland_client_surface_attach(old_client, NULL);
+ 
+-        if ((data->client_surface = new_client))
+-        {
+-            if (toplevel && visible)
+-                wayland_client_surface_attach(new_client, toplevel);
+-            else
+-                wayland_client_surface_attach(new_client, NULL);
+-        }
++        data->client_surface = new_client;
++    }
++
++    if (data->client_surface)
++    {
++        if (toplevel && is_client_visible(hwnd))
++            wayland_client_surface_attach(data->client_surface, toplevel);
++        else
++            wayland_client_surface_attach(data->client_surface, NULL);
+     }
+ 
+     wayland_win_data_release(data);
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index f8a2b0a8fd4..370585f591d 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -800,10 +800,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+             if (toplevel && NtUserIsWindowVisible(hwnd))
+                 wayland_client_surface_attach(client, toplevel);
+             else
+-            {
+                 wayland_client_surface_attach(client, NULL);
+-                data->client_surface = NULL;
+-            }
+         }
+         if (data->wayland_surface)
+         {
+@@ -1423,6 +1420,11 @@ static BOOL window_client_surface_attached(struct wayland_win_data *data)
+            data->client_surface->toplevel == data->hwnd;
+ }
+ 
++static BOOL window_client_surface_pending_first_frame(struct wayland_win_data *data)
++{
++    return data->client_surface && !data->client_surface->has_presented;
++}
++
+ /* Whether the flush path should snapshot child geometry for overlays before
+  * taking win_data_mutex in set_window_surface_contents. Overlays exist only
+  * while an attached client surface occludes the whole GDI buffer. Dmabuf
+@@ -1462,7 +1464,7 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
+                 wayland_surface_sync_alpha(wayland_surface);
+             }
+ 
+-            if (window_client_surface_attached(data) && !data->client_surface->has_presented)
++            if (window_client_surface_pending_first_frame(data))
+                 dummy_buffer = wayland_surface_create_dummy_buffer(wayland_surface,
+                                                                    WL_SHM_FORMAT_ARGB8888,
+                                                                    &dummy_damage);
+@@ -1486,13 +1488,11 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
+     }
+ 
+     /* An attached client stays attached on GDI commits. Detaching would flash
+-     * the empty GDI buffer. GDI children show via overlays instead. Only a
+-     * no-longer-attached client is cleaned up here. */
+-    if (committed && data->client_surface && !window_client_surface_attached(data))
+-    {
++     * the empty GDI buffer. Lifecycle callbacks clear dead client surfaces. */
++    if (committed && data->client_surface && !window_client_surface_attached(data) &&
++        !window_client_surface_pending_first_frame(data))
+         wayland_client_surface_attach(data->client_surface, NULL);
+-        data->client_surface = NULL;
+-    }
++
+     /* Update the latest window buffer for the wayland surface. Note that we
+      * only care whether the buffer contains the latest window contents,
+      * it's irrelevant if it was actually committed or not. */

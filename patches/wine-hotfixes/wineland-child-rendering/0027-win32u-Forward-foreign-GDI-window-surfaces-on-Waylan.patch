@@ -1,0 +1,874 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Sat, 4 Jul 2026 19:27:06 +0200
+Subject: [PATCH 27/49] win32u: Forward foreign GDI window surfaces on Wayland.
+
+X11 lets a foreign process draw directly into another process' window
+drawable. Wayland window buffers are process local, so software rendering
+multi-process clients that rely on foreign GetDC drawing can leave the
+owner window showing only its background.
+
+Add a Wayland only foreign GDI bridge. When a foreign HWND DC cannot target
+an in-process window surface, win32u backs it with a SHM producer surface
+and publishes stable slots over the existing hwnd dmabuf channel. The
+Wayland consumer accepts SHM producers alongside dmabuf producers,
+translates the wire fourcc values to wl_shm formats and composites the
+child producer through the existing punch-through path.
+
+Allocate the SHM ring lazily on the first real flush so hidden foreign
+windows that never paint do not reserve large buffers, keep dirty bounds
+across backpressure and mark replaced producer surfaces lost so stale
+frames are ignored.
+
+Fixes the Warframe launcher white window on Wayland.
+---
+ dlls/win32u/dce.c                      | 451 +++++++++++++++++++++++++
+ dlls/win32u/driver.c                   |  12 +
+ dlls/winewayland.drv/wayland_surface.c | 122 +++++--
+ dlls/winewayland.drv/waylanddrv_main.c |   6 +
+ include/wine/gdi_driver.h              |   3 +-
+ include/wine/hwnd_dmabuf.h             |   6 +
+ include/wine/server_protocol.h         |   2 +
+ server/protocol.def                    |   2 +
+ 8 files changed, 579 insertions(+), 25 deletions(-)
+
+diff --git a/dlls/win32u/dce.c b/dlls/win32u/dce.c
+index 1f58163fc52..216ae9fa7f6 100644
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -24,12 +24,16 @@
+ #endif
+ 
+ #include <assert.h>
++#include <limits.h>
+ #include <pthread.h>
++#include <unistd.h>
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+ #include "ntgdi_private.h"
+ #include "ntuser_private.h"
++#include "win32u_private.h"
+ #include "wine/opengl_driver.h"
++#include "wine/hwnd_dmabuf.h"
+ #include "wine/server.h"
+ #include "wine/debug.h"
+ 
+@@ -53,6 +57,437 @@ static struct list dce_list = LIST_INIT(dce_list);
+ static struct list window_surfaces = LIST_INIT( window_surfaces );
+ static pthread_mutex_t surfaces_lock = PTHREAD_MUTEX_INITIALIZER;
+ 
++#define FOREIGN_GDI_RING_SIZE 3
++
++struct foreign_gdi_slot
++{
++    HANDLE section;
++    void *bits;
++    int fd;
++    UINT64 release_token;
++    unsigned int image_id;
++    BOOL busy;
++};
++
++struct foreign_gdi_surface
++{
++    struct window_surface header;
++    struct list entry;
++    HWND hwnd;
++    int channel_fd;
++    UINT64 producer_unique_id;
++    UINT64 next_release_token;
++    unsigned int frame_seq;
++    unsigned int ring_generation;
++    int width, height, stride, size;
++    BOOL lost, slots_created, linked;
++    struct foreign_gdi_slot slots[FOREIGN_GDI_RING_SIZE];
++};
++
++static struct list foreign_gdi_surfaces = LIST_INIT( foreign_gdi_surfaces );
++static pthread_mutex_t foreign_gdi_lock = PTHREAD_MUTEX_INITIALIZER;
++static LONGLONG volatile foreign_gdi_next_producer_id;
++
++static struct foreign_gdi_surface *foreign_gdi_surface_from_window_surface( struct window_surface *surface )
++{
++    return CONTAINING_RECORD( surface, struct foreign_gdi_surface, header );
++}
++
++static void foreign_gdi_slot_destroy( struct foreign_gdi_slot *slot )
++{
++    if (slot->fd >= 0) close( slot->fd );
++    if (slot->bits) NtUnmapViewOfSection( GetCurrentProcess(), slot->bits );
++    if (slot->section) NtClose( slot->section );
++    memset( slot, 0, sizeof(*slot) );
++    slot->fd = -1;
++}
++
++static BOOL foreign_gdi_slot_create( struct foreign_gdi_slot *slot, unsigned int image_id, int size )
++{
++    LARGE_INTEGER section_size;
++    SIZE_T view_size = 0;
++    NTSTATUS status;
++
++    memset( slot, 0, sizeof(*slot) );
++    slot->fd = -1;
++    slot->image_id = image_id;
++
++    section_size.QuadPart = size;
++    status = NtCreateSection( &slot->section, GENERIC_READ | SECTION_MAP_READ | SECTION_MAP_WRITE,
++                              NULL, &section_size, PAGE_READWRITE, SEC_COMMIT, 0 );
++    if (status)
++    {
++        WARN( "failed to create foreign GDI shm section status %#x\n", status );
++        return FALSE;
++    }
++
++    status = NtMapViewOfSection( slot->section, GetCurrentProcess(), &slot->bits, 0, 0, NULL,
++                                 &view_size, ViewUnmap, 0, PAGE_READWRITE );
++    if (status)
++    {
++        WARN( "failed to map foreign GDI shm section status %#x\n", status );
++        foreign_gdi_slot_destroy( slot );
++        return FALSE;
++    }
++
++    status = wine_server_handle_to_fd( slot->section, FILE_READ_DATA, &slot->fd, NULL );
++    if (status)
++    {
++        WARN( "failed to export foreign GDI shm section status %#x\n", status );
++        foreign_gdi_slot_destroy( slot );
++        return FALSE;
++    }
++
++    return TRUE;
++}
++
++static BOOL foreign_gdi_surface_ensure_slots( struct foreign_gdi_surface *surface )
++{
++    unsigned int i;
++
++    if (surface->slots_created) return TRUE;
++
++    for (i = 0; i < FOREIGN_GDI_RING_SIZE; i++)
++        if (!foreign_gdi_slot_create( &surface->slots[i], i, surface->size ))
++        {
++            while (i--) foreign_gdi_slot_destroy( &surface->slots[i] );
++            return FALSE;
++        }
++
++    surface->slots_created = TRUE;
++    TRACE( "foreign_gdi hwnd=%p allocated %u shm slots size=%d\n",
++           surface->hwnd, FOREIGN_GDI_RING_SIZE, surface->size );
++    return TRUE;
++}
++
++static void foreign_gdi_surface_close_channel( struct foreign_gdi_surface *surface )
++{
++    if (surface->channel_fd >= 0)
++    {
++        hwnd_dmabuf_close_channel( surface->hwnd, surface->channel_fd );
++        surface->channel_fd = -1;
++    }
++}
++
++static BOOL foreign_gdi_surface_ensure_channel( struct foreign_gdi_surface *surface )
++{
++    LONGLONG producer_id;
++
++    if (surface->lost) return FALSE;
++    if (surface->channel_fd >= 0) return TRUE;
++
++    if ((surface->channel_fd = hwnd_dmabuf_open_channel( surface->hwnd )) < 0)
++    {
++        surface->lost = TRUE;
++        TRACE( "foreign_gdi hwnd=%p failed to open producer channel\n", surface->hwnd );
++        return FALSE;
++    }
++
++    producer_id = InterlockedIncrement64( &foreign_gdi_next_producer_id );
++    if (!producer_id) producer_id = InterlockedIncrement64( &foreign_gdi_next_producer_id );
++    surface->producer_unique_id = producer_id;
++    surface->ring_generation++;
++    if (!surface->ring_generation) surface->ring_generation++;
++    TRACE( "foreign_gdi hwnd=%p opened producer channel fd=%d producer=%s generation=%u\n",
++           surface->hwnd, surface->channel_fd, wine_dbgstr_longlong(surface->producer_unique_id),
++           surface->ring_generation );
++    return TRUE;
++}
++
++static void foreign_gdi_surface_drain_releases( struct foreign_gdi_surface *surface )
++{
++    hwnd_dmabuf_release_t rel;
++    int ret;
++
++    if (surface->channel_fd < 0) return;
++    while ((ret = hwnd_dmabuf_channel_recv_release( surface->channel_fd, &rel )) == HWND_DMABUF_CHANNEL_OK)
++    {
++        struct foreign_gdi_slot *slot;
++
++        if (rel.producer_unique_id != surface->producer_unique_id) continue;
++        if (rel.ring_generation != surface->ring_generation) continue;
++        if (rel.image_id >= FOREIGN_GDI_RING_SIZE) continue;
++
++        slot = &surface->slots[rel.image_id];
++        if (!slot->release_token || slot->release_token != rel.release_token) continue;
++
++        slot->busy = FALSE;
++        slot->release_token = 0;
++        TRACE( "foreign_gdi hwnd=%p released slot=%u flags=%#x\n",
++               surface->hwnd, rel.image_id, rel.flags );
++    }
++
++    if (ret == HWND_DMABUF_CHANNEL_CLOSED)
++    {
++        surface->lost = TRUE;
++        foreign_gdi_surface_close_channel( surface );
++    }
++}
++
++static struct foreign_gdi_slot *foreign_gdi_surface_get_free_slot( struct foreign_gdi_surface *surface )
++{
++    unsigned int i;
++
++    foreign_gdi_surface_drain_releases( surface );
++    for (i = 0; i < FOREIGN_GDI_RING_SIZE; i++)
++        if (!surface->slots[i].busy)
++            return &surface->slots[i];
++    return NULL;
++}
++
++static void foreign_gdi_copy_frame( struct foreign_gdi_surface *surface, struct foreign_gdi_slot *slot,
++                                    const BITMAPINFO *color_info, const void *color_bits )
++{
++    int height = abs( color_info->bmiHeader.biHeight );
++    int src_stride = color_info->bmiHeader.biSizeImage / max( 1, height );
++    int copy_stride = min( src_stride, surface->stride );
++    const char *src = color_bits;
++    char *dst = slot->bits;
++    int y, rows = min( height, surface->height );
++
++    for (y = 0; y < rows; y++)
++        memcpy( dst + y * surface->stride, src + y * src_stride, copy_stride );
++}
++
++static UINT64 foreign_gdi_surface_next_release_token( struct foreign_gdi_surface *surface )
++{
++    UINT64 token = ++surface->next_release_token;
++
++    if (!token) token = ++surface->next_release_token;
++    return token;
++}
++
++static void foreign_gdi_fill_dirty_rect( hwnd_dmabuf_frame_desc_t *desc, const RECT *dirty )
++{
++    RECT rect = *dirty;
++
++    rect.left = max( 0, min( rect.left, (LONG)desc->width ) );
++    rect.top = max( 0, min( rect.top, (LONG)desc->height ) );
++    rect.right = max( rect.left, min( rect.right, (LONG)desc->width ) );
++    rect.bottom = max( rect.top, min( rect.bottom, (LONG)desc->height ) );
++
++    desc->dirty_count = 1;
++    desc->dirty_rects[0][0] = min( rect.left, 0xffff );
++    desc->dirty_rects[0][1] = min( rect.top, 0xffff );
++    desc->dirty_rects[0][2] = min( rect.right, 0xffff );
++    desc->dirty_rects[0][3] = min( rect.bottom, 0xffff );
++}
++
++static BOOL foreign_gdi_surface_flush( struct window_surface *window_surface, const RECT *rect, const RECT *dirty,
++                                       const BITMAPINFO *color_info, const void *color_bits, BOOL shape_changed,
++                                       const BITMAPINFO *shape_info, const void *shape_bits )
++{
++    struct foreign_gdi_surface *surface = foreign_gdi_surface_from_window_surface( window_surface );
++    struct foreign_gdi_slot *slot;
++    hwnd_dmabuf_frame_desc_t desc;
++    int ret;
++
++    if (surface->lost) return TRUE;
++    if (!foreign_gdi_surface_ensure_slots( surface )) return FALSE;
++    if (!foreign_gdi_surface_ensure_channel( surface )) return TRUE;
++    if (!(slot = foreign_gdi_surface_get_free_slot( surface )))
++    {
++        TRACE( "foreign_gdi hwnd=%p no free shm slot, keeping dirty=%s\n",
++               surface->hwnd, wine_dbgstr_rect(dirty) );
++        return FALSE;
++    }
++
++    foreign_gdi_copy_frame( surface, slot, color_info, color_bits );
++
++    memset( &desc, 0, sizeof(desc) );
++    desc.version = HWND_DMABUF_DESC_VERSION_V1;
++    desc.flags = HWND_DMABUF_FLAG_SHM | HWND_DMABUF_FLAG_STABLE_SLOT;
++    desc.width = surface->width;
++    desc.height = surface->height;
++    desc.fourcc = HWND_DMABUF_SHM_FORMAT_XRGB8888;
++    desc.stride = surface->stride;
++    desc.frame_seq = ++surface->frame_seq;
++    desc.ring_generation = surface->ring_generation;
++    desc.image_id = slot->image_id;
++    desc.modifier = HWND_DMABUF_MOD_LINEAR;
++    desc.producer_unique_id = surface->producer_unique_id;
++    desc.release_token = foreign_gdi_surface_next_release_token( surface );
++    desc.alpha_mode = HWND_DMABUF_ALPHA_MODE_IGNORE;
++    desc.plane_count = 1;
++    desc.plane_offsets[0] = 0;
++    desc.plane_strides[0] = surface->stride;
++    foreign_gdi_fill_dirty_rect( &desc, dirty );
++
++    slot->busy = TRUE;
++    slot->release_token = desc.release_token;
++    ret = hwnd_dmabuf_channel_publish( surface->hwnd, surface->channel_fd, &desc, slot->fd );
++    if (ret == HWND_DMABUF_CHANNEL_OK)
++    {
++        TRACE( "foreign_gdi hwnd=%p published shm slot=%u seq=%u size=%ux%u dirty=%s token=%s\n",
++               surface->hwnd, slot->image_id, desc.frame_seq, desc.width, desc.height,
++               wine_dbgstr_rect(dirty), wine_dbgstr_longlong(desc.release_token) );
++        return TRUE;
++    }
++
++    slot->busy = FALSE;
++    slot->release_token = 0;
++    WARN( "foreign_gdi hwnd=%p failed to publish shm slot=%u ret=%d\n",
++          surface->hwnd, slot->image_id, ret );
++    if (ret == HWND_DMABUF_CHANNEL_CLOSED)
++    {
++        surface->lost = TRUE;
++        foreign_gdi_surface_close_channel( surface );
++        return TRUE;
++    }
++    return FALSE;
++}
++
++static void foreign_gdi_surface_set_clip( struct window_surface *surface, const RECT *rects, UINT count )
++{
++}
++
++static void foreign_gdi_surface_destroy( struct window_surface *window_surface )
++{
++    struct foreign_gdi_surface *surface = foreign_gdi_surface_from_window_surface( window_surface );
++    unsigned int i;
++
++    pthread_mutex_lock( &foreign_gdi_lock );
++    if (surface->linked)
++    {
++        list_remove( &surface->entry );
++        surface->linked = FALSE;
++    }
++    pthread_mutex_unlock( &foreign_gdi_lock );
++
++    foreign_gdi_surface_close_channel( surface );
++    for (i = 0; i < FOREIGN_GDI_RING_SIZE; i++)
++        foreign_gdi_slot_destroy( &surface->slots[i] );
++}
++
++static const struct window_surface_funcs foreign_gdi_surface_funcs =
++{
++    foreign_gdi_surface_set_clip,
++    foreign_gdi_surface_flush,
++    foreign_gdi_surface_destroy
++};
++
++static struct foreign_gdi_surface *foreign_gdi_surface_create( HWND hwnd, int width, int height )
++{
++    char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
++    BITMAPINFO *info = (BITMAPINFO *)buffer;
++    struct foreign_gdi_surface *surface;
++    struct window_surface *window_surface;
++    RECT rect = {0, 0, width, height};
++    unsigned int i;
++
++    if (width <= 0 || height <= 0) return NULL;
++    if (width > INT_MAX / 4) return NULL;
++    if (height > INT_MAX / (width * 4)) return NULL;
++
++    memset( info, 0, sizeof(*info) );
++    info->bmiHeader.biSize = sizeof(info->bmiHeader);
++    info->bmiHeader.biWidth = width;
++    info->bmiHeader.biHeight = -height;
++    info->bmiHeader.biPlanes = 1;
++    info->bmiHeader.biBitCount = 32;
++    info->bmiHeader.biCompression = BI_RGB;
++    info->bmiHeader.biSizeImage = get_dib_image_size( info );
++
++    if (!(window_surface = window_surface_create( sizeof(*surface), &foreign_gdi_surface_funcs,
++                                                  hwnd, &rect, info, 0 )))
++        return NULL;
++
++    surface = foreign_gdi_surface_from_window_surface( window_surface );
++    surface->hwnd = hwnd;
++    surface->channel_fd = -1;
++    surface->width = width;
++    surface->height = height;
++    surface->stride = width * 4;
++    surface->size = surface->stride * height;
++    surface->ring_generation = 1;
++    for (i = 0; i < FOREIGN_GDI_RING_SIZE; i++)
++        surface->slots[i].fd = -1;
++
++    TRACE( "foreign_gdi hwnd=%p created producer surface %p size=%dx%d\n",
++           hwnd, surface, width, height );
++    return surface;
++}
++
++static struct window_surface *foreign_gdi_surface_get( HWND hwnd, const RECT *win_rect )
++{
++    struct foreign_gdi_surface *surface, *old = NULL, *created;
++    int width = win_rect->right - win_rect->left;
++    int height = win_rect->bottom - win_rect->top;
++
++    if (width <= 0 || height <= 0) return NULL;
++
++    pthread_mutex_lock( &foreign_gdi_lock );
++    LIST_FOR_EACH_ENTRY( surface, &foreign_gdi_surfaces, struct foreign_gdi_surface, entry )
++    {
++        if (surface->hwnd != hwnd) continue;
++        if (surface->width == width && surface->height == height && !surface->lost)
++        {
++            window_surface_add_ref( &surface->header );
++            pthread_mutex_unlock( &foreign_gdi_lock );
++            return &surface->header;
++        }
++        list_remove( &surface->entry );
++        surface->linked = FALSE;
++        old = surface;
++        break;
++    }
++    pthread_mutex_unlock( &foreign_gdi_lock );
++
++    if (old)
++    {
++        window_surface_lock( &old->header );
++        old->lost = TRUE;
++        foreign_gdi_surface_close_channel( old );
++        window_surface_unlock( &old->header );
++        register_window_surface( &old->header, NULL );
++        window_surface_release( &old->header );
++    }
++
++    if (!(created = foreign_gdi_surface_create( hwnd, width, height ))) return NULL;
++
++    pthread_mutex_lock( &foreign_gdi_lock );
++    LIST_FOR_EACH_ENTRY( surface, &foreign_gdi_surfaces, struct foreign_gdi_surface, entry )
++    {
++        if (surface->hwnd != hwnd) continue;
++        if (surface->width == width && surface->height == height && !surface->lost)
++        {
++            window_surface_add_ref( &surface->header );
++            pthread_mutex_unlock( &foreign_gdi_lock );
++            window_surface_release( &created->header );
++            return &surface->header;
++        }
++    }
++    list_add_tail( &foreign_gdi_surfaces, &created->entry );
++    created->linked = TRUE;
++    window_surface_add_ref( &created->header );
++    pthread_mutex_unlock( &foreign_gdi_lock );
++
++    register_window_surface( NULL, &created->header );
++    return &created->header;
++}
++
++static void foreign_gdi_surface_flush_hwnd( HWND hwnd )
++{
++    struct foreign_gdi_surface *surface;
++    struct window_surface *window_surface = NULL;
++
++    pthread_mutex_lock( &foreign_gdi_lock );
++    LIST_FOR_EACH_ENTRY( surface, &foreign_gdi_surfaces, struct foreign_gdi_surface, entry )
++    {
++        if (surface->hwnd != hwnd) continue;
++        window_surface = &surface->header;
++        window_surface_add_ref( window_surface );
++        break;
++    }
++    pthread_mutex_unlock( &foreign_gdi_lock );
++
++    if (window_surface)
++    {
++        window_surface_flush( window_surface );
++        window_surface_release( window_surface );
++    }
++}
++
+ /*******************************************************************
+  * Dummy window surface for windows that shouldn't get painted.
+  */
+@@ -858,6 +1293,7 @@ static void update_visible_region( struct dce *dce )
+     UINT raw_dpi;
+     DWORD layered_flags;
+     WND *win;
++    BOOL foreign = dce->hwnd && !is_current_process_window( dce->hwnd );
+ 
+     /* don't clip siblings if using parent clip region */
+     if (flags & DCX_PARENTCLIP) flags &= ~DCX_CLIPSIBLINGS;
+@@ -920,9 +1356,21 @@ static void update_visible_region( struct dce *dce )
+     }
+     else
+     {
++        struct window_surface *foreign_surface = NULL;
+         RECT window_rect, toplevel_rect;
+         UINT dpi;
+ 
++        if (foreign && user_driver->pUseForeignGdiBridge())
++            foreign_surface = foreign_gdi_surface_get( dce->hwnd, &win_rect );
++
++        if (foreign_surface)
++        {
++            user_driver->pGetDC( dce->hdc, dce->hwnd, top_win, &win_rect, &win_rect, flags );
++            set_visible_region( dce->hdc, vis_rgn, &win_rect, &win_rect, foreign_surface, 0, 0 );
++            window_surface_release( foreign_surface );
++            return;
++        }
++
+         get_win_monitor_dpi( top_win, &raw_dpi );
+         dpi = get_dpi_for_window( top_win );
+ 
+@@ -1459,7 +1907,10 @@ HDC WINAPI NtUserGetDCEx( HWND hwnd, HRGN clip_rgn, DWORD flags )
+ INT WINAPI NtUserReleaseDC( HWND hwnd, HDC hdc )
+ {
+     if (hwnd && !is_current_process_window( hwnd ))
++    {
++        foreign_gdi_surface_flush_hwnd( hwnd );
+         user_driver->pProcessEvents( 0 );
++    }
+ 
+     return release_dc( hwnd, hdc, FALSE );
+ }
+diff --git a/dlls/win32u/driver.c b/dlls/win32u/driver.c
+index c7e84e2c3b0..8bedab54e1d 100644
+--- a/dlls/win32u/driver.c
++++ b/dlls/win32u/driver.c
+@@ -907,6 +907,11 @@ static void nulldrv_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_h
+ {
+ }
+ 
++static BOOL nulldrv_UseForeignGdiBridge(void)
++{
++    return FALSE;
++}
++
+ static BOOL nulldrv_SystemParametersInfo( UINT action, UINT int_param, void *ptr_param, UINT flags )
+ {
+     return FALSE;
+@@ -1262,6 +1267,11 @@ static UINT loaderdrv_OpenGLInit( UINT version, const struct opengl_funcs *openg
+     return load_driver()->pOpenGLInit( version, opengl_funcs, driver_funcs );
+ }
+ 
++static BOOL loaderdrv_UseForeignGdiBridge(void)
++{
++    return load_driver()->pUseForeignGdiBridge();
++}
++
+ static const struct user_driver_funcs lazy_load_driver =
+ {
+     { NULL },
+@@ -1331,6 +1341,7 @@ static const struct user_driver_funcs lazy_load_driver =
+     nulldrv_CreateWindowSurface,
+     nulldrv_MoveWindowBits,
+     nulldrv_WindowPosChanged,
++    loaderdrv_UseForeignGdiBridge,
+     /* system parameters */
+     nulldrv_SystemParametersInfo,
+     /* wintab support */
+@@ -1433,6 +1444,7 @@ void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version
+     SET_USER_FUNC(CreateWindowSurface);
+     SET_USER_FUNC(MoveWindowBits);
+     SET_USER_FUNC(WindowPosChanged);
++    SET_USER_FUNC(UseForeignGdiBridge);
+     SET_USER_FUNC(SystemParametersInfo);
+     SET_USER_FUNC(WintabProc);
+     SET_USER_FUNC(VulkanInit);
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 7c0281ecbdf..09e5489f16f 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -25,6 +25,7 @@
+ #include "config.h"
+ 
+ #include <assert.h>
++#include <limits.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <time.h>
+@@ -2244,15 +2245,59 @@ static int wayland_hwnd_dmabuf_channel_recv_one(int channel_fd, hwnd_dmabuf_fram
+     return 1;
+ }
+ 
+-/* Build a wl_buffer wrapping the dmabuf fd plus its tracking buffer, cached on the
+- * surface. Does not close fd (caller owns it). Returns NULL on failure. */
+-static struct wayland_hwnd_dmabuf_buffer *wayland_hwnd_dmabuf_create_buffer(
+-        struct wayland_hwnd_dmabuf_surface *surface, const hwnd_dmabuf_frame_desc_t *desc,
+-        int fd, BOOL stable_slot)
++static BOOL wayland_hwnd_dmabuf_desc_is_shm(const hwnd_dmabuf_frame_desc_t *desc)
++{
++    return !!(desc->flags & HWND_DMABUF_FLAG_SHM);
++}
++
++static BOOL wayland_hwnd_shm_format_from_fourcc(unsigned int fourcc, uint32_t *format)
++{
++    switch (fourcc)
++    {
++    case HWND_DMABUF_SHM_FORMAT_XRGB8888:
++        if (format) *format = WL_SHM_FORMAT_XRGB8888;
++        return TRUE;
++    case HWND_DMABUF_SHM_FORMAT_ARGB8888:
++        if (format) *format = WL_SHM_FORMAT_ARGB8888;
++        return TRUE;
++    default:
++        return FALSE;
++    }
++}
++
++static struct wl_buffer *wayland_hwnd_dmabuf_create_shm_wl_buffer(
++        struct wayland_hwnd_dmabuf_surface *surface, const hwnd_dmabuf_frame_desc_t *desc, int fd)
++{
++    struct wl_shm_pool *pool;
++    struct wl_buffer *wl_buffer;
++    uint32_t format;
++    UINT64 size;
++
++    if (!process_wayland.wl_shm || fd < 0) return NULL;
++    if (!wayland_hwnd_shm_format_from_fourcc(desc->fourcc, &format)) return NULL;
++    if (!desc->stride || desc->height > (UINT_MAX - desc->offset) / desc->stride) return NULL;
++    size = desc->offset + (UINT64)desc->stride * desc->height;
++    if (!size || size > INT_MAX) return NULL;
++
++    if (!(pool = wl_shm_create_pool(process_wayland.wl_shm, fd, (int)size)))
++        return NULL;
++    wl_buffer = wl_shm_pool_create_buffer(pool, desc->offset, desc->width, desc->height,
++                                          desc->stride, format);
++    wl_shm_pool_destroy(pool);
++    if (!wl_buffer)
++        WARN("hwnd=%p failed to create shm buffer size=%ux%u stride=%u fourcc=%#x format=%#x\n",
++             surface->hwnd, desc->width, desc->height, desc->stride, desc->fourcc, format);
++    return wl_buffer;
++}
++
++static struct wl_buffer *wayland_hwnd_dmabuf_create_dmabuf_wl_buffer(
++        struct wayland_hwnd_dmabuf_surface *surface, const hwnd_dmabuf_frame_desc_t *desc, int fd)
+ {
+-    struct wayland_hwnd_dmabuf_buffer *buffer;
+     struct zwp_linux_buffer_params_v1 *params;
+     unsigned int i, plane_count = desc->plane_count;
++    struct wl_buffer *wl_buffer;
++
++    if (!process_wayland.zwp_linux_dmabuf_v1 || fd < 0) return NULL;
+ 
+     if (plane_count < 1) plane_count = 1;
+     if (plane_count > HWND_DMABUF_MAX_PLANES) plane_count = HWND_DMABUF_MAX_PLANES;
+@@ -2263,25 +2308,40 @@ static struct wayland_hwnd_dmabuf_buffer *wayland_hwnd_dmabuf_create_buffer(
+     for (i = 0; i < plane_count; i++)
+         zwp_linux_buffer_params_v1_add(params, fd, i, desc->plane_offsets[i], desc->plane_strides[i],
+                                        desc->modifier >> 32, desc->modifier & 0xffffffff);
+-    if (!(buffer = calloc(1, sizeof(*buffer))))
+-    {
+-        zwp_linux_buffer_params_v1_destroy(params);
+-        return NULL;
+-    }
+-    buffer->channel_fd = -1;
+-    buffer->wl_buffer = zwp_linux_buffer_params_v1_create_immed(params, desc->width, desc->height,
+-                                                                desc->fourcc, 0);
++    wl_buffer = zwp_linux_buffer_params_v1_create_immed(params, desc->width, desc->height,
++                                                        desc->fourcc, 0);
+     zwp_linux_buffer_params_v1_destroy(params);
+-    if (!buffer->wl_buffer)
+-    {
++    if (!wl_buffer)
+         WARN("hwnd=%p failed to create dmabuf buffer size=%ux%u fourcc=%#x "
+              "modifier=0x%08x%08x stride=%u alpha=%u\n",
+              surface->hwnd, desc->width, desc->height, desc->fourcc,
+              (unsigned int)(desc->modifier >> 32), (unsigned int)desc->modifier,
+              desc->stride, desc->alpha_mode);
+-        free(buffer);
++    return wl_buffer;
++}
++
++/* Build a wl_buffer wrapping the producer fd plus its tracking buffer, cached on the
++ * surface. Does not close fd (caller owns it). Returns NULL on failure. */
++static struct wayland_hwnd_dmabuf_buffer *wayland_hwnd_dmabuf_create_buffer(
++        struct wayland_hwnd_dmabuf_surface *surface, const hwnd_dmabuf_frame_desc_t *desc,
++        int fd, BOOL stable_slot)
++{
++    struct wayland_hwnd_dmabuf_buffer *buffer;
++    struct wl_buffer *wl_buffer;
++
++    if (wayland_hwnd_dmabuf_desc_is_shm(desc))
++        wl_buffer = wayland_hwnd_dmabuf_create_shm_wl_buffer(surface, desc, fd);
++    else
++        wl_buffer = wayland_hwnd_dmabuf_create_dmabuf_wl_buffer(surface, desc, fd);
++    if (!wl_buffer) return NULL;
++
++    if (!(buffer = calloc(1, sizeof(*buffer))))
++    {
++        wl_buffer_destroy(wl_buffer);
+         return NULL;
+     }
++    buffer->channel_fd = -1;
++    buffer->wl_buffer = wl_buffer;
+     buffer->ref = 1;  /* owner ref. A compositor ref is added per attach in the update loop */
+     buffer->surface = surface;
+     buffer->producer_unique_id = desc->producer_unique_id;
+@@ -2323,7 +2383,7 @@ static void wayland_hwnd_dmabuf_attach_current(struct wayland_hwnd_dmabuf_surfac
+     if (!buffer) return;
+     if (!surface->logged_first_attach)
+     {
+-        TRACE("hwnd=%p attaching dmabuf slot=%u size=%dx%d fourcc=%#x alpha=%u\n",
++        TRACE("hwnd=%p attaching producer slot=%u size=%dx%d fourcc=%#x alpha=%u\n",
+               surface->hwnd, buffer->image_id, buffer->width, buffer->height,
+               buffer->fourcc, buffer->alpha_mode);
+         surface->logged_first_attach = TRUE;
+@@ -2348,7 +2408,7 @@ static void wayland_hwnd_dmabuf_drop_current_frame(struct wayland_hwnd_dmabuf_su
+ }
+ 
+ /* Stable-slot path (HWND_DMABUF_FLAG_STABLE_SLOT): ensure this slot is imported and cached
+- * (no attach). The producer sends a slot's dmabuf fd only once, then fd-less references:
++ * (no attach). The producer may send a slot fd once, then fd-less references:
+  *  - cache hit (exact layout match): reuse the cached wl_buffer.
+  *  - fd-bearing miss: import and cache it.
+  *  - fd-less miss: the slot is not cached -> return NULL. The failed release clears the
+@@ -2425,6 +2485,14 @@ static BOOL wayland_hwnd_dmabuf_desc_is_valid(const hwnd_dmabuf_frame_desc_t *de
+            desc->stride && desc->fourcc && desc->release_token;
+ }
+ 
++static BOOL wayland_hwnd_dmabuf_desc_format_supported(const hwnd_dmabuf_frame_desc_t *desc)
++{
++    if (wayland_hwnd_dmabuf_desc_is_shm(desc))
++        return process_wayland.wl_shm && wayland_hwnd_shm_format_from_fourcc(desc->fourcc, NULL);
++    return process_wayland.zwp_linux_dmabuf_v1 &&
++           wayland_dmabuf_format_supported(desc->fourcc, desc->modifier);
++}
++
+ /* Drain the channel, importing every fd-bearing slot so none is lost, then show the newest
+  * frame. Stable-slot producers send a slot's fd once and fd-less references after. The fd
+  * is dup'd + passed via SCM_RIGHTS once per slot, not once per frame. created_buffer reports
+@@ -2451,7 +2519,7 @@ retry:
+     {
+         BOOL desc_valid = wayland_hwnd_dmabuf_desc_is_valid(&desc);
+         BOOL format_supported = desc_valid &&
+-                wayland_dmabuf_format_supported(desc.fourcc, desc.modifier);
++                wayland_hwnd_dmabuf_desc_format_supported(&desc);
+ 
+         if (!desc_valid || !format_supported)
+         {
+@@ -2499,9 +2567,10 @@ retry:
+         *created_buffer = TRUE;
+         if (!surface->logged_first_import)
+         {
+-            TRACE("hwnd=%p imported dmabuf seq=%u slot=%u size=%ux%u "
++            TRACE("hwnd=%p imported %s seq=%u slot=%u size=%ux%u "
+                   "fourcc=%#x modifier=0x%08x%08x alpha=%u flags=%#x\n",
+-                  surface->hwnd, pdesc.frame_seq, pdesc.image_id,
++                  surface->hwnd, wayland_hwnd_dmabuf_desc_is_shm(&pdesc) ? "shm" : "dmabuf",
++                  pdesc.frame_seq, pdesc.image_id,
+                   pdesc.width, pdesc.height, pdesc.fourcc,
+                   (unsigned int)(pdesc.modifier >> 32),
+                   (unsigned int)pdesc.modifier, pdesc.alpha_mode, pdesc.flags);
+@@ -2688,6 +2757,12 @@ static BOOL wayland_surface_update_direct_dmabuf(struct wayland_surface *surface
+     BOOL created_buffer, attached_frame = FALSE;
+     int width, height;
+ 
++    if (!process_wayland.zwp_linux_dmabuf_v1)
++    {
++        wayland_surface_clear_direct_dmabuf(surface, data);
++        return FALSE;
++    }
++
+     if (!wayland_surface_direct_dmabuf_candidate(surface, data, frames, count))
+     {
+         wayland_surface_clear_direct_dmabuf(surface, data);
+@@ -2853,8 +2928,7 @@ static void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
+     unsigned long long now = wayland_time_ms();
+     BOOL any_new = FALSE;
+ 
+-    if (!process_wayland.zwp_linux_dmabuf_v1) return;
+-    /* dmabuf children are composited for primary surfaces. */
++    /* Producer children are composited for primary surfaces. */
+     if (!wayland_surface_is_toplevel(surface) && !wayland_surface_is_popup(surface) &&
+         !wayland_surface_is_layer(surface))
+         return;
+diff --git a/dlls/winewayland.drv/waylanddrv_main.c b/dlls/winewayland.drv/waylanddrv_main.c
+index 4612a14d30d..f93ae4cc8d3 100644
+--- a/dlls/winewayland.drv/waylanddrv_main.c
++++ b/dlls/winewayland.drv/waylanddrv_main.c
+@@ -37,6 +37,11 @@ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
+ char *process_name = NULL;
+ char *process_activate_token = NULL;
+ 
++static BOOL WAYLAND_UseForeignGdiBridge(void)
++{
++    return TRUE;
++}
++
+ static const struct user_driver_funcs waylanddrv_funcs =
+ {
+     .pActivateWindow = WAYLAND_ActivateWindow,
+@@ -62,6 +67,7 @@ static const struct user_driver_funcs waylanddrv_funcs =
+     .pWindowPosChanged = WAYLAND_WindowPosChanged,
+     .pWindowPosChanging = WAYLAND_WindowPosChanging,
+     .pCreateWindowSurface = WAYLAND_CreateWindowSurface,
++    .pUseForeignGdiBridge = WAYLAND_UseForeignGdiBridge,
+     .pGetWindowStyleMasks = WAYLAND_GetWindowStyleMasks,
+     .pGetWindowStateUpdates = WAYLAND_GetWindowStateUpdates,
+     .pGetWindowMaxTrackSize = WAYLAND_GetWindowMaxTrackSize,
+diff --git a/include/wine/gdi_driver.h b/include/wine/gdi_driver.h
+index 455e090512c..4e3c3d04d03 100644
+--- a/include/wine/gdi_driver.h
++++ b/include/wine/gdi_driver.h
+@@ -218,7 +218,7 @@ struct gdi_dc_funcs
+ };
+ 
+ /* increment this when you change the DC function table */
+-#define WINE_GDI_DRIVER_VERSION 110
++#define WINE_GDI_DRIVER_VERSION 111
+ 
+ #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
+ #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
+@@ -469,6 +469,7 @@ struct user_driver_funcs
+     BOOL    (*pCreateWindowSurface)(HWND,BOOL,const RECT *,struct window_surface**);
+     void    (*pMoveWindowBits)(HWND,const struct window_rects *,const struct window_rects *,const RECT *);
+     void    (*pWindowPosChanged)(HWND,HWND,HWND,UINT,const struct window_rects*,struct window_surface*);
++    BOOL    (*pUseForeignGdiBridge)(void);
+     /* system parameters */
+     BOOL    (*pSystemParametersInfo)(UINT,UINT,void*,UINT);
+     /* wintab support */
+diff --git a/include/wine/hwnd_dmabuf.h b/include/wine/hwnd_dmabuf.h
+index 8646bb7dd09..25ce5fefa23 100644
+--- a/include/wine/hwnd_dmabuf.h
++++ b/include/wine/hwnd_dmabuf.h
+@@ -12,6 +12,12 @@
+ #define HWND_DMABUF_ALPHA_MODE_UNSPECIFIED     0
+ #define HWND_DMABUF_ALPHA_MODE_IGNORE          3
+ 
++/* DRM fourcc values carried in hwnd_dmabuf_frame_desc_t.fourcc when
++ * HWND_DMABUF_FLAG_SHM is set. Consumers translate them to native shm
++ * protocol formats where needed. */
++#define HWND_DMABUF_SHM_FORMAT_XRGB8888        0x34325258 /* 'XR24' */
++#define HWND_DMABUF_SHM_FORMAT_ARGB8888        0x34325241 /* 'AR24' */
++
+ enum hwnd_dmabuf_channel_result
+ {
+     HWND_DMABUF_CHANNEL_OK = 0,
+diff --git a/include/wine/server_protocol.h b/include/wine/server_protocol.h
+index b735b8e7591..431f7870231 100644
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -285,6 +285,8 @@ enum hwnd_dmabuf_status
+  * then may the consumer cache and reuse the wl_buffer per slot. Producers that
+  * re-export a fresh dmabuf each publish (e.g. the wined3d GL path) must NOT set it. */
+ #define HWND_DMABUF_FLAG_STABLE_SLOT      0x00000001
++/* Frame fd is a wl_shm-compatible shared-memory buffer, not a dma-buf. */
++#define HWND_DMABUF_FLAG_SHM              0x00000002
+ 
+ typedef struct
+ {
+diff --git a/server/protocol.def b/server/protocol.def
+index e94a5cef374..6cae5633b63 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -301,6 +301,8 @@ enum hwnd_dmabuf_status
+  * then may the consumer cache and reuse the wl_buffer per slot. Producers that
+  * re-export a fresh dmabuf each publish (e.g. the wined3d GL path) must NOT set it. */
+ #define HWND_DMABUF_FLAG_STABLE_SLOT      0x00000001
++/* Frame fd is a wl_shm-compatible shared-memory buffer, not a dma-buf. */
++#define HWND_DMABUF_FLAG_SHM              0x00000002
+ 
+ typedef struct
+ {

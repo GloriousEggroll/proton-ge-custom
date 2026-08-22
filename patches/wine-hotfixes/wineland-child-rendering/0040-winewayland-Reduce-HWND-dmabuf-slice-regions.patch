@@ -1,0 +1,214 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Wed, 15 Jul 2026 12:02:58 +0200
+Subject: [PATCH 40/49] winewayland: Reduce HWND dmabuf slice regions.
+
+Build an exact grid cover for shaped producer regions and use it only
+when it lowers the slice count. Bound the attempt by rect and cell count
+so complex regions fall back to the original decomposition without large
+allocation spikes.
+---
+ dlls/winewayland.drv/wayland_surface.c | 183 +++++++++++++++++++++++++
+ 1 file changed, 183 insertions(+)
+
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 4d2b02ac2ea..a45e9a44ea2 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -552,6 +552,188 @@ static struct wl_surface *wayland_hwnd_dmabuf_surface_slice_stack_bottom(
+     return bottom;
+ }
+ 
++#define WAYLAND_DMABUF_COVER_MAX_RECTS 1024
++#define WAYLAND_DMABUF_COVER_MAX_CELLS (1024 * 1024)
++
++static int compare_long(const void *a, const void *b)
++{
++    LONG x = *(const LONG *)a, y = *(const LONG *)b;
++
++    return (x > y) - (x < y);
++}
++
++static unsigned int sort_unique_longs(LONG *values, unsigned int count)
++{
++    unsigned int i, out = 0;
++
++    qsort(values, count, sizeof(*values), compare_long);
++    for (i = 0; i < count; i++)
++    {
++        if (out && values[out - 1] == values[i]) continue;
++        values[out++] = values[i];
++    }
++    return out;
++}
++
++static int find_long_index(const LONG *values, unsigned int count, LONG value)
++{
++    unsigned int low = 0, high = count;
++
++    while (low < high)
++    {
++        unsigned int mid = low + (high - low) / 2;
++
++        if (values[mid] == value) return mid;
++        if (values[mid] < value) low = mid + 1;
++        else high = mid;
++    }
++    return -1;
++}
++
++static RECT *wayland_hwnd_dmabuf_cover_slice_rects(const RECT *rects, unsigned int count,
++                                                   unsigned int *covered_count)
++{
++    unsigned int i, j, x_count, y_count, x_cells, y_cells, out_count = 0;
++    unsigned int remaining = 0, edge_count = count * 2;
++    LONG *x_edges = NULL, *y_edges = NULL;
++    RECT *out = NULL;
++    unsigned char *cells = NULL;
++    size_t cell_count;
++
++    *covered_count = 0;
++    if (!count || count > WAYLAND_DMABUF_COVER_MAX_RECTS) return NULL;
++    if (!(x_edges = malloc(edge_count * sizeof(*x_edges)))) goto failed;
++    if (!(y_edges = malloc(edge_count * sizeof(*y_edges)))) goto failed;
++
++    for (i = 0; i < count; i++)
++    {
++        x_edges[i * 2] = rects[i].left;
++        x_edges[i * 2 + 1] = rects[i].right;
++        y_edges[i * 2] = rects[i].top;
++        y_edges[i * 2 + 1] = rects[i].bottom;
++    }
++    x_count = sort_unique_longs(x_edges, edge_count);
++    y_count = sort_unique_longs(y_edges, edge_count);
++    if (x_count < 2 || y_count < 2) goto failed;
++
++    x_cells = x_count - 1;
++    y_cells = y_count - 1;
++    if (x_cells && y_cells > ~(size_t)0 / x_cells) goto failed;
++    cell_count = (size_t)x_cells * y_cells;
++    if (cell_count > WAYLAND_DMABUF_COVER_MAX_CELLS) goto failed;
++    if (!(cells = calloc(cell_count, sizeof(*cells)))) goto failed;
++    if (!(out = calloc(WAYLAND_DMABUF_MAX_SLICES, sizeof(*out)))) goto failed;
++
++    for (i = 0; i < count; i++)
++    {
++        int left = find_long_index(x_edges, x_count, rects[i].left);
++        int right = find_long_index(x_edges, x_count, rects[i].right);
++        int top = find_long_index(y_edges, y_count, rects[i].top);
++        int bottom = find_long_index(y_edges, y_count, rects[i].bottom);
++        int x, y;
++
++        if (left < 0 || right < 0 || top < 0 || bottom < 0) goto failed;
++        for (y = top; y < bottom; y++)
++            for (x = left; x < right; x++)
++            {
++                size_t idx = (size_t)y * x_cells + x;
++
++                if (cells[idx]) continue;
++                cells[idx] = 1;
++                remaining++;
++            }
++    }
++
++    while (remaining)
++    {
++        unsigned int start_x = 0, start_y = 0, width, best_width = 1, best_height = 1;
++        unsigned int best_area = 1;
++        BOOL found = FALSE;
++
++        for (i = 0; i < y_cells && !found; i++)
++            for (j = 0; j < x_cells; j++)
++                if (cells[(size_t)i * x_cells + j])
++                {
++                    start_y = i;
++                    start_x = j;
++                    found = TRUE;
++                    break;
++                }
++        if (!found) break;
++
++        for (width = 0; start_x + width < x_cells &&
++             cells[(size_t)start_y * x_cells + start_x + width]; width++)
++            ;
++
++        for (i = start_y; i < y_cells && width; i++)
++        {
++            unsigned int row_width = 0, height = i - start_y + 1;
++            unsigned int area;
++
++            while (row_width < width && cells[(size_t)i * x_cells + start_x + row_width])
++                row_width++;
++            width = row_width;
++            if (!width) break;
++            area = width * height;
++            if (area > best_area)
++            {
++                best_area = area;
++                best_width = width;
++                best_height = height;
++            }
++        }
++
++        if (out_count == WAYLAND_DMABUF_MAX_SLICES) goto failed;
++        out[out_count].left = x_edges[start_x];
++        out[out_count].right = x_edges[start_x + best_width];
++        out[out_count].top = y_edges[start_y];
++        out[out_count].bottom = y_edges[start_y + best_height];
++        out_count++;
++
++        for (i = start_y; i < start_y + best_height; i++)
++            for (j = start_x; j < start_x + best_width; j++)
++            {
++                size_t idx = (size_t)i * x_cells + j;
++
++                if (!cells[idx]) continue;
++                cells[idx] = 0;
++                remaining--;
++            }
++    }
++
++    free(cells);
++    free(x_edges);
++    free(y_edges);
++    *covered_count = out_count;
++    return out;
++
++failed:
++    free(out);
++    free(cells);
++    free(x_edges);
++    free(y_edges);
++    return NULL;
++}
++
++static void wayland_hwnd_dmabuf_try_cover_slice_rects(RECT **rects, unsigned int *count)
++{
++    RECT *covered_rects;
++    unsigned int covered_count;
++
++    if (!(covered_rects = wayland_hwnd_dmabuf_cover_slice_rects(*rects, *count, &covered_count)))
++        return;
++    if (covered_count && covered_count < *count)
++    {
++        free(*rects);
++        *rects = covered_rects;
++        *count = covered_count;
++    }
++    else
++    {
++        free(covered_rects);
++    }
++}
++
+ static BOOL wayland_hwnd_dmabuf_surface_apply_slice_layout(
+         struct wayland_hwnd_dmabuf_surface *surface,
+         const struct wayland_hwnd_dmabuf_slice_geometry *layout, unsigned int count,
+@@ -2562,6 +2744,7 @@ static enum wayland_hwnd_dmabuf_configure_result wayland_hwnd_dmabuf_surface_con
+         free(visible_rects);
+         return WAYLAND_HWNDDMABUF_CONFIGURE_FAILED;
+     }
++    wayland_hwnd_dmabuf_try_cover_slice_rects(&visible_rects, &count);
+     if (count > WAYLAND_DMABUF_MAX_SLICES)
+     {
+         free(visible_rects);

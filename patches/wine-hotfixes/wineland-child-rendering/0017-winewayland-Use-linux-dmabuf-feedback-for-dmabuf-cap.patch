@@ -1,0 +1,763 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Fri, 26 Jun 2026 22:20:59 +0200
+Subject: [PATCH 17/49] winewayland: Use linux-dmabuf feedback for dmabuf caps
+
+---
+ .../linux-dmabuf-unstable-v1.xml              | 285 ++++++++++++++++--
+ dlls/winewayland.drv/vulkan.c                 |   4 +
+ dlls/winewayland.drv/wayland.c                | 194 +++++++++++-
+ dlls/winewayland.drv/waylanddrv.h             |  39 ++-
+ include/wine/hwnd_dmabuf.h                    |   2 +
+ 5 files changed, 478 insertions(+), 46 deletions(-)
+
+diff --git a/dlls/winewayland.drv/linux-dmabuf-unstable-v1.xml b/dlls/winewayland.drv/linux-dmabuf-unstable-v1.xml
+index a17d930f2ae..6f11e925b68 100644
+--- a/dlls/winewayland.drv/linux-dmabuf-unstable-v1.xml
++++ b/dlls/winewayland.drv/linux-dmabuf-unstable-v1.xml
+@@ -24,17 +24,18 @@
+     DEALINGS IN THE SOFTWARE.
+   </copyright>
+ 
+-  <interface name="zwp_linux_dmabuf_v1" version="3">
++  <interface name="zwp_linux_dmabuf_v1" version="5">
+     <description summary="factory for creating dmabuf-based wl_buffers">
+       Following the interfaces from:
+       https://www.khronos.org/registry/egl/extensions/EXT/EGL_EXT_image_dma_buf_import.txt
+       https://www.khronos.org/registry/EGL/extensions/EXT/EGL_EXT_image_dma_buf_import_modifiers.txt
+       and the Linux DRM sub-system's AddFb2 ioctl.
+ 
+-      This interface offers ways to create generic dmabuf-based
+-      wl_buffers. Immediately after a client binds to this interface,
+-      the set of supported formats and format modifiers is sent with
+-      'format' and 'modifier' events.
++      This interface offers ways to create generic dmabuf-based wl_buffers.
++
++      Clients can use the get_surface_feedback request to get dmabuf feedback
++      for a particular surface. If the client wants to retrieve feedback not
++      tied to a surface, they can use the get_default_feedback request.
+ 
+       The following are required from clients:
+ 
+@@ -55,6 +56,12 @@
+         at any time use those fds to import the dmabuf into any kernel
+         sub-system that might accept it.
+ 
++      However, when the underlying graphics stack fails to deliver the
++      promise, because of e.g. a device hot-unplug which raises internal
++      errors, after the wl_buffer has been successfully created the
++      compositor must not raise protocol errors to the client when dmabuf
++      import later fails.
++
+       To create a wl_buffer from one or more dmabufs, a client creates a
+       zwp_linux_dmabuf_params_v1 object with a zwp_linux_dmabuf_v1.create_params
+       request. All planes required by the intended format are added with
+@@ -76,14 +83,17 @@
+           client. If the client uses a failed wl_buffer as an argument to any
+           request, the behaviour is compositor implementation-defined.
+ 
+-      Warning! The protocol described in this file is experimental and
+-      backward incompatible changes may be made. Backward compatible changes
+-      may be added together with the corresponding interface version bump.
+-      Backward incompatible changes are done by bumping the version number in
+-      the protocol and interface names and resetting the interface version.
+-      Once the protocol is to be declared stable, the 'z' prefix and the
+-      version number in the protocol and interface names are removed and the
+-      interface version number is reset.
++      For all DRM formats and unless specified in another protocol extension,
++      pre-multiplied alpha is used for pixel values.
++
++      Unless specified otherwise in another protocol extension, implicit
++      synchronization is used. In other words, compositors and clients must
++      wait and signal fences implicitly passed via the DMA-BUF's reservation
++      mechanism.
++
++      Disclaimer: This protocol extension has been marked stable. This copy is
++      no longer used and only retained for backwards compatibility. The
++      canonical version can be found in the stable/ directory.
+     </description>
+ 
+     <request name="destroy" type="destructor">
+@@ -114,10 +124,9 @@
+         For the definition of the format codes, see the
+         zwp_linux_buffer_params_v1::create request.
+ 
+-        Warning: the 'format' event is likely to be deprecated and replaced
+-        with the 'modifier' event introduced in zwp_linux_dmabuf_v1
+-        version 3, described below. Please refrain from using the information
+-        received from this event.
++        Starting version 4, the format event is deprecated and must not be
++        sent by compositors. Instead, use get_default_feedback or
++        get_surface_feedback.
+       </description>
+       <arg name="format" type="uint" summary="DRM_FORMAT code"/>
+     </event>
+@@ -137,9 +146,16 @@
+         is as if no explicit modifier is specified. The effective modifier
+         will be derived from the dmabuf.
+ 
++        A compositor that sends valid modifiers and DRM_FORMAT_MOD_INVALID for
++        a given format supports both explicit modifiers and implicit modifiers.
++
+         For the definition of the format and modifier codes, see the
+         zwp_linux_buffer_params_v1::create and zwp_linux_buffer_params_v1::add
+         requests.
++
++        Starting version 4, the modifier event is deprecated and must not be
++        sent by compositors. Instead, use get_default_feedback or
++        get_surface_feedback.
+       </description>
+       <arg name="format" type="uint" summary="DRM_FORMAT code"/>
+       <arg name="modifier_hi" type="uint"
+@@ -147,9 +163,34 @@
+       <arg name="modifier_lo" type="uint"
+            summary="low 32 bits of layout modifier"/>
+     </event>
++
++    <!-- Version 4 additions -->
++
++    <request name="get_default_feedback" since="4">
++      <description summary="get default feedback">
++        This request creates a new wp_linux_dmabuf_feedback object not bound
++        to a particular surface. This object will deliver feedback about dmabuf
++        parameters to use if the client doesn't support per-surface feedback
++        (see get_surface_feedback).
++      </description>
++      <arg name="id" type="new_id" interface="zwp_linux_dmabuf_feedback_v1"/>
++    </request>
++
++    <request name="get_surface_feedback" since="4">
++      <description summary="get feedback for a surface">
++        This request creates a new wp_linux_dmabuf_feedback object for the
++        specified wl_surface. This object will deliver feedback about dmabuf
++        parameters to use for buffers attached to this surface.
++
++        If the surface is destroyed before the wp_linux_dmabuf_feedback object,
++        the feedback object becomes inert.
++      </description>
++      <arg name="id" type="new_id" interface="zwp_linux_dmabuf_feedback_v1"/>
++      <arg name="surface" type="object" interface="wl_surface"/>
++    </request>
+   </interface>
+ 
+-  <interface name="zwp_linux_buffer_params_v1" version="3">
++  <interface name="zwp_linux_buffer_params_v1" version="5">
+     <description summary="parameters for creating a dmabuf-based wl_buffer">
+       This temporary object is a collection of dmabufs and other
+       parameters that together form a single logical buffer. The temporary
+@@ -206,10 +247,11 @@
+         compression, etc. driver-specific modifications to the base format
+         defined by the DRM fourcc code.
+ 
+-        Warning: It should be an error if the format/modifier pair was not
+-        advertised with the modifier event. This is not enforced yet because
+-        some implementations always accept DRM_FORMAT_MOD_INVALID. Also
+-        version 2 of this protocol does not have the modifier event.
++        Starting from version 4, the invalid_format protocol error is sent if
++        the format + modifier pair was not advertised as supported.
++
++        Starting from version 5, the invalid_format protocol error is sent if
++        all planes don't use the same modifier.
+ 
+         This request raises the PLANE_IDX error if plane_idx is too large.
+         The error PLANE_SET is raised if attempting to set a plane that
+@@ -225,7 +267,7 @@
+            summary="low 32 bits of layout modifier"/>
+     </request>
+ 
+-    <enum name="flags">
++    <enum name="flags" bitfield="true">
+       <entry name="y_invert" value="1" summary="contents are y-inverted"/>
+       <entry name="interlaced" value="2" summary="content is interlaced"/>
+       <entry name="bottom_first" value="4" summary="bottom field first"/>
+@@ -296,7 +338,7 @@
+       <arg name="width" type="int" summary="base plane width in pixels"/>
+       <arg name="height" type="int" summary="base plane height in pixels"/>
+       <arg name="format" type="uint" summary="DRM_FORMAT code"/>
+-      <arg name="flags" type="uint" summary="see enum flags"/>
++      <arg name="flags" type="uint" enum="flags" summary="see enum flags"/>
+     </request>
+ 
+     <event name="created">
+@@ -305,7 +347,7 @@
+         successful. It provides the new wl_buffer referencing the dmabuf(s).
+ 
+         Upon receiving this event, the client should destroy the
+-        zlinux_dmabuf_params object.
++        zwp_linux_buffer_params_v1 object.
+       </description>
+       <arg name="buffer" type="new_id" interface="wl_buffer"
+            summary="the newly created wl_buffer"/>
+@@ -318,7 +360,7 @@
+         has not been fulfilled.
+ 
+         Upon receiving this event, the client should destroy the
+-        zlinux_buffer_params object.
++        zwp_linux_buffer_params_v1 object.
+       </description>
+     </event>
+ 
+@@ -340,7 +382,7 @@
+             of planes and the format, bad format, non-positive width or
+             height, or bad offset or stride.
+           - INVALID_WL_BUFFER, in case the cause for failure is unknown or
+-            plaform specific.
++            platform specific.
+         - the server creates an invalid wl_buffer, marks it as failed and
+           sends a 'failed' event to the client. The result of using this
+           invalid wl_buffer as an argument in any request by the client is
+@@ -354,9 +396,194 @@
+       <arg name="width" type="int" summary="base plane width in pixels"/>
+       <arg name="height" type="int" summary="base plane height in pixels"/>
+       <arg name="format" type="uint" summary="DRM_FORMAT code"/>
+-      <arg name="flags" type="uint" summary="see enum flags"/>
++      <arg name="flags" type="uint" enum="flags" summary="see enum flags"/>
+     </request>
++  </interface>
+ 
++  <interface name="zwp_linux_dmabuf_feedback_v1" version="5">
++    <description summary="dmabuf feedback">
++      This object advertises dmabuf parameters feedback. This includes the
++      preferred devices and the supported formats/modifiers.
++
++      The parameters are sent once when this object is created and whenever they
++      change. The done event is always sent once after all parameters have been
++      sent. When a single parameter changes, all parameters are re-sent by the
++      compositor.
++
++      Compositors can re-send the parameters when the current client buffer
++      allocations are sub-optimal. Compositors should not re-send the
++      parameters if re-allocating the buffers would not result in a more optimal
++      configuration. In particular, compositors should avoid sending the exact
++      same parameters multiple times in a row.
++
++      The tranche_target_device and tranche_formats events are grouped by
++      tranches of preference. For each tranche, a tranche_target_device, one
++      tranche_flags and one or more tranche_formats events are sent, followed
++      by a tranche_done event finishing the list. The tranches are sent in
++      descending order of preference. All formats and modifiers in the same
++      tranche have the same preference.
++
++      To send parameters, the compositor sends one main_device event, tranches
++      (each consisting of one tranche_target_device event, one tranche_flags
++      event, tranche_formats events and then a tranche_done event), then one
++      done event.
++    </description>
++
++    <request name="destroy" type="destructor">
++      <description summary="destroy the feedback object">
++        Using this request a client can tell the server that it is not going to
++        use the wp_linux_dmabuf_feedback object anymore.
++      </description>
++    </request>
++
++    <event name="done">
++      <description summary="all feedback has been sent">
++        This event is sent after all parameters of a wp_linux_dmabuf_feedback
++        object have been sent.
++
++        This allows changes to the wp_linux_dmabuf_feedback parameters to be
++        seen as atomic, even if they happen via multiple events.
++      </description>
++    </event>
++
++    <event name="format_table">
++      <description summary="format and modifier table">
++        This event provides a file descriptor which can be memory-mapped to
++        access the format and modifier table.
++
++        The table contains a tightly packed array of consecutive format +
++        modifier pairs. Each pair is 16 bytes wide. It contains a format as a
++        32-bit unsigned integer, followed by 4 bytes of unused padding, and a
++        modifier as a 64-bit unsigned integer. The native endianness is used.
++
++        The client must map the file descriptor in read-only private mode.
++
++        Compositors are not allowed to mutate the table file contents once this
++        event has been sent. Instead, compositors must create a new, separate
++        table file and re-send feedback parameters. Compositors are allowed to
++        store duplicate format + modifier pairs in the table.
++      </description>
++      <arg name="fd" type="fd" summary="table file descriptor"/>
++      <arg name="size" type="uint" summary="table size, in bytes"/>
++    </event>
++
++    <event name="main_device">
++      <description summary="preferred main device">
++        This event advertises the main device that the server prefers to use
++        when direct scan-out to the target device isn't possible. The
++        advertised main device may be different for each
++        wp_linux_dmabuf_feedback object, and may change over time.
++
++        There is exactly one main device. The compositor must send at least
++        one preference tranche with tranche_target_device equal to main_device.
++
++        Clients need to create buffers that the main device can import and
++        read from, otherwise creating the dmabuf wl_buffer will fail (see the
++        wp_linux_buffer_params.create and create_immed requests for details).
++        The main device will also likely be kept active by the compositor,
++        so clients can use it instead of waking up another device for power
++        savings.
++
++        In general the device is a DRM node. The DRM node type (primary vs.
++        render) is unspecified. Clients must not rely on the compositor sending
++        a particular node type. Clients cannot check two devices for equality
++        by comparing the dev_t value.
++
++        If explicit modifiers are not supported and the client performs buffer
++        allocations on a different device than the main device, then the client
++        must force the buffer to have a linear layout.
++      </description>
++      <arg name="device" type="array" summary="device dev_t value"/>
++    </event>
++
++    <event name="tranche_done">
++      <description summary="a preference tranche has been sent">
++        This event splits tranche_target_device and tranche_formats events in
++        preference tranches. It is sent after a set of tranche_target_device
++        and tranche_formats events; it represents the end of a tranche. The
++        next tranche will have a lower preference.
++      </description>
++    </event>
++
++    <event name="tranche_target_device">
++      <description summary="target device">
++        This event advertises the target device that the server prefers to use
++        for a buffer created given this tranche. The advertised target device
++        may be different for each preference tranche, and may change over time.
++
++        There is exactly one target device per tranche.
++
++        The target device may be a scan-out device, for example if the
++        compositor prefers to directly scan-out a buffer created given this
++        tranche. The target device may be a rendering device, for example if
++        the compositor prefers to texture from said buffer.
++
++        The client can use this hint to allocate the buffer in a way that makes
++        it accessible from the target device, ideally directly. The buffer must
++        still be accessible from the main device, either through direct import
++        or through a potentially more expensive fallback path. If the buffer
++        can't be directly imported from the main device then clients must be
++        prepared for the compositor changing the tranche priority or making
++        wl_buffer creation fail (see the wp_linux_buffer_params.create and
++        create_immed requests for details).
++
++        If the device is a DRM node, the DRM node type (primary vs. render) is
++        unspecified. Clients must not rely on the compositor sending a
++        particular node type. Clients cannot check two devices for equality by
++        comparing the dev_t value.
++
++        This event is tied to a preference tranche, see the tranche_done event.
++      </description>
++      <arg name="device" type="array" summary="device dev_t value"/>
++    </event>
++
++    <event name="tranche_formats">
++      <description summary="supported buffer format modifier">
++        This event advertises the format + modifier combinations that the
++        compositor supports.
++
++        It carries an array of indices, each referring to a format + modifier
++        pair in the last received format table (see the format_table event).
++        Each index is a 16-bit unsigned integer in native endianness.
++
++        For legacy support, DRM_FORMAT_MOD_INVALID is an allowed modifier.
++        It indicates that the server can support the format with an implicit
++        modifier. When a buffer has DRM_FORMAT_MOD_INVALID as its modifier, it
++        is as if no explicit modifier is specified. The effective modifier
++        will be derived from the dmabuf.
++
++        A compositor that sends valid modifiers and DRM_FORMAT_MOD_INVALID for
++        a given format supports both explicit modifiers and implicit modifiers.
++
++        Compositors must not send duplicate format + modifier pairs within the
++        same tranche or across two different tranches with the same target
++        device and flags.
++
++        This event is tied to a preference tranche, see the tranche_done event.
++
++        For the definition of the format and modifier codes, see the
++        wp_linux_buffer_params.create request.
++      </description>
++      <arg name="indices" type="array" summary="array of 16-bit indexes"/>
++    </event>
++
++    <enum name="tranche_flags" bitfield="true">
++      <entry name="scanout" value="1" summary="direct scan-out tranche"/>
++    </enum>
++
++    <event name="tranche_flags">
++      <description summary="tranche flags">
++        This event sets tranche-specific flags.
++
++        The scanout flag is a hint that direct scan-out may be attempted by the
++        compositor on the target device if the client appropriately allocates a
++        buffer. How to allocate a buffer that can be scanned out on the target
++        device is implementation-defined.
++
++        This event is tied to a preference tranche, see the tranche_done event.
++      </description>
++      <arg name="flags" type="uint" enum="tranche_flags" summary="tranche flags"/>
++    </event>
+   </interface>
+ 
+-</protocol>
+\ No newline at end of file
++</protocol>
+diff --git a/dlls/winewayland.drv/vulkan.c b/dlls/winewayland.drv/vulkan.c
+index 88736785f26..150c8189b26 100644
+--- a/dlls/winewayland.drv/vulkan.c
++++ b/dlls/winewayland.drv/vulkan.c
+@@ -221,6 +221,7 @@ static UINT wayland_vulkan_get_hwnd_dmabuf_caps(HWND hwnd, void *caps_ptr, void
+         }
+     }
+ 
++    pthread_mutex_lock(&process_wayland.dmabuf_mutex);
+     wl_list_for_each(entry, &process_wayland.dmabuf_formats, link)
+         count++;
+ 
+@@ -230,9 +231,12 @@ static UINT wayland_vulkan_get_hwnd_dmabuf_caps(HWND hwnd, void *caps_ptr, void
+         if (copied >= max_format_modifiers)
+             break;
+         format_modifiers[copied].fourcc = entry->format;
++        format_modifiers[copied].tranche_index = entry->tranche_index;
++        format_modifiers[copied].tranche_flags = entry->tranche_flags;
+         format_modifiers[copied].modifier = entry->modifier;
+         copied++;
+     }
++    pthread_mutex_unlock(&process_wayland.dmabuf_mutex);
+ 
+     caps->format_modifier_count = copied;
+     *format_modifier_count = count;
+diff --git a/dlls/winewayland.drv/wayland.c b/dlls/winewayland.drv/wayland.c
+index 96978a15d04..8013f50664d 100644
+--- a/dlls/winewayland.drv/wayland.c
++++ b/dlls/winewayland.drv/wayland.c
+@@ -28,7 +28,11 @@
+ 
+ #include "wine/debug.h"
+ 
++#include <stdint.h>
+ #include <stdlib.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <unistd.h>
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
+ 
+@@ -41,6 +45,10 @@ struct wayland process_wayland =
+                             &process_wayland.touch.touch_points },
+     .text_input.mutex = PTHREAD_MUTEX_INITIALIZER,
+     .dmabuf_formats = {&process_wayland.dmabuf_formats, &process_wayland.dmabuf_formats},
++    .dmabuf_default_feedback.pending_formats =
++        {&process_wayland.dmabuf_default_feedback.pending_formats,
++         &process_wayland.dmabuf_default_feedback.pending_formats},
++    .dmabuf_mutex = PTHREAD_MUTEX_INITIALIZER,
+     .data_device.mutex = PTHREAD_MUTEX_INITIALIZER,
+     .output_mutex = PTHREAD_MUTEX_INITIALIZER,
+ };
+@@ -156,20 +164,46 @@ static int wayland_use_ime(void)
+         enabled = (env = getenv("WAYLANDDRV_IME")) && !strcmp(env, "1");
+ 
+     return enabled;
+-static void wayland_dmabuf_add_format(uint32_t format, uint64_t modifier)
++}
++
++static void wayland_dmabuf_clear_format_list(struct wl_list *list)
++{
++    struct wayland_dmabuf_format *entry, *next;
++
++    wl_list_for_each_safe(entry, next, list, link)
++    {
++        wl_list_remove(&entry->link);
++        free(entry);
++    }
++    wl_list_init(list);
++}
++
++static BOOL wayland_dmabuf_add_format_to_list(struct wl_list *list, uint32_t format,
++                                              uint64_t modifier, uint32_t tranche_index,
++                                              uint32_t tranche_flags)
+ {
+     struct wayland_dmabuf_format *entry;
+ 
+-    wl_list_for_each(entry, &process_wayland.dmabuf_formats, link)
++    wl_list_for_each(entry, list, link)
+     {
+         if (entry->format == format && entry->modifier == modifier)
+-            return;
++            return TRUE;
+     }
+ 
+-    if (!(entry = calloc(1, sizeof(*entry)))) return;
++    if (!(entry = calloc(1, sizeof(*entry)))) return FALSE;
+     entry->format = format;
+     entry->modifier = modifier;
+-    wl_list_insert(process_wayland.dmabuf_formats.prev, &entry->link);
++    entry->tranche_index = tranche_index;
++    entry->tranche_flags = tranche_flags;
++    wl_list_insert(list->prev, &entry->link);
++    return TRUE;
++}
++
++static void wayland_dmabuf_add_format(uint32_t format, uint64_t modifier)
++{
++    pthread_mutex_lock(&process_wayland.dmabuf_mutex);
++    wayland_dmabuf_add_format_to_list(&process_wayland.dmabuf_formats, format, modifier, 0, 0);
++    pthread_mutex_unlock(&process_wayland.dmabuf_mutex);
+ }
+ 
+ static void zwp_linux_dmabuf_v1_handle_format(void *data, struct zwp_linux_dmabuf_v1 *dmabuf,
+@@ -191,17 +225,151 @@ static const struct zwp_linux_dmabuf_v1_listener zwp_linux_dmabuf_v1_listener =
+     zwp_linux_dmabuf_v1_handle_modifier
+ };
+ 
++static void zwp_linux_dmabuf_feedback_v1_handle_done(void *data,
++                                                     struct zwp_linux_dmabuf_feedback_v1 *feedback)
++{
++    struct wayland_dmabuf_feedback *state = data;
++    struct wayland_dmabuf_format *entry, *next;
++    unsigned int count = 0;
++
++    pthread_mutex_lock(&process_wayland.dmabuf_mutex);
++    wayland_dmabuf_clear_format_list(&process_wayland.dmabuf_formats);
++    wl_list_for_each_safe(entry, next, &state->pending_formats, link)
++    {
++        wl_list_remove(&entry->link);
++        wl_list_insert(process_wayland.dmabuf_formats.prev, &entry->link);
++        count++;
++    }
++    pthread_mutex_unlock(&process_wayland.dmabuf_mutex);
++    wl_list_init(&state->pending_formats);
++    state->tranche_index = 0;
++    state->tranche_flags = 0;
++
++    TRACE("default dmabuf feedback advertised %u format/modifier pairs.\n", count);
++}
++
++static void zwp_linux_dmabuf_feedback_v1_handle_format_table(void *data,
++        struct zwp_linux_dmabuf_feedback_v1 *feedback, int fd, uint32_t size)
++{
++    struct wayland_dmabuf_feedback *state = data;
++    struct wayland_dmabuf_feedback_format *table;
++    void *map;
++
++    free(state->format_table);
++    state->format_table = NULL;
++    state->format_table_count = 0;
++
++    if (!size || size % sizeof(*state->format_table))
++    {
++        WARN("Ignoring invalid dmabuf feedback format table size %u.\n", size);
++        close(fd);
++        return;
++    }
++
++    if ((map = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0)) == MAP_FAILED)
++    {
++        WARN("Failed to map dmabuf feedback format table.\n");
++        close(fd);
++        return;
++    }
++    close(fd);
++
++    if ((table = malloc(size)))
++    {
++        memcpy(table, map, size);
++        state->format_table = table;
++        state->format_table_count = size / sizeof(*state->format_table);
++    }
++    munmap(map, size);
++}
++
++static void zwp_linux_dmabuf_feedback_v1_handle_main_device(void *data,
++        struct zwp_linux_dmabuf_feedback_v1 *feedback, struct wl_array *device)
++{
++}
++
++static void zwp_linux_dmabuf_feedback_v1_handle_tranche_done(void *data,
++        struct zwp_linux_dmabuf_feedback_v1 *feedback)
++{
++    struct wayland_dmabuf_feedback *state = data;
++    struct wayland_dmabuf_format *entry;
++
++    wl_list_for_each(entry, &state->pending_formats, link)
++    {
++        if (entry->tranche_index == state->tranche_index)
++            entry->tranche_flags = state->tranche_flags;
++    }
++
++    state->tranche_index++;
++    state->tranche_flags = 0;
++}
++
++static void zwp_linux_dmabuf_feedback_v1_handle_tranche_target_device(void *data,
++        struct zwp_linux_dmabuf_feedback_v1 *feedback, struct wl_array *device)
++{
++}
++
++static void zwp_linux_dmabuf_feedback_v1_handle_tranche_formats(void *data,
++        struct zwp_linux_dmabuf_feedback_v1 *feedback, struct wl_array *indices)
++{
++    struct wayland_dmabuf_feedback *state = data;
++    uint16_t *index;
++
++    if (indices->size % sizeof(*index))
++    {
++        WARN("Ignoring invalid dmabuf feedback tranche index list size %zu.\n", indices->size);
++        return;
++    }
++
++    wl_array_for_each(index, indices)
++    {
++        if (*index >= state->format_table_count)
++        {
++            WARN("Ignoring out-of-range dmabuf feedback format index %u.\n", *index);
++            continue;
++        }
++        wayland_dmabuf_add_format_to_list(&state->pending_formats,
++                state->format_table[*index].format, state->format_table[*index].modifier,
++                state->tranche_index, 0);
++    }
++}
++
++static void zwp_linux_dmabuf_feedback_v1_handle_tranche_flags(void *data,
++        struct zwp_linux_dmabuf_feedback_v1 *feedback, uint32_t flags)
++{
++    struct wayland_dmabuf_feedback *state = data;
++
++    state->tranche_flags = flags;
++}
++
++static const struct zwp_linux_dmabuf_feedback_v1_listener zwp_linux_dmabuf_feedback_v1_listener =
++{
++    zwp_linux_dmabuf_feedback_v1_handle_done,
++    zwp_linux_dmabuf_feedback_v1_handle_format_table,
++    zwp_linux_dmabuf_feedback_v1_handle_main_device,
++    zwp_linux_dmabuf_feedback_v1_handle_tranche_done,
++    zwp_linux_dmabuf_feedback_v1_handle_tranche_target_device,
++    zwp_linux_dmabuf_feedback_v1_handle_tranche_formats,
++    zwp_linux_dmabuf_feedback_v1_handle_tranche_flags,
++};
++
+ BOOL wayland_dmabuf_format_supported(uint32_t format, uint64_t modifier)
+ {
+     struct wayland_dmabuf_format *entry;
++    BOOL supported = FALSE;
+ 
++    pthread_mutex_lock(&process_wayland.dmabuf_mutex);
+     wl_list_for_each(entry, &process_wayland.dmabuf_formats, link)
+     {
+         if (entry->format == format && entry->modifier == modifier)
+-            return TRUE;
++        {
++            supported = TRUE;
++            break;
++        }
+     }
++    pthread_mutex_unlock(&process_wayland.dmabuf_mutex);
+ 
+-    return FALSE;
++    return supported;
+ }
+ 
+ /**********************************************************************
+@@ -396,9 +564,19 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
+     {
+         process_wayland.zwp_linux_dmabuf_v1 =
+             wl_registry_bind(registry, id, &zwp_linux_dmabuf_v1_interface,
+-                             version < 3 ? version : 3);
++                             version < 5 ? version : 5);
+         zwp_linux_dmabuf_v1_add_listener(process_wayland.zwp_linux_dmabuf_v1,
+                                          &zwp_linux_dmabuf_v1_listener, NULL);
++        if (version >= 4)
++        {
++            struct wayland_dmabuf_feedback *feedback = &process_wayland.dmabuf_default_feedback;
++
++            feedback->zwp_linux_dmabuf_feedback_v1 =
++                zwp_linux_dmabuf_v1_get_default_feedback(process_wayland.zwp_linux_dmabuf_v1);
++            zwp_linux_dmabuf_feedback_v1_add_listener(feedback->zwp_linux_dmabuf_feedback_v1,
++                                                      &zwp_linux_dmabuf_feedback_v1_listener,
++                                                      feedback);
++        }
+     }
+ }
+ 
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index ae0e632e500..9aaad18d28a 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -248,6 +248,34 @@ struct wayland_data_device
+     pthread_mutex_t mutex;
+ };
+ 
++struct wayland_dmabuf_format
++{
++    struct wl_list link;
++    uint32_t format;
++    uint32_t tranche_index;
++    uint32_t tranche_flags;
++    uint64_t modifier;
++};
++
++#define DRM_FORMAT_MOD_INVALID 0x00ffffffffffffffull
++
++struct wayland_dmabuf_feedback_format
++{
++    uint32_t format;
++    uint32_t padding;
++    uint64_t modifier;
++};
++
++struct wayland_dmabuf_feedback
++{
++    struct zwp_linux_dmabuf_feedback_v1 *zwp_linux_dmabuf_feedback_v1;
++    struct wayland_dmabuf_feedback_format *format_table;
++    size_t format_table_count;
++    struct wl_list pending_formats;
++    uint32_t tranche_index;
++    uint32_t tranche_flags;
++};
++
+ struct wayland
+ {
+     BOOL initialized;
+@@ -262,7 +290,9 @@ struct wayland
+     struct wl_subcompositor *wl_subcompositor;
+     struct wl_fixes *wl_fixes;
+     struct zwp_linux_dmabuf_v1 *zwp_linux_dmabuf_v1;
++    struct wayland_dmabuf_feedback dmabuf_default_feedback;
+     struct wl_list dmabuf_formats;
++    pthread_mutex_t dmabuf_mutex;
+     struct wp_fractional_scale_manager_v1 *wp_fractional_scale_manager_v1;
+     struct zwp_pointer_constraints_v1 *zwp_pointer_constraints_v1;
+     struct zwp_relative_pointer_manager_v1 *zwp_relative_pointer_manager_v1;
+@@ -347,15 +377,6 @@ struct wayland_output_state
+     unsigned int flags;
+ };
+ 
+-struct wayland_dmabuf_format
+-{
+-    struct wl_list link;
+-    uint32_t format;
+-    uint64_t modifier;
+-};
+-
+-#define DRM_FORMAT_MOD_INVALID 0x00ffffffffffffffull
+-
+ struct wayland_output
+ {
+     struct wl_list link;
+diff --git a/include/wine/hwnd_dmabuf.h b/include/wine/hwnd_dmabuf.h
+index 4546786de88..8646bb7dd09 100644
+--- a/include/wine/hwnd_dmabuf.h
++++ b/include/wine/hwnd_dmabuf.h
+@@ -33,6 +33,8 @@ typedef struct
+     unsigned int     format_modifier_count;
+ } hwnd_dmabuf_host_caps_t;
+ 
++#define HWND_DMABUF_TRANCHE_FLAG_SCANOUT       0x1
++
+ /* Release token sent from the consumer back to the producer over the channel. */
+ typedef struct
+ {

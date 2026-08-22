@@ -1,0 +1,453 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Wed, 24 Jun 2026 09:55:34 +0200
+Subject: [PATCH 10/49] winewayland: Respect xdg toplevel configure bounds
+
+Track xdg_toplevel configure_bounds as part of the configure generation
+and apply committed bounds as floating toplevel max-size limits.
+
+Expose committed Wayland bounds through a user driver max-track hook so
+Win32 sizing uses the same limit as the compositor.
+---
+ dlls/win32u/driver.c                   |   7 +
+ dlls/win32u/window.c                   |  13 ++
+ dlls/winewayland.drv/wayland_surface.c | 193 +++++++++++++++++++++++--
+ dlls/winewayland.drv/waylanddrv.h      |  22 +++
+ dlls/winewayland.drv/waylanddrv_main.c |   1 +
+ dlls/winewayland.drv/window.c          |  14 ++
+ include/wine/gdi_driver.h              |   3 +-
+ 7 files changed, 240 insertions(+), 13 deletions(-)
+
+diff --git a/dlls/win32u/driver.c b/dlls/win32u/driver.c
+index 793de3fd27e..c7e84e2c3b0 100644
+--- a/dlls/win32u/driver.c
++++ b/dlls/win32u/driver.c
+@@ -887,6 +887,11 @@ static BOOL nulldrv_GetWindowStateUpdates( HWND hwnd, UINT *state_cmd, UINT *swp
+     return FALSE;
+ }
+ 
++static BOOL nulldrv_GetWindowMaxTrackSize( HWND hwnd, SIZE *size )
++{
++    return FALSE;
++}
++
+ static BOOL nulldrv_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_rect, struct window_surface **surface )
+ {
+     return FALSE;
+@@ -1322,6 +1327,7 @@ static const struct user_driver_funcs lazy_load_driver =
+     nulldrv_WindowPosChanging,
+     nulldrv_GetWindowStyleMasks,
+     nulldrv_GetWindowStateUpdates,
++    nulldrv_GetWindowMaxTrackSize,
+     nulldrv_CreateWindowSurface,
+     nulldrv_MoveWindowBits,
+     nulldrv_WindowPosChanged,
+@@ -1423,6 +1429,7 @@ void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version
+     SET_USER_FUNC(WindowPosChanging);
+     SET_USER_FUNC(GetWindowStyleMasks);
+     SET_USER_FUNC(GetWindowStateUpdates);
++    SET_USER_FUNC(GetWindowMaxTrackSize);
+     SET_USER_FUNC(CreateWindowSurface);
+     SET_USER_FUNC(MoveWindowBits);
+     SET_USER_FUNC(WindowPosChanged);
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index 69c6f16ae00..9ca479d7ddc 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -4576,6 +4576,17 @@ static void send_parent_notify( HWND hwnd, UINT msg )
+     }
+ }
+ 
++static void apply_driver_max_track_size( HWND hwnd, MINMAXINFO *minmax )
++{
++    SIZE max_track;
++
++    if (!user_driver->pGetWindowMaxTrackSize( hwnd, &max_track )) return;
++    if (max_track.cx > 0)
++        minmax->ptMaxTrackSize.x = min( minmax->ptMaxTrackSize.x, max_track.cx );
++    if (max_track.cy > 0)
++        minmax->ptMaxTrackSize.y = min( minmax->ptMaxTrackSize.y, max_track.cy );
++}
++
+ /*******************************************************************
+  *           get_min_max_info
+  *
+@@ -4655,6 +4666,8 @@ MINMAXINFO get_min_max_info( HWND hwnd )
+         }
+     }
+ 
++    apply_driver_max_track_size( hwnd, &minmax );
++
+     TRACE( "%d %d / %d %d / %d %d / %d %d\n",
+            minmax.ptMaxSize.x, minmax.ptMaxSize.y,
+            minmax.ptMaxPosition.x, minmax.ptMaxPosition.y,
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 582716fa024..42d5f1acb82 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -267,6 +267,35 @@ static void update_window_state(HWND hwnd)
+     NtUserSetRawWindowPos(hwnd, rect, swp_flags, FALSE);
+ }
+ 
++static BOOL wayland_surface_config_has_bounds(const struct wayland_surface_config *config)
++{
++    return config->bounds_set && config->bounds_width > 0 && config->bounds_height > 0;
++}
++
++static const struct wayland_surface_config *wayland_surface_latest_config(struct wayland_surface *surface)
++{
++    if (surface->requested.serial) return &surface->requested;
++    if (surface->processing.serial) return &surface->processing;
++    if (surface->current.serial) return &surface->current;
++    return NULL;
++}
++
++static void wayland_surface_config_inherit_caps_and_bounds(struct wayland_surface_config *config,
++                                                           struct wayland_surface *surface)
++{
++    const struct wayland_surface_config *prev = wayland_surface_latest_config(surface);
++
++    if (!prev) return;
++
++    if (!config->caps && prev->caps) config->caps = prev->caps;
++    if (!config->bounds_set)
++    {
++        config->bounds_set = prev->bounds_set;
++        config->bounds_width = prev->bounds_width;
++        config->bounds_height = prev->bounds_height;
++    }
++}
++
+ static void xdg_surface_handle_configure(void *private, struct xdg_surface *xdg_surface,
+                                          uint32_t serial)
+ {
+@@ -295,6 +324,17 @@ static void xdg_surface_handle_configure(void *private, struct xdg_surface *xdg_
+         should_post = surface->requested.serial == 0;
+         should_expose = surface->current.serial == 0;
+         surface->pending.serial = serial;
++        wayland_surface_config_inherit_caps_and_bounds(&surface->pending, surface);
++        if (!surface->pending.decor && surface->current.decor)
++            surface->pending.decor = surface->current.decor;
++        else if (!surface->pending.decor && surface->requested.decor)
++            surface->pending.decor = surface->requested.decor;
++        if (surface->pending.decor &&
++            surface->pending.decor != surface->current.decor)
++        {
++            should_post = TRUE;
++            should_expose = TRUE;
++        }
+         surface->requested = surface->pending;
+         memset(&surface->pending, 0, sizeof(surface->pending));
+     }
+@@ -380,10 +420,81 @@ static void xdg_toplevel_handle_close(void *data, struct xdg_toplevel *xdg_tople
+     NtUserPostMessage((HWND)data, WM_SYSCOMMAND, SC_CLOSE, 0);
+ }
+ 
++static void xdg_toplevel_handle_configure_bounds(void *private,
++                                                 struct xdg_toplevel *xdg_toplevel,
++                                                 int width, int height)
++{
++    struct wayland_surface *surface;
++    struct wayland_win_data *data;
++    HWND hwnd = private;
++
++    TRACE("hwnd=%p bounds=%dx%d\n", hwnd, width, height);
++
++    if (!(data = wayland_win_data_get(hwnd))) return;
++
++    if ((surface = data->wayland_surface) && wayland_surface_is_toplevel(surface))
++    {
++        surface->pending.bounds_width = width;
++        surface->pending.bounds_height = height;
++        surface->pending.bounds_set = TRUE;
++    }
++
++    wayland_win_data_release(data);
++}
++
++static void xdg_toplevel_handle_wm_caps(void *private, struct xdg_toplevel *xdg_toplevel, struct wl_array *caps)
++{
++    int *state;
++    HWND hwnd = private;
++    struct wayland_surface *surface;
++    struct wayland_win_data *data;
++    enum wayland_surface_wm_caps cap = WAYLAND_SURFACE_WM_CAPS_CHANGED;
++
++    wl_array_for_each(state, caps)
++    {
++        switch (*state)
++        {
++            case XDG_TOPLEVEL_WM_CAPABILITIES_FULLSCREEN:
++                cap |= WAYLAND_SURFACE_WM_CAPS_FULLSCREEN;
++                break;
++            case XDG_TOPLEVEL_WM_CAPABILITIES_MINIMIZE:
++                cap |= WAYLAND_SURFACE_WM_CAPS_MINIMIZE;
++                break;
++            case XDG_TOPLEVEL_WM_CAPABILITIES_MAXIMIZE:
++                cap |= WAYLAND_SURFACE_WM_CAPS_MAXIMIZE;
++                break;
++            case XDG_TOPLEVEL_WM_CAPABILITIES_WINDOW_MENU:
++                cap |= WAYLAND_SURFACE_WM_CAPS_SHOW_WINDOW;
++                break;
++            default: break;
++        }
++    }
++
++    TRACE("hwnd %p caps %x\n", hwnd, cap);
++
++    if (!(cap & WAYLAND_SURFACE_WM_CAPS_FULLSCREEN))
++        WARN("Compositor does not support fullscreen!\n");
++    if (!(cap & WAYLAND_SURFACE_WM_CAPS_MAXIMIZE))
++        WARN("Compositor does not support maximize!\n");
++    if (!(cap & WAYLAND_SURFACE_WM_CAPS_MINIMIZE))
++        WARN("Compositor does not support minimize, cannot implement window focus loss!\n");
++
++    if (!(data = wayland_win_data_get(hwnd))) return;
++
++    if ((surface = data->wayland_surface) && wayland_surface_is_toplevel(surface))
++    {
++        surface->pending.caps = cap;
++    }
++
++    wayland_win_data_release(data);
++}
++
+ static const struct xdg_toplevel_listener xdg_toplevel_listener =
+ {
+     xdg_toplevel_handle_configure,
+-    xdg_toplevel_handle_close
++    xdg_toplevel_handle_close,
++    xdg_toplevel_handle_configure_bounds,
++    xdg_toplevel_handle_wm_caps
+ };
+ 
+ static void xdg_popup_handle_configure(void *private, struct xdg_popup *xdg_popup,
+@@ -1620,6 +1731,7 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
+ 
+     memset(&surface->comitted, 0, sizeof(surface->comitted));
+     surface->comitted.scale = 0.0;
++    memset(&surface->toplevel_size_limits, 0, sizeof(surface->toplevel_size_limits));
+ 
+     /* Ensure no buffer is attached, otherwise future role assignments may fail. */
+     wl_surface_attach(surface->wl_surface, NULL, 0, 0);
+@@ -1800,6 +1912,72 @@ void wayland_surface_update_toplevel_parent(struct wayland_surface *surface)
+     xdg_toplevel_set_parent(surface->xdg_toplevel, owner_surface ? owner_surface->xdg_toplevel : NULL);
+ }
+ 
++static BOOL wayland_surface_config_is_managed(const struct wayland_surface_config *config)
++{
++    return config->state & (WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED |
++                            WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN |
++                            WAYLAND_SURFACE_CONFIG_STATE_TILED);
++}
++
++BOOL wayland_surface_get_max_track_size(struct wayland_surface *surface, SIZE *size)
++{
++    const struct wayland_surface_config *config = &surface->current;
++    int width, height;
++
++    if (!surface->window.resizeable || !wayland_surface_is_toplevel(surface) ||
++        !surface->xdg_toplevel)
++        return FALSE;
++    if (!config->serial || wayland_surface_config_is_managed(config) ||
++        !wayland_surface_config_has_bounds(config))
++        return FALSE;
++
++    wayland_surface_coords_to_window(surface, config->bounds_width,
++                                     config->bounds_height, &width, &height);
++    if (width <= 0 || height <= 0) return FALSE;
++
++    size->cx = width;
++    size->cy = height;
++    return TRUE;
++}
++
++static void wayland_surface_apply_toplevel_size_limits(struct wayland_surface *surface,
++                                                       int width, int height)
++{
++    struct wayland_toplevel_size_limits limits = {0};
++
++    if (!wayland_surface_is_toplevel(surface)) return;
++
++    if (surface->window.resizeable)
++    {
++        if (!wayland_surface_config_is_managed(&surface->current) &&
++            wayland_surface_config_has_bounds(&surface->current))
++        {
++            limits.max_width = surface->current.bounds_width;
++            limits.max_height = surface->current.bounds_height;
++        }
++    }
++    else
++    {
++        limits.min_width = limits.max_width = width;
++        limits.min_height = limits.max_height = height;
++    }
++
++    if (surface->toplevel_size_limits.valid &&
++        surface->toplevel_size_limits.min_width == limits.min_width &&
++        surface->toplevel_size_limits.min_height == limits.min_height &&
++        surface->toplevel_size_limits.max_width == limits.max_width &&
++        surface->toplevel_size_limits.max_height == limits.max_height)
++        return;
++
++    xdg_toplevel_set_min_size(surface->xdg_toplevel, limits.min_width,
++                              limits.min_height);
++    xdg_toplevel_set_max_size(surface->xdg_toplevel, limits.max_width,
++                              limits.max_height);
++
++    limits.valid = TRUE;
++    surface->toplevel_size_limits = limits;
++}
++
+ /**********************************************************************
+  *          wayland_surface_reconfigure_geometry
+  *
+@@ -1841,22 +2019,13 @@ static void wayland_surface_reconfigure_geometry(struct wayland_surface *surface
+     if (!IsRectEmpty(&rect))
+     {
+         int width = rect.right - rect.left, height = rect.bottom - rect.top;
++
+         xdg_surface_set_window_geometry(surface->xdg_surface, 0, 0, width, height);
+         surface->geometry = rect;
+         /* min/max size are toplevel-only. xdg_popup aliases xdg_toplevel in the union. */
+         if (!wayland_surface_is_toplevel(surface)) return;
+ 
+-        if (surface->window.resizeable)
+-        {
+-            xdg_toplevel_set_min_size(surface->xdg_toplevel, 0, 0);
+-            xdg_toplevel_set_max_size(surface->xdg_toplevel, 0, 0);
+-        }
+-        else
+-        {
+-            xdg_toplevel_set_min_size(surface->xdg_toplevel, width, height);
+-            xdg_toplevel_set_max_size(surface->xdg_toplevel, width, height);
+-        }
+-
++        wayland_surface_apply_toplevel_size_limits(surface, width, height);
+         wayland_surface_update_toplevel_parent(surface);
+     }
+ }
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index f4a680a0dd5..a66bfe76a85 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -107,6 +107,15 @@ enum wayland_surface_role
+     WAYLAND_SURFACE_ROLE_LAYER,
+ };
+ 
++enum wayland_surface_wm_caps
++{
++    WAYLAND_SURFACE_WM_CAPS_CHANGED = (1 << 0),
++    WAYLAND_SURFACE_WM_CAPS_SHOW_WINDOW = (1 << 1),
++    WAYLAND_SURFACE_WM_CAPS_MAXIMIZE = (1 << 2),
++    WAYLAND_SURFACE_WM_CAPS_FULLSCREEN = (1 << 3),
++    WAYLAND_SURFACE_WM_CAPS_MINIMIZE = (1 << 4)
++};
++
+ enum wayland_surface_ensure_type
+ {
+     WAYLAND_SURFACE_NOT_ENSURED = 0,
+@@ -363,10 +372,20 @@ struct wayland_output
+ struct wayland_surface_config
+ {
+     RECT rect;
++    int32_t bounds_width, bounds_height;
+     enum wayland_surface_config_state state;
+     enum zxdg_toplevel_decoration_v1_mode decor;
++    enum wayland_surface_wm_caps caps;
+     uint32_t serial;
+     BOOL processed;
++    BOOL bounds_set;
++};
++
++struct wayland_toplevel_size_limits
++{
++    int min_width, min_height;
++    int max_width, max_height;
++    BOOL valid;
+ };
+ 
+ struct wayland_window_config
+@@ -488,6 +507,7 @@ struct wayland_surface
+     struct wp_alpha_modifier_surface_v1 *wp_alpha_modifier_surface_v1;
+ 
+     struct wayland_surface_config pending, requested, processing, current;
++    struct wayland_toplevel_size_limits toplevel_size_limits;
+     BOOL resizing;
+     enum wayland_surface_ensure_type ensured_contents;
+     struct wl_list hwnd_dmabuf_surfaces;
+@@ -554,6 +574,7 @@ RECT map_rect_to_surface(struct wayland_surface *surface, RECT rect);
+ POINT map_point_to_surface(struct wayland_surface *surface, POINT point);
+ RECT map_rect_from_surface(struct wayland_surface *surface, RECT rect);
+ POINT map_point_from_surface(struct wayland_surface *surface, POINT point);
++BOOL wayland_surface_get_max_track_size(struct wayland_surface *surface, SIZE *size);
+ BOOL wayland_surface_has_hwnd_dmabuf_content(struct wayland_surface *surface);
+ void wayland_surface_prepare_direct_dmabuf_shm_commit(struct wayland_surface *surface);
+ void wayland_surface_finish_direct_dmabuf_shm_commit(struct wayland_surface *surface);
+@@ -767,6 +788,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+                               const struct window_rects *new_rects, struct window_surface *surface);
+ BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const struct window_rects *rects);
+ BOOL WAYLAND_GetWindowStateUpdates(HWND hwnd, UINT *state_cmd, UINT *swp_flags, RECT *rect, HWND *foreground);
++BOOL WAYLAND_GetWindowMaxTrackSize(HWND hwnd, SIZE *size);
+ BOOL WAYLAND_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rect, struct window_surface **surface);
+ BOOL WAYLAND_GetWindowStyleMasks(HWND hwnd,  UINT style, UINT ex_style, UINT *style_mask, UINT *ex_style_mask);
+ BOOL WAYLAND_HasWindowManager(const char *name);
+diff --git a/dlls/winewayland.drv/waylanddrv_main.c b/dlls/winewayland.drv/waylanddrv_main.c
+index 3c566017dfd..4612a14d30d 100644
+--- a/dlls/winewayland.drv/waylanddrv_main.c
++++ b/dlls/winewayland.drv/waylanddrv_main.c
+@@ -64,6 +64,7 @@ static const struct user_driver_funcs waylanddrv_funcs =
+     .pCreateWindowSurface = WAYLAND_CreateWindowSurface,
+     .pGetWindowStyleMasks = WAYLAND_GetWindowStyleMasks,
+     .pGetWindowStateUpdates = WAYLAND_GetWindowStateUpdates,
++    .pGetWindowMaxTrackSize = WAYLAND_GetWindowMaxTrackSize,
+     .pHasWindowManager = WAYLAND_HasWindowManager,
+     .pVulkanInit = WAYLAND_VulkanInit,
+     .pOpenGLInit = WAYLAND_OpenGLInit,
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index 44c6c58af37..488bb18988f 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -1452,6 +1452,20 @@ BOOL WAYLAND_GetWindowStateUpdates(HWND hwnd, UINT *state_cmd, UINT *swp_flags,
+     return TRUE;
+ }
+ 
++BOOL WAYLAND_GetWindowMaxTrackSize(HWND hwnd, SIZE *size)
++{
++    struct wayland_win_data *data;
++    BOOL ret = FALSE;
++
++    if (!(data = wayland_win_data_get(hwnd))) return FALSE;
++
++    if (data->wayland_surface)
++        ret = wayland_surface_get_max_track_size(data->wayland_surface, size);
++
++    wayland_win_data_release(data);
++    return ret;
++}
++
+ /* True when the client surface occludes this window's GDI buffer. A detached
+  * or reparented client does not count. */
+ static BOOL window_client_surface_attached(struct wayland_win_data *data)
+diff --git a/include/wine/gdi_driver.h b/include/wine/gdi_driver.h
+index 7909c5dbd2b..455e090512c 100644
+--- a/include/wine/gdi_driver.h
++++ b/include/wine/gdi_driver.h
+@@ -218,7 +218,7 @@ struct gdi_dc_funcs
+ };
+ 
+ /* increment this when you change the DC function table */
+-#define WINE_GDI_DRIVER_VERSION 108
++#define WINE_GDI_DRIVER_VERSION 110
+ 
+ #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
+ #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
+@@ -465,6 +465,7 @@ struct user_driver_funcs
+     BOOL    (*pWindowPosChanging)(HWND,UINT,BOOL,const struct window_rects *);
+     BOOL    (*pGetWindowStyleMasks)(HWND,UINT,UINT,UINT*,UINT*);
+     BOOL    (*pGetWindowStateUpdates)(HWND,UINT*,UINT*,RECT*,HWND*);
++    BOOL    (*pGetWindowMaxTrackSize)(HWND,SIZE*);
+     BOOL    (*pCreateWindowSurface)(HWND,BOOL,const RECT *,struct window_surface**);
+     void    (*pMoveWindowBits)(HWND,const struct window_rects *,const struct window_rects *,const RECT *);
+     void    (*pWindowPosChanged)(HWND,HWND,HWND,UINT,const struct window_rects*,struct window_surface*);

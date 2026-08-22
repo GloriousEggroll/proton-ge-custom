@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Wed, 24 Jun 2026 17:39:46 +0200
+Subject: [PATCH 14/49] winewayland: Avoid state loops for maximized toplevels.
+
+Resizable maximized windows may intentionally include frame margins outside
+the monitor bounds. Do not classify them as fullscreen and do not apply the
+Wayland move hack while they are maximized.
+
+Also avoid resending maximize/fullscreen requests when an equivalent state
+is already pending so compositor configure handshakes can converge without
+repeated state requests.
+---
+ dlls/win32u/window.c          |  2 +-
+ dlls/winewayland.drv/window.c | 22 ++++++++++++++++++++--
+ 2 files changed, 21 insertions(+), 3 deletions(-)
+
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index 9ca479d7ddc..1eafe1be0a4 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -2298,7 +2298,7 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
+     ICONINFO ii, ii_small;
+ 
+     /* HACK: move windows within the virtual screen on winewayland */
+-    if (use_move_hack())
++    if (use_move_hack() && !(get_window_long( hwnd, GWL_STYLE ) & WS_MAXIMIZE))
+     {
+         RECT temp, *adj;
+         RECT virtual_screen = get_virtual_screen_rect( get_thread_dpi(), MDT_DEFAULT );
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index cb87459afa8..90564a67456 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -169,7 +169,9 @@ static BOOL wayland_win_data_is_fullscreen(struct wayland_win_data *data, DWORD
+     RECT rect;
+ 
+     if (!data->is_fullscreen) return FALSE;
+-    if (style & WS_MAXIMIZE) return TRUE;
++    if (!(style & WS_POPUP) &&
++        (style & (WS_MAXIMIZE | WS_THICKFRAME)) == (WS_MAXIMIZE | WS_THICKFRAME))
++        return FALSE;
+     if (NtUserGetPresentRect(data->hwnd, &rect, -1)) return TRUE;
+     return !(style & (WS_CAPTION | WS_THICKFRAME));
+ }
+@@ -369,6 +371,14 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
+     return TRUE;
+ }
+ 
++static BOOL wayland_surface_has_pending_state(struct wayland_surface *surface,
++                                              enum wayland_surface_config_state state)
++{
++    if (surface->requested.serial && (surface->requested.state & state)) return TRUE;
++    if (surface->processing.serial && (surface->processing.state & state)) return TRUE;
++    return FALSE;
++}
++
+ static void wayland_surface_update_state_toplevel(struct wayland_surface *surface)
+ {
+     const RECT *rect = &surface->window.rect;
+@@ -403,7 +413,9 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
+         }
+ 
+         if ((surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
+-           !(surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED))
++            !(surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
++            !wayland_surface_has_pending_state(surface,
++                                               WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED))
+         {
+             xdg_toplevel_set_maximized(surface->xdg_toplevel);
+         }
+@@ -425,6 +437,12 @@ static void wayland_surface_update_state_toplevel(struct wayland_surface *surfac
+                 else
+                     goto skip_fullscreen;
+             }
++            else if (surface->requested_output == wl_output &&
++                     wayland_surface_has_pending_state(surface,
++                                                       WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
++            {
++                goto skip_fullscreen;
++            }
+ 
+             xdg_toplevel_set_fullscreen(surface->xdg_toplevel, wl_output);
+             wayland_surface_shortcut_control(surface, TRUE);

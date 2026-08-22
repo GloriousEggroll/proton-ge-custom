@@ -1,0 +1,221 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Sat, 22 Aug 2026 17:15:00 -0600
+Subject: [PATCH 57/57] winewayland: Recreate EGL surfaces across client role
+ transitions.
+
+An OpenGL client surface may be created and made current before its parent
+window has acquired a live Wayland role. When the client is later attached as
+a subsurface, some EGL implementations permanently invalidate the window
+surface created while the wl_surface was roleless. Subsequent presents then
+fail with EGL_BAD_SURFACE, leaving only the transparent carrier visible.
+
+Track client-subsurface attachment generations. Recreate the EGL window
+surface after a role transition while preserving and rebinding its current
+context. Also recover once from an unexpected EGL_BAD_SURFACE so later
+detach/reparent transitions cannot leave the drawable permanently unusable.
+---
+ dlls/winewayland.drv/opengl.c          | 105 +++++++++++++++++++--
+ dlls/winewayland.drv/wayland_surface.c |   3 +
+ dlls/winewayland.drv/waylanddrv.h      |   1 +
+ 3 files changed, 100 insertions(+), 9 deletions(-)
+
+diff --git a/dlls/winewayland.drv/opengl.c b/dlls/winewayland.drv/opengl.c
+index 91a336f..424c1eb 100644
+--- a/dlls/winewayland.drv/opengl.c
++++ b/dlls/winewayland.drv/opengl.c
+@@ -114,6 +114,9 @@ struct wayland_gl_drawable
+ {
+     struct opengl_drawable base;
+     struct wl_egl_window *wl_egl_window;
++    EGLConfig config;
++    LONG attachment_generation;
++    BOOL present_opaque;
+     BOOL swap_interval_initialized;
+     BOOL manual_frame_throttle;
+ };
+@@ -147,11 +150,80 @@ static void wayland_gl_drawable_sync_size(struct wayland_gl_drawable *gl)
+     wl_egl_window_resize(gl->wl_egl_window, client_width, client_height, 0, 0);
+ }
+ 
++static EGLSurface wayland_gl_drawable_create_egl_surface(struct wayland_gl_drawable *gl)
++{
++    EGLint attribs[4], *attrib = attribs;
++
++    if (gl->present_opaque)
++    {
++        *attrib++ = EGL_PRESENT_OPAQUE_EXT;
++        *attrib++ = EGL_TRUE;
++    }
++    *attrib++ = EGL_NONE;
++
++    return funcs->p_eglCreateWindowSurface(egl->display, gl->config,
++                                           gl->wl_egl_window, attribs);
++}
++
++static BOOL wayland_gl_drawable_recreate_egl_surface(struct wayland_gl_drawable *gl)
++{
++    EGLSurface old_surface = gl->base.surface;
++    EGLSurface draw_surface = EGL_NO_SURFACE, read_surface = EGL_NO_SURFACE;
++    EGLContext context = funcs->p_eglGetCurrentContext();
++    BOOL rebind = FALSE;
++
++    if (context != EGL_NO_CONTEXT)
++    {
++        draw_surface = funcs->p_eglGetCurrentSurface(EGL_DRAW);
++        read_surface = funcs->p_eglGetCurrentSurface(EGL_READ);
++        rebind = draw_surface == old_surface || read_surface == old_surface;
++        if (rebind && !funcs->p_eglMakeCurrent(egl->display, EGL_NO_SURFACE,
++                                              EGL_NO_SURFACE, EGL_NO_CONTEXT))
++        {
++            ERR("Failed to release EGL surface %p with error %#x.\n",
++                old_surface, funcs->p_eglGetError());
++            return FALSE;
++        }
++    }
++
++    if (old_surface != EGL_NO_SURFACE &&
++        !funcs->p_eglDestroySurface(egl->display, old_surface))
++    {
++        ERR("Failed to destroy stale EGL surface %p with error %#x.\n",
++            old_surface, funcs->p_eglGetError());
++        return FALSE;
++    }
++
++    gl->base.surface = wayland_gl_drawable_create_egl_surface(gl);
++    if (gl->base.surface == EGL_NO_SURFACE)
++    {
++        ERR("Failed to recreate EGL window surface with error %#x.\n",
++            funcs->p_eglGetError());
++        return FALSE;
++    }
++
++    if (rebind)
++    {
++        if (draw_surface == old_surface) draw_surface = gl->base.surface;
++        if (read_surface == old_surface) read_surface = gl->base.surface;
++        if (!funcs->p_eglMakeCurrent(egl->display, draw_surface, read_surface, context))
++        {
++            ERR("Failed to bind recreated EGL surface %p with error %#x.\n",
++                gl->base.surface, funcs->p_eglGetError());
++            return FALSE;
++        }
++    }
++
++    gl->swap_interval_initialized = FALSE;
++    TRACE("Recreated EGL surface %p as %p after a client role transition.\n",
++          old_surface, gl->base.surface);
++    return TRUE;
++}
++
+ static BOOL wayland_opengl_surface_create(HWND hwnd, BOOL raw, int format, struct opengl_drawable **drawable)
+ {
+     EGLConfig config = egl_config_for_format(format);
+     struct wayland_client_surface *client;
+-    EGLint attribs[4], *attrib = attribs;
+     struct opengl_drawable *previous;
+     struct wayland_gl_drawable *gl;
+     RECT rect;
+@@ -166,12 +238,6 @@ static BOOL wayland_opengl_surface_create(HWND hwnd, BOOL raw, int format, struc
+ 
+     if (!egl->has_EGL_EXT_present_opaque)
+         WARN("Missing EGL_EXT_present_opaque extension\n");
+-    else
+-    {
+-        *attrib++ = EGL_PRESENT_OPAQUE_EXT;
+-        *attrib++ = EGL_TRUE;
+-    }
+-    *attrib++ = EGL_NONE;
+ 
+     if (!(client = wayland_client_surface_create(hwnd))) return FALSE;
+     gl = opengl_drawable_create(sizeof(*gl), &wayland_drawable_funcs, format, &client->client);
+@@ -181,11 +247,14 @@ static BOOL wayland_opengl_surface_create(HWND hwnd, BOOL raw, int format, struc
+     gl->base.buffer_map[1] = GL_BACK_RIGHT;
+     gl->base.buffer_map[GL_FRONT - GL_FRONT_LEFT] = GL_BACK;
+     gl->base.buffer_map[GL_FRONT_AND_BACK - GL_FRONT_LEFT] = GL_BACK;
++    gl->config = config;
++    gl->present_opaque = egl->has_EGL_EXT_present_opaque;
++    gl->attachment_generation = ReadAcquire(&client->attachment_generation);
+ 
+     NtCreateEvent(&client->throttle, EVENT_ALL_ACCESS, NULL, SynchronizationEvent, TRUE);
+ 
+     if (!(gl->wl_egl_window = wl_egl_window_create(client->wl_surface, rect.right, rect.bottom))) goto err;
+-    if (!(gl->base.surface = funcs->p_eglCreateWindowSurface(egl->display, config, gl->wl_egl_window, attribs))) goto err;
++    if (!(gl->base.surface = wayland_gl_drawable_create_egl_surface(gl))) goto err;
+     set_client_surface(hwnd, client);
+ 
+     TRACE("Created drawable %s with egl_surface %p\n", debugstr_opengl_drawable(&gl->base), gl->base.surface);
+@@ -244,11 +313,20 @@ static BOOL wayland_drawable_swap(struct opengl_drawable *base)
+     struct wayland_gl_drawable *gl = impl_from_opengl_drawable(base);
+     struct wayland_client_surface *surface = impl_from_client_surface(base->client);
+     struct wl_callback *callback;
++    LONG attachment_generation;
++    EGLint error;
+ 
+     client_surface_present(base->client);
+     if (!surface->toplevel && !surface->hwnd_dmabuf_producer)
+         return TRUE;
+ 
++    attachment_generation = ReadAcquire(&surface->attachment_generation);
++    if (gl->attachment_generation != attachment_generation)
++    {
++        if (!wayland_gl_drawable_recreate_egl_surface(gl)) return TRUE;
++        gl->attachment_generation = attachment_generation;
++    }
++
+     if (!gl->swap_interval_initialized)
+     {
+         gl->manual_frame_throttle = funcs->p_eglSwapInterval(egl->display, 0);
+@@ -279,7 +357,16 @@ static BOOL wayland_drawable_swap(struct opengl_drawable *base)
+         }
+     }
+     if (!funcs->p_eglSwapBuffers(egl->display, gl->base.surface))
+-        ERR("eglSwapBuffers failed with error %#x.\n", funcs->p_eglGetError());
++    {
++        error = funcs->p_eglGetError();
++        if (error == EGL_BAD_SURFACE && wayland_gl_drawable_recreate_egl_surface(gl))
++        {
++            gl->attachment_generation = ReadAcquire(&surface->attachment_generation);
++            if (funcs->p_eglSwapBuffers(egl->display, gl->base.surface)) return TRUE;
++            error = funcs->p_eglGetError();
++        }
++        ERR("eglSwapBuffers failed with error %#x.\n", error);
++    }
+ 
+     return TRUE;
+ }
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 0c9a43e..08d5a4c 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -4639,6 +4639,7 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
+             wl_subsurface_destroy(client->wl_subsurface);
+             client->wl_subsurface = NULL;
+             client->toplevel_wl_surface = NULL;
++            InterlockedIncrement(&client->attachment_generation);
+         }
+ 
+         SetRect(&client->viewport_rect, -INT32_MAX, 0, -INT32_MAX, 0);
+@@ -4671,6 +4672,8 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
+                                             surface->wl_surface);
+         if (!client->wl_subsurface) goto done;
+ 
++        InterlockedIncrement(&client->attachment_generation);
++
+         /* If the parent wl_surface changes, then the subsurface will be reattached.
+          * So this place_above only need to be done once on attach. If two child windows
+          * are on top of each other then the composition behavior depends on the clip rect
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index 1d49ff2..7ae1ce1 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -445,6 +445,7 @@ struct wayland_client_surface
+     struct client_surface client;
+     HWND toplevel;
+     HANDLE throttle;
++    LONG attachment_generation;
+     RECT viewport_rect;
+     struct wl_callback *wl_callback;
+     BOOL hwnd_dmabuf_producer;
+-- 
+2.51.0

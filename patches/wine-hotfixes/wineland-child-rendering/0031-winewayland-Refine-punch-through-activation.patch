@@ -1,0 +1,749 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Tue, 7 Jul 2026 01:15:55 +0200
+Subject: [PATCH 31/49] winewayland: Refine punch through activation.
+
+- Creating a Vulkan surface is not enough to prove that a window is
+  presenting into it. Mark Vulkan windows as pixel format clients only once
+  a swapchain is created.
+
+- Avoid committing freshly created SHM contents for windows that have not
+  painted into their backing store. Track painted regions and keep
+  unpainted damage transparent or backed by the previous contents.
+
+- Do not treat erase or copy bits operations as GDI-over-producer paints.
+
+- Limit popup grabs to native menu windows so non-menu popups are not
+  dismissed by the compositor.
+
+Fixes issues related to Assetto Corsa game start and content manager app
+issues.
+---
+ dlls/win32u/dce.c                      | 146 ++++++++++++++++++++++++-
+ dlls/win32u/dibdrv/dc.c                |   4 +
+ dlls/win32u/dibdrv/dibdrv.h            |   1 +
+ dlls/win32u/vulkan.c                   |   4 +-
+ dlls/win32u/window.c                   |   6 +-
+ dlls/winewayland.drv/wayland_surface.c |  23 ++--
+ dlls/winewayland.drv/waylanddrv.h      |   1 +
+ dlls/winewayland.drv/window.c          |  29 +++--
+ dlls/winewayland.drv/window_surface.c  | 108 +++++++++++++++---
+ include/wine/gdi_driver.h              |   3 +
+ server/window.c                        |   3 +-
+ 11 files changed, 286 insertions(+), 42 deletions(-)
+
+diff --git a/dlls/win32u/dce.c b/dlls/win32u/dce.c
+index 4a02495853f..41d136deda5 100644
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -51,6 +51,10 @@ struct dce
+ };
+ 
+ static struct list dce_list = LIST_INIT(dce_list);
++static pthread_key_t background_erase_key;
++static pthread_once_t background_erase_once = PTHREAD_ONCE_INIT;
++static pthread_key_t copy_bits_key;
++static pthread_once_t copy_bits_once = PTHREAD_ONCE_INIT;
+ 
+ #define DCE_CACHE_SIZE 64
+ 
+@@ -88,6 +92,40 @@ static struct list foreign_gdi_surfaces = LIST_INIT( foreign_gdi_surfaces );
+ static pthread_mutex_t foreign_gdi_lock = PTHREAD_MUTEX_INITIALIZER;
+ static LONGLONG volatile foreign_gdi_next_producer_id;
+ 
++static void init_background_erase_key(void)
++{
++    pthread_key_create( &background_erase_key, NULL );
++}
++
++static UINT get_background_erase_depth(void)
++{
++    pthread_once( &background_erase_once, init_background_erase_key );
++    return (UINT)(ULONG_PTR)pthread_getspecific( background_erase_key );
++}
++
++static void set_background_erase_depth( UINT depth )
++{
++    pthread_once( &background_erase_once, init_background_erase_key );
++    pthread_setspecific( background_erase_key, (void *)(ULONG_PTR)depth );
++}
++
++static void init_copy_bits_key(void)
++{
++    pthread_key_create( &copy_bits_key, NULL );
++}
++
++static UINT get_copy_bits_depth(void)
++{
++    pthread_once( &copy_bits_once, init_copy_bits_key );
++    return (UINT)(ULONG_PTR)pthread_getspecific( copy_bits_key );
++}
++
++static void set_copy_bits_depth( UINT depth )
++{
++    pthread_once( &copy_bits_once, init_copy_bits_key );
++    pthread_setspecific( copy_bits_key, (void *)(ULONG_PTR)depth );
++}
++
+ static struct foreign_gdi_surface *foreign_gdi_surface_from_window_surface( struct window_surface *surface )
+ {
+     return CONTAINING_RECORD( surface, struct foreign_gdi_surface, header );
+@@ -629,6 +667,7 @@ static BOOL scaled_surface_flush( struct window_surface *window_surface, const R
+     NtGdiDeleteObjectApp( hdc_src );
+ 
+     window_surface_lock( surface->target_surface );
++    window_surface_add_app_paint_rect( surface->target_surface, &dst );
+     add_bounds_rect( &surface->target_surface->bounds, &dst );
+     window_surface_unlock( surface->target_surface );
+ 
+@@ -1004,6 +1043,7 @@ W32KAPI void window_surface_release( struct window_surface *surface )
+     {
+         if (surface != &dummy_surface) pthread_mutex_destroy( &surface->mutex );
+         if (surface->clip_region) NtGdiDeleteObjectApp( surface->clip_region );
++        if (surface->app_painted_region) NtGdiDeleteObjectApp( surface->app_painted_region );
+         if (surface->gdi_over_producer_region) NtGdiDeleteObjectApp( surface->gdi_over_producer_region );
+         if (surface->gdi_over_paint_region) NtGdiDeleteObjectApp( surface->gdi_over_paint_region );
+         if (surface->color_bitmap) NtGdiDeleteObjectApp( surface->color_bitmap );
+@@ -1104,12 +1144,51 @@ W32KAPI void window_surface_flush( struct window_surface *surface )
+     window_surface_unlock( surface );
+ }
+ 
++W32KAPI void window_surface_add_app_paint_rect( struct window_surface *surface, const RECT *rect )
++{
++    HRGN rect_region, surface_region;
++
++    if (surface == &dummy_surface || IsRectEmpty( rect )) return;
++    if (surface->app_painted_full) return;
++    if (rect->left <= surface->rect.left && rect->top <= surface->rect.top &&
++        rect->right >= surface->rect.right && rect->bottom >= surface->rect.bottom)
++    {
++        if (surface->app_painted_region)
++        {
++            NtGdiDeleteObjectApp( surface->app_painted_region );
++            surface->app_painted_region = 0;
++        }
++        surface->app_painted_full = TRUE;
++        return;
++    }
++    if (!(rect_region = NtGdiCreateRectRgn( rect->left, rect->top, rect->right, rect->bottom ))) return;
++    if (!surface->app_painted_region)
++        surface->app_painted_region = NtGdiCreateRectRgn( 0, 0, 0, 0 );
++    if (surface->app_painted_region)
++    {
++        NtGdiCombineRgn( surface->app_painted_region, surface->app_painted_region, rect_region, RGN_OR );
++        if ((surface_region = NtGdiCreateRectRgn( surface->rect.left, surface->rect.top,
++                                                  surface->rect.right, surface->rect.bottom )))
++        {
++            if (NtGdiEqualRgn( surface->app_painted_region, surface_region ))
++            {
++                NtGdiDeleteObjectApp( surface->app_painted_region );
++                surface->app_painted_region = 0;
++                surface->app_painted_full = TRUE;
++            }
++            NtGdiDeleteObjectApp( surface_region );
++        }
++    }
++    NtGdiDeleteObjectApp( rect_region );
++}
++
+ W32KAPI void window_surface_add_gdi_over_paint_rect( struct window_surface *surface, const RECT *rect )
+ {
+-    HRGN rect_region, clipped_region;
++    HRGN rect_region, clipped_region, producer_region = 0, synthetic_region = 0, combined_region = 0;
+     int type;
+ 
+-    if (!surface->gdi_over_producer_region || IsRectEmpty( rect )) return;
++    if (IsRectEmpty( rect )) return;
++    if (get_background_erase_depth() || get_copy_bits_depth()) return;
+     if (!(rect_region = NtGdiCreateRectRgn( rect->left, rect->top, rect->right, rect->bottom ))) return;
+     if (!(clipped_region = NtGdiCreateRectRgn( 0, 0, 0, 0 )))
+     {
+@@ -1117,7 +1196,53 @@ W32KAPI void window_surface_add_gdi_over_paint_rect( struct window_surface *surf
+         return;
+     }
+ 
+-    type = NtGdiCombineRgn( clipped_region, rect_region, surface->gdi_over_producer_region, RGN_AND );
++    if (surface->clip_region && !surface->alpha_mask && surface->color_key == CLR_INVALID &&
++        surface->alpha_bits == -1 &&
++        (!surface->shape_region || !NtGdiEqualRgn( surface->clip_region, surface->shape_region )))
++    {
++        HRGN surface_region;
++
++        if ((surface_region = NtGdiCreateRectRgn( surface->rect.left, surface->rect.top,
++                                                  surface->rect.right, surface->rect.bottom )))
++        {
++            int producer_type;
++
++            synthetic_region = NtGdiCreateRectRgn( 0, 0, 0, 0 );
++            if (synthetic_region)
++            {
++                producer_type = NtGdiCombineRgn( synthetic_region, surface_region,
++                                                 surface->clip_region, RGN_DIFF );
++                if (producer_type == ERROR || producer_type == NULLREGION)
++                {
++                    NtGdiDeleteObjectApp( synthetic_region );
++                    synthetic_region = 0;
++                }
++            }
++            NtGdiDeleteObjectApp( surface_region );
++        }
++    }
++
++    if (surface->gdi_over_producer_region && synthetic_region)
++    {
++        combined_region = NtGdiCreateRectRgn( 0, 0, 0, 0 );
++        if (combined_region &&
++            NtGdiCombineRgn( combined_region, surface->gdi_over_producer_region,
++                             synthetic_region, RGN_OR ) != ERROR)
++            producer_region = combined_region;
++        else producer_region = surface->gdi_over_producer_region;
++    }
++    else producer_region = surface->gdi_over_producer_region ? surface->gdi_over_producer_region : synthetic_region;
++
++    if (!producer_region)
++    {
++        if (synthetic_region) NtGdiDeleteObjectApp( synthetic_region );
++        if (combined_region) NtGdiDeleteObjectApp( combined_region );
++        NtGdiDeleteObjectApp( clipped_region );
++        NtGdiDeleteObjectApp( rect_region );
++        return;
++    }
++
++    type = NtGdiCombineRgn( clipped_region, rect_region, producer_region, RGN_AND );
+     if (type != ERROR && type != NULLREGION)
+     {
+         if (!surface->gdi_over_paint_region)
+@@ -1127,6 +1252,8 @@ W32KAPI void window_surface_add_gdi_over_paint_rect( struct window_surface *surf
+                              clipped_region, RGN_OR );
+     }
+ 
++    if (combined_region) NtGdiDeleteObjectApp( combined_region );
++    if (synthetic_region) NtGdiDeleteObjectApp( synthetic_region );
+     NtGdiDeleteObjectApp( clipped_region );
+     NtGdiDeleteObjectApp( rect_region );
+ }
+@@ -1436,7 +1563,8 @@ static void update_visible_region( struct dce *dce )
+ 
+     if (surface)
+     {
+-        BOOL gdi_over_source = !foreign && (dce->hwnd != top_win) &&
++        BOOL gdi_over_source = !foreign &&
++            (dce->hwnd != top_win) &&
+             (get_window_long( dce->hwnd, GWL_EXSTYLE ) & WS_EX_TRANSPARENT) &&
+             !(paint_flags & (SET_WINPOS_PIXEL_FORMAT | SET_WINPOS_CLIP_CLIENT));
+ 
+@@ -2229,7 +2357,11 @@ static BOOL send_erase( HWND hwnd, UINT flags, HRGN client_rgn,
+                 /* don't erase if the clip box is empty */
+                 if (type != NULLREGION)
+                 {
++                    UINT erase_depth = get_background_erase_depth();
++
++                    set_background_erase_depth( erase_depth + 1 );
+                     need_erase = !send_message_timeout( hwnd, WM_ERASEBKGND, (WPARAM)hdc, 0, SMTO_ABORTIFHUNG, 1000, FALSE );
++                    set_background_erase_depth( erase_depth );
+                     if (need_erase && RtlGetLastWin32Error() == ERROR_TIMEOUT) ERR( "timeout.\n" );
+                 }
+             }
+@@ -2257,13 +2389,16 @@ void move_window_bits( HWND hwnd, const struct window_rects *rects, const RECT *
+         UINT flags = UPDATE_NOCHILDREN | UPDATE_CLIPCHILDREN;
+         HRGN rgn = get_update_region( hwnd, &flags, NULL );
+         HDC hdc = NtUserGetDCEx( hwnd, rgn, DCX_CACHE | DCX_WINDOW | DCX_EXCLUDERGN );
++        UINT copy_bits_depth = get_copy_bits_depth();
+ 
+         TRACE( "copying %s -> %s\n", wine_dbgstr_rect( &src ), wine_dbgstr_rect( &dst ));
+         OffsetRect( &src, -rects->window.left, -rects->window.top );
+         OffsetRect( &dst, -rects->window.left, -rects->window.top );
+ 
++        set_copy_bits_depth( copy_bits_depth + 1 );
+         NtGdiStretchBlt( hdc, dst.left, dst.top, dst.right - dst.left, dst.bottom - dst.top,
+                          hdc, src.left, src.top, src.right - src.left, src.bottom - src.top, SRCCOPY, 0 );
++        set_copy_bits_depth( copy_bits_depth );
+         NtUserReleaseDC( hwnd, hdc );
+     }
+ }
+@@ -2286,6 +2421,7 @@ void move_window_bits_surface( HWND hwnd, const RECT *window_rect, struct window
+ 
+     RECT dst = valid_rects[0];
+     RECT src = valid_rects[1];
++    UINT copy_bits_depth = get_copy_bits_depth();
+ 
+     TRACE( "copying %s -> %s\n", wine_dbgstr_rect( &src ), wine_dbgstr_rect( &dst ));
+     OffsetRect( &src, -old_visible_rect->left, -old_visible_rect->top );
+@@ -2293,10 +2429,12 @@ void move_window_bits_surface( HWND hwnd, const RECT *window_rect, struct window
+ 
+     window_surface_lock( old_surface );
+     bits = window_surface_get_color( old_surface, info );
++    set_copy_bits_depth( copy_bits_depth + 1 );
+     NtGdiSetDIBitsToDeviceInternal( hdc, dst.left, dst.top, dst.right - dst.left, dst.bottom - dst.top,
+                                     src.left - old_surface->rect.left, old_surface->rect.bottom - src.bottom,
+                                     0, old_surface->rect.bottom - old_surface->rect.top,
+                                     bits, info, DIB_RGB_COLORS, 0, 0, FALSE, NULL );
++    set_copy_bits_depth( copy_bits_depth );
+     window_surface_unlock( old_surface );
+     NtUserReleaseDC( hwnd, hdc );
+ }
+diff --git a/dlls/win32u/dibdrv/dc.c b/dlls/win32u/dibdrv/dc.c
+index 8682859fc5f..8f6bedc97a9 100644
+--- a/dlls/win32u/dibdrv/dc.c
++++ b/dlls/win32u/dibdrv/dc.c
+@@ -316,6 +316,9 @@ void add_clipped_bounds( dibdrv_physdev *dev, const RECT *rect, HRGN clip )
+ 
+     if (IsRectEmpty( &rc )) return;
+     OffsetRect( &rc, dev->dib.rect.left, dev->dib.rect.top );
++    /* Erase and CopyBits still prove the surface has app-visible pixels.
++     * GDI-over-producer tracking filters those paths separately. */
++    if (dev->window_surface) window_surface_add_app_paint_rect( dev->window_surface, &rc );
+     add_bounds_rect( dev->bounds, &rc );
+     if (dev->gdi_over_surface) window_surface_add_gdi_over_paint_rect( dev->gdi_over_surface, &rc );
+ }
+@@ -601,6 +604,7 @@ void dibdrv_set_window_surface( DC *dc, struct window_surface *surface, BOOL gdi
+         dibdrv->dib.rect = dc->attr->vis_rect;
+         OffsetRect( &dibdrv->dib.rect, -dc->device_rect.left, -dc->device_rect.top );
+         dibdrv->bounds = &surface->bounds;
++        dibdrv->window_surface = surface != &dummy_surface ? surface : NULL;
+         dibdrv->gdi_over_surface = (gdi_over_source && surface != &dummy_surface) ? surface : NULL;
+         DC_InitDC( dc );
+     }
+diff --git a/dlls/win32u/dibdrv/dibdrv.h b/dlls/win32u/dibdrv/dibdrv.h
+index ffcdc4cc465..0a68bd3f43a 100644
+--- a/dlls/win32u/dibdrv/dibdrv.h
++++ b/dlls/win32u/dibdrv/dibdrv.h
+@@ -99,6 +99,7 @@ typedef struct dibdrv_physdev
+ 
+     HRGN clip;
+     RECT *bounds;
++    struct window_surface *window_surface;
+     struct window_surface *gdi_over_surface;
+     struct cached_font *font;
+ 
+diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+index 873534bdeda..7b10d84b508 100644
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -1848,7 +1848,6 @@ static VkResult win32u_vkCreateWin32SurfaceKHR( VkInstance client_instance, cons
+         return res;
+     }
+     add_window_client_surface( surface->hwnd, surface->client );
+-    set_window_pixel_format( surface->hwnd, -1, TRUE );
+ 
+     vulkan_object_init( &surface->obj.obj, host_surface );
+     surface->obj.instance = instance;
+@@ -3610,6 +3609,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
+                 swapchain->extents = managed->extents;
+                 swapchain->managed = managed;
+                 instance->p_insert_object( instance, &swapchain->obj.obj );
++                set_window_pixel_format( surface->hwnd, -1, TRUE );
+ 
+                 *ret = swapchain->obj.client.swapchain;
+                 TRACE( "hwnd %p -> wine-managed swapchain %p (cross-process dmabuf producer)\n",
+@@ -3658,6 +3658,8 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
+               debugstr_vkextent2d(&swapchain->extents), debugstr_vkextent2d(&swapchain->host_extents) );
+     }
+ 
++    set_window_pixel_format( surface->hwnd, -1, TRUE );
++
+     *ret = swapchain->obj.client.swapchain;
+     return VK_SUCCESS;
+ }
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index b4c5199075b..350f2f4a264 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -2853,7 +2853,11 @@ BOOL WINAPI NtUserUpdateLayeredWindow( HWND hwnd, HDC hdc_dst, const POINT *pts_
+         ret = NtGdiAlphaBlend( hdc, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
+                                hdc_src, src_rect.left, src_rect.top, src_rect.right - src_rect.left, src_rect.bottom - src_rect.top,
+                                *(DWORD *)&src_blend, 0 );
+-        if (ret) add_bounds_rect( &surface->bounds, &rect );
++        if (ret)
++        {
++            window_surface_add_app_paint_rect( surface, &rect );
++            add_bounds_rect( &surface->bounds, &rect );
++        }
+ 
+         NtGdiDeleteObjectApp( hdc );
+         window_surface_unlock( surface );
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index bc6a14b3771..0b22c67d2f7 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -1474,7 +1474,7 @@ void wayland_surface_make_popup(struct wayland_surface *surface,
+     if (!surface->xdg_popup) goto err;
+     xdg_popup_add_listener(surface->xdg_popup, &xdg_popup_listener, surface->hwnd);
+ 
+-    if (wayland_is_menu_popup(surface->hwnd))
++    if (wayland_is_popup_menu_class(surface->hwnd))
+         grab_serial = popup_grab_serial_for_owner(owner);
+     if (grab_serial)
+     {
+@@ -3007,7 +3007,7 @@ static const struct wl_buffer_listener transparent_carrier_buffer_listener =
+     transparent_carrier_buffer_release
+ };
+ 
+-static BOOL wayland_surface_attach_transparent_carrier(struct wayland_surface *surface)
++BOOL wayland_surface_attach_transparent_carrier(struct wayland_surface *surface)
+ {
+     struct wayland_shm_buffer *shm_buffer;
+     int width, height;
+@@ -4027,9 +4027,9 @@ static void wayland_client_surface_present(struct client_surface *client, HDC hd
+         return;
+     }
+ 
++    surface->has_presented = TRUE;
+     set_client_surface(hwnd, surface);
+     ensure_window_surface_contents(toplevel);
+-    surface->has_presented = TRUE;
+ }
+ 
+ void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
+@@ -4037,14 +4037,19 @@ void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
+     HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
+     struct wayland_client_surface *old_client;
+     struct wayland_win_data *data;
+-    BOOL visible = FALSE;
++    BOOL visible;
+ 
+     /* ownership is shared with the callers, the last caller to release
+      * its reference will also destroy it and clear our pointer. */
+ 
+-    if (toplevel) visible = is_client_visible(hwnd);
+     if (!(data = wayland_win_data_get(hwnd))) return;
+ 
++    visible = is_client_visible(hwnd);
++
++    if (new_client && new_client != data->client_surface && data->client_surface &&
++        data->client_surface->has_presented && !new_client->has_presented)
++        goto done;
++
+     if (new_client != data->client_surface)
+     {
+         if ((old_client = data->client_surface))
+@@ -4055,12 +4060,13 @@ void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
+ 
+     if (data->client_surface)
+     {
+-        if (toplevel && is_client_visible(hwnd))
++        if (toplevel && visible)
+             wayland_client_surface_attach(data->client_surface, toplevel);
+         else
+             wayland_client_surface_attach(data->client_surface, NULL);
+     }
+ 
++done:
+     wayland_win_data_release(data);
+ }
+ 
+@@ -4153,7 +4159,7 @@ static BOOL wayland_surface_has_live_role(struct wayland_surface *surface)
+ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND toplevel)
+ {
+     struct wayland_win_data *toplevel_data;
+-    struct wayland_surface *surface;
++    struct wayland_surface *surface = NULL;
+     HWND hwnd = client->client.hwnd;
+     RECT client_rect, dst;
+     struct wayland_child_visibility_info visibility;
+@@ -4162,8 +4168,6 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
+     {
+         if (client->wl_subsurface)
+         {
+-            if (client->toplevel)
+-                NtUserPostMessage(hwnd, WM_WINE_SETWINDOWSURFACECLIP, FALSE, 0);
+             wl_subsurface_destroy(client->wl_subsurface);
+             client->wl_subsurface = NULL;
+             client->toplevel_wl_surface = NULL;
+@@ -4213,7 +4217,6 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
+         client->toplevel = toplevel;
+         client->toplevel_wl_surface = surface->wl_surface;
+         SetRect(&client->rect, 0, 0, -1, -1);
+-        NtUserPostMessage(hwnd, WM_WINE_SETWINDOWSURFACECLIP, TRUE, 0);
+ 
+         TRACE("Created subsurface for toplevel=%p\n", toplevel);
+     }
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index adfa3c659bb..38fa70ffc6e 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -594,6 +594,7 @@ BOOL wayland_surface_has_hwnd_dmabuf_content(struct wayland_surface *surface);
+ BOOL wayland_surface_client_is_unmaskable(struct wayland_surface *surface);
+ void wayland_surface_sync_window_regions(struct wayland_surface *surface,
+                                          struct window_surface *window_surface);
++BOOL wayland_surface_attach_transparent_carrier(struct wayland_surface *surface);
+ void wayland_surface_prepare_direct_dmabuf_shm_commit(struct wayland_surface *surface);
+ void wayland_surface_finish_direct_dmabuf_shm_commit(struct wayland_surface *surface);
+ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface);
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index f39dc246f75..f7441287d42 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -1549,14 +1549,18 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
+                 wayland_surface_sync_alpha(wayland_surface);
+             }
+ 
+-            wayland_surface_prepare_direct_dmabuf_shm_commit(wayland_surface);
+-            wayland_surface_attach_shm(wayland_surface, shm_buffer, damage_region);
+-            wayland_surface->transparent_carrier_attached = FALSE;
+-            wl_surface_commit(wayland_surface->wl_surface);
+-            wayland_surface_finish_direct_dmabuf_shm_commit(wayland_surface);
+-            wayland_surface->ensured_contents = WAYLAND_SURFACE_ENSURED_FLUSH;
+-            wayland_surface_update_hwnd_dmabufs(wayland_surface);
+-            committed = TRUE;
++            if (shm_buffer)
++            {
++                wayland_surface_prepare_direct_dmabuf_shm_commit(wayland_surface);
++                wayland_surface_attach_shm(wayland_surface, shm_buffer, damage_region);
++                wayland_surface->transparent_carrier_attached = FALSE;
++                wl_surface_commit(wayland_surface->wl_surface);
++                wayland_surface_finish_direct_dmabuf_shm_commit(wayland_surface);
++                wayland_surface->ensured_contents = WAYLAND_SURFACE_ENSURED_FLUSH;
++                wayland_surface_update_hwnd_dmabufs(wayland_surface);
++                committed = TRUE;
++            }
++            else committed = wayland_surface_attach_transparent_carrier(wayland_surface);
+         }
+         else
+         {
+@@ -1566,7 +1570,7 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
+ 
+     /* An attached client stays attached on GDI commits. Detaching would flash
+      * the empty GDI buffer. Lifecycle callbacks clear dead client surfaces. */
+-    if (committed && data->client_surface && !window_client_surface_attached(data) &&
++    if (committed && shm_buffer && data->client_surface && !window_client_surface_attached(data) &&
+         !window_client_surface_pending_first_frame(data))
+         wayland_client_surface_attach(data->client_surface, NULL);
+ 
+@@ -1575,7 +1579,12 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
+      * it's irrelevant if it was actually committed or not. */
+     if (data->window_contents)
+         wayland_shm_buffer_unref(data->window_contents);
+-    wayland_shm_buffer_ref((data->window_contents = shm_buffer));
++    data->window_contents = NULL;
++    if (shm_buffer)
++    {
++        wayland_shm_buffer_ref(shm_buffer);
++        data->window_contents = shm_buffer;
++    }
+ 
+     wayland_win_data_release(data);
+ 
+diff --git a/dlls/winewayland.drv/window_surface.c b/dlls/winewayland.drv/window_surface.c
+index 22324c9b8eb..23fd3c06d1e 100644
+--- a/dlls/winewayland.drv/window_surface.c
++++ b/dlls/winewayland.drv/window_surface.c
+@@ -143,7 +143,7 @@ static BOOL wayland_gdi_overlay_slot_create(struct wayland_gdi_overlay_slot *slo
+                              NULL, &section_size, PAGE_READWRITE, SEC_COMMIT, 0);
+     if (status)
+     {
+-        WARN("failed to create GDI overlay shm section status %#lx\n", status);
++        WARN("failed to create GDI overlay shm section status %#x\n", status);
+         return FALSE;
+     }
+ 
+@@ -151,7 +151,7 @@ static BOOL wayland_gdi_overlay_slot_create(struct wayland_gdi_overlay_slot *slo
+                                 &view_size, ViewUnmap, 0, PAGE_READWRITE);
+     if (status)
+     {
+-        WARN("failed to map GDI overlay shm section status %#lx\n", status);
++        WARN("failed to map GDI overlay shm section status %#x\n", status);
+         wayland_gdi_overlay_slot_destroy(slot);
+         return FALSE;
+     }
+@@ -159,7 +159,7 @@ static BOOL wayland_gdi_overlay_slot_create(struct wayland_gdi_overlay_slot *slo
+     status = wine_server_handle_to_fd(slot->section, FILE_READ_DATA, &slot->fd, NULL);
+     if (status)
+     {
+-        WARN("failed to export GDI overlay shm section status %#lx\n", status);
++        WARN("failed to export GDI overlay shm section status %#x\n", status);
+         wayland_gdi_overlay_slot_destroy(slot);
+         return FALSE;
+     }
+@@ -1010,6 +1010,46 @@ static void wayland_shm_buffer_clear_outside_clip(struct wayland_shm_buffer *buf
+     NtGdiDeleteObjectApp(dirty_region);
+ }
+ 
++static HRGN create_occluded_region(const RECT *surface_rect, HRGN clip_region)
++{
++    HRGN surface_region, occluded_region;
++    int type;
++
++    if (!clip_region) return 0;
++    if (!(surface_region = NtGdiCreateRectRgn(surface_rect->left, surface_rect->top,
++                                              surface_rect->right, surface_rect->bottom)))
++        return 0;
++    if (!(occluded_region = NtGdiCreateRectRgn(0, 0, 0, 0)))
++    {
++        NtGdiDeleteObjectApp(surface_region);
++        return 0;
++    }
++
++    type = NtGdiCombineRgn(occluded_region, surface_region, clip_region, RGN_DIFF);
++    NtGdiDeleteObjectApp(surface_region);
++    if (type == ERROR || type == NULLREGION)
++    {
++        NtGdiDeleteObjectApp(occluded_region);
++        return 0;
++    }
++    return occluded_region;
++}
++
++static HRGN union_regions(HRGN a, HRGN b)
++{
++    HRGN region;
++
++    if (!a) return b;
++    if (!b) return a;
++    if (!(region = NtGdiCreateRectRgn(0, 0, 0, 0))) return a;
++    if (NtGdiCombineRgn(region, a, b, RGN_OR) == ERROR)
++    {
++        NtGdiDeleteObjectApp(region);
++        return a;
++    }
++    return region;
++}
++
+ /**********************************************************************
+  *          wayland_shm_buffer_copy_data
+  */
+@@ -1070,13 +1110,24 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface,
+ {
+     RECT surface_rect = {.right = color_info->bmiHeader.biWidth, .bottom = abs(color_info->bmiHeader.biHeight)};
+     struct wayland_window_surface *wws = wayland_window_surface_cast(window_surface);
+-    struct wayland_shm_buffer *shm_buffer = NULL, *latest_buffer;
++    struct wayland_shm_buffer *shm_buffer = NULL, *latest_buffer = NULL;
+     BOOL flushed = FALSE;
+     BOOL overlay_flushed;
+     HRGN surface_damage_region = NULL;
+-    HRGN copy_from_window_region;
++    HRGN occluded_region = NULL;
++    HRGN merged_gdi_over_region = NULL;
++    HRGN gdi_over_region, gdi_over_paint_region;
++    HRGN copy_from_window_region = NULL;
+     uint32_t buffer_format;
+ 
++    if (!window_surface->app_painted_full && !window_surface->app_painted_region)
++    {
++        if (shape_changed) wayland_window_surface_sync_regions(window_surface);
++        flushed = set_window_surface_contents(window_surface->hwnd, NULL, NULL);
++        wl_display_flush(process_wayland.wl_display);
++        goto done;
++    }
++
+     surface_damage_region = NtGdiCreateRectRgn(rect->left + dirty->left, rect->top + dirty->top,
+                                                rect->left + dirty->right, rect->top + dirty->bottom);
+     if (!surface_damage_region)
+@@ -1084,6 +1135,17 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface,
+         ERR("failed to create surface damage region\n");
+         goto done;
+     }
++    if (window_surface->app_painted_full)
++        copy_from_window_region = surface_damage_region;
++    else if (!(copy_from_window_region = NtGdiCreateRectRgn(0, 0, 0, 0)))
++    {
++        ERR("failed to create copy_from_window region\n");
++        goto done;
++    }
++    if (!window_surface->app_painted_full &&
++        NtGdiCombineRgn(copy_from_window_region, surface_damage_region,
++                        window_surface->app_painted_region, RGN_AND) == ERROR)
++        goto done;
+ 
+     buffer_format = (shape_bits || wws->occlusion_clipped || wws->layered) ?
+                     WL_SHM_FORMAT_ARGB8888 : WL_SHM_FORMAT_XRGB8888;
+@@ -1119,30 +1181,42 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface,
+                 goto done;
+             }
+             NtGdiCombineRgn(copy_from_latest_region, shm_buffer->damage_region,
+-                            surface_damage_region, RGN_DIFF);
++                            copy_from_window_region, RGN_DIFF);
+             wayland_shm_buffer_copy(latest_buffer,
+                                     shm_buffer, copy_from_latest_region);
+             NtGdiDeleteObjectApp(copy_from_latest_region);
+         }
+-        /* ... and use the window_surface as the source of pixel data contained
+-         * in the flush bounds. */
+-        copy_from_window_region = surface_damage_region;
+         wayland_shm_buffer_unref(latest_buffer);
+     }
+     else
+     {
++        HRGN clear_region;
++
+         TRACE("latest_window_buffer=NULL\n");
+-        /* If we don't have a latest buffer, use the window_surface as
+-         * the source of all pixel data. */
+-        copy_from_window_region = shm_buffer->damage_region;
++
++        if ((clear_region = NtGdiCreateRectRgn(0, 0, 0, 0)))
++        {
++            NtGdiCombineRgn(clear_region, surface_damage_region, copy_from_window_region, RGN_DIFF);
++            clear_pixel_region(shm_buffer, clear_region);
++            NtGdiDeleteObjectApp(clear_region);
++        }
+     }
+ 
+     wayland_shm_buffer_copy_data(shm_buffer, color_bits, &surface_rect, copy_from_window_region,
+                                  (shape_bits || wws->occlusion_clipped) && !wws->layered);
+     if (shape_bits) wayland_shm_buffer_copy_shape(shm_buffer, rect, shape_info, shape_bits);
++
++    gdi_over_region = window_surface->gdi_over_producer_region;
++    gdi_over_paint_region = window_surface->gdi_over_paint_region;
++    if (wws->occlusion_clipped && !wws->layered)
++    {
++        occluded_region = create_occluded_region(&surface_rect, window_surface->clip_region);
++        merged_gdi_over_region = union_regions(window_surface->gdi_over_producer_region, occluded_region);
++        gdi_over_region = merged_gdi_over_region;
++    }
++
+     overlay_flushed = wayland_gdi_overlay_update(window_surface->hwnd, &wws->gdi_overlay, shm_buffer, dirty,
+-                                                 window_surface->gdi_over_producer_region,
+-                                                 window_surface->gdi_over_paint_region);
++                                                 gdi_over_region, gdi_over_paint_region);
+     if (wws->occlusion_clipped)
+         wayland_shm_buffer_clear_outside_clip(shm_buffer, dirty, window_surface->clip_region);
+ 
+@@ -1158,6 +1232,12 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface,
+     wl_display_flush(process_wayland.wl_display);
+ 
+ done:
++    if (merged_gdi_over_region && merged_gdi_over_region != window_surface->gdi_over_producer_region &&
++        merged_gdi_over_region != occluded_region)
++        NtGdiDeleteObjectApp(merged_gdi_over_region);
++    if (occluded_region) NtGdiDeleteObjectApp(occluded_region);
++    if (copy_from_window_region && copy_from_window_region != surface_damage_region)
++        NtGdiDeleteObjectApp(copy_from_window_region);
+     if (surface_damage_region) NtGdiDeleteObjectApp(surface_damage_region);
+     return flushed;
+ }
+diff --git a/include/wine/gdi_driver.h b/include/wine/gdi_driver.h
+index ac9a2c8d350..6935bdfa629 100644
+--- a/include/wine/gdi_driver.h
++++ b/include/wine/gdi_driver.h
+@@ -308,6 +308,8 @@ struct window_surface
+     RECT                               bounds;       /* dirty area rectangle */
+     HRGN                               clip_region;  /* visible region of the surface, fully visible if 0 */
+     DWORD                              draw_start_ticks; /* start ticks of fresh draw */
++    HRGN                               app_painted_region; /* app-originated pixels in surface coordinates */
++    BOOL                               app_painted_full; /* app-originated pixels cover the whole surface */
+     COLORREF                           color_key;    /* layered window surface color key, invalid if CLR_INVALID */
+     UINT                               alpha_bits;   /* layered window global alpha bits, invalid if -1 */
+     UINT                               alpha_mask;   /* layered window per-pixel alpha mask, invalid if 0 */
+@@ -327,6 +329,7 @@ W32KAPI void window_surface_lock( struct window_surface *surface );
+ W32KAPI void window_surface_unlock( struct window_surface *surface );
+ W32KAPI void window_surface_set_layered( struct window_surface *surface, COLORREF color_key, UINT alpha_bits, UINT alpha_mask );
+ W32KAPI void window_surface_flush( struct window_surface *surface );
++W32KAPI void window_surface_add_app_paint_rect( struct window_surface *surface, const RECT *rect );
+ W32KAPI void window_surface_add_gdi_over_paint_rect( struct window_surface *surface, const RECT *rect );
+ W32KAPI void window_surface_set_clip( struct window_surface *surface, HRGN clip_region );
+ W32KAPI void window_surface_set_shape( struct window_surface *surface, HRGN shape_region );
+diff --git a/server/window.c b/server/window.c
+index 3dfae38a704..5adb28222a9 100644
+--- a/server/window.c
++++ b/server/window.c
+@@ -467,8 +467,7 @@ static int set_parent_window( struct window *win, struct window *parent )
+         if (parent->thread && parent->thread != win->thread && !is_desktop_window(parent))
+             attach_thread_input( win->thread, parent->thread );
+ 
+-        if (window_has_punch_through_content( win ))
+-            update_clip_client_flags( win );
++        if (window_has_punch_through_content( win )) update_clip_client_flags( win );
+     }
+     else  /* move it to parent unlinked list */
+     {

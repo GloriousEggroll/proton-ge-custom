@@ -1,0 +1,175 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Wed, 24 Jun 2026 10:50:15 +0200
+Subject: [PATCH 11/49] winewayland: Sync shaped window input regions
+
+Apply the shaped input region when creating or flushing a Wayland
+surface, so compositor hit testing matches the Win32 window region.
+---
+ dlls/winewayland.drv/wayland_surface.c | 68 ++++++++++++++++++++++++++
+ dlls/winewayland.drv/waylanddrv.h      |  2 +
+ dlls/winewayland.drv/window.c          | 11 +----
+ dlls/winewayland.drv/window_surface.c  | 15 ++++++
+ 4 files changed, 87 insertions(+), 9 deletions(-)
+
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 42d5f1acb82..2bb01afb426 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -45,6 +45,74 @@ static void wayland_surface_clear_direct_dmabuf(struct wayland_surface *surface,
+ static void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface);
+ static BOOL wayland_surface_try_direct_dmabuf(HWND hwnd);
+ 
++static struct wl_region *wayland_surface_create_shape_input_region(struct wayland_surface *surface,
++                                                                   HRGN shape_region)
++{
++    struct wl_region *region;
++    RGNDATA *data;
++    RECT *rect, *end;
++
++    if (!(region = wl_compositor_create_region(process_wayland.wl_compositor)))
++        return NULL;
++
++    if (!(data = get_region_data(shape_region)))
++    {
++        wl_region_destroy(region);
++        return NULL;
++    }
++
++    rect = (RECT *)data->Buffer;
++    end = rect + data->rdh.nCount;
++    for (; rect < end; rect++)
++    {
++        int left, top, right, bottom;
++
++        wayland_surface_coords_from_window(surface, rect->left, rect->top, &left, &top);
++        wayland_surface_coords_from_window(surface, rect->right, rect->bottom, &right, &bottom);
++        if (right > left && bottom > top)
++            wl_region_add(region, left, top, right - left, bottom - top);
++    }
++
++    free(data);
++    return region;
++}
++
++void wayland_surface_sync_shape_input_region(struct wayland_surface *surface, HRGN shape_region)
++{
++    DWORD exstyle = NtUserGetWindowLongW(surface->hwnd, GWL_EXSTYLE);
++    BOOL transparent = (exstyle & WS_EX_TRANSPARENT) && (exstyle & WS_EX_LAYERED);
++    struct wl_region *region = NULL;
++
++    if (transparent)
++    {
++        region = wl_compositor_create_region(process_wayland.wl_compositor);
++        if (region) wl_surface_set_input_region(surface->wl_surface, region);
++    }
++    else if (shape_region)
++    {
++        region = wayland_surface_create_shape_input_region(surface, shape_region);
++        if (region) wl_surface_set_input_region(surface->wl_surface, region);
++    }
++    else wl_surface_set_input_region(surface->wl_surface, NULL);
++
++    if (region) wl_region_destroy(region);
++}
++
++void wayland_surface_sync_window_input_region(struct wayland_surface *surface)
++{
++    HRGN shape_region = NtGdiCreateRectRgn(0, 0, 0, 0);
++
++    if (!shape_region) return;
++    if (NtUserGetWindowRgnEx(surface->hwnd, shape_region, 0) == ERROR)
++    {
++        NtGdiDeleteObjectApp(shape_region);
++        shape_region = 0;
++    }
++
++    wayland_surface_sync_shape_input_region(surface, shape_region);
++    if (shape_region) NtGdiDeleteObjectApp(shape_region);
++}
++
+ static void request_window_surface_expose(HWND hwnd, BOOL allow_inline)
+ {
+     /* The direct dmabuf fast path may run inline from event callbacks because
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index a66bfe76a85..30cb7ec0e0e 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -576,6 +576,8 @@ RECT map_rect_from_surface(struct wayland_surface *surface, RECT rect);
+ POINT map_point_from_surface(struct wayland_surface *surface, POINT point);
+ BOOL wayland_surface_get_max_track_size(struct wayland_surface *surface, SIZE *size);
+ BOOL wayland_surface_has_hwnd_dmabuf_content(struct wayland_surface *surface);
++void wayland_surface_sync_shape_input_region(struct wayland_surface *surface, HRGN shape_region);
++void wayland_surface_sync_window_input_region(struct wayland_surface *surface);
+ void wayland_surface_prepare_direct_dmabuf_shm_commit(struct wayland_surface *surface);
+ void wayland_surface_finish_direct_dmabuf_shm_commit(struct wayland_surface *surface);
+ struct child_overlay_snapshot *child_overlays_snapshot(HWND hwnd);
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index 488bb18988f..dbe42950561 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -273,7 +273,6 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
+     BOOL visible, layer_set, server_decor = FALSE;
+     DWORD exstyle = NtUserGetWindowLongW(data->hwnd, GWL_EXSTYLE);
+     DWORD style = NtUserGetWindowLongW(data->hwnd, GWL_STYLE);
+-    struct wl_region *input_region;
+ 
+     TRACE("hwnd=%p\n", data->hwnd);
+ 
+@@ -320,14 +319,6 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
+ 
+     if (!(surface = data->wayland_surface) && !(surface = wayland_surface_create(data->hwnd))) return FALSE;
+ 
+-    /* Pass through mouse events for layered, transparent windows, to match
+-     * Windows behavior. */
+-    input_region = ((exstyle & WS_EX_TRANSPARENT) && (exstyle & WS_EX_LAYERED)) ?
+-                   wl_compositor_create_region(process_wayland.wl_compositor) :
+-                   NULL;
+-    wl_surface_set_input_region(surface->wl_surface, input_region);
+-    if (input_region) wl_region_destroy(input_region);
+-
+     surface->ensured_contents = WAYLAND_SURFACE_NOT_ENSURED;
+ 
+     if (!EqualRect(&data->rects.visible, &data->rects.window)
+@@ -366,6 +357,8 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
+         if (role != WAYLAND_SURFACE_ROLE_NONE) wayland_client_surface_attach(client, data->hwnd);
+         else wayland_client_surface_attach(client, NULL);
+     }
++    wayland_surface_sync_window_input_region(surface);
++
+     /* Size/position changes affect the effective pointer constraint, so update
+      * it as needed. */
+     if (data->hwnd == NtUserGetForegroundWindow()) reapply_cursor_clipping();
+diff --git a/dlls/winewayland.drv/window_surface.c b/dlls/winewayland.drv/window_surface.c
+index fcdba99d023..609e60e5a72 100644
+--- a/dlls/winewayland.drv/window_surface.c
++++ b/dlls/winewayland.drv/window_surface.c
+@@ -250,6 +250,19 @@ RGNDATA *get_region_data(HRGN region)
+     return data;
+ }
+ 
++static void wayland_window_surface_sync_input_region(struct window_surface *window_surface)
++{
++    struct wayland_win_data *data;
++
++    if (!(data = wayland_win_data_get(window_surface->hwnd)))
++        return;
++
++    if (data->wayland_surface)
++        wayland_surface_sync_shape_input_region(data->wayland_surface, window_surface->shape_region);
++
++    wayland_win_data_release(data);
++}
++
+ /**********************************************************************
+  *          copy_pixel_region
+  */
+@@ -456,6 +469,8 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface,
+ 
+     NtGdiSetRectRgn(shm_buffer->damage_region, 0, 0, 0, 0);
+ 
++    if (shape_changed) wayland_window_surface_sync_input_region(window_surface);
++
+     /* snapshot child geometry before set_window_surface_contents locks win_data_mutex */
+     if (window_surface_needs_child_overlays(window_surface->hwnd))
+         overlay_snapshot = child_overlays_snapshot(window_surface->hwnd);

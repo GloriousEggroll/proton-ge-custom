@@ -1,0 +1,1348 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Sat, 4 Jul 2026 01:13:04 +0200
+Subject: [PATCH 24/49] winewayland: Use punch-through compositing for child
+ content.
+
+Client and dmabuf child content used to be reconciled with GDI by copying
+child pixels into driver-owned overlay subsurfaces. That made the Wayland
+driver query window-tree state with NtUser from the wrong side of the lock
+boundary and left the driver with a second cached view of child geometry
+and z-order.
+
+Instead keep the server/win32u window tree as the source of truth. Let
+client subsurfaces toggle parent surface clipping, extend the server
+surface region walk to subtract visible self-presenting descendants
+and stack client/dmabuf subsurfaces below the parent GDI surface so the
+punched-through regions reveal the producer content.
+
+This removes the copy-overlay snapshot path, avoids driver-side child
+tree pulls, fixes the client-vs-dmabuf stacking race, and keeps pure
+producer windows mapped with a transparent carrier until real parent
+contents exist.
+
+Fixes EA Launcher crash during start.
+---
+ dlls/win32u/message.c                  |   2 +-
+ dlls/win32u/win32u_private.h           |   2 +-
+ dlls/win32u/window.c                   |  12 +-
+ dlls/winewayland.drv/wayland_surface.c | 481 ++++++-------------------
+ dlls/winewayland.drv/waylanddrv.h      |  51 +--
+ dlls/winewayland.drv/window.c          |  99 +----
+ dlls/winewayland.drv/window_surface.c  |   9 +-
+ server/window.c                        | 140 ++++---
+ 8 files changed, 235 insertions(+), 561 deletions(-)
+
+diff --git a/dlls/win32u/message.c b/dlls/win32u/message.c
+index f3e8cdbda2e..10e0bdb7b30 100644
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -2279,7 +2279,7 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
+         set_window_pixel_format( hwnd, wparam, lparam );
+         return 0;
+     case WM_WINE_SETWINDOWSURFACECLIP:
+-        set_window_surface_clip( hwnd );
++        set_window_surface_clip( hwnd, wparam );
+         return 0;
+     case WM_WINE_TRACKMOUSEEVENT:
+     {
+diff --git a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+index a3a3afc94b5..3363c48906f 100644
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -321,7 +321,7 @@ extern BOOL is_window_unicode( HWND hwnd );
+ extern BOOL is_window_visible( HWND hwnd );
+ extern BOOL is_zoomed( HWND hwnd );
+ extern BOOL set_window_pixel_format( HWND hwnd, int format, BOOL internal );
+-extern BOOL set_window_surface_clip( HWND hwnd );
++extern BOOL set_window_surface_clip( HWND hwnd, BOOL enable );
+ extern int get_window_pixel_format( HWND hwnd );
+ extern DWORD get_window_long( HWND hwnd, INT offset );
+ extern ULONG_PTR get_window_long_ptr( HWND hwnd, INT offset, BOOL ansi );
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index 09bd02423a9..9776a9d033c 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -1631,18 +1631,24 @@ BOOL set_window_pixel_format( HWND hwnd, int format, BOOL internal )
+     return TRUE;
+ }
+ 
+-BOOL set_window_surface_clip( HWND hwnd )
++BOOL set_window_surface_clip( HWND hwnd, BOOL enable )
+ {
+     WND *win = get_win_ptr( hwnd );
+     BOOL changed = FALSE;
+ 
++    enable = enable != FALSE;
++
+     if (!win || win == WND_DESKTOP || win == WND_OTHER_PROCESS)
+     {
+-        NtUserPostMessage( hwnd, WM_WINE_SETWINDOWSURFACECLIP, 0, 0 );
++        NtUserPostMessage( hwnd, WM_WINE_SETWINDOWSURFACECLIP, enable, 0 );
+         return FALSE;
+     }
+ 
+-    if (!win->clip_from_parent) changed = win->clip_from_parent = TRUE;
++    if (win->clip_from_parent != enable)
++    {
++        win->clip_from_parent = enable;
++        changed = TRUE;
++    }
+     release_win_ptr( win );
+ 
+     if (changed) update_window_state( hwnd );
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index be7c44e50ff..e6ad9bc8448 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -188,9 +188,8 @@ static void request_window_surface_expose(HWND hwnd, BOOL allow_inline)
+     if (wayland_surface_try_direct_dmabuf(hwnd)) return;
+ 
+     /* Inline exposes preserve the initial-configure path for windows that draw
+-     * without pumping messages. Child-overlay windows must defer to avoid the
+-     * event thread taking the surface lock before win_data_mutex. */
+-    if (allow_inline && !window_surface_needs_child_overlays(hwnd))
++     * without pumping messages. */
++    if (allow_inline)
+     {
+         NtUserExposeWindowSurface(hwnd, 0, NULL, 0);
+         return;
+@@ -793,52 +792,16 @@ static const struct zxdg_toplevel_decoration_v1_listener zxdg_toplevel_decoratio
+     zxdg_toplevel_decoration_v1_configure
+ };
+ 
+-/**********************************************************************
+- *          wayland_surface_create
+- *
+- * Creates a role-less wayland surface.
+- */
+-/**********************************************************************
+- *          child window overlays
+- *
+- * A GDI child of an accelerated toplevel is painted into the toplevel's
+- * window-surface, which is hidden behind the client surface. Promote each
+- * visible child to a wl_subsurface above the client, copied from that buffer.
+- */
+-
+-static void overlay_buffer_release(void *data, struct wl_buffer *wl_buffer)
+-{
+-    wayland_shm_buffer_unref(data);
+-}
+-static const struct wl_buffer_listener overlay_buffer_listener = { overlay_buffer_release };
+-
+-static void wayland_child_overlay_destroy(struct wayland_child_overlay *overlay)
+-{
+-    wl_list_remove(&overlay->link);
+-    if (overlay->wp_viewport) wp_viewport_destroy(overlay->wp_viewport);
+-    if (overlay->wl_subsurface) wl_subsurface_destroy(overlay->wl_subsurface);
+-    if (overlay->wl_surface) wl_surface_destroy(overlay->wl_surface);
+-    free(overlay);
+-}
+-
+-void wayland_surface_clear_child_overlays(struct wayland_surface *surface)
+-{
+-    struct wayland_child_overlay *overlay, *next;
+-    wl_list_for_each_safe(overlay, next, &surface->child_overlays, link)
+-        wayland_child_overlay_destroy(overlay);
+-}
+-
+ static void wayland_surface_clear_child_surfaces(struct wayland_surface *surface)
+ {
+     struct wayland_hwnd_dmabuf_surface *dmabuf_surface, *next;
+ 
+-    wayland_surface_clear_child_overlays(surface);
+     wayland_surface_clear_direct_dmabuf(surface, NULL);
+ 
+     wl_list_for_each_safe(dmabuf_surface, next, &surface->hwnd_dmabuf_surfaces, link)
+         wayland_hwnd_dmabuf_surface_destroy(dmabuf_surface);
+ 
+-    surface->dmabuf_top = NULL;
++    surface->dmabuf_bottom = NULL;
+ }
+ 
+ /* Clear cached input state when the wl_surface is destroyed. Role changes are
+@@ -872,302 +835,34 @@ static void wayland_surface_clear_input_state(struct wayland_surface *surface)
+     pthread_mutex_unlock(&process_wayland.text_input.mutex);
+ }
+ 
+-/* Prune on hide/destroy: a client-rendered toplevel may never flush GDI again. */
+-void wayland_surface_remove_child_overlay(struct wayland_surface *surface, HWND child)
+-{
+-    struct wayland_child_overlay *overlay, *next;
+-    BOOL removed = FALSE;
+-
+-    wl_list_for_each_safe(overlay, next, &surface->child_overlays, link)
+-        if (overlay->hwnd == child) { wayland_child_overlay_destroy(overlay); removed = TRUE; }
+-
+-    /* commit the parent so the removal shows without a new client frame */
+-    if (removed) wl_surface_commit(surface->wl_surface);
+-}
+-
+-static struct wayland_child_overlay *wayland_child_overlay_create(struct wayland_surface *surface,
+-                                                                  HWND child)
+-{
+-    struct wayland_child_overlay *overlay;
+-
+-    if (!(overlay = calloc(1, sizeof(*overlay)))) return NULL;
+-    overlay->hwnd = child;
+-    overlay->wl_surface = wl_compositor_create_surface(process_wayland.wl_compositor);
+-    if (overlay->wl_surface)
+-        overlay->wl_subsurface =
+-            wl_subcompositor_get_subsurface(process_wayland.wl_subcompositor,
+-                                            overlay->wl_surface, surface->wl_surface);
+-    if (!overlay->wl_subsurface)
+-    {
+-        if (overlay->wl_surface) wl_surface_destroy(overlay->wl_surface);
+-        free(overlay);
+-        return NULL;
+-    }
+-    wl_subsurface_set_desync(overlay->wl_subsurface);
+-    overlay->wp_viewport = wp_viewporter_get_viewport(process_wayland.wp_viewporter,
+-                                                      overlay->wl_surface);
+-    /* Pixels only: empty input region so clicks fall through to the toplevel and
+-     * hit-test to the real child HWND. Input region is committed state, set once. */
+-    {
+-        struct wl_region *empty =
+-            wl_compositor_create_region(process_wayland.wl_compositor);
+-        if (empty)
+-        {
+-            wl_surface_set_input_region(overlay->wl_surface, empty);
+-            wl_region_destroy(empty);
+-        }
+-    }
+-    return overlay;
+-}
+-
+-/* Stack overlays above 'above', chaining each above the previous to preserve
+- * Win32 z-order. child_overlays is ordered bottom-to-top. */
+-static void wayland_surface_raise_child_overlays(struct wayland_surface *surface,
+-                                                 struct wl_surface *above)
+-{
+-    struct wayland_child_overlay *overlay;
+-    wl_list_for_each(overlay, &surface->child_overlays, link)
+-    {
+-        wl_subsurface_place_above(overlay->wl_subsurface, above);
+-        above = overlay->wl_surface;
+-    }
+-}
+-
+-/* Anchor for the overlay chain: top of the dmabuf chain if alive, else the
+- * client surface if attached to this toplevel, else the main surface. The
+- * liveness guards matter: place_above on a detached or reparented surface is a
+- * fatal protocol error. The fixed [main, client, dmabufs, overlays] order stays
+- * stable no matter which chain restacks last. */
+-static struct wl_surface *wayland_surface_overlay_anchor(struct wayland_surface *surface)
++static struct wl_surface *wayland_surface_dmabuf_stack_bottom(struct wayland_surface *surface)
+ {
+     struct wayland_hwnd_dmabuf_surface *dmabuf_surface;
+-    struct wayland_win_data *data;
+-    struct wl_surface *above = surface->wl_surface;
+-
+-    if ((data = wayland_win_data_get_nolock(surface->hwnd)) &&
+-        data->client_surface && data->client_surface->wl_subsurface &&
+-        data->client_surface->toplevel == surface->hwnd)
+-        above = data->client_surface->wl_surface;
+-
+-    /* dmabuf_top may be stale. Use it only while it is still a live member */
+-    if (surface->dmabuf_top)
+-    {
+-        wl_list_for_each(dmabuf_surface, &surface->hwnd_dmabuf_surfaces, link)
+-        {
+-            if (dmabuf_surface->wl_surface == surface->dmabuf_top && dmabuf_surface->current)
+-            {
+-                above = surface->dmabuf_top;
+-                break;
+-            }
+-        }
+-    }
+-
+-    return above;
+-}
+ 
+-/* True if child or a descendant is a dmabuf producer of toplevel. That subtree
+- * is fed through the hwnd dmabuf chain. Copying this window-surface buffer over
+- * it would stack an opaque overlay above the live dmabuf. The producer is
+- * in-process (CEF parents its GPU widget host below a full-window content host).
+- * Process identity does not distinguish it. Walks the parent chain with NtUser.
+- * Runs WITHOUT win_data_mutex. */
+-static BOOL child_hosts_dmabuf_producer(HWND toplevel, HWND child,
+-                                        const HWND *producers, unsigned int count)
+-{
+-    unsigned int i;
++    if (!surface->dmabuf_bottom) return NULL;
+ 
+-    for (i = 0; i < count; i++)
+-    {
+-        HWND a = producers[i];
+-        while (a)
+-        {
+-            if (a == child) return TRUE;
+-            if (a == toplevel) break;
+-            a = NtUserGetAncestor(a, GA_PARENT);
+-        }
+-    }
+-    return FALSE;
+-}
+-
+-/* Capture visible child geometry with NtUser calls. Runs WITHOUT win_data_mutex.
+- * Querying win32u under the mutex can deadlock against threads that hold win32u
+- * state while waiting for it (the NGS anti-cheat launcher freeze). */
+-struct child_overlay_snapshot *child_overlays_snapshot(HWND hwnd)
+-{
+-    UINT dpi = NtUserGetDpiForWindow(hwnd);
+-    struct child_overlay_snapshot *snap;
+-    unsigned int capacity = 8;
+-    RECT top_rect, client_rect;
+-    HWND producers[16], child;
+-    unsigned int producer_count = 0;
+-
+-    if (!NtUserGetWindowRect(hwnd, &top_rect, dpi)) return NULL;
+-    /* toplevel client area in screen coords. Children are clipped to it */
+-    if (!NtUserGetClientRect(hwnd, &client_rect, dpi)) return NULL;
+-    NtUserMapWindowPoints(hwnd, 0, (POINT *)&client_rect, 2, dpi);
+-
+-    if (!(snap = malloc(offsetof(struct child_overlay_snapshot, entries[capacity]))))
+-        return NULL;
+-    snap->count = 0;
+-
+-    /* dmabuf producers under this toplevel, used below to skip their host children */
++    wl_list_for_each(dmabuf_surface, &surface->hwnd_dmabuf_surfaces, link)
+     {
+-        hwnd_dmabuf_frame_info_t frames[16];
+-        unsigned int total = 0, fcount = 0, i;
+-        if (wine_hwnd_dmabuf_list(hwnd, frames, ARRAY_SIZE(frames), &total, &fcount) == HWND_DMABUF_OK)
+-        {
+-            for (i = 0; i < fcount && producer_count < ARRAY_SIZE(producers); i++)
+-                producers[producer_count++] = (HWND)(UINT_PTR)frames[i].hwnd;
+-            if (total > producer_count)
+-                TRACE("hwnd=%p dmabuf producers %u exceed skip capacity %u\n",
+-                      hwnd, total, (unsigned int)ARRAY_SIZE(producers));
+-        }
+-    }
+-
+-    for (child = NtUserGetWindowRelative(hwnd, GW_CHILD); child;
+-         child = NtUserGetWindowRelative(child, GW_HWNDNEXT))
+-    {
+-        DWORD style = NtUserGetWindowLongW(child, GWL_STYLE);
+-        struct child_overlay_snapshot_entry *entry;
+-        DWORD pid = 0;
+-        int rx, ry, rw, rh;
+-        RECT cr, vis;
+-
+-        if ((style & WS_VISIBLE) != WS_VISIBLE) continue;
+-        /* cross-process children never paint into this buffer. Neither does an
+-         * in-process host whose content a nested dmabuf producer renders. Both
+-         * arrive through the hwnd dmabuf chain. An overlay copied over them would
+-         * sit opaque above the live dmabuf. */
+-        NtUserGetWindowThread(child, &pid);
+-        if (pid != GetCurrentProcessId()) continue;
+-        if (child_hosts_dmabuf_producer(hwnd, child, producers, producer_count)) continue;
+-        if (!NtUserGetWindowRect(child, &cr, dpi)) continue;
+-        /* clip to the client area. Sibling occlusion is handled by stacking */
+-        vis = cr;
+-        if (vis.left < client_rect.left) vis.left = client_rect.left;
+-        if (vis.top < client_rect.top) vis.top = client_rect.top;
+-        if (vis.right > client_rect.right) vis.right = client_rect.right;
+-        if (vis.bottom > client_rect.bottom) vis.bottom = client_rect.bottom;
+-        rx = vis.left - top_rect.left; ry = vis.top - top_rect.top;
+-        rw = vis.right - vis.left; rh = vis.bottom - vis.top;
+-        if (rw <= 0 || rh <= 0) continue;
+-        if (rx < 0) { rw += rx; rx = 0; }
+-        if (ry < 0) { rh += ry; ry = 0; }
+-        if (rw <= 0 || rh <= 0) continue;
+-
+-        if (snap->count == capacity)
+-        {
+-            struct child_overlay_snapshot *grown;
+-            capacity *= 2;
+-            if (!(grown = realloc(snap, offsetof(struct child_overlay_snapshot, entries[capacity]))))
+-                break;
+-            snap = grown;
+-        }
+-        entry = &snap->entries[snap->count++];
+-        entry->hwnd = child;
+-        entry->rect = cr;
+-        entry->rx = rx; entry->ry = ry;
+-        entry->rw = rw; entry->rh = rh;
++        if (dmabuf_surface->wl_surface == surface->dmabuf_bottom && dmabuf_surface->current)
++            return surface->dmabuf_bottom;
+     }
+ 
+-    return snap;
+-}
+-
+-/* True for a child that presents its own subsurface (in-process GPU child or a
+- * cross-process dmabuf child). Its content must not be covered by a pixel copy. */
+-static BOOL wayland_surface_child_self_presents(struct wayland_surface *surface, HWND child)
+-{
+-    struct wayland_hwnd_dmabuf_surface *dmabuf_surface;
+-    struct wayland_win_data *child_data;
+-
+-    if ((child_data = wayland_win_data_get_nolock(child)) &&
+-        child_data->wayland_surface &&
+-        child_data->wayland_surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE)
+-        return TRUE;
+-
+-    wl_list_for_each(dmabuf_surface, &surface->hwnd_dmabuf_surfaces, link)
+-        if (dmabuf_surface->hwnd == child) return TRUE;
+-
+-    return FALSE;
++    surface->dmabuf_bottom = NULL;
++    return NULL;
+ }
+ 
+-/* Apply a child geometry snapshot to the overlay subsurfaces. Runs under
+- * win_data_mutex and must not call NtUser. A NULL snapshot carries no fresh
+- * information. Existing overlays are kept and only restacked. shm_buffer is
+- * the pixel source and may be NULL to reposition without refreshing content. */
+-void wayland_surface_apply_child_overlays(struct wayland_surface *surface,
+-                                          struct wayland_shm_buffer *shm_buffer,
+-                                          const struct child_overlay_snapshot *snapshot)
++static struct wl_surface *wayland_surface_client_stack_anchor(struct wayland_surface *surface)
+ {
+-    struct wayland_child_overlay *overlay, *next;
+-    struct wl_list old;
+-    unsigned int i;
+-
+-    if (snapshot)
+-    {
+-        /* refreshed children are moved back below. The rest (gone/hidden) are dropped */
+-        wl_list_init(&old);
+-        wl_list_insert_list(&old, &surface->child_overlays);
+-        wl_list_init(&surface->child_overlays);
+-
+-        for (i = 0; i < snapshot->count; i++)
+-        {
+-            const struct child_overlay_snapshot_entry *entry = &snapshot->entries[i];
+-            int rx = entry->rx, ry = entry->ry, rw = entry->rw, rh = entry->rh;
+-            struct wayland_shm_buffer *ob;
+-            int r, x, y, dw, dh;
+-
+-            if (wayland_surface_child_self_presents(surface, entry->hwnd)) continue;
+-
+-            if (shm_buffer)
+-            {
+-                if (rx + rw > shm_buffer->width) rw = shm_buffer->width - rx;
+-                if (ry + rh > shm_buffer->height) rh = shm_buffer->height - ry;
+-            }
+-            if (rw <= 0 || rh <= 0) continue;
+-
+-            overlay = NULL;
+-            wl_list_for_each(next, &old, link)
+-                if (next->hwnd == entry->hwnd) { overlay = next; break; }
+-            if (overlay) wl_list_remove(&overlay->link);
+-            else if (!shm_buffer) continue; /* no pixels to show a new child with */
+-            else if (!(overlay = wayland_child_overlay_create(surface, entry->hwnd))) continue;
+-            wl_list_insert(&surface->child_overlays, &overlay->link);
+-            overlay->rect = entry->rect;
+-
+-            wayland_surface_coords_from_window(surface, rx, ry, &x, &y);
+-            wayland_surface_coords_from_window(surface, rw, rh, &dw, &dh);
+-            wl_subsurface_set_position(overlay->wl_subsurface, x, y);
+-            if (dw > 0 && dh > 0) wp_viewport_set_destination(overlay->wp_viewport, dw, dh);
+-
+-            if (!shm_buffer)
+-            {
+-                wl_surface_commit(overlay->wl_surface);
+-                continue;
+-            }
+-
+-            if (!(ob = wayland_shm_buffer_create(rw, rh, shm_buffer->format))) continue;
+-            for (r = 0; r < rh; r++)
+-                memcpy((char *)ob->map_data + (size_t)r * rw * 4,
+-                       (char *)shm_buffer->map_data + (size_t)(ry + r) * shm_buffer->width * 4 + (size_t)rx * 4,
+-                       (size_t)rw * 4);
+-
+-            ob->busy = TRUE;
+-            wl_buffer_add_listener(ob->wl_buffer, &overlay_buffer_listener, ob);
+-            wl_surface_attach(overlay->wl_surface, ob->wl_buffer, 0, 0);
+-            wl_surface_damage_buffer(overlay->wl_surface, 0, 0, rw, rh);
+-            wl_surface_commit(overlay->wl_surface);
++    struct wl_surface *bottom = wayland_surface_dmabuf_stack_bottom(surface);
+ 
+-            TRACE("hwnd=%p child=%p overlay %d,%d+%dx%d\n", surface->hwnd, entry->hwnd, x, y, dw, dh);
+-        }
+-
+-        wl_list_for_each_safe(overlay, next, &old, link)
+-            wayland_child_overlay_destroy(overlay);
+-    }
+-
+-    wayland_surface_raise_child_overlays(surface, wayland_surface_overlay_anchor(surface));
++    return bottom ? bottom : surface->wl_surface;
+ }
+ 
++/**********************************************************************
++ *          wayland_surface_create
++ *
++ * Creates a role-less wayland surface.
++ */
+ struct wayland_surface *wayland_surface_create(HWND hwnd)
+ {
+     struct wayland_surface *surface;
+@@ -1184,7 +879,6 @@ struct wayland_surface *wayland_surface_create(HWND hwnd)
+     surface->hwnd = hwnd;
+     surface->serial = InterlockedIncrement(&wayland_surface_serial_counter);
+     wl_list_init(&surface->hwnd_dmabuf_surfaces);
+-    wl_list_init(&surface->child_overlays);
+     surface->wl_surface = wl_compositor_create_surface(process_wayland.wl_compositor);
+     if (!surface->wl_surface)
+     {
+@@ -1787,6 +1481,8 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
+ 
+     /* Keep input state across role churn; it follows wl_surface enter/leave. */
+     wayland_surface_clear_child_surfaces(surface);
++    surface->transparent_carrier_attached = FALSE;
++    surface->transparent_carrier_width = surface->transparent_carrier_height = 0;
+ 
+     /* some objects are shared between several roles */
+ 
+@@ -2236,9 +1932,8 @@ static BOOL wayland_surface_reconfigure_client(struct wayland_surface *surface,
+         if (client->wl_subsurface)
+         {
+             wl_subsurface_set_position(client->wl_subsurface, rect.left, rect.top);
+-            wl_subsurface_place_above(client->wl_subsurface, surface->wl_surface);
+-            /* keep any GDI child overlays stacked above the client surface */
+-            wayland_surface_raise_child_overlays(surface, wayland_surface_overlay_anchor(surface));
++            wl_subsurface_place_below(client->wl_subsurface,
++                                      wayland_surface_client_stack_anchor(surface));
+         }
+ 
+         if (rect.left != rect.right && rect.top != rect.bottom)
+@@ -2477,10 +2172,10 @@ static BOOL wayland_hwnd_dmabuf_surface_compute_geometry(struct wayland_surface
+ 
+ static void wayland_hwnd_dmabuf_surface_apply_geometry(struct wayland_hwnd_dmabuf_surface *surface,
+                                                        const struct wayland_hwnd_dmabuf_geometry *geometry,
+-                                                       struct wl_surface *above)
++                                                       struct wl_surface *sibling)
+ {
+     wl_subsurface_set_position(surface->wl_subsurface, geometry->x, geometry->y);
+-    wl_subsurface_place_above(surface->wl_subsurface, above);
++    wl_subsurface_place_below(surface->wl_subsurface, sibling);
+     wp_viewport_set_source(surface->wp_viewport,
+                            wl_fixed_from_double(geometry->source_x),
+                            wl_fixed_from_double(geometry->source_y),
+@@ -2493,14 +2188,14 @@ static void wayland_hwnd_dmabuf_surface_apply_geometry(struct wayland_hwnd_dmabu
+ static BOOL wayland_hwnd_dmabuf_surface_configure(struct wayland_surface *parent,
+                                                   struct wayland_hwnd_dmabuf_surface *surface,
+                                                   const hwnd_dmabuf_frame_info_t *info,
+-                                                  struct wl_surface *above)
++                                                  struct wl_surface *sibling)
+ {
+     struct wayland_hwnd_dmabuf_geometry geometry;
+ 
+     if (!wayland_hwnd_dmabuf_surface_compute_geometry(parent, surface, info, &geometry))
+         return FALSE;
+ 
+-    wayland_hwnd_dmabuf_surface_apply_geometry(surface, &geometry, above);
++    wayland_hwnd_dmabuf_surface_apply_geometry(surface, &geometry, sibling);
+     return TRUE;
+ }
+ 
+@@ -2741,12 +2436,14 @@ static struct wayland_hwnd_dmabuf_buffer *wayland_hwnd_dmabuf_surface_import_buf
+     struct wayland_hwnd_dmabuf_buffer *buffer = NULL;
+     hwnd_dmabuf_frame_desc_t pdesc, desc;
+     BOOL have_pending = FALSE;
++    BOOL retried = FALSE;
+     int pfd = -1, fd, r;
+ 
+     *created_buffer = FALSE;
+     *attached_frame = FALSE;
+     memset(&pdesc, 0, sizeof(pdesc));
+ 
++retry:
+     wayland_hwnd_dmabuf_surface_claim_channel(surface);
+     if (surface->channel_fd < 0) return surface->current;
+ 
+@@ -2781,6 +2478,16 @@ static struct wayland_hwnd_dmabuf_buffer *wayland_hwnd_dmabuf_surface_import_buf
+         pfd = fd;
+         have_pending = TRUE;
+     }
++    if (r < 0)
++    {
++        close(surface->channel_fd);
++        surface->channel_fd = -1;
++        if (!have_pending && !retried)
++        {
++            retried = TRUE;
++            goto retry;
++        }
++    }
+ 
+     if (!have_pending) return surface->current;
+ 
+@@ -2847,7 +2554,6 @@ static BOOL wayland_surface_direct_dmabuf_candidate(struct wayland_surface *surf
+     if (!wayland_surface_is_toplevel(surface)) return FALSE;
+     if (!data || data->client_surface) return FALSE;
+     if (data->window_contents) return FALSE;
+-    if (!wl_list_empty(&surface->child_overlays)) return FALSE;
+     if (wayland_surface_has_region_constraints(surface))
+     {
+         TRACE("hwnd=%p direct parent dmabuf rejected for visual constraints\n", surface->hwnd);
+@@ -2868,6 +2574,7 @@ static BOOL wayland_surface_replace_direct_dmabuf_with_shm(struct wayland_surfac
+     wl_surface_set_opaque_region(surface->wl_surface, NULL);
+     wayland_surface_attach_shm(surface, data->window_contents,
+                                data->window_contents->damage_region);
++    surface->transparent_carrier_attached = FALSE;
+     wl_surface_commit(surface->wl_surface);
+     wayland_hwnd_dmabuf_surface_destroy(direct);
+     return TRUE;
+@@ -2887,18 +2594,21 @@ static const struct wl_buffer_listener transparent_carrier_buffer_listener =
+     transparent_carrier_buffer_release
+ };
+ 
+-static BOOL wayland_surface_replace_direct_dmabuf_with_transparent_shm(struct wayland_surface *surface)
++static BOOL wayland_surface_attach_transparent_carrier(struct wayland_surface *surface)
+ {
+-    struct wayland_hwnd_dmabuf_surface *direct = surface->direct_dmabuf_surface;
+     struct wayland_shm_buffer *shm_buffer;
+     int width, height;
+ 
+-    if (!direct || !wayland_surface_reconfigure(surface)) return FALSE;
+-
+-    /* Keep a pure-dmabuf toplevel mapped when it leaves direct mode before any
+-     * real GDI buffer exists; do not leave the stale producer frame as base. */
+     width = max(1, surface->window.rect.right - surface->window.rect.left);
+     height = max(1, surface->window.rect.bottom - surface->window.rect.top);
++
++    if (surface->transparent_carrier_attached &&
++        surface->transparent_carrier_width == width &&
++        surface->transparent_carrier_height == height)
++        return TRUE;
++
++    if (!wayland_surface_reconfigure(surface)) return FALSE;
++
+     if (!(shm_buffer = wayland_shm_buffer_create(width, height, WL_SHM_FORMAT_ARGB8888)))
+         return FALSE;
+ 
+@@ -2908,6 +2618,22 @@ static BOOL wayland_surface_replace_direct_dmabuf_with_transparent_shm(struct wa
+     wayland_surface_attach_shm(surface, shm_buffer, shm_buffer->damage_region);
+     wl_surface_commit(surface->wl_surface);
+     wayland_shm_buffer_unref(shm_buffer);
++    surface->transparent_carrier_attached = TRUE;
++    surface->transparent_carrier_width = width;
++    surface->transparent_carrier_height = height;
++    return TRUE;
++}
++
++static BOOL wayland_surface_replace_direct_dmabuf_with_transparent_shm(struct wayland_surface *surface)
++{
++    struct wayland_hwnd_dmabuf_surface *direct = surface->direct_dmabuf_surface;
++
++    if (!direct) return FALSE;
++
++    /* Keep a pure-dmabuf toplevel mapped when it leaves direct mode before any
++     * real GDI buffer exists; do not leave the stale producer frame as base. */
++    if (!wayland_surface_attach_transparent_carrier(surface)) return FALSE;
++
+     wayland_hwnd_dmabuf_surface_destroy(direct);
+     return TRUE;
+ }
+@@ -2948,7 +2674,7 @@ static void wayland_surface_clear_dmabuf_children(struct wayland_surface *surfac
+ 
+     wl_list_for_each_safe(dmabuf_surface, next, &surface->hwnd_dmabuf_surfaces, link)
+         wayland_hwnd_dmabuf_surface_destroy(dmabuf_surface);
+-    surface->dmabuf_top = NULL;
++    surface->dmabuf_bottom = NULL;
+ }
+ 
+ static BOOL wayland_surface_update_direct_dmabuf(struct wayland_surface *surface,
+@@ -3074,7 +2800,6 @@ static BOOL wayland_surface_try_direct_dmabuf(HWND hwnd)
+                               (wayland_surface_is_toplevel(surface) &&
+                                !data->window_contents &&
+                                !data->client_surface &&
+-                               wl_list_empty(&surface->child_overlays) &&
+                                wayland_surface_client_fills_window(surface)));
+         wayland_win_data_release(data);
+     }
+@@ -3124,7 +2849,7 @@ static void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
+     struct wayland_hwnd_dmabuf_surface *dmabuf_surface, *next;
+     enum hwnd_dmabuf_status status;
+     struct wayland_win_data *data;
+-    struct wl_surface *above;
++    struct wl_surface *sibling, *bottom = NULL;
+     unsigned long long now = wayland_time_ms();
+     BOOL any_new = FALSE;
+ 
+@@ -3162,25 +2887,15 @@ static void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
+         return;
+     }
+ 
+-    /* Anchor the dmabuf chain above the client subsurface, not the main surface.
+-     * Both used to place_above() main. Whichever committed last won the top,
+-     * a per-frame z-order race (the flicker). A fixed sibling anchor makes
+-     * [main, client, dmabuf...] resolve the same regardless. (win_data_mutex held.) */
+-    above = surface->wl_surface;
+-    if (data &&
+-        data->client_surface && data->client_surface->wl_subsurface &&
+-        data->client_surface->toplevel == surface->hwnd)
+-        above = data->client_surface->wl_surface;
+-    /* Server child lists are returned in z-order from top to bottom, while
+-     * Wayland subsurface stacking needs to be applied from bottom to top when
+-     * chaining place_above() calls. */
+-    for (i = count; i-- > 0; )
++    /* Self-presenting children are stacked below the GDI surface; server order
++     * is top-to-bottom, matching place_below chaining. */
++    sibling = surface->wl_surface;
++
++    for (i = 0; i < count; i++)
+     {
+         HWND hwnd = (HWND)(UINT_PTR)frames[i].hwnd;
+         BOOL created_buffer, attached_frame;
+ 
+-        TRACE("hwnd=%p child=%p frame_seq=%u opened=%u\n",
+-              surface->hwnd, hwnd, frames[i].frame_seq, frames[i].opened);
+         if (!frames[i].opened)
+         {
+             if ((dmabuf_surface = wayland_hwnd_dmabuf_surface_get(surface, hwnd)))
+@@ -3188,10 +2903,10 @@ static void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
+                 dmabuf_surface->seen = TRUE;
+                 dmabuf_surface->last_seen_ms = now;
+                 if (dmabuf_surface->current &&
+-                    wayland_hwnd_dmabuf_surface_configure(surface, dmabuf_surface, &frames[i], above))
++                    wayland_hwnd_dmabuf_surface_configure(surface, dmabuf_surface, &frames[i], sibling))
+                 {
+                     wl_surface_commit(dmabuf_surface->wl_surface);
+-                    above = dmabuf_surface->wl_surface;
++                    bottom = sibling = dmabuf_surface->wl_surface;
+                     any_new = TRUE;
+                 }
+             }
+@@ -3216,7 +2931,7 @@ static void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
+         if (attached_frame) any_new = TRUE;
+         if (!dmabuf_surface->current) continue;
+         if (attached_frame) wayland_hwnd_dmabuf_attach_current(dmabuf_surface);
+-        if (!wayland_hwnd_dmabuf_surface_configure(surface, dmabuf_surface, &frames[i], above))
++        if (!wayland_hwnd_dmabuf_surface_configure(surface, dmabuf_surface, &frames[i], sibling))
+         {
+             TRACE("hwnd=%p child=%p configure failed frame_seq=%u\n",
+                   surface->hwnd, hwnd, frames[i].frame_seq);
+@@ -3238,16 +2953,15 @@ static void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
+             InterlockedIncrement(&dmabuf_surface->current->ref);
+             dmabuf_surface->current_committed = TRUE;
+         }
+-        above = dmabuf_surface->wl_surface;
++        bottom = sibling = dmabuf_surface->wl_surface;
+     }
+ 
+-    /* record the chain top for the GDI overlay anchor, see wayland_surface_overlay_anchor */
+-    surface->dmabuf_top = above;
++    surface->dmabuf_bottom = bottom;
+ 
+-    /* A child absent from the descendant list: hide its stale overlay at once so the
+-     * content behind it (e.g. the client surface) is not occluded. Keep the dmabuf
+-     * cache for a grace window so a brief gap does not force a re-import. Reap the
+-     * cache only once the grace expires. */
++    /* A child absent from the descendant list: hide its stale dmabuf subsurface
++     * at once so the content behind it (e.g. the client surface) is not
++     * occluded. Keep the dmabuf cache for a grace window so a brief gap does
++     * not force a re-import. Reap the cache only once the grace expires. */
+     wl_list_for_each_safe(dmabuf_surface, next, &surface->hwnd_dmabuf_surfaces, link)
+     {
+         if (dmabuf_surface->seen) continue;
+@@ -3265,6 +2979,17 @@ static void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
+         }
+     }
+ 
++    if (data && !data->window_contents && wayland_surface_has_hwnd_dmabuf_content(surface))
++        wayland_surface_attach_transparent_carrier(surface);
++
++    if (any_new && data && data->client_surface && data->client_surface->wl_subsurface &&
++        data->client_surface->toplevel == surface->hwnd)
++    {
++        wl_subsurface_place_below(data->client_surface->wl_subsurface,
++                                  wayland_surface_client_stack_anchor(surface));
++        any_new = TRUE;
++    }
++
+     /* Commit and arm the next vsync only when something changed. An idle window costs nothing. */
+     /* Commit the parent to apply subsurface stacking. No frame callback: import is
+      * paced by the producer, not by our toplevel being presented. */
+@@ -3767,12 +3492,6 @@ static void wayland_client_surface_detach(struct client_surface *client)
+     {
+         if (data->client_surface == surface) data->client_surface = NULL;
+         wayland_client_surface_attach(surface, NULL);
+-        /* the occluder is gone, GDI children show through the base again */
+-        if (data->wayland_surface && !wl_list_empty(&data->wayland_surface->child_overlays))
+-        {
+-            wayland_surface_clear_child_overlays(data->wayland_surface);
+-            wl_surface_commit(data->wayland_surface->wl_surface);
+-        }
+         wayland_win_data_release(data);
+     }
+ }
+@@ -3966,8 +3685,11 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
+     {
+         if (client->wl_subsurface)
+         {
++            if (client->toplevel)
++                NtUserPostMessage(hwnd, WM_WINE_SETWINDOWSURFACECLIP, FALSE, 0);
+             wl_subsurface_destroy(client->wl_subsurface);
+             client->wl_subsurface = NULL;
++            client->toplevel_wl_surface = NULL;
+         }
+ 
+         SetRect(&client->viewport_rect, -INT32_MAX, 0, -INT32_MAX, 0);
+@@ -3983,7 +3705,8 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
+         return wayland_client_surface_attach(client, NULL);
+     }
+ 
+-    if (client->toplevel != toplevel)
++    if (client->toplevel != toplevel ||
++        client->toplevel_wl_surface != surface->wl_surface)
+     {
+         wayland_client_surface_attach(client, NULL);
+ 
+@@ -4001,8 +3724,13 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
+ 
+         /* Present contents independently of the parent surface. */
+         wl_subsurface_set_desync(client->wl_subsurface);
++        wl_subsurface_place_below(client->wl_subsurface,
++                                  wayland_surface_client_stack_anchor(surface));
+ 
+         client->toplevel = toplevel;
++        client->toplevel_wl_surface = surface->wl_surface;
++        SetRect(&client->rect, 0, 0, -1, -1);
++        NtUserPostMessage(hwnd, WM_WINE_SETWINDOWSURFACECLIP, TRUE, 0);
+ 
+         TRACE("Created subsurface for toplevel=%p\n", toplevel);
+     }
+@@ -4032,6 +3760,9 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
+     /* Commit to apply subsurface positioning. */
+     wl_surface_commit(surface->wl_surface);
+ 
++    if (!toplevel_data->window_contents)
++        wayland_surface_attach_transparent_carrier(surface);
++
+ done:
+     wayland_win_data_release(toplevel_data);
+ }
+@@ -4115,8 +3846,8 @@ void wayland_client_surface_set_alpha(struct client_surface *client, BOOL alpha)
+  *          wayland_surface_ensure_contents
+  *
+  * Import any direct or child dmabuf content. Parent SHM contents normally come
+- * from the real window surface expose path; a transparent carrier is used only
+- * to replace an already-mapped direct frame when child compositing takes over.
++ * from the real window surface expose path; punch-through mode uses a
++ * transparent carrier when below-main content has no real parent buffer yet.
+  */
+ void wayland_surface_ensure_contents(struct wayland_surface *surface,
+                                      struct wayland_client_surface *client)
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index 0a3167dce46..e59ea23f60e 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -450,6 +450,7 @@ struct wayland_client_surface
+     BOOL hwnd_dmabuf_producer;
+     RECT rect;
+     struct wl_surface *wl_surface;
++    const struct wl_surface *toplevel_wl_surface;
+     struct wl_subsurface *wl_subsurface;
+     struct wp_color_management_surface_v1 *wp_color_management_surface_v1;
+     struct wp_viewport *wp_viewport;
+@@ -460,32 +461,6 @@ struct wayland_client_surface
+     struct wayland_visual_constraint_trace visual_constraint_trace;
+ };
+ 
+-/* A GDI child window shown on its own wl_subsurface above a client surface. Its
+- * toplevel's GDI window-surface is hidden behind that client. */
+-struct wayland_child_overlay
+-{
+-    struct wl_list link;
+-    HWND hwnd;                          /* the child window */
+-    struct wl_surface *wl_surface;
+-    struct wl_subsurface *wl_subsurface;
+-    struct wp_viewport *wp_viewport;
+-    RECT rect;                          /* last rect, toplevel-window-relative */
+-};
+-
+-/* Child window geometry captured via NtUser outside win_data_mutex. Querying
+- * win32u under the mutex can deadlock against threads holding win32u state and
+- * waiting for it. */
+-struct child_overlay_snapshot
+-{
+-    unsigned int count;
+-    struct child_overlay_snapshot_entry
+-    {
+-        HWND hwnd;
+-        RECT rect;          /* child rect in screen coords */
+-        int rx, ry, rw, rh; /* visible part, toplevel-window-relative */
+-    } entries[];
+-};
+-
+ struct wayland_shm_buffer
+ {
+     struct wl_list link;
+@@ -552,16 +527,12 @@ struct wayland_surface
+     BOOL resizing;
+     enum wayland_surface_ensure_type ensured_contents;
+     struct wl_list hwnd_dmabuf_surfaces;
+-    struct wl_list child_overlays; /* GDI child windows shown above a client surface */
+-    BOOL client_placeholder;
+     struct wayland_hwnd_dmabuf_surface *direct_dmabuf_surface;
+-    /* Existing overlays were captured before any dmabuf producer was visible;
+-     * refresh them once when the producer first wakes this toplevel. */
+-    BOOL child_overlays_need_dmabuf_refresh;
+-    /* Top of the dmabuf subsurface chain as last stacked. Overlays anchor above it,
+-     * keeping the [base, client, dmabufs, overlays] order stable whichever chain
+-     * restacks last. Validated against the live list before use, never freed. */
+-    struct wl_surface *dmabuf_top;
++    /* Bottom of the below-main dmabuf subsurface chain. Client subsurfaces
++     * anchor below this so children stay above their parent's client content. */
++    struct wl_surface *dmabuf_bottom;
++    BOOL transparent_carrier_attached;
++    int transparent_carrier_width, transparent_carrier_height;
+     HRGN child_region;
+     BOOL shaped;
+     BOOL occlusion_clipped;
+@@ -624,12 +595,6 @@ void wayland_surface_sync_window_regions(struct wayland_surface *surface,
+                                          struct window_surface *window_surface);
+ void wayland_surface_prepare_direct_dmabuf_shm_commit(struct wayland_surface *surface);
+ void wayland_surface_finish_direct_dmabuf_shm_commit(struct wayland_surface *surface);
+-struct child_overlay_snapshot *child_overlays_snapshot(HWND hwnd);
+-void wayland_surface_apply_child_overlays(struct wayland_surface *surface,
+-                                          struct wayland_shm_buffer *shm_buffer,
+-                                          const struct child_overlay_snapshot *snapshot);
+-void wayland_surface_clear_child_overlays(struct wayland_surface *surface);
+-void wayland_surface_remove_child_overlay(struct wayland_surface *surface, HWND child);
+ void wayland_surface_coords_from_window(struct wayland_surface *surface,
+                                         int window_x, int window_y,
+                                         int *surface_x, int *surface_y);
+@@ -727,9 +692,7 @@ void wayland_win_data_release(struct wayland_win_data *data);
+ 
+ struct wayland_client_surface *get_client_surface(HWND hwnd);
+ void set_client_surface(HWND hwnd, struct wayland_client_surface *client);
+-BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region,
+-                                 const struct child_overlay_snapshot *overlay_snapshot);
+-BOOL window_surface_needs_child_overlays(HWND hwnd);
++BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region);
+ struct wayland_shm_buffer *get_window_surface_contents(HWND hwnd);
+ void ensure_window_surface_contents(HWND hwnd);
+ void wayland_window_init(void);
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index 2c6e423413b..d12cf8c5732 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -54,7 +54,7 @@ static pthread_mutex_t win_data_mutex;
+ static struct rb_tree win_data_rb = { wayland_win_data_cmp_rb };
+ static BOOL window_surface_configure_blocks_dmabuf(HWND hwnd);
+ static BOOL window_surface_has_requested_configure(HWND hwnd);
+-static BOOL window_surface_needs_dmabuf_overlay_refresh(HWND hwnd);
++static BOOL window_surface_has_hwnd_dmabuf_content(HWND hwnd);
+ 
+ static const WCHAR frameless_window_prop[] =
+     {'_','_','w','i','n','e','_','w','i','n','3','2','u','_','f','r','a','m','e','l','e','s','s',0};
+@@ -753,17 +753,11 @@ static BOOL is_window_managed(HWND hwnd, HWND menu_popup_owner, UINT swp_flags,
+  */
+ void WAYLAND_DestroyWindow(HWND hwnd)
+ {
+-    HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
+-    struct wayland_win_data *data, *toplevel_data;
++    struct wayland_win_data *data;
+ 
+     TRACE("%p\n", hwnd);
+ 
+     if (!(data = wayland_win_data_get(hwnd))) return;
+-    /* drop this child's overlay (if any) from its toplevel */
+-    if (toplevel && toplevel != hwnd &&
+-        (toplevel_data = wayland_win_data_get_nolock(toplevel)) &&
+-        toplevel_data->wayland_surface)
+-        wayland_surface_remove_child_overlay(toplevel_data->wayland_surface, hwnd);
+     wayland_win_data_destroy(data);
+ }
+ 
+@@ -790,12 +784,9 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+                               const struct window_rects *new_rects, struct window_surface *surface)
+ {
+     HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT), owner = NULL, menu_popup_owner = NULL;
+-    /* GA_ROOT host of any GDI child overlays, resolved independently below. */
+-    HWND overlay_toplevel = toplevel;
+-    struct child_overlay_snapshot *snapshot = NULL;
+-    struct wayland_surface *toplevel_surface = NULL, *owner_surface = NULL, *overlay_surface;
++    struct wayland_surface *toplevel_surface = NULL, *owner_surface = NULL;
+     struct wayland_client_surface *client;
+-    struct wayland_win_data *data, *toplevel_data, *owner_data, *overlay_data;
++    struct wayland_win_data *data, *toplevel_data, *owner_data;
+     BOOL managed, fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
+     BOOL tray_menu = swp_flags & WINE_SWP_TRAY_MENU;
+     BOOL use_layer_shell = FALSE;
+@@ -822,18 +813,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+           hwnd, toplevel, owner, owner_hint, menu_popup_owner, debugstr_window_rects(new_rects),
+           insert_after, swp_flags);
+ 
+-    /* A child moved, restacked or changed visibility. Snapshot the toplevel's
+-     * overlay stack outside win_data_mutex so overlays track the window tree
+-     * without waiting for the next GDI flush. */
+-    if (overlay_toplevel && overlay_toplevel != hwnd &&
+-        window_surface_needs_child_overlays(overlay_toplevel))
+-        snapshot = child_overlays_snapshot(overlay_toplevel);
+-
+-    if (!(data = wayland_win_data_get(hwnd)))
+-    {
+-        free(snapshot);
+-        return;
+-    }
++    if (!(data = wayland_win_data_get(hwnd))) return;
+     toplevel_data = toplevel && toplevel != hwnd ? wayland_win_data_get_nolock(toplevel) : NULL;
+     toplevel_surface = toplevel_data ? toplevel_data->wayland_surface : NULL;
+     owner_data = owner && owner != hwnd ? wayland_win_data_get_nolock(owner) : NULL;
+@@ -863,16 +843,6 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+         toplevel_surface = NULL;
+     }
+ 
+-    /* Reposition and restack overlays only. Content refresh stays flush-driven. */
+-    if (snapshot && overlay_toplevel && overlay_toplevel != hwnd &&
+-        (overlay_data = wayland_win_data_get_nolock(overlay_toplevel)) &&
+-        (overlay_surface = overlay_data->wayland_surface))
+-    {
+-        wayland_surface_apply_child_overlays(overlay_surface, NULL, snapshot);
+-        wl_surface_commit(overlay_surface->wl_surface);
+-    }
+-    free(snapshot);
+-
+     data->rects = *new_rects;
+     data->is_fullscreen = fullscreen;
+     data->resizeable = swp_flags & WINE_SWP_RESIZABLE;
+@@ -1140,7 +1110,7 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+         return 0;
+     case WM_WAYLAND_DMABUF_FRAME:
+     {
+-        struct child_overlay_snapshot *snapshot = NULL;
++        BOOL had_dmabuf_content = FALSE;
+ 
+         if (window_surface_has_requested_configure(hwnd))
+             wayland_configure_window(hwnd);
+@@ -1148,29 +1118,11 @@ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+             return 0;
+ 
+         /* A producer published a frame for a descendant of this toplevel.
+-         * Import it in the process that owns the toplevel's wayland surface.
+-         * If GDI child overlays were captured before the producer existed,
+-         * refresh them once with a producer-aware snapshot so stale host
+-         * overlays do not stay stacked above the live dmabuf. */
+-        if (window_surface_needs_dmabuf_overlay_refresh(hwnd))
+-            snapshot = child_overlays_snapshot(hwnd);
++         * Import it in the process that owns the toplevel's wayland surface. */
++        had_dmabuf_content = window_surface_has_hwnd_dmabuf_content(hwnd);
+         ensure_window_surface_contents(hwnd);
+-        if (snapshot)
+-        {
+-            struct wayland_win_data *data;
+-
+-            if ((data = wayland_win_data_get(hwnd)))
+-            {
+-                if (data->wayland_surface)
+-                {
+-                    wayland_surface_apply_child_overlays(data->wayland_surface, NULL, snapshot);
+-                    wl_surface_commit(data->wayland_surface->wl_surface);
+-                    wl_display_flush(process_wayland.wl_display);
+-                }
+-                wayland_win_data_release(data);
+-            }
+-            free(snapshot);
+-        }
++        if (had_dmabuf_content != window_surface_has_hwnd_dmabuf_content(hwnd))
++            NtUserPostMessage(hwnd, WM_WINE_UPDATEWINDOWSTATE, 0, 0);
+         return 0;
+     }
+     case WM_WAYLAND_EXPOSE:
+@@ -1529,23 +1481,6 @@ static BOOL window_client_surface_pending_first_frame(struct wayland_win_data *d
+     return data->client_surface && !data->client_surface->has_presented;
+ }
+ 
+-/* Whether the flush path should snapshot child geometry for overlays before
+- * taking win_data_mutex in set_window_surface_contents. Overlays exist only
+- * while an attached client surface occludes the whole GDI buffer. Dmabuf
+- * children do NOT count: they cover only their own rects, the base stays
+- * visible and a copy overlay would occlude their content (Steam black window). */
+-BOOL window_surface_needs_child_overlays(HWND hwnd)
+-{
+-    struct wayland_win_data *data;
+-    BOOL ret;
+-
+-    if (!(data = wayland_win_data_get(hwnd))) return FALSE;
+-    ret = window_client_surface_attached(data);
+-    wayland_win_data_release(data);
+-
+-    return ret;
+-}
+-
+ static BOOL window_surface_has_requested_configure(HWND hwnd)
+ {
+     struct wayland_win_data *data;
+@@ -1583,20 +1518,19 @@ static BOOL window_surface_configure_blocks_dmabuf(HWND hwnd)
+     return ret;
+ }
+ 
+-static BOOL window_surface_needs_dmabuf_overlay_refresh(HWND hwnd)
++static BOOL window_surface_has_hwnd_dmabuf_content(HWND hwnd)
+ {
+     struct wayland_win_data *data;
+-    BOOL ret;
++    BOOL ret = FALSE;
+ 
+     if (!(data = wayland_win_data_get(hwnd))) return FALSE;
+-    ret = data->wayland_surface && data->wayland_surface->child_overlays_need_dmabuf_refresh;
++    ret = data->wayland_surface && wayland_surface_has_hwnd_dmabuf_content(data->wayland_surface);
+     wayland_win_data_release(data);
+ 
+     return ret;
+ }
+ 
+-BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region,
+-                                 const struct child_overlay_snapshot *overlay_snapshot)
++BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region)
+ {
+     struct wayland_surface *wayland_surface;
+     struct wayland_win_data *data;
+@@ -1617,10 +1551,7 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
+ 
+             wayland_surface_prepare_direct_dmabuf_shm_commit(wayland_surface);
+             wayland_surface_attach_shm(wayland_surface, shm_buffer, damage_region);
+-            if (window_client_surface_attached(data))
+-                wayland_surface_apply_child_overlays(wayland_surface, shm_buffer, overlay_snapshot);
+-            else if (!wl_list_empty(&wayland_surface->child_overlays))
+-                wayland_surface_clear_child_overlays(wayland_surface);
++            wayland_surface->transparent_carrier_attached = FALSE;
+             wl_surface_commit(wayland_surface->wl_surface);
+             wayland_surface_finish_direct_dmabuf_shm_commit(wayland_surface);
+             wayland_surface->ensured_contents = WAYLAND_SURFACE_ENSURED_FLUSH;
+diff --git a/dlls/winewayland.drv/window_surface.c b/dlls/winewayland.drv/window_surface.c
+index 86355a0283b..a0399588b97 100644
+--- a/dlls/winewayland.drv/window_surface.c
++++ b/dlls/winewayland.drv/window_surface.c
+@@ -477,7 +477,6 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface,
+     RECT surface_rect = {.right = color_info->bmiHeader.biWidth, .bottom = abs(color_info->bmiHeader.biHeight)};
+     struct wayland_window_surface *wws = wayland_window_surface_cast(window_surface);
+     struct wayland_shm_buffer *shm_buffer = NULL, *latest_buffer;
+-    struct child_overlay_snapshot *overlay_snapshot = NULL;
+     BOOL flushed = FALSE;
+     HRGN surface_damage_region = NULL;
+     HRGN copy_from_window_region;
+@@ -553,16 +552,10 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface,
+ 
+     if (shape_changed) wayland_window_surface_sync_regions(window_surface);
+ 
+-    /* snapshot child geometry before set_window_surface_contents locks win_data_mutex */
+-    if (window_surface_needs_child_overlays(window_surface->hwnd))
+-        overlay_snapshot = child_overlays_snapshot(window_surface->hwnd);
+-
+-    flushed = set_window_surface_contents(window_surface->hwnd, shm_buffer, surface_damage_region,
+-                                          overlay_snapshot);
++    flushed = set_window_surface_contents(window_surface->hwnd, shm_buffer, surface_damage_region);
+     wl_display_flush(process_wayland.wl_display);
+ 
+ done:
+-    free(overlay_snapshot);
+     if (surface_damage_region) NtGdiDeleteObjectApp(surface_damage_region);
+     return flushed;
+ }
+diff --git a/server/window.c b/server/window.c
+index b460ee1b90c..1f092f6d478 100644
+--- a/server/window.c
++++ b/server/window.c
+@@ -259,6 +259,18 @@ static inline void update_clip_client_flags( struct window *win )
+         win->paint_flags |= PAINT_CLIP_CLIENT_CHILD;
+ }
+ 
++static inline int window_has_self_presenting_content( struct window *win )
++{
++    return (win->paint_flags & (PAINT_HAS_PIXEL_FORMAT | PAINT_CLIP_CLIENT)) ||
++           win->dmabuf_pending_count || win->dmabuf_producer_count;
++}
++
++static inline int window_has_punch_through_content( struct window *win )
++{
++    return window_has_self_presenting_content( win ) ||
++           (win->paint_flags & PAINT_CLIP_CLIENT_CHILD);
++}
++
+ static struct rectangle monitors_get_union_rect( struct winstation *winstation, int is_raw )
+ {
+     struct monitor_info *monitor, *end;
+@@ -450,7 +462,7 @@ static int set_parent_window( struct window *win, struct window *parent )
+         if (parent->thread && parent->thread != win->thread && !is_desktop_window(parent))
+             attach_thread_input( win->thread, parent->thread );
+ 
+-        if (win->paint_flags & (PAINT_HAS_PIXEL_FORMAT | PAINT_CLIP_CLIENT | PAINT_CLIP_CLIENT_CHILD))
++        if (window_has_punch_through_content( win ))
+             update_clip_client_flags( win );
+     }
+     else  /* move it to parent unlinked list */
+@@ -1435,80 +1447,114 @@ error:
+ }
+ 
+ 
+-/* clip all children that draw outside of the parent surface out of the visible region */
+-static struct region *clip_client_children( struct window *parent, struct region *parent_clip,
+-                                            struct region *region, int offset_x, int offset_y )
++static int is_self_presenting_window( struct window *win )
++{
++    return window_has_self_presenting_content( win );
++}
++
++static int set_window_rect_region( struct region *region, struct window *win,
++                                   const struct rectangle *rect, struct region *clip,
++                                   int offset_x, int offset_y )
++{
++    set_region_rect( region, rect );
++    if (win->win_region && !intersect_window_region( region, win )) return 0;
++    offset_region( region, offset_x, offset_y );
++    return intersect_region( region, region, clip ) != NULL;
++}
++
++static int add_window_coverage( struct window *win, struct region *clip,
++                                struct region *covered, struct region *visible,
++                                int offset_x, int offset_y )
++{
++    if (!set_window_rect_region( visible, win, &win->visible_rect, clip, offset_x, offset_y ))
++        return 0;
++    if (!subtract_region( visible, visible, covered )) return 0;
++    return union_region( covered, covered, visible ) != NULL;
++}
++
++/* Walk the child tree in top-to-bottom z-order. 'covered' tracks pixels already
++ * claimed by higher windows; 'holes' tracks pixels where the topmost window is
++ * self-presenting and must show through the parent surface. */
++static int collect_punch_through_holes( struct window *win, struct region *parent_clip,
++                                        struct region *holes, struct region *covered,
++                                        int offset_x, int offset_y )
+ {
+     struct window *ptr;
+-    struct region *clip = create_empty_region();
++    struct region *client_clip = NULL, *visible = NULL, *tmp = NULL;
++    int ret = 0;
++
++    if (!(client_clip = create_empty_region())) return 0;
++    if (!(visible = create_empty_region())) goto done;
++    if (!(tmp = create_empty_region())) goto done;
+ 
+-    if (!clip) return NULL;
++    if (!set_window_rect_region( client_clip, win, &win->client_rect, parent_clip, offset_x, offset_y ))
++        goto done;
+ 
+-    LIST_FOR_EACH_ENTRY_REV( ptr, &parent->children, struct window, entry )
++    LIST_FOR_EACH_ENTRY( ptr, &win->children, struct window, entry )
+     {
+         if (!(ptr->style & WS_VISIBLE)) continue;
+         if (ptr->ex_style & WS_EX_TRANSPARENT) continue;
+ 
+-        /* add the visible rect */
+-        set_region_rect( clip, &ptr->visible_rect );
+-        if (ptr->win_region && !intersect_window_region( clip, ptr )) break;
+-        offset_region( clip, offset_x, offset_y );
+-        if (!intersect_region( clip, clip, parent_clip )) break;
+-        if (!union_region( region, region, clip )) break;
+-        if (!(ptr->paint_flags & (PAINT_HAS_PIXEL_FORMAT | PAINT_CLIP_CLIENT | PAINT_CLIP_CLIENT_CHILD))) continue;
+-
+-        /* subtract the client rect if it draws outside of the parent surface */
+-        set_region_rect( clip, &ptr->client_rect );
+-        if (ptr->win_region && !intersect_window_region( clip, ptr )) break;
+-        offset_region( clip, offset_x, offset_y );
+-        if (!intersect_region( clip, clip, parent_clip )) break;
+-        if ((ptr->paint_flags & (PAINT_HAS_PIXEL_FORMAT | PAINT_CLIP_CLIENT)) &&
+-            !subtract_region( region, region, clip ))
+-            break;
++        if (window_has_punch_through_content( ptr ))
++        {
++            if (!collect_punch_through_holes( ptr, client_clip, holes, covered,
++                                              offset_x + win->client_rect.left,
++                                              offset_y + win->client_rect.top ))
++                goto done;
++        }
++        else if (!add_window_coverage( ptr, client_clip, covered, visible,
++                                       offset_x + win->client_rect.left,
++                                       offset_y + win->client_rect.top ))
++            goto done;
++    }
+ 
+-        if (!clip_client_children( ptr, clip, region, offset_x + ptr->client_rect.left,
+-                                   offset_y + ptr->client_rect.top ))
+-            break;
++    if (is_self_presenting_window( win ))
++    {
++        if (!subtract_region( tmp, client_clip, covered )) goto done;
++        if (!union_region( holes, holes, tmp )) goto done;
+     }
+-    free_region( clip );
+-    return region;
++
++    if (!add_window_coverage( win, parent_clip, covered, visible, offset_x, offset_y )) goto done;
++
++    ret = 1;
++
++done:
++    if (tmp) free_region( tmp );
++    if (visible) free_region( visible );
++    free_region( client_clip );
++    return ret;
+ }
+ 
+ 
+ /* compute the visible surface region of a window, in parent coordinates */
+ static struct region *get_surface_region( struct window *win )
+ {
+-    struct region *region, *clip;
+-    int offset_x, offset_y;
++    struct region *region, *clip = NULL, *holes = NULL, *covered = NULL;
+ 
+     /* create a region relative to the window itself */
+ 
+     if (!(region = create_empty_region())) return NULL;
+     if (!(clip = create_empty_region())) goto error;
++    if (!(holes = create_empty_region())) goto error;
++    if (!(covered = create_empty_region())) goto error;
++
+     set_region_rect( region, &win->visible_rect );
+     if (win->win_region && !intersect_window_region( region, win )) goto error;
+-    set_region_rect( clip, &win->client_rect );
+-    if (win->win_region && !intersect_window_region( clip, win )) goto error;
+-
+-    if ((win->paint_flags & (PAINT_HAS_PIXEL_FORMAT | PAINT_CLIP_CLIENT)) &&
+-        !subtract_region( region, region, clip ))
+-        goto error;
+ 
+-    /* clip children */
+-
+-    if (!is_desktop_window(win))
+-    {
+-        offset_x = win->client_rect.left;
+-        offset_y = win->client_rect.top;
+-    }
+-    else offset_x = offset_y = 0;
++    set_region_rect( clip, &win->visible_rect );
++    if (win->win_region && !intersect_window_region( clip, win )) goto error;
+ 
+-    if (!clip_client_children( win, clip, region, offset_x, offset_y )) goto error;
++    if (!collect_punch_through_holes( win, clip, holes, covered, 0, 0 )) goto error;
++    if (!subtract_region( region, region, holes )) goto error;
+ 
++    free_region( covered );
++    free_region( holes );
+     free_region( clip );
+     return region;
+ 
+ error:
++    if (covered) free_region( covered );
++    if (holes) free_region( holes );
+     if (clip) free_region( clip );
+     free_region( region );
+     return NULL;
+@@ -3094,7 +3140,10 @@ DECL_HANDLER(hwnd_dmabuf_set_pending)
+     if (!win) return;
+ 
+     if (req->pending)
++    {
++        if (!window_has_self_presenting_content( win )) update_clip_client_flags( win );
+         win->dmabuf_pending_count++;
++    }
+     else if (win->dmabuf_pending_count)
+         win->dmabuf_pending_count--;
+     if (!win->dmabuf_pending_count && !win->dmabuf_producer_count)
+@@ -3151,6 +3200,7 @@ static int hwnd_dmabuf_alloc_producer_handle( struct window *win, obj_handle_t *
+ 
+ static void hwnd_dmabuf_commit_producer_open( struct window *win, int exclusive )
+ {
++    if (!window_has_self_presenting_content( win )) update_clip_client_flags( win );
+     win->dmabuf_producer_count++;
+     if (exclusive)
+         win->dmabuf_exclusive_count++;

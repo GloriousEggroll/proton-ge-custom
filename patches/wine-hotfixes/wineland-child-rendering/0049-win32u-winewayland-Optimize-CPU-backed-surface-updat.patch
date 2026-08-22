@@ -1,0 +1,403 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Tue, 4 Aug 2026 22:08:57 +0200
+Subject: [PATCH 49/49] win32u, winewayland: Optimize CPU-backed surface
+ updates.
+
+Advertise the foreign GDI SHM transport only when wl_shm is available.
+Track damage independently for each stable slot so reused buffers copy
+only pixels changed while the consumer owned them.
+
+Also trace why managed dma-buf presentation falls back to host WSI.
+---
+ dlls/win32u/dce.c                      | 71 ++++++++++++++++++++++----
+ dlls/win32u/driver.c                   | 12 ++---
+ dlls/win32u/vulkan.c                   | 16 +++++-
+ dlls/winewayland.drv/vulkan.c          |  3 ++
+ dlls/winewayland.drv/waylanddrv_main.c |  6 +--
+ dlls/winewayland.drv/window_surface.c  | 66 ++++++++++++++++++++++--
+ include/wine/gdi_driver.h              |  5 +-
+ include/wine/hwnd_dmabuf.h             |  3 +-
+ 8 files changed, 156 insertions(+), 26 deletions(-)
+
+diff --git a/dlls/win32u/dce.c b/dlls/win32u/dce.c
+index 41d136deda5..3d44289bfe8 100644
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -68,9 +68,10 @@ struct foreign_gdi_slot
+     HANDLE section;
+     void *bits;
+     int fd;
++    RECT damage;
+     UINT64 release_token;
+     unsigned int image_id;
+-    BOOL busy;
++    BOOL busy, initialized, has_damage;
+ };
+ 
+ struct foreign_gdi_surface
+@@ -273,18 +274,57 @@ static struct foreign_gdi_slot *foreign_gdi_surface_get_free_slot( struct foreig
+     return NULL;
+ }
+ 
++static void foreign_gdi_slot_add_damage( struct foreign_gdi_slot *slot, const RECT *damage )
++{
++    /* Stable slots may lag behind while the consumer owns them. */
++    if (!slot->initialized) return;
++    if (!slot->has_damage)
++    {
++        slot->damage = *damage;
++        slot->has_damage = TRUE;
++        return;
++    }
++
++    slot->damage.left = min( slot->damage.left, damage->left );
++    slot->damage.top = min( slot->damage.top, damage->top );
++    slot->damage.right = max( slot->damage.right, damage->right );
++    slot->damage.bottom = max( slot->damage.bottom, damage->bottom );
++}
++
++static void foreign_gdi_surface_add_damage( struct foreign_gdi_surface *surface, const RECT *dirty )
++{
++    RECT bounds = {0, 0, surface->width, surface->height}, damage;
++    unsigned int i;
++
++    if (!intersect_rect( &damage, dirty, &bounds )) return;
++    for (i = 0; i < FOREIGN_GDI_RING_SIZE; i++)
++        foreign_gdi_slot_add_damage( &surface->slots[i], &damage );
++}
++
+ static void foreign_gdi_copy_frame( struct foreign_gdi_surface *surface, struct foreign_gdi_slot *slot,
+-                                    const BITMAPINFO *color_info, const void *color_bits )
++                                    const BITMAPINFO *color_info, const void *color_bits,
++                                    const RECT *damage )
+ {
+     int height = abs( color_info->bmiHeader.biHeight );
+-    int src_stride = color_info->bmiHeader.biSizeImage / max( 1, height );
+-    int copy_stride = min( src_stride, surface->stride );
++    int width = abs( color_info->bmiHeader.biWidth );
++    int src_stride, left, right, top, bottom;
+     const char *src = color_bits;
+     char *dst = slot->bits;
+-    int y, rows = min( height, surface->height );
++    int y;
++
++    if (!height || !width) return;
++    src_stride = color_info->bmiHeader.biSizeImage / height;
++    if (src_stride <= 0) return;
++
++    left = max( 0, damage->left );
++    top = max( 0, damage->top );
++    right = min( min( min( surface->width, width ), src_stride / 4 ), damage->right );
++    bottom = min( min( surface->height, height ), damage->bottom );
++    if (left >= right || top >= bottom) return;
+ 
+-    for (y = 0; y < rows; y++)
+-        memcpy( dst + y * surface->stride, src + y * src_stride, copy_stride );
++    for (y = top; y < bottom; y++)
++        memcpy( dst + y * surface->stride + left * 4,
++                src + y * src_stride + left * 4, (right - left) * 4 );
+ }
+ 
+ static UINT64 foreign_gdi_surface_next_release_token( struct foreign_gdi_surface *surface )
+@@ -322,6 +362,7 @@ static BOOL foreign_gdi_surface_flush( struct window_surface *window_surface, co
+ 
+     if (surface->lost) return TRUE;
+     if (!foreign_gdi_surface_ensure_slots( surface )) return FALSE;
++    foreign_gdi_surface_add_damage( surface, dirty );
+     if (!foreign_gdi_surface_ensure_channel( surface )) return TRUE;
+     if (!(slot = foreign_gdi_surface_get_free_slot( surface )))
+     {
+@@ -330,7 +371,17 @@ static BOOL foreign_gdi_surface_flush( struct window_surface *window_surface, co
+         return FALSE;
+     }
+ 
+-    foreign_gdi_copy_frame( surface, slot, color_info, color_bits );
++    if (!slot->initialized)
++    {
++        RECT full = {0, 0, surface->width, surface->height};
++        foreign_gdi_copy_frame( surface, slot, color_info, color_bits, &full );
++    }
++    else if (slot->has_damage)
++    {
++        foreign_gdi_copy_frame( surface, slot, color_info, color_bits, &slot->damage );
++    }
++    slot->initialized = TRUE;
++    slot->has_damage = FALSE;
+ 
+     memset( &desc, 0, sizeof(desc) );
+     desc.version = HWND_DMABUF_DESC_VERSION_V1;
+@@ -441,7 +492,7 @@ static struct foreign_gdi_surface *foreign_gdi_surface_create( HWND hwnd, int wi
+     for (i = 0; i < FOREIGN_GDI_RING_SIZE; i++)
+         surface->slots[i].fd = -1;
+ 
+-    TRACE( "foreign_gdi hwnd=%p created producer surface %p size=%dx%d\n",
++    TRACE( "foreign_gdi hwnd=%p using cpu-shm surface %p size=%dx%d\n",
+            hwnd, surface, width, height );
+     return surface;
+ }
+@@ -1578,7 +1629,7 @@ static void update_visible_region( struct dce *dce )
+         RECT window_rect, toplevel_rect;
+         UINT dpi;
+ 
+-        if (foreign && user_driver->pUseForeignGdiBridge())
++        if (foreign && (user_driver->pGetForeignGdiSurfaceCaps() & WINE_GDI_FOREIGN_SURFACE_SHM))
+             foreign_surface = foreign_gdi_surface_get( dce->hwnd, &win_rect );
+ 
+         if (foreign_surface)
+diff --git a/dlls/win32u/driver.c b/dlls/win32u/driver.c
+index 8bedab54e1d..a8a3cea3a0c 100644
+--- a/dlls/win32u/driver.c
++++ b/dlls/win32u/driver.c
+@@ -907,9 +907,9 @@ static void nulldrv_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_h
+ {
+ }
+ 
+-static BOOL nulldrv_UseForeignGdiBridge(void)
++static UINT nulldrv_GetForeignGdiSurfaceCaps(void)
+ {
+-    return FALSE;
++    return 0;
+ }
+ 
+ static BOOL nulldrv_SystemParametersInfo( UINT action, UINT int_param, void *ptr_param, UINT flags )
+@@ -1267,9 +1267,9 @@ static UINT loaderdrv_OpenGLInit( UINT version, const struct opengl_funcs *openg
+     return load_driver()->pOpenGLInit( version, opengl_funcs, driver_funcs );
+ }
+ 
+-static BOOL loaderdrv_UseForeignGdiBridge(void)
++static UINT loaderdrv_GetForeignGdiSurfaceCaps(void)
+ {
+-    return load_driver()->pUseForeignGdiBridge();
++    return load_driver()->pGetForeignGdiSurfaceCaps();
+ }
+ 
+ static const struct user_driver_funcs lazy_load_driver =
+@@ -1341,7 +1341,7 @@ static const struct user_driver_funcs lazy_load_driver =
+     nulldrv_CreateWindowSurface,
+     nulldrv_MoveWindowBits,
+     nulldrv_WindowPosChanged,
+-    loaderdrv_UseForeignGdiBridge,
++    loaderdrv_GetForeignGdiSurfaceCaps,
+     /* system parameters */
+     nulldrv_SystemParametersInfo,
+     /* wintab support */
+@@ -1444,7 +1444,7 @@ void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version
+     SET_USER_FUNC(CreateWindowSurface);
+     SET_USER_FUNC(MoveWindowBits);
+     SET_USER_FUNC(WindowPosChanged);
+-    SET_USER_FUNC(UseForeignGdiBridge);
++    SET_USER_FUNC(GetForeignGdiSurfaceCaps);
+     SET_USER_FUNC(SystemParametersInfo);
+     SET_USER_FUNC(WintabProc);
+     SET_USER_FUNC(VulkanInit);
+diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+index 0feca436ced..42ab547d134 100644
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -3604,8 +3604,10 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
+         struct wine_managed_swapchain *managed = NULL;
+         hwnd_dmabuf_host_caps_t probe_caps = {0};
+         UINT probe_count = 0;
++        UINT probe_status;
+ 
+-        if (hwnd_dmabuf_get_caps( surface->hwnd, &probe_caps, NULL, 0, &probe_count ) == HWND_DMABUF_OK && probe_count)
++        probe_status = hwnd_dmabuf_get_caps( surface->hwnd, &probe_caps, NULL, 0, &probe_count );
++        if (probe_status == HWND_DMABUF_OK && probe_count)
+         {
+             /* Use the host-clamped extents so the dmabuf size matches the window. */
+             VkSwapchainCreateInfoKHR managed_info = *create_info;
+@@ -3631,8 +3633,18 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
+             TRACE( "managed swapchain build failed (res %d) for hwnd %p, using host swapchain\n",
+                    res, surface->hwnd );
+         }
++        else
++        {
++            TRACE( "managed dmabuf unavailable for hwnd %p (status %u, formats %u), using host swapchain\n",
++                   surface->hwnd, probe_status, probe_count );
++        }
++    }
++    else
++    {
++        TRACE( "managed dmabuf unavailable for hwnd %p (modifier %u, external memory %u), using host swapchain\n",
++               surface->hwnd, device->extensions.has_VK_EXT_image_drm_format_modifier,
++               device->extensions.has_VK_EXT_external_memory_dma_buf );
+     }
+-
+ 
+     if ((res = device->p_vkCreateSwapchainKHR( device->host.device, &create_info_host, NULL, &host_swapchain )))
+     {
+diff --git a/dlls/winewayland.drv/vulkan.c b/dlls/winewayland.drv/vulkan.c
+index b69b49dfa21..28a023954c9 100644
+--- a/dlls/winewayland.drv/vulkan.c
++++ b/dlls/winewayland.drv/vulkan.c
+@@ -203,7 +203,10 @@ static UINT wayland_vulkan_get_hwnd_dmabuf_caps(HWND hwnd, void *caps_ptr, void
+     if (!caps || !format_modifier_count || (max_format_modifiers && !format_modifiers))
+         return HWND_DMABUF_INVALID_ARGS;
+     if (!process_wayland.zwp_linux_dmabuf_v1)
++    {
++        TRACE("hwnd %p has no linux-dmabuf transport\n", hwnd);
+         return HWND_DMABUF_NOT_FOUND;
++    }
+ 
+     /* Most local top-levels should present directly through Vulkan WSI. If the
+      * top-level's client content cannot be represented as a rectangular Wayland
+diff --git a/dlls/winewayland.drv/waylanddrv_main.c b/dlls/winewayland.drv/waylanddrv_main.c
+index f93ae4cc8d3..011c6d32d5a 100644
+--- a/dlls/winewayland.drv/waylanddrv_main.c
++++ b/dlls/winewayland.drv/waylanddrv_main.c
+@@ -37,9 +37,9 @@ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
+ char *process_name = NULL;
+ char *process_activate_token = NULL;
+ 
+-static BOOL WAYLAND_UseForeignGdiBridge(void)
++static UINT WAYLAND_GetForeignGdiSurfaceCaps(void)
+ {
+-    return TRUE;
++    return process_wayland.wl_shm ? WINE_GDI_FOREIGN_SURFACE_SHM : 0;
+ }
+ 
+ static const struct user_driver_funcs waylanddrv_funcs =
+@@ -67,7 +67,7 @@ static const struct user_driver_funcs waylanddrv_funcs =
+     .pWindowPosChanged = WAYLAND_WindowPosChanged,
+     .pWindowPosChanging = WAYLAND_WindowPosChanging,
+     .pCreateWindowSurface = WAYLAND_CreateWindowSurface,
+-    .pUseForeignGdiBridge = WAYLAND_UseForeignGdiBridge,
++    .pGetForeignGdiSurfaceCaps = WAYLAND_GetForeignGdiSurfaceCaps,
+     .pGetWindowStyleMasks = WAYLAND_GetWindowStyleMasks,
+     .pGetWindowStateUpdates = WAYLAND_GetWindowStateUpdates,
+     .pGetWindowMaxTrackSize = WAYLAND_GetWindowMaxTrackSize,
+diff --git a/dlls/winewayland.drv/window_surface.c b/dlls/winewayland.drv/window_surface.c
+index 23fd3c06d1e..aef0055e90e 100644
+--- a/dlls/winewayland.drv/window_surface.c
++++ b/dlls/winewayland.drv/window_surface.c
+@@ -56,9 +56,10 @@ struct wayland_gdi_overlay_slot
+     HANDLE section;
+     void *bits;
+     int fd;
++    RECT damage;
+     UINT64 release_token;
+     unsigned int image_id;
+-    BOOL busy;
++    BOOL busy, initialized, has_damage;
+ };
+ 
+ struct wayland_gdi_overlay_producer
+@@ -400,6 +401,54 @@ static BOOL wayland_gdi_overlay_master_copy_region(struct wayland_gdi_overlay_pr
+     return copied;
+ }
+ 
++static void wayland_gdi_overlay_slot_add_damage(struct wayland_gdi_overlay_slot *slot,
++                                                const RECT *damage)
++{
++    /* Stable slots may lag behind while the consumer owns them. */
++    if (!slot->initialized) return;
++    if (!slot->has_damage)
++    {
++        slot->damage = *damage;
++        slot->has_damage = TRUE;
++        return;
++    }
++
++    slot->damage.left = min(slot->damage.left, damage->left);
++    slot->damage.top = min(slot->damage.top, damage->top);
++    slot->damage.right = max(slot->damage.right, damage->right);
++    slot->damage.bottom = max(slot->damage.bottom, damage->bottom);
++}
++
++static void wayland_gdi_overlay_add_slot_damage(struct wayland_gdi_overlay_producer *producer,
++                                                HRGN region)
++{
++    RECT bounds = {0, 0, producer->width, producer->height}, damage;
++    unsigned int i;
++    int type;
++
++    if (!region || (type = NtGdiGetRgnBox(region, &damage)) == ERROR)
++        damage = bounds;
++    else if (type == NULLREGION || !intersect_rect(&damage, &damage, &bounds))
++        return;
++
++    for (i = 0; i < GDI_OVERLAY_RING_SIZE; i++)
++        wayland_gdi_overlay_slot_add_damage(&producer->slots[i], &damage);
++}
++
++static void wayland_gdi_overlay_copy_slot(struct wayland_gdi_overlay_producer *producer,
++                                          struct wayland_gdi_overlay_slot *slot,
++                                          const RECT *damage)
++{
++    RECT bounds = {0, 0, producer->width, producer->height}, rect;
++    int y;
++
++    if (!intersect_rect(&rect, damage, &bounds)) return;
++    for (y = rect.top; y < rect.bottom; y++)
++        memcpy((char *)slot->bits + (size_t)y * producer->stride + (size_t)rect.left * 4,
++               (char *)producer->master_bits + (size_t)y * producer->stride + (size_t)rect.left * 4,
++               (size_t)(rect.right - rect.left) * 4);
++}
++
+ static void wayland_gdi_overlay_master_clear_region(struct wayland_gdi_overlay_producer *producer,
+                                                     HRGN region)
+ {
+@@ -536,15 +585,26 @@ static BOOL wayland_gdi_overlay_publish(HWND hwnd, struct wayland_gdi_overlay_pr
+     struct wayland_gdi_overlay_slot *slot;
+     int ret;
+ 
+-    if (!wayland_gdi_overlay_ensure_channel(hwnd, producer)) return TRUE;
+     if (!producer->slots_created) return FALSE;
++    wayland_gdi_overlay_add_slot_damage(producer, dirty_region);
++    if (!wayland_gdi_overlay_ensure_channel(hwnd, producer)) return TRUE;
+     if (!(slot = wayland_gdi_overlay_get_free_slot(hwnd, producer)))
+     {
+         TRACE("gdi_overlay hwnd=%p no free shm slot\n", hwnd);
+         return FALSE;
+     }
+ 
+-    memcpy(slot->bits, producer->master_bits, producer->size);
++    if (!slot->initialized)
++    {
++        RECT full = {0, 0, producer->width, producer->height};
++        wayland_gdi_overlay_copy_slot(producer, slot, &full);
++    }
++    else if (slot->has_damage)
++    {
++        wayland_gdi_overlay_copy_slot(producer, slot, &slot->damage);
++    }
++    slot->initialized = TRUE;
++    slot->has_damage = FALSE;
+ 
+     memset(&desc, 0, sizeof(desc));
+     desc.version = HWND_DMABUF_DESC_VERSION_V1;
+diff --git a/include/wine/gdi_driver.h b/include/wine/gdi_driver.h
+index 6935bdfa629..38aa5a0c949 100644
+--- a/include/wine/gdi_driver.h
++++ b/include/wine/gdi_driver.h
+@@ -402,6 +402,9 @@ struct gdi_device_manager
+ #define WINE_SWP_RESIZABLE  0x40000000
+ #define WINE_SWP_TRAY_MENU  0x20000000
+ 
++/* CPU transports for GDI targeting a window owned by another process. */
++#define WINE_GDI_FOREIGN_SURFACE_SHM 0x00000001
++
+ struct vulkan_driver_funcs;
+ struct opengl_driver_funcs;
+ 
+@@ -476,7 +479,7 @@ struct user_driver_funcs
+     BOOL    (*pCreateWindowSurface)(HWND,BOOL,const RECT *,struct window_surface**);
+     void    (*pMoveWindowBits)(HWND,const struct window_rects *,const struct window_rects *,const RECT *);
+     void    (*pWindowPosChanged)(HWND,HWND,HWND,UINT,const struct window_rects*,struct window_surface*);
+-    BOOL    (*pUseForeignGdiBridge)(void);
++    UINT    (*pGetForeignGdiSurfaceCaps)(void);
+     /* system parameters */
+     BOOL    (*pSystemParametersInfo)(UINT,UINT,void*,UINT);
+     /* wintab support */
+diff --git a/include/wine/hwnd_dmabuf.h b/include/wine/hwnd_dmabuf.h
+index 92e1b9ff8a3..ad9e1d869b5 100644
+--- a/include/wine/hwnd_dmabuf.h
++++ b/include/wine/hwnd_dmabuf.h
+@@ -1,4 +1,5 @@
+-/* Wine-internal HWND dmabuf bridge helpers. */
++/* Wine-internal HWND buffer bridge helpers. The historical channel name also
++ * carries CPU-backed SHM frames. */
+ 
+ #ifndef __WINE_HWND_DMABUF_H
+ #define __WINE_HWND_DMABUF_H

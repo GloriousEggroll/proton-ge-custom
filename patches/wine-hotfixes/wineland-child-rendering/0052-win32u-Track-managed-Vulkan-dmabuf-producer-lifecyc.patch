@@ -1,0 +1,133 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <nano.matters.code@gmail.com>
+Date: Sun, 21 Jun 2026 13:01:37 +0200
+Subject: [PATCH 52/52] win32u: Track managed Vulkan dmabuf producer lifecycle.
+
+Restore the Vulkan portion of the pending-producer lifecycle which was
+omitted from the selective child-rendering rebase. Mark the HWND pending
+before allocating exportable images so the parent does not snapshot a
+temporary GDI surface over the producer. Release active and pending server
+references on every teardown path.
+
+Original commit: 64f5e7717f44103bff67e02de78bec9ecbabb3c8
+---
+ dlls/win32u/hwnd_dmabuf.c    |  8 ++++++++
+ dlls/win32u/ntuser_private.h |  1 +
+ dlls/win32u/vulkan.c         | 28 ++++++++++++++++++++++++++++
+ 3 files changed, 37 insertions(+)
+
+diff --git a/dlls/win32u/hwnd_dmabuf.c b/dlls/win32u/hwnd_dmabuf.c
+index 21c1bc140bc..74c9a0a2b67 100644
+--- a/dlls/win32u/hwnd_dmabuf.c
++++ b/dlls/win32u/hwnd_dmabuf.c
+@@ -24,6 +24,11 @@ void hwnd_dmabuf_post_wake( HWND hwnd )
+     if (toplevel) NtUserPostMessage( toplevel, WM_WINE_HWND_DMABUF_FRAME, 0, 0 );
+ }
+ 
++unsigned int hwnd_dmabuf_set_pending( HWND hwnd, BOOL pending )
++{
++    return wine_hwnd_dmabuf_set_pending( hwnd, pending );
++}
++
+ /* Open the producer end of hwnd's channel. */
+ int hwnd_dmabuf_open_channel( HWND hwnd )
+ {
+@@ -32,7 +37,10 @@ int hwnd_dmabuf_open_channel( HWND hwnd )
+     if (wine_hwnd_dmabuf_get_channel( hwnd, &handle ) != HWND_DMABUF_OK || !handle)
+         return -1;
+     if (wine_server_handle_to_fd( handle, FILE_READ_DATA | FILE_WRITE_DATA, &fd, NULL ))
++    {
+         fd = -1;
++        wine_hwnd_dmabuf_release_channel( hwnd );
++    }
+     NtClose( handle );
+     return fd;
+ }
+diff --git a/dlls/win32u/ntuser_private.h b/dlls/win32u/ntuser_private.h
+index 9def950a3e6..6fc2cfbcd4b 100644
+--- a/dlls/win32u/ntuser_private.h
++++ b/dlls/win32u/ntuser_private.h
+@@ -249,6 +249,7 @@ extern struct vulkan_instance *vulkan_instance_create( const struct vulkan_insta
+ extern struct vulkan_instance *get_d3dkmt_vulkan_instance( void );
+ 
+ /* hwnd_dmabuf.c */
++extern unsigned int hwnd_dmabuf_set_pending( HWND hwnd, BOOL pending );
+ extern int hwnd_dmabuf_open_channel( HWND hwnd );
+ extern int hwnd_dmabuf_open_channel_exclusive( HWND hwnd );
+ extern void hwnd_dmabuf_close_channel( HWND hwnd, int channel_fd );
+diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+index f12bbd0bbd9..94983ea037a 100644
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -297,6 +297,9 @@ struct wine_managed_swapchain
+     VkFence present_fence;          /* per-frame render-complete fence (export gate) */
+     PFN_vkWaitForFences p_vkWaitForFences;
+     PFN_vkResetFences p_vkResetFences;
++    HWND hwnd;                      /* server-visible producer HWND */
++    BOOL pending_registered;        /* server pending reference is live */
++    BOOL channel_registered;        /* server active producer reference is live */
+ };
+ 
+ struct swapchain
+@@ -3185,6 +3188,10 @@ static void managed_free( struct vulkan_device *device, struct wine_managed_swap
+         managed_destroy_image( device, &managed->images[i] );
+     if (managed->present_fence) device->p_vkDestroyFence( device->host.device, managed->present_fence, NULL );
+     if (managed->channel_fd >= 0) close( managed->channel_fd );
++    if (managed->channel_registered)
++        hwnd_dmabuf_release_channel( managed->hwnd );
++    if (managed->pending_registered)
++        hwnd_dmabuf_set_pending( managed->hwnd, FALSE );
+     pthread_mutex_destroy( &managed->lock );
+     free( managed );
+ }
+@@ -3384,6 +3391,7 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
+     uint32_t modifier_count, count, i;
+     VkImageUsageFlags usage;
+     VkResult res;
++    unsigned int status;
+ 
+     *out = NULL;
+ 
+@@ -3406,6 +3414,7 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
+     if (!(managed = calloc( 1, sizeof(*managed) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+     pthread_mutex_init( &managed->lock, NULL );
+     managed->channel_fd = -1;
++    managed->hwnd = surface->hwnd;
+     managed->format = create_info->imageFormat;
+     managed->fourcc = fourcc;
+     /* If the chosen fourcc is the opaque X-variant, tell the compositor to ignore
+@@ -3421,6 +3430,16 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
+         managed->producer_unique_id = InterlockedIncrement64( &managed_next_producer_id );
+     managed->ring_generation = 1;
+ 
++    status = hwnd_dmabuf_set_pending( managed->hwnd, TRUE );
++    if (status != HWND_DMABUF_OK)
++    {
++        WARN( "failed to mark hwnd %p as pending dmabuf producer, status %u\n",
++              managed->hwnd, status );
++        managed_free( device, managed );
++        return VK_ERROR_INITIALIZATION_FAILED;
++    }
++    managed->pending_registered = TRUE;
++
+     /* At least 3 images for fire-and-forget publishing (no FIFO pacing). */
+     count = max( create_info->minImageCount, 3u );
+     if (count > WINE_VK_MANAGED_MAX_IMAGES) count = WINE_VK_MANAGED_MAX_IMAGES;
+@@ -3451,6 +3470,15 @@ static VkResult managed_swapchain_create( struct vulkan_device *device, struct s
+     }
+ 
+     managed->channel_fd = hwnd_dmabuf_open_channel( surface->hwnd );
++    if (managed->channel_fd < 0)
++    {
++        WARN( "failed to open hwnd %p dmabuf producer channel, falling back to host swapchain\n",
++              surface->hwnd );
++        managed_free( device, managed );
++        return VK_ERROR_INITIALIZATION_FAILED;
++    }
++    managed->channel_registered = TRUE;
++    managed->pending_registered = FALSE;
+     managed->last_progress_ms = NtGetTickCount();
+     TRACE( "managed swapchain %p hwnd %p socket channel fd %d\n", managed, surface->hwnd, managed->channel_fd );
+ 
+-- 
+2.53.0

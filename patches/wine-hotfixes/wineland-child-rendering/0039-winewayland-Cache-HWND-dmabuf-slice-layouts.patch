@@ -1,0 +1,474 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Wed, 15 Jul 2026 12:02:13 +0200
+Subject: [PATCH 39/49] winewayland: Cache HWND dmabuf slice layouts.
+
+Avoid re-sending retained subsurface geometry and viewport state when
+a shaped dmabuf producer keeps the same visible region. Still attach new
+producer frames through the existing slice surfaces, so buffer release
+accounting remains unchanged.
+---
+ dlls/winewayland.drv/wayland_surface.c | 298 ++++++++++++++++++-------
+ 1 file changed, 218 insertions(+), 80 deletions(-)
+
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index aff1a48b48a..4d2b02ac2ea 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -220,13 +220,23 @@ struct wayland_hwnd_dmabuf_slice_buffer
+     struct wayland_hwnd_dmabuf_buffer *buffer;
+ };
+ 
++struct wayland_hwnd_dmabuf_slice_geometry
++{
++    int x, y;
++    int width, height;
++    wl_fixed_t source_x, source_y;
++    wl_fixed_t source_width, source_height;
++};
++
+ struct wayland_hwnd_dmabuf_slice
+ {
+     struct wl_list link;
+     struct wl_surface *wl_surface;
+     struct wl_subsurface *wl_subsurface;
+     struct wp_viewport *wp_viewport;
++    struct wayland_hwnd_dmabuf_slice_geometry geometry;
+     BOOL seen;
++    BOOL geometry_valid;
+ };
+ 
+ struct wayland_hwnd_dmabuf_surface
+@@ -255,9 +265,17 @@ struct wayland_hwnd_dmabuf_surface
+     int committed_width, committed_height;
+     int channel_fd;                 /* consumer end of the producer socket, or -1 */
+     struct wl_surface *stack_bottom;
++    struct wl_surface *slice_layout_sibling;
+     struct wayland_visual_constraint visual_constraint;
+ };
+ 
++enum wayland_hwnd_dmabuf_configure_result
++{
++    WAYLAND_HWNDDMABUF_CONFIGURE_FAILED,
++    WAYLAND_HWNDDMABUF_CONFIGURE_NOOP,
++    WAYLAND_HWNDDMABUF_CONFIGURE_UPDATED,
++};
++
+ /* A child may briefly drop out of the descendant list between frames. Tearing its surface
+  * (and dmabuf cache) down on a single miss churns the cache and, with fd-once, strands slots
+  * the producer thinks are still cached. Keep an unseen surface for a grace window first. */
+@@ -347,6 +365,8 @@ static void wayland_hwnd_dmabuf_send_release(struct wayland_hwnd_dmabuf_surface
+ }
+ 
+ static void wayland_hwnd_dmabuf_surface_clear_slices(struct wayland_hwnd_dmabuf_surface *surface);
++static struct wayland_hwnd_dmabuf_slice *wayland_hwnd_dmabuf_surface_get_slice(
++        struct wayland_hwnd_dmabuf_surface *surface);
+ 
+ /* Present-thread teardown: detach from the surface and drop the owner ref.
+  * Must be called with win_data_mutex held.
+@@ -473,6 +493,19 @@ static void wayland_hwnd_dmabuf_slice_destroy(struct wayland_hwnd_dmabuf_slice *
+     free(slice);
+ }
+ 
++static void wayland_hwnd_dmabuf_surface_assert_slice_cache(struct wayland_hwnd_dmabuf_surface *surface)
++{
++    struct wayland_hwnd_dmabuf_slice *slice;
++    unsigned int count = 0;
++
++    wl_list_for_each(slice, &surface->slices, link)
++        count++;
++
++    assert(count == surface->slice_count);
++    assert(surface->sliced == !!surface->slice_count);
++    if (!surface->sliced) assert(!surface->slice_layout_sibling);
++}
++
+ static void wayland_hwnd_dmabuf_surface_clear_slices(struct wayland_hwnd_dmabuf_surface *surface)
+ {
+     struct wayland_hwnd_dmabuf_slice *slice, *next;
+@@ -482,6 +515,80 @@ static void wayland_hwnd_dmabuf_surface_clear_slices(struct wayland_hwnd_dmabuf_
+     surface->sliced = FALSE;
+     surface->slice_count = 0;
+     surface->stack_bottom = surface->wl_surface;
++    surface->slice_layout_sibling = NULL;
++    wayland_hwnd_dmabuf_surface_assert_slice_cache(surface);
++}
++
++static BOOL wayland_hwnd_dmabuf_surface_slice_layout_matches(
++        struct wayland_hwnd_dmabuf_surface *surface, struct wl_surface *sibling,
++        const struct wayland_hwnd_dmabuf_slice_geometry *layout, unsigned int count)
++{
++    struct wayland_hwnd_dmabuf_slice *slice;
++    unsigned int i = 0;
++
++    if (!surface->sliced || surface->slice_count != count ||
++        surface->slice_layout_sibling != sibling)
++        return FALSE;
++
++    wl_list_for_each(slice, &surface->slices, link)
++    {
++        if (i >= count || !slice->geometry_valid ||
++            memcmp(&slice->geometry, &layout[i], sizeof(layout[i])))
++            return FALSE;
++        i++;
++    }
++
++    return i == count;
++}
++
++static struct wl_surface *wayland_hwnd_dmabuf_surface_slice_stack_bottom(
++        struct wayland_hwnd_dmabuf_surface *surface)
++{
++    struct wayland_hwnd_dmabuf_slice *slice;
++    struct wl_surface *bottom = surface->wl_surface;
++
++    wl_list_for_each(slice, &surface->slices, link)
++        bottom = slice->wl_surface;
++    return bottom;
++}
++
++static BOOL wayland_hwnd_dmabuf_surface_apply_slice_layout(
++        struct wayland_hwnd_dmabuf_surface *surface,
++        const struct wayland_hwnd_dmabuf_slice_geometry *layout, unsigned int count,
++        struct wl_surface *sibling)
++{
++    struct wayland_hwnd_dmabuf_slice *slice, *next;
++    struct wl_surface *initial_sibling = sibling;
++    unsigned int i;
++
++    wl_list_for_each(slice, &surface->slices, link) slice->seen = FALSE;
++
++    for (i = 0; i < count; i++)
++    {
++        if (!(slice = wayland_hwnd_dmabuf_surface_get_slice(surface))) return FALSE;
++
++        wl_subsurface_set_position(slice->wl_subsurface, layout[i].x, layout[i].y);
++        wl_subsurface_place_below(slice->wl_subsurface, sibling);
++        wp_viewport_set_source(slice->wp_viewport, layout[i].source_x, layout[i].source_y,
++                               layout[i].source_width, layout[i].source_height);
++        wp_viewport_set_destination(slice->wp_viewport, layout[i].width, layout[i].height);
++        slice->geometry = layout[i];
++        slice->geometry_valid = TRUE;
++        sibling = slice->wl_surface;
++    }
++
++    wl_list_for_each_safe(slice, next, &surface->slices, link)
++    {
++        if (slice->seen) continue;
++        wayland_hwnd_dmabuf_slice_destroy(slice);
++    }
++
++    surface->sliced = TRUE;
++    surface->slice_count = count;
++    surface->slice_layout_sibling = initial_sibling;
++    surface->stack_bottom = sibling;
++    wayland_hwnd_dmabuf_surface_assert_slice_cache(surface);
++    return TRUE;
+ }
+ 
+ static struct wayland_hwnd_dmabuf_slice *wayland_hwnd_dmabuf_surface_get_slice(
+@@ -521,6 +628,26 @@ err:
+     return NULL;
+ }
+ 
++static BOOL wayland_hwnd_dmabuf_surface_attach_slices(struct wayland_hwnd_dmabuf_surface *surface)
++{
++    struct wayland_hwnd_dmabuf_buffer *buffer = surface->current;
++    struct wayland_hwnd_dmabuf_slice *slice;
++    unsigned int count = 0;
++
++    if (!buffer) return FALSE;
++
++    wl_list_for_each(slice, &surface->slices, link)
++    {
++        if (!wayland_hwnd_dmabuf_slice_attach_buffer(slice, buffer))
++            return FALSE;
++        wl_surface_damage_buffer(slice->wl_surface, 0, 0, buffer->width, buffer->height);
++        wl_surface_commit(slice->wl_surface);
++        count++;
++    }
++
++    return count == surface->slice_count && count;
++}
++
+ static void wayland_hwnd_dmabuf_surface_destroy(struct wayland_hwnd_dmabuf_surface *surface)
+ {
+     struct wayland_hwnd_dmabuf_buffer *buffer, *buffer_next;
+@@ -2365,27 +2492,27 @@ static void wayland_hwnd_dmabuf_surface_apply_geometry(struct wayland_hwnd_dmabu
+     surface->stack_bottom = surface->wl_surface;
+ }
+ 
+-static BOOL wayland_hwnd_dmabuf_surface_configure_slices(struct wayland_surface *parent,
+-                                                         struct wayland_hwnd_dmabuf_surface *surface,
+-                                                         const hwnd_dmabuf_frame_info_t *info,
+-                                                         struct wl_surface *sibling)
++static enum wayland_hwnd_dmabuf_configure_result wayland_hwnd_dmabuf_surface_configure_slices(
++        struct wayland_surface *parent, struct wayland_hwnd_dmabuf_surface *surface,
++        const hwnd_dmabuf_frame_info_t *info, struct wl_surface *sibling, BOOL attach_frame)
+ {
+     RECT child_rect = wine_server_get_rect(info->client), clipped, client, dst;
+-    struct wayland_hwnd_dmabuf_slice *slice, *next;
++    struct wayland_hwnd_dmabuf_slice_geometry layout[WAYLAND_DMABUF_MAX_SLICES];
++    RECT *visible_rects;
+     struct wayland_hwnd_dmabuf_buffer *buffer = surface->current;
+     struct wayland_child_visibility_info visibility;
++    BOOL layout_matches;
+     RGNDATA *data;
+     RECT *rect, *end;
+     int child_width, child_height;
+-    unsigned int count = 0;
+-    BOOL attach_failed = FALSE;
++    unsigned int count = 0, region_count, i;
+ 
+     if (surface->gdi_overlay || surface->direct || !buffer || !parent->child_region)
+-        return FALSE;
++        return WAYLAND_HWNDDMABUF_CONFIGURE_FAILED;
+ 
+     child_width = child_rect.right - child_rect.left;
+     child_height = child_rect.bottom - child_rect.top;
+-    if (child_width <= 0 || child_height <= 0) return FALSE;
++    if (child_width <= 0 || child_height <= 0) return WAYLAND_HWNDDMABUF_CONFIGURE_FAILED;
+ 
+     client.left = client.top = 0;
+     client.right = parent->window.client_rect.right - parent->window.client_rect.left;
+@@ -2395,7 +2522,7 @@ static BOOL wayland_hwnd_dmabuf_surface_configure_slices(struct wayland_surface
+     clipped.top = max(child_rect.top, client.top);
+     clipped.right = min(child_rect.right, client.right);
+     clipped.bottom = min(child_rect.bottom, client.bottom);
+-    if (IsRectEmpty(&clipped)) return FALSE;
++    if (IsRectEmpty(&clipped)) return WAYLAND_HWNDDMABUF_CONFIGURE_FAILED;
+ 
+     dst = clipped;
+     OffsetRect(&dst, parent->window.client_rect.left - parent->window.rect.left,
+@@ -2404,10 +2531,17 @@ static BOOL wayland_hwnd_dmabuf_surface_configure_slices(struct wayland_surface
+     wayland_surface_classify_child_visibility(parent, &dst, &visibility);
+     wayland_surface_update_child_visibility(&dst, &visibility, &surface->visual_constraint);
+     if (visibility.visibility != WAYLAND_CHILD_VISIBILITY_UNMASKABLE)
+-        return FALSE;
++        return WAYLAND_HWNDDMABUF_CONFIGURE_FAILED;
+ 
+-    if (!(data = get_region_data(parent->child_region))) return FALSE;
++    if (!(data = get_region_data(parent->child_region)))
++        return WAYLAND_HWNDDMABUF_CONFIGURE_FAILED;
+ 
++    region_count = data->rdh.nCount;
++    if (!(visible_rects = calloc(region_count ? region_count : 1, sizeof(*visible_rects))))
++    {
++        free(data);
++        return WAYLAND_HWNDDMABUF_CONFIGURE_FAILED;
++    }
+     rect = (RECT *)data->Buffer;
+     end = rect + data->rdh.nCount;
+     for (; rect < end; rect++)
+@@ -2419,33 +2553,26 @@ static BOOL wayland_hwnd_dmabuf_surface_configure_slices(struct wayland_surface
+         visible.right = min(visible.right, dst.right);
+         visible.bottom = min(visible.bottom, dst.bottom);
+         if (IsRectEmpty(&visible)) continue;
+-        count++;
++        visible_rects[count++] = visible;
++    }
++    free(data);
++
++    if (!count)
++    {
++        free(visible_rects);
++        return WAYLAND_HWNDDMABUF_CONFIGURE_FAILED;
+     }
+     if (count > WAYLAND_DMABUF_MAX_SLICES)
+     {
+-        free(data);
+-        return FALSE;
++        free(visible_rects);
++        return WAYLAND_HWNDDMABUF_CONFIGURE_FAILED;
+     }
+-    count = 0;
+ 
+-    wl_list_for_each(slice, &surface->slices, link) slice->seen = FALSE;
+-
+-    rect = (RECT *)data->Buffer;
+-    end = rect + data->rdh.nCount;
+-    for (; rect < end; rect++)
++    for (i = 0; i < count; i++)
+     {
+-        RECT visible = *rect, source_rect;
+-        int x, y, width, height;
++        RECT *visible = &visible_rects[i], source_rect = *visible;
+         double sx, sy, sw, sh;
+ 
+-        visible.left = max(visible.left, dst.left);
+-        visible.top = max(visible.top, dst.top);
+-        visible.right = min(visible.right, dst.right);
+-        visible.bottom = min(visible.bottom, dst.bottom);
+-        if (IsRectEmpty(&visible)) continue;
+-        if (!(slice = wayland_hwnd_dmabuf_surface_get_slice(surface))) break;
+-
+-        source_rect = visible;
+         OffsetRect(&source_rect, parent->window.rect.left - parent->window.client_rect.left,
+                    parent->window.rect.top - parent->window.client_rect.top);
+ 
+@@ -2454,70 +2581,69 @@ static BOOL wayland_hwnd_dmabuf_surface_configure_slices(struct wayland_surface
+         sw = (double)(source_rect.right - source_rect.left) * buffer->width / child_width;
+         sh = (double)(source_rect.bottom - source_rect.top) * buffer->height / child_height;
+ 
+-        wayland_surface_coords_from_window(parent, visible.left, visible.top, &x, &y);
+-        wayland_surface_coords_from_window(parent, visible.right - visible.left,
+-                                           visible.bottom - visible.top, &width, &height);
+-        width = max(1, width);
+-        height = max(1, height);
++        wayland_surface_coords_from_window(parent, visible->left, visible->top,
++                                           &layout[i].x, &layout[i].y);
++        wayland_surface_coords_from_window(parent, visible->right - visible->left,
++                                           visible->bottom - visible->top,
++                                           &layout[i].width, &layout[i].height);
++        layout[i].width = max(1, layout[i].width);
++        layout[i].height = max(1, layout[i].height);
++        layout[i].source_x = wl_fixed_from_double(sx);
++        layout[i].source_y = wl_fixed_from_double(sy);
++        layout[i].source_width = wl_fixed_from_double(sw);
++        layout[i].source_height = wl_fixed_from_double(sh);
++    }
++    free(visible_rects);
++
++    layout_matches = wayland_hwnd_dmabuf_surface_slice_layout_matches(surface, sibling, layout, count);
+ 
+-        wl_subsurface_set_position(slice->wl_subsurface, x, y);
+-        wl_subsurface_place_below(slice->wl_subsurface, sibling);
+-        wp_viewport_set_source(slice->wp_viewport, wl_fixed_from_double(sx),
+-                               wl_fixed_from_double(sy), wl_fixed_from_double(sw),
+-                               wl_fixed_from_double(sh));
+-        wp_viewport_set_destination(slice->wp_viewport, width, height);
+-        if (!wayland_hwnd_dmabuf_slice_attach_buffer(slice, buffer))
++    if (layout_matches)
++        surface->stack_bottom = wayland_hwnd_dmabuf_surface_slice_stack_bottom(surface);
++
++    if (layout_matches && !attach_frame)
++        return WAYLAND_HWNDDMABUF_CONFIGURE_NOOP;
++
++    if (!layout_matches)
++    {
++        if (!wayland_hwnd_dmabuf_surface_apply_slice_layout(surface, layout, count, sibling))
+         {
+-            slice->seen = FALSE;
+-            attach_failed = TRUE;
+-            break;
++            wayland_hwnd_dmabuf_surface_clear_slices(surface);
++            return WAYLAND_HWNDDMABUF_CONFIGURE_FAILED;
+         }
+-        wl_surface_damage_buffer(slice->wl_surface, 0, 0, buffer->width, buffer->height);
+-        wl_surface_commit(slice->wl_surface);
+-
+-        sibling = slice->wl_surface;
+-        count++;
+     }
+-    free(data);
+ 
+-    if (attach_failed)
++    if (attach_frame || !layout_matches)
+     {
+-        wayland_hwnd_dmabuf_surface_clear_slices(surface);
+-        return FALSE;
++        wl_surface_attach(surface->wl_surface, NULL, 0, 0);
++        wl_surface_commit(surface->wl_surface);
++        surface->current_attach_count = 0;
+     }
+ 
+-    wl_list_for_each_safe(slice, next, &surface->slices, link)
++    if ((attach_frame || !layout_matches) && !wayland_hwnd_dmabuf_surface_attach_slices(surface))
+     {
+-        if (slice->seen) continue;
+-        wayland_hwnd_dmabuf_slice_destroy(slice);
++        wayland_hwnd_dmabuf_surface_clear_slices(surface);
++        return WAYLAND_HWNDDMABUF_CONFIGURE_FAILED;
+     }
+ 
+-    if (!count) return FALSE;
+-
+-    wl_surface_attach(surface->wl_surface, NULL, 0, 0);
+-    wl_surface_commit(surface->wl_surface);
+-    surface->current_attach_count = 0;
+-    surface->stack_bottom = sibling;
+-    surface->sliced = TRUE;
+-    surface->slice_count = count;
+-    return TRUE;
++    return WAYLAND_HWNDDMABUF_CONFIGURE_UPDATED;
+ }
+ 
+-static BOOL wayland_hwnd_dmabuf_surface_configure(struct wayland_surface *parent,
+-                                                  struct wayland_hwnd_dmabuf_surface *surface,
+-                                                  const hwnd_dmabuf_frame_info_t *info,
+-                                                  struct wl_surface *sibling)
++static enum wayland_hwnd_dmabuf_configure_result wayland_hwnd_dmabuf_surface_configure(
++        struct wayland_surface *parent, struct wayland_hwnd_dmabuf_surface *surface,
++        const hwnd_dmabuf_frame_info_t *info, struct wl_surface *sibling, BOOL attach_frame)
+ {
+     struct wayland_hwnd_dmabuf_geometry geometry;
++    enum wayland_hwnd_dmabuf_configure_result ret;
+ 
+-    if (wayland_hwnd_dmabuf_surface_configure_slices(parent, surface, info, sibling))
+-        return TRUE;
++    ret = wayland_hwnd_dmabuf_surface_configure_slices(parent, surface, info, sibling, attach_frame);
++    if (ret != WAYLAND_HWNDDMABUF_CONFIGURE_FAILED)
++        return ret;
+ 
+     if (!wayland_hwnd_dmabuf_surface_compute_geometry(parent, surface, info, &geometry))
+-        return FALSE;
++        return WAYLAND_HWNDDMABUF_CONFIGURE_FAILED;
+ 
+     wayland_hwnd_dmabuf_surface_apply_geometry(surface, &geometry, sibling);
+-    return TRUE;
++    return WAYLAND_HWNDDMABUF_CONFIGURE_UPDATED;
+ }
+ 
+ /* Claim this child's consumer channel end once. The producer mints it lazily. Retry. */
+@@ -3329,6 +3455,7 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
+         HWND hwnd = (HWND)(UINT_PTR)frames[i].hwnd;
+         BOOL gdi_overlay = (frames[i].opened & HWND_DMABUF_FRAME_GDI_OVERLAY) != 0;
+         BOOL created_buffer, attached_frame;
++        enum wayland_hwnd_dmabuf_configure_result configure_result;
+ 
+         if (!frames[i].opened)
+         {
+@@ -3337,11 +3464,16 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
+                 dmabuf_surface->seen = TRUE;
+                 dmabuf_surface->last_seen_ms = now;
+                 if (dmabuf_surface->current &&
+-                    wayland_hwnd_dmabuf_surface_configure(surface, dmabuf_surface, &frames[i], sibling))
++                    (configure_result = wayland_hwnd_dmabuf_surface_configure(
++                            surface, dmabuf_surface, &frames[i], sibling, FALSE)) !=
++                    WAYLAND_HWNDDMABUF_CONFIGURE_FAILED)
+                 {
+-                    wl_surface_commit(dmabuf_surface->wl_surface);
++                    if (configure_result == WAYLAND_HWNDDMABUF_CONFIGURE_UPDATED)
++                    {
++                        wl_surface_commit(dmabuf_surface->wl_surface);
++                        any_new = TRUE;
++                    }
+                     bottom = sibling = dmabuf_surface->stack_bottom;
+-                    any_new = TRUE;
+                 }
+             }
+             continue;
+@@ -3365,7 +3497,9 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
+         if (attached_frame) any_new = TRUE;
+         if (!dmabuf_surface->current) continue;
+         if (attached_frame) wayland_hwnd_dmabuf_attach_current(dmabuf_surface);
+-        if (!wayland_hwnd_dmabuf_surface_configure(surface, dmabuf_surface, &frames[i], sibling))
++        if ((configure_result = wayland_hwnd_dmabuf_surface_configure(
++                surface, dmabuf_surface, &frames[i], sibling, attached_frame)) ==
++            WAYLAND_HWNDDMABUF_CONFIGURE_FAILED)
+         {
+             TRACE("hwnd=%p child=%p configure failed frame_seq=%u\n",
+                   surface->hwnd, hwnd, frames[i].frame_seq);
+@@ -3378,7 +3512,11 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
+             continue;
+         }
+ 
+-        wl_surface_commit(dmabuf_surface->wl_surface);
++        if (configure_result == WAYLAND_HWNDDMABUF_CONFIGURE_UPDATED)
++        {
++            wl_surface_commit(dmabuf_surface->wl_surface);
++            any_new = TRUE;
++        }
+         /* One compositor ref per attached frame. The wl_buffer.release handler drops
+          * it. Cached slots re-attach the same wl_buffer each new frame, hence the ref
+          * is per-attach. The busy gate keeps at most one attach of a slot outstanding. */
