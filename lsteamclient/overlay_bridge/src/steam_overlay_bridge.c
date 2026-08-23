@@ -18,13 +18,63 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <GL/gl.h>
+#include <GL/glx.h>
 #include <X11/Xatom.h>
 #include <X11/cursorfont.h>
+#include <X11/extensions/Xfixes.h>
+#include <X11/extensions/shape.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 
 #define GE_WHEEL_DELTA 120
 #define GE_CURSOR_MAP_SIZE 64
+#define GE_EVENT_ALL_ACCESS 0x001f0003u
+#define GE_OBJ_CASE_INSENSITIVE 0x00000040u
+#define GE_OBJ_OPENIF 0x00000080u
+#define GE_PROCESS_SESSION_INFORMATION 24
+
+typedef int32_t wine_ntstatus_t;
+typedef void *wine_handle_t;
+
+struct wine_unicode_string
+{
+    uint16_t length;
+    uint16_t maximum_length;
+    uint16_t *buffer;
+};
+
+struct wine_object_attributes
+{
+    uint32_t length;
+    wine_handle_t root_directory;
+    struct wine_unicode_string *object_name;
+    uint32_t attributes;
+    void *security_descriptor;
+    void *security_quality_of_service;
+};
+
+typedef wine_ntstatus_t (*wine_nt_close_fn)(wine_handle_t);
+typedef wine_ntstatus_t (*wine_nt_create_event_fn)(
+    wine_handle_t *, uint32_t, const struct wine_object_attributes *, int,
+    uint8_t);
+typedef wine_ntstatus_t (*wine_nt_query_information_process_fn)(
+    wine_handle_t, int, void *, uint32_t, uint32_t *);
+typedef wine_ntstatus_t (*wine_nt_reset_event_fn)(wine_handle_t, int32_t *);
+typedef wine_ntstatus_t (*wine_nt_set_event_fn)(wine_handle_t, int32_t *);
+typedef wine_ntstatus_t (*wine_nt_wait_for_single_object_fn)(
+    wine_handle_t, uint8_t, const int64_t *);
+
+struct wine_ntdll_api
+{
+    void *module;
+    wine_nt_close_fn close;
+    wine_nt_create_event_fn create_event;
+    wine_nt_query_information_process_fn query_information_process;
+    wine_nt_reset_event_fn reset_event;
+    wine_nt_set_event_fn set_event;
+    wine_nt_wait_for_single_object_fn wait_for_single_object;
+};
 
 enum overlay_x11_request_type
 {
@@ -111,6 +161,8 @@ typedef Bool (*xcheck_if_event_fn)(Display *, XEvent *,
                                   Bool (*)(Display *, XEvent *, XPointer),
                                   XPointer);
 typedef void (*vulkan_steam_overlay_set_window_type_fn)(uintptr_t, int);
+typedef int (*overlay_needs_present_fn)(void);
+typedef int (*overlay_is_enabled_fn)(void);
 typedef void (*overlay_input_stream_write_fn)(void *, const void *, size_t);
 
 #define STEAM_OVERLAY_WINDOW_TYPE_XLIB 2
@@ -124,6 +176,11 @@ extern int _XPutBackEvent(Display *display, XEvent *event);
 
 static pthread_mutex_t overlay_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t cursor_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t overlay_event_api_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t overlay_event_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct wine_ntdll_api wine_ntdll;
+static wine_handle_t overlay_event;
+static int overlay_event_owned;
 static Display *overlay_display;
 static Window overlay_window;
 static Window overlay_root;
@@ -131,9 +188,14 @@ static Atom overlay_owner_atom;
 static int (*previous_after_function)(Display *display);
 static xcheck_if_event_fn overlay_check_if_event;
 static vulkan_steam_overlay_set_window_type_fn overlay_set_window_type;
+static overlay_needs_present_fn overlay_needs_present;
+static overlay_is_enabled_fn overlay_is_enabled;
 static void **overlay_input_stream_slot;
 static void *overlay_renderer_base;
 static int overlay_input_stream_scanned;
+static int *overlay_screen_width_slot;
+static int *overlay_screen_height_slot;
+static int overlay_screen_size_scanned;
 static unsigned long overlay_serial;
 static unsigned int overlay_state;
 static int overlay_initialized;
@@ -152,6 +214,24 @@ static int pointer_y;
 static struct overlay_cursor_entry overlay_cursor_map[GE_CURSOR_MAP_SIZE];
 static uint32_t overlay_cursor_shape = GE_STEAM_OVERLAY_CURSOR_DEFAULT;
 static int overlay_cursor_dirty;
+static int overlay_opengl_requested;
+static GLXContext overlay_glx_context;
+static Colormap overlay_glx_colormap;
+static int overlay_glx_requested_x;
+static int overlay_glx_requested_y;
+static int overlay_glx_requested_width;
+static int overlay_glx_requested_height;
+static int overlay_glx_geometry_dirty;
+static pthread_mutex_t overlay_glx_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t overlay_glx_cond = PTHREAD_COND_INITIALIZER;
+static pthread_t overlay_glx_thread;
+static unsigned long overlay_glx_frame;
+static int overlay_glx_thread_running;
+static int overlay_glx_thread_ready;
+static int overlay_glx_thread_failed;
+static int overlay_glx_stop;
+
+static int request_overlay_control_state(int closed);
 
 static int overlay_debug_enabled(void)
 {
@@ -174,6 +254,137 @@ static void overlay_trace(const char *format, ...)
     va_end(args);
 }
 
+static void load_wine_ntdll_api(void)
+{
+    void *module;
+
+    module = dlopen("ntdll.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!module) return;
+
+    wine_ntdll.close = (wine_nt_close_fn)dlsym(module, "NtClose");
+    wine_ntdll.create_event =
+        (wine_nt_create_event_fn)dlsym(module, "NtCreateEvent");
+    wine_ntdll.query_information_process =
+        (wine_nt_query_information_process_fn)dlsym(
+            module, "NtQueryInformationProcess");
+    wine_ntdll.reset_event =
+        (wine_nt_reset_event_fn)dlsym(module, "NtResetEvent");
+    wine_ntdll.set_event =
+        (wine_nt_set_event_fn)dlsym(module, "NtSetEvent");
+    wine_ntdll.wait_for_single_object =
+        (wine_nt_wait_for_single_object_fn)dlsym(
+            module, "NtWaitForSingleObject");
+
+    if (!wine_ntdll.close || !wine_ntdll.create_event ||
+        !wine_ntdll.query_information_process || !wine_ntdll.reset_event ||
+        !wine_ntdll.set_event || !wine_ntdll.wait_for_single_object)
+    {
+        memset(&wine_ntdll, 0, sizeof(wine_ntdll));
+        dlclose(module);
+        return;
+    }
+
+    wine_ntdll.module = module;
+}
+
+static int create_overlay_event_locked(void)
+{
+    struct wine_object_attributes attributes;
+    struct wine_unicode_string name;
+    uint16_t path_w[256];
+    uint32_t session_id;
+    char path[256];
+    wine_ntstatus_t status;
+    int length;
+    int i;
+
+    if (overlay_event) return 1;
+
+    pthread_once(&overlay_event_api_once, load_wine_ntdll_api);
+    if (!wine_ntdll.module) return 0;
+
+    status = wine_ntdll.query_information_process(
+        (wine_handle_t)(intptr_t)-1, GE_PROCESS_SESSION_INFORMATION,
+        &session_id, sizeof(session_id), NULL);
+    if (status < 0) return 0;
+
+    length = snprintf(
+        path, sizeof(path),
+        "\\Sessions\\%u\\BaseNamedObjects\\__wine_steamclient_GameOverlayActivated",
+        session_id);
+    if (length < 0 || (size_t)length >= sizeof(path) ||
+        (size_t)length >= sizeof(path_w) / sizeof(path_w[0]))
+        return 0;
+
+    for (i = 0; i <= length; ++i) path_w[i] = (unsigned char)path[i];
+
+    name.length = (uint16_t)(length * sizeof(path_w[0]));
+    name.maximum_length = (uint16_t)((length + 1) * sizeof(path_w[0]));
+    name.buffer = path_w;
+
+    memset(&attributes, 0, sizeof(attributes));
+    attributes.length = sizeof(attributes);
+    attributes.object_name = &name;
+    attributes.attributes = GE_OBJ_CASE_INSENSITIVE | GE_OBJ_OPENIF;
+
+    status = wine_ntdll.create_event(
+        &overlay_event, GE_EVENT_ALL_ACCESS, &attributes,
+        0 /* NotificationEvent */, 0);
+    if (status < 0 || !overlay_event)
+    {
+        overlay_event = NULL;
+        return 0;
+    }
+
+    overlay_trace("opened shared Steam overlay input event\n");
+    return 1;
+}
+
+static void set_overlay_event_active(int active)
+{
+    int64_t timeout = 0;
+
+    pthread_mutex_lock(&overlay_event_mutex);
+    if (!create_overlay_event_locked())
+    {
+        pthread_mutex_unlock(&overlay_event_mutex);
+        return;
+    }
+
+    if (active)
+    {
+        if (wine_ntdll.wait_for_single_object(overlay_event, 0, &timeout))
+        {
+            if (!wine_ntdll.set_event(overlay_event, NULL))
+            {
+                overlay_event_owned = 1;
+                overlay_trace("signaled shared Steam overlay input event\n");
+            }
+        }
+    }
+    else if (overlay_event_owned)
+    {
+        wine_ntdll.reset_event(overlay_event, NULL);
+        overlay_event_owned = 0;
+        overlay_trace("reset shared Steam overlay input event\n");
+    }
+    pthread_mutex_unlock(&overlay_event_mutex);
+}
+
+static void destroy_overlay_event(void)
+{
+    pthread_mutex_lock(&overlay_event_mutex);
+    if (overlay_event)
+    {
+        if (overlay_event_owned)
+            wine_ntdll.reset_event(overlay_event, NULL);
+        wine_ntdll.close(overlay_event);
+    }
+    overlay_event = NULL;
+    overlay_event_owned = 0;
+    pthread_mutex_unlock(&overlay_event_mutex);
+}
+
 static int env_enabled(const char *name, int default_value)
 {
     const char *value = getenv(name);
@@ -188,9 +399,328 @@ static uint64_t monotonic_msec(void)
     return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+static XVisualInfo *choose_overlay_glx_visual(Display *display, int screen)
+{
+    static const int attributes[] =
+    {
+        GLX_X_RENDERABLE, True,
+        GLX_DRAWABLE_TYPE, GLX_WINDOW_BIT,
+        GLX_RENDER_TYPE, GLX_RGBA_BIT,
+        GLX_X_VISUAL_TYPE, GLX_TRUE_COLOR,
+        GLX_RED_SIZE, 8,
+        GLX_GREEN_SIZE, 8,
+        GLX_BLUE_SIZE, 8,
+        GLX_ALPHA_SIZE, 8,
+        GLX_DOUBLEBUFFER, True,
+        None,
+    };
+    GLXFBConfig *configs;
+    XVisualInfo *best = NULL;
+    int count = 0;
+    int i;
+
+    if (!(configs = glXChooseFBConfig(display, screen, attributes, &count)))
+        return NULL;
+
+    for (i = 0; i < count; ++i)
+    {
+        XVisualInfo *visual = glXGetVisualFromFBConfig(display, configs[i]);
+        int alpha = 0;
+
+        if (!visual) continue;
+        glXGetFBConfigAttrib(display, configs[i], GLX_ALPHA_SIZE, &alpha);
+        if (alpha < 8)
+        {
+            XFree(visual);
+            continue;
+        }
+
+        if (!best || visual->depth == 32)
+        {
+            if (best) XFree(best);
+            best = visual;
+            if (visual->depth == 32) break;
+        }
+        else
+        {
+            XFree(visual);
+        }
+    }
+
+    XFree(configs);
+    return best;
+}
+
+static void *run_opengl_presenter(void *arg)
+{
+    enum
+    {
+        OVERLAY_PRIME_FIRST_SWAP,
+        OVERLAY_PRIME_WAIT_FOCUS,
+        OVERLAY_PRIME_WAIT_ENABLE,
+        OVERLAY_PRIME_WAIT_DISABLE,
+        OVERLAY_PRIME_COMPLETE,
+    } prime_state = OVERLAY_PRIME_FIRST_SWAP;
+    uint64_t prime_deadline = 0;
+    unsigned long frame = 0;
+    int context_current;
+
+    (void)arg;
+    /* Use the classic GLX calls intercepted by gameoverlayrenderer. */
+    context_current = glXMakeCurrent(overlay_display, overlay_window,
+                                     overlay_glx_context);
+    pthread_mutex_lock(&overlay_glx_mutex);
+    overlay_glx_thread_ready = 1;
+    overlay_glx_thread_failed = !context_current;
+    pthread_cond_broadcast(&overlay_glx_cond);
+    pthread_mutex_unlock(&overlay_glx_mutex);
+    if (!context_current)
+    {
+        overlay_trace("failed to make isolated GLX overlay context current\n");
+        return NULL;
+    }
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_SCISSOR_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+
+    for (;;)
+    {
+        int geometry_dirty;
+        int x, y, width, height;
+        int stop;
+
+        pthread_mutex_lock(&overlay_glx_mutex);
+        while (!overlay_glx_stop && frame == overlay_glx_frame)
+            pthread_cond_wait(&overlay_glx_cond, &overlay_glx_mutex);
+        stop = overlay_glx_stop;
+        frame = overlay_glx_frame;
+        geometry_dirty = overlay_glx_geometry_dirty;
+        x = overlay_glx_requested_x;
+        y = overlay_glx_requested_y;
+        width = overlay_glx_requested_width;
+        height = overlay_glx_requested_height;
+        if (geometry_dirty)
+            overlay_glx_geometry_dirty = 0;
+        pthread_mutex_unlock(&overlay_glx_mutex);
+        if (stop) break;
+
+        if (geometry_dirty)
+        {
+            XMoveResizeWindow(overlay_display, overlay_window, x, y,
+                              (unsigned int)width, (unsigned int)height);
+            XRaiseWindow(overlay_display, overlay_window);
+            XSync(overlay_display, False);
+            overlay_trace("resized isolated GLX overlay to %dx%d%+d%+d\n",
+                          width, height, x, y);
+        }
+
+        glViewport(0, 0, width, height);
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        if (prime_state == OVERLAY_PRIME_WAIT_FOCUS)
+        {
+            int focused;
+
+            pthread_mutex_lock(&overlay_mutex);
+            focused = overlay_requested_focus && overlay_focus_owner;
+            pthread_mutex_unlock(&overlay_mutex);
+
+            if (focused && request_overlay_control_state(0))
+            {
+                prime_state = OVERLAY_PRIME_WAIT_ENABLE;
+                prime_deadline = monotonic_msec() + 1000;
+                overlay_trace("requested hidden OpenGL overlay initialization\n");
+            }
+        }
+        else if (prime_state == OVERLAY_PRIME_WAIT_ENABLE)
+        {
+            if ((overlay_is_enabled && overlay_is_enabled()) ||
+                monotonic_msec() >= prime_deadline)
+            {
+                if (request_overlay_control_state(1))
+                {
+                    prime_state = OVERLAY_PRIME_WAIT_DISABLE;
+                    prime_deadline = monotonic_msec() + 1000;
+                    overlay_trace("requested initial OpenGL overlay closure\n");
+                }
+            }
+        }
+        else if (prime_state == OVERLAY_PRIME_WAIT_DISABLE)
+        {
+            if (!overlay_is_enabled || !overlay_is_enabled())
+            {
+                prime_state = OVERLAY_PRIME_COMPLETE;
+                overlay_trace("completed hidden OpenGL overlay initialization\n");
+            }
+            else if (monotonic_msec() >= prime_deadline)
+            {
+                request_overlay_control_state(1);
+                prime_deadline = monotonic_msec() + 1000;
+            }
+        }
+
+        /* This resolves to gameoverlayrenderer.so's GLX hook. It operates on
+         * this private drawable and never sees Wine's EGL context or surface. */
+        if (overlay_needs_present) overlay_needs_present();
+
+        /* Initialize GLX tracking with one transparent swap. During the
+         * activation/closure handshake, do not present Steam's temporary
+         * active frame to the user. */
+        if (prime_state == OVERLAY_PRIME_FIRST_SWAP)
+        {
+            glXSwapBuffers(overlay_display, overlay_window);
+            prime_state = OVERLAY_PRIME_WAIT_FOCUS;
+        }
+        else if (prime_state == OVERLAY_PRIME_WAIT_FOCUS ||
+                 prime_state == OVERLAY_PRIME_COMPLETE)
+        {
+            glXSwapBuffers(overlay_display, overlay_window);
+        }
+    }
+
+    glXMakeCurrent(overlay_display, None, NULL);
+    return NULL;
+}
+
+static int start_opengl_presenter(void)
+{
+    pthread_t thread;
+    int failed;
+
+    pthread_mutex_lock(&overlay_glx_mutex);
+    overlay_glx_stop = 0;
+    overlay_glx_frame = 0;
+    if (overlay_glx_requested_width < 1) overlay_glx_requested_width = 1;
+    if (overlay_glx_requested_height < 1) overlay_glx_requested_height = 1;
+    overlay_glx_geometry_dirty = 0;
+    overlay_glx_thread_ready = 0;
+    overlay_glx_thread_failed = 0;
+    if (pthread_create(&overlay_glx_thread, NULL, run_opengl_presenter, NULL))
+    {
+        pthread_mutex_unlock(&overlay_glx_mutex);
+        overlay_trace("failed to start isolated GLX overlay thread\n");
+        return 0;
+    }
+    overlay_glx_thread_running = 1;
+    while (!overlay_glx_thread_ready)
+        pthread_cond_wait(&overlay_glx_cond, &overlay_glx_mutex);
+    failed = overlay_glx_thread_failed;
+    thread = overlay_glx_thread;
+    pthread_mutex_unlock(&overlay_glx_mutex);
+
+    if (failed)
+    {
+        pthread_join(thread, NULL);
+        pthread_mutex_lock(&overlay_glx_mutex);
+        overlay_glx_thread_running = 0;
+        overlay_glx_thread_ready = 0;
+        overlay_glx_thread_failed = 0;
+        pthread_mutex_unlock(&overlay_glx_mutex);
+        return 0;
+    }
+
+    overlay_trace("started isolated GLX overlay presenter\n");
+    return 1;
+}
+
+static void stop_opengl_presenter(void)
+{
+    pthread_t thread;
+    int join = 0;
+
+    pthread_mutex_lock(&overlay_glx_mutex);
+    if (overlay_glx_thread_running)
+    {
+        overlay_glx_stop = 1;
+        pthread_cond_broadcast(&overlay_glx_cond);
+        thread = overlay_glx_thread;
+        join = 1;
+    }
+    pthread_mutex_unlock(&overlay_glx_mutex);
+
+    if (join) pthread_join(thread, NULL);
+
+    pthread_mutex_lock(&overlay_glx_mutex);
+    overlay_glx_thread_running = 0;
+    overlay_glx_thread_ready = 0;
+    overlay_glx_thread_failed = 0;
+    overlay_glx_stop = 0;
+    overlay_glx_frame = 0;
+    overlay_glx_geometry_dirty = 0;
+    pthread_mutex_unlock(&overlay_glx_mutex);
+}
+
+static void destroy_opengl_presenter_resources(void)
+{
+    if (overlay_display && overlay_glx_context)
+        glXDestroyContext(overlay_display, overlay_glx_context);
+    if (overlay_display && overlay_glx_colormap)
+        XFreeColormap(overlay_display, overlay_glx_colormap);
+
+    overlay_glx_context = NULL;
+    overlay_glx_colormap = None;
+    overlay_glx_requested_x = 0;
+    overlay_glx_requested_y = 0;
+    overlay_glx_requested_width = 0;
+    overlay_glx_requested_height = 0;
+    overlay_glx_geometry_dirty = 0;
+}
+
+void ge_overlay_bridge_enable_opengl_presenter(int32_t x, int32_t y,
+                                               uint32_t width,
+                                               uint32_t height)
+{
+    if (!width) width = 1;
+    if (!height) height = 1;
+    if (width > 65535) width = 65535;
+    if (height > 65535) height = 65535;
+
+    pthread_mutex_lock(&overlay_glx_mutex);
+    overlay_glx_requested_x = x;
+    overlay_glx_requested_y = y;
+    overlay_glx_requested_width = width;
+    overlay_glx_requested_height = height;
+    overlay_glx_geometry_dirty = 0;
+    pthread_mutex_unlock(&overlay_glx_mutex);
+
+    pthread_mutex_lock(&overlay_mutex);
+    overlay_opengl_requested = 1;
+    pthread_mutex_unlock(&overlay_mutex);
+}
+
+void ge_overlay_bridge_present_opengl(int32_t x, int32_t y,
+                                      uint32_t width, uint32_t height)
+{
+    if (!width) width = 1;
+    if (!height) height = 1;
+    if (width > 65535) width = 65535;
+    if (height > 65535) height = 65535;
+
+    pthread_mutex_lock(&overlay_glx_mutex);
+    if (overlay_glx_thread_running)
+    {
+        if (overlay_glx_requested_x != x || overlay_glx_requested_y != y ||
+            overlay_glx_requested_width != (int)width ||
+            overlay_glx_requested_height != (int)height)
+        {
+            overlay_glx_requested_x = x;
+            overlay_glx_requested_y = y;
+            overlay_glx_requested_width = width;
+            overlay_glx_requested_height = height;
+            overlay_glx_geometry_dirty = 1;
+        }
+        ++overlay_glx_frame;
+        pthread_cond_signal(&overlay_glx_cond);
+    }
+    pthread_mutex_unlock(&overlay_glx_mutex);
+}
+
 static int resolve_overlay_renderer_hook(void)
 {
     Dl_info info;
+    Dl_info needs_present_info;
 
     if (overlay_check_if_event) return 1;
 
@@ -206,7 +736,25 @@ static int resolve_overlay_renderer_hook(void)
     overlay_set_window_type =
         (vulkan_steam_overlay_set_window_type_fn)dlsym(
             RTLD_DEFAULT, "VulkanSteamOverlaySetWindowType");
+    overlay_needs_present =
+        (overlay_needs_present_fn)dlsym(RTLD_DEFAULT, "BOverlayNeedsPresent");
+    if (!overlay_needs_present ||
+        !dladdr((void *)overlay_needs_present, &needs_present_info) ||
+        needs_present_info.dli_fbase != overlay_renderer_base)
+        overlay_needs_present = NULL;
+    overlay_is_enabled =
+        (overlay_is_enabled_fn)dlsym(RTLD_DEFAULT, "IsOverlayEnabled");
+    if (overlay_is_enabled)
+    {
+        Dl_info enabled_info;
+
+        if (!dladdr((void *)overlay_is_enabled, &enabled_info) ||
+            enabled_info.dli_fbase != overlay_renderer_base)
+            overlay_is_enabled = NULL;
+    }
     overlay_trace("using XCheckIfEvent interposed by %s\n", info.dli_fname);
+    if (overlay_needs_present)
+        overlay_trace("using Steam overlay present-state poll hook\n");
     return 1;
 }
 
@@ -258,6 +806,95 @@ static int resolve_overlay_input_stream(void)
     overlay_trace("Steam overlay character event stream signature not found\n");
 #endif
     return 0;
+}
+
+static int request_overlay_control_state(int closed)
+{
+    overlay_input_stream_write_fn write_event;
+    void **vtable;
+    void *stream;
+    Dl_info writer_info;
+    int32_t state = !!closed;
+
+    pthread_mutex_lock(&overlay_mutex);
+    if (!resolve_overlay_input_stream() ||
+        !(stream = *overlay_input_stream_slot) ||
+        !(vtable = *(void ***)stream) ||
+        !(write_event = (overlay_input_stream_write_fn)vtable[4]) ||
+        !dladdr((void *)write_event, &writer_info) ||
+        writer_info.dli_fbase != overlay_renderer_base)
+    {
+        pthread_mutex_unlock(&overlay_mutex);
+        return 0;
+    }
+
+    /* Steam's base-input protocol uses 0 to request activation and 1 to
+     * request closure. */
+    write_event(stream, &state, sizeof(state));
+    pthread_mutex_unlock(&overlay_mutex);
+    return 1;
+}
+
+static int resolve_overlay_screen_size_slots(void)
+{
+#if defined(__x86_64__)
+    static const unsigned char width_load[] = {0x8b, 0x44, 0x24, 0x08, 0x89, 0x05};
+    static const unsigned char height_load[] = {0x8b, 0x44, 0x24, 0x0c, 0x89, 0x05};
+    unsigned char *function;
+    Dl_info function_info;
+    Dl_info width_info;
+    Dl_info height_info;
+    int32_t displacement;
+    unsigned int i;
+
+    if (overlay_screen_width_slot && overlay_screen_height_slot) return 1;
+    if (overlay_screen_size_scanned) return 0;
+    overlay_screen_size_scanned = 1;
+
+    function = (unsigned char *)dlsym(RTLD_DEFAULT, "glXSwapBuffers");
+    if (!function || !dladdr(function, &function_info) ||
+        function_info.dli_fbase != overlay_renderer_base)
+        return 0;
+
+    /* gameoverlayrenderer stores the dimensions returned by its internal
+     * pre-swap path in two module globals. Resolve the stores themselves so
+     * the passive overlay receives valid geometry before its first frame. */
+    for (i = 0; i + 20 <= 256; ++i)
+    {
+        int *width;
+        int *height;
+
+        if (memcmp(function + i, width_load, sizeof(width_load)) ||
+            memcmp(function + i + 10, height_load, sizeof(height_load)))
+            continue;
+
+        memcpy(&displacement, function + i + 6, sizeof(displacement));
+        width = (int *)(function + i + 10 + displacement);
+        memcpy(&displacement, function + i + 16, sizeof(displacement));
+        height = (int *)(function + i + 20 + displacement);
+        if (!dladdr(width, &width_info) || !dladdr(height, &height_info) ||
+            width_info.dli_fbase != overlay_renderer_base ||
+            height_info.dli_fbase != overlay_renderer_base)
+            continue;
+
+        overlay_screen_width_slot = width;
+        overlay_screen_height_slot = height;
+        overlay_trace("resolved Steam overlay screen-size slots\n");
+        return 1;
+    }
+
+    overlay_trace("Steam overlay screen-size signature not found\n");
+#endif
+    return 0;
+}
+
+static void prime_overlay_screen_size(unsigned int width, unsigned int height)
+{
+    if (!resolve_overlay_screen_size_slots()) return;
+
+    __atomic_store_n(overlay_screen_width_slot, (int)width, __ATOMIC_RELAXED);
+    __atomic_store_n(overlay_screen_height_slot, (int)height, __ATOMIC_RELAXED);
+    overlay_trace("primed Steam overlay screen size to %ux%u\n", width, height);
 }
 
 static int dispatch_overlay_character(uint32_t utf32)
@@ -511,6 +1148,11 @@ static int update_overlay_active(void)
     overlay_active = active;
     pthread_mutex_unlock(&overlay_mutex);
 
+    if (active)
+        set_overlay_event_active(1);
+    else if (changed)
+        set_overlay_event_active(0);
+
     if (changed)
     {
         overlay_trace("overlay is now %s\n", active ? "active" : "inactive");
@@ -571,11 +1213,22 @@ static int init_overlay_bridge(int force_retry)
 {
     XSetWindowAttributes attributes = {0};
     XClassHint class_hint;
+    XVisualInfo *glx_visual = NULL;
+    Visual *window_visual = (Visual *)CopyFromParent;
     const char *display_name;
     const char *env;
     char owner_selection[160];
     char window_class[128];
+    unsigned long window_mask = CWOverrideRedirect | CWEventMask;
     unsigned long pid;
+    unsigned long bypass_compositor = 0;
+    unsigned int window_width = 1;
+    unsigned int window_height = 1;
+    int window_depth = CopyFromParent;
+    int window_x = -1;
+    int window_y = -1;
+    int screen;
+    Atom bypass_compositor_atom;
     Atom net_wm_pid;
     uint64_t now;
 
@@ -616,19 +1269,105 @@ static int init_overlay_bridge(int force_retry)
     XInitThreads();
     if (!(overlay_display = XOpenDisplay(display_name))) goto retry;
 
+    screen = DefaultScreen(overlay_display);
     overlay_root = DefaultRootWindow(overlay_display);
     attributes.override_redirect = True;
     attributes.event_mask = KeyPressMask | KeyReleaseMask | ButtonPressMask |
                             ButtonReleaseMask | PointerMotionMask;
+
+    if (overlay_opengl_requested)
+    {
+        if (!(glx_visual = choose_overlay_glx_visual(overlay_display, screen)))
+        {
+            overlay_trace("failed to find an ARGB GLX visual\n");
+            XCloseDisplay(overlay_display);
+            overlay_display = NULL;
+            goto retry;
+        }
+
+        pthread_mutex_lock(&overlay_glx_mutex);
+        window_x = overlay_glx_requested_x;
+        window_y = overlay_glx_requested_y;
+        window_width = overlay_glx_requested_width ? overlay_glx_requested_width : 1;
+        window_height = overlay_glx_requested_height ? overlay_glx_requested_height : 1;
+        pthread_mutex_unlock(&overlay_glx_mutex);
+        window_depth = glx_visual->depth;
+        window_visual = glx_visual->visual;
+        overlay_glx_colormap = XCreateColormap(
+            overlay_display, overlay_root, window_visual, AllocNone);
+        if (!overlay_glx_colormap)
+        {
+            XFree(glx_visual);
+            glx_visual = NULL;
+            XCloseDisplay(overlay_display);
+            overlay_display = NULL;
+            goto retry;
+        }
+
+        attributes.colormap = overlay_glx_colormap;
+        attributes.background_pixel = 0;
+        attributes.border_pixel = 0;
+        window_mask |= CWColormap | CWBackPixel | CWBorderPixel;
+    }
+
     overlay_window = XCreateWindow(
-        overlay_display, overlay_root, -1, -1, 1, 1, 0, CopyFromParent,
-        InputOutput,
-        CopyFromParent, CWOverrideRedirect | CWEventMask, &attributes);
+        overlay_display, overlay_root, window_x, window_y,
+        window_width, window_height, 0, window_depth, InputOutput,
+        window_visual, window_mask, &attributes);
     if (!overlay_window)
     {
+        if (glx_visual) XFree(glx_visual);
+        destroy_opengl_presenter_resources();
         XCloseDisplay(overlay_display);
         overlay_display = NULL;
         goto retry;
+    }
+
+    if (overlay_opengl_requested)
+    {
+        XserverRegion input_region;
+
+        /* Steam's GLX renderer owns this drawable. Wayland input continues
+        * through the private bridge queue, so the XWayland surface itself
+         * must never intercept compositor input. */
+        input_region = XFixesCreateRegion(overlay_display, NULL, 0);
+        if (!input_region)
+        {
+            overlay_trace("failed to create empty GLX overlay input region\n");
+            XFree(glx_visual);
+            glx_visual = NULL;
+            XDestroyWindow(overlay_display, overlay_window);
+            overlay_window = None;
+            destroy_opengl_presenter_resources();
+            XCloseDisplay(overlay_display);
+            overlay_display = NULL;
+            goto retry;
+        }
+        XFixesSetWindowShapeRegion(overlay_display, overlay_window,
+                                   ShapeInput, 0, 0, input_region);
+        XFixesDestroyRegion(overlay_display, input_region);
+
+        bypass_compositor_atom = XInternAtom(
+            overlay_display, "_NET_WM_BYPASS_COMPOSITOR", False);
+        XChangeProperty(overlay_display, overlay_window,
+                        bypass_compositor_atom, XA_CARDINAL, 32,
+                        PropModeReplace,
+                        (unsigned char *)&bypass_compositor, 1);
+
+        overlay_glx_context = glXCreateContext(
+            overlay_display, glx_visual, NULL, True);
+        XFree(glx_visual);
+        glx_visual = NULL;
+        if (!overlay_glx_context)
+        {
+            overlay_trace("failed to create isolated GLX overlay context\n");
+            XDestroyWindow(overlay_display, overlay_window);
+            overlay_window = None;
+            destroy_opengl_presenter_resources();
+            XCloseDisplay(overlay_display);
+            overlay_display = NULL;
+            goto retry;
+        }
     }
 
     if (overlay_set_window_type)
@@ -666,13 +1405,29 @@ static int init_overlay_bridge(int force_retry)
     previous_after_function =
         XSetAfterFunction(overlay_display, overlay_x11_after_request);
     XMapWindow(overlay_display, overlay_window);
-    XFlush(overlay_display);
+    if (overlay_opengl_requested) XRaiseWindow(overlay_display, overlay_window);
+    XSync(overlay_display, False);
+    if (overlay_opengl_requested)
+        prime_overlay_screen_size(window_width, window_height);
+    if (overlay_opengl_requested && !start_opengl_presenter())
+    {
+        XSetAfterFunction(overlay_display, previous_after_function);
+        previous_after_function = NULL;
+        XDestroyWindow(overlay_display, overlay_window);
+        overlay_window = None;
+        destroy_opengl_presenter_resources();
+        XCloseDisplay(overlay_display);
+        overlay_display = NULL;
+        goto retry;
+    }
     overlay_initialized = 1;
     overlay_next_init_retry_ms = 0;
     overlay_wait_logged = 0;
     pthread_mutex_unlock(&overlay_mutex);
 
-    overlay_trace("created X11 input proxy window %#lx\n", overlay_window);
+    overlay_trace("created X11 %s window %#lx\n",
+                  overlay_opengl_requested ? "GLX overlay" : "input proxy",
+                  overlay_window);
     return 1;
 
 retry:
@@ -766,10 +1521,13 @@ static void sync_overlay_focus(void)
 
     overlay_trace("X11 focus proxy is now %s\n",
                   focused ? "focused" : "unfocused");
-    event.type = focused ? FocusIn : FocusOut;
-    event.xfocus.mode = NotifyNormal;
-    event.xfocus.detail = NotifyNonlinear;
-    forward_overlay_x11_event(&event);
+    if (!overlay_opengl_requested)
+    {
+        event.type = focused ? FocusIn : FocusOut;
+        event.xfocus.mode = NotifyNormal;
+        event.xfocus.detail = NotifyNonlinear;
+        forward_overlay_x11_event(&event);
+    }
     update_overlay_active();
 }
 
@@ -1068,6 +1826,8 @@ static void destroy_overlay_bridge(void)
     Window current_focus;
     int revert_to;
 
+    stop_opengl_presenter();
+    destroy_overlay_event();
     pthread_mutex_lock(&overlay_mutex);
     overlay_requested_focus = 0;
     overlay_bridge_suspended = 1;
@@ -1079,9 +1839,13 @@ static void destroy_overlay_bridge(void)
         overlay_initialized = 0;
         overlay_check_if_event = NULL;
         overlay_set_window_type = NULL;
+        overlay_is_enabled = NULL;
         overlay_input_stream_slot = NULL;
         overlay_renderer_base = NULL;
         overlay_input_stream_scanned = 0;
+        overlay_screen_width_slot = NULL;
+        overlay_screen_height_slot = NULL;
+        overlay_screen_size_scanned = 0;
         pthread_mutex_unlock(&overlay_mutex);
         return;
     }
@@ -1100,6 +1864,7 @@ static void destroy_overlay_bridge(void)
     XDestroyWindow(overlay_display, overlay_window);
     XSync(overlay_display, False);
     XUnlockDisplay(overlay_display);
+    destroy_opengl_presenter_resources();
     XCloseDisplay(overlay_display);
 
     overlay_display = NULL;
@@ -1115,9 +1880,13 @@ static void destroy_overlay_bridge(void)
     overlay_focus_owner = 0;
     overlay_check_if_event = NULL;
     overlay_set_window_type = NULL;
+    overlay_is_enabled = NULL;
     overlay_input_stream_slot = NULL;
     overlay_renderer_base = NULL;
     overlay_input_stream_scanned = 0;
+    overlay_screen_width_slot = NULL;
+    overlay_screen_height_slot = NULL;
+    overlay_screen_size_scanned = 0;
     pointer_x = 0;
     pointer_y = 0;
 
@@ -1130,7 +1899,7 @@ static void destroy_overlay_bridge(void)
 
     ge_overlay_wayland_set_overlay_active(0);
     ge_overlay_wayland_set_cursor_shape(GE_STEAM_OVERLAY_CURSOR_DEFAULT);
-    overlay_trace("destroyed X11 input proxy\n");
+    overlay_trace("destroyed X11 overlay bridge window\n");
 }
 
 void ge_overlay_bridge_surface_destroyed(void)

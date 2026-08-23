@@ -63,6 +63,8 @@ struct ge_overlay_wayland_surface
 
 static pthread_mutex_t input_surface_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct ge_overlay_wayland_surface *process_input_surface;
+static pthread_mutex_t external_surface_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct ge_overlay_wayland_surface *external_input_surface;
 static pthread_mutex_t focused_pointer_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct ge_overlay_wayland_surface *focused_pointer;
 static uint32_t requested_cursor_shape = GE_STEAM_OVERLAY_CURSOR_DEFAULT;
@@ -1046,4 +1048,32 @@ void ge_overlay_wayland_surface_destroy(struct ge_overlay_wayland_surface *surfa
     if (surface->queue) wl_event_queue_destroy(surface->queue);
     if (surface->bridge_registered) ge_overlay_bridge_surface_destroyed();
     free(surface);
+}
+
+void ge_overlay_external_wayland_attach(struct wl_display *display,
+                                        int32_t x, int32_t y,
+                                        uint32_t width, uint32_t height)
+{
+    pthread_mutex_lock(&external_surface_mutex);
+    if (!external_input_surface && display)
+    {
+        ge_overlay_bridge_enable_opengl_presenter(x, y, width, height);
+        external_input_surface =
+            ge_overlay_wayland_surface_create(display, NULL);
+        if (external_input_surface)
+            overlay_trace("attached external Wayland input bridge");
+    }
+    pthread_mutex_unlock(&external_surface_mutex);
+}
+
+void ge_overlay_external_wayland_dispatch(int32_t x, int32_t y,
+                                          uint32_t width, uint32_t height)
+{
+    pthread_mutex_lock(&external_surface_mutex);
+    if (external_input_surface)
+    {
+        ge_overlay_wayland_surface_dispatch(external_input_surface);
+        ge_overlay_bridge_present_opengl(x, y, width, height);
+    }
+    pthread_mutex_unlock(&external_surface_mutex);
 }

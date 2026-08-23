@@ -1,0 +1,74 @@
+From: GE-Proton <noreply@localhost>
+Subject: [PATCH] win32u: suppress game input while Steam overlay is active
+
+lsteamclient's native Wayland bridge forwards a private copy of keyboard and
+pointer events to Steam's X11 overlay hooks. Suppress Wine's independent copy
+at the generic hardware-message boundary while the existing shared Steam
+overlay event is signaled. This keeps the policy out of winewayland.drv and
+also lets the existing dinput, hidclass, and xinput checks suppress controller
+input through the same event.
+
+Injected input remains available so lsteamclient can release activation keys
+without leaving game-side keyboard state stuck.
+
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -43,6 +43,49 @@ WINE_DECLARE_DEBUG_CHANNEL(relay);
+ #define QS_HARDWARE     0x40000000
+ #define QS_INTERNAL     (QS_DRIVER | QS_HARDWARE)
+ 
++static pthread_once_t steam_overlay_event_once = PTHREAD_ONCE_INIT;
++static HANDLE steam_overlay_event;
++
++static void init_steam_overlay_event(void)
++{
++    OBJECT_ATTRIBUTES attributes;
++    UNICODE_STRING name;
++    WCHAR buffer[MAX_PATH];
++    char path[MAX_PATH];
++    const char *env;
++    int length;
++
++    if (!(env = getenv( "WINE_WAYLAND_STEAM_OVERLAY_LAYER" )) || !atoi( env )) return;
++    if ((env = getenv( "DISABLE_WINE_WAYLAND_STEAM_OVERLAY_LAYER" )) && atoi( env )) return;
++
++    length = snprintf( path, sizeof(path),
++                       "\\Sessions\\%u\\BaseNamedObjects\\__wine_steamclient_GameOverlayActivated",
++                       (unsigned int)NtCurrentTeb()->Peb->SessionId );
++    if (length < 0 || (size_t)length >= sizeof(path) ||
++        (size_t)length >= ARRAY_SIZE(buffer)) return;
++
++    ascii_to_unicode( buffer, path, length + 1 );
++    name.Buffer = buffer;
++    name.Length = length * sizeof(WCHAR);
++    name.MaximumLength = (length + 1) * sizeof(WCHAR);
++    InitializeObjectAttributes( &attributes, &name,
++                                OBJ_CASE_INSENSITIVE | OBJ_OPENIF, 0, NULL );
++    NtCreateEvent( &steam_overlay_event, EVENT_ALL_ACCESS, &attributes,
++                   NotificationEvent, FALSE );
++}
++
++static BOOL steam_overlay_suppresses_hardware_input(UINT flags, const INPUT *input)
++{
++    LARGE_INTEGER timeout = {0};
++
++    if (flags & SEND_HWMSG_INJECTED) return FALSE;
++    if (input->type != INPUT_KEYBOARD && input->type != INPUT_MOUSE) return FALSE;
++
++    pthread_once( &steam_overlay_event_once, init_steam_overlay_event );
++    return steam_overlay_event &&
++           NtWaitForSingleObject( steam_overlay_event, FALSE, &timeout ) == STATUS_WAIT_0;
++}
++
+ static const struct _KUSER_SHARED_DATA *user_shared_data = (struct _KUSER_SHARED_DATA *)0x7ffe0000;
+ 
+ static LONG atomic_load_long( const volatile LONG *ptr )
+@@ -3948,6 +3991,8 @@ NTSTATUS send_hardware_message( HWND hwnd, UINT flags, const INPUT *input, LPARA
+     NTSTATUS ret;
+     BOOL wait;
+ 
++    if (steam_overlay_suppresses_hardware_input( flags, input )) return STATUS_SUCCESS;
++
+     info.type     = MSG_HARDWARE;
+     info.dest_tid = 0;
+     info.hwnd     = hwnd;

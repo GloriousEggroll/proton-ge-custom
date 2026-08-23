@@ -1,0 +1,130 @@
+From: GE-Proton <noreply@localhost>
+Subject: [PATCH] win32u: bridge Steam overlay through native EGL
+
+When Proton selects its Wine-Wayland overlay bridge, pass the Wayland display
+to lsteamclient's native overlay bridge and pump its private event queue before
+native OpenGL presents. Keep Wine's EGL dispatch bound directly to the EGL
+driver; Steam's GLX interposer must not receive the game's native EGL calls.
+
+Defer creation of the GLX presenter until the first real game swap, when the
+drawable's monitor-relative geometry is known. This lets Steam register a
+fully sized overlay surface immediately instead of first seeing a hidden 1x1
+placeholder.
+
+This does not modify winewayland.drv and does not translate OpenGL through
+Vulkan.
+
+--- a/dlls/win32u/opengl.c
++++ b/dlls/win32u/opengl.c
+@@ -65,6 +65,12 @@ static struct wgl_pixel_format *pixel_formats;
+ static UINT formats_count, onscreen_count;
+ static char wgl_extensions[4096];
+ 
++#ifdef SONAME_LIBEGL
++static void steam_overlay_opengl_dispatch( struct opengl_drawable *drawable );
++#else
++static void steam_overlay_opengl_dispatch( struct opengl_drawable *drawable ) {}
++#endif
++
+ static BOOL has_extension( const char *list, const char *ext )
+ {
+     size_t len = strlen( ext );
+@@ -180,5 +186,6 @@ static BOOL opengl_drawable_swap( struct opengl_drawable *drawable )
+ {
+     if (!is_client_surface_window( drawable->client, 0 )) return FALSE;
++    steam_overlay_opengl_dispatch( drawable );
+     client_surface_update( drawable->client );
+     return drawable->funcs->swap( drawable );
+ }
+@@ -1449,6 +1456,82 @@ static const struct opengl_driver_funcs egldrv_funcs =
+     .p_make_current = egldrv_make_current,
+ };
+ 
++typedef void (*steam_overlay_opengl_attach_func)( void *display, int x, int y,
++                                                   unsigned int width, unsigned int height );
++typedef void (*steam_overlay_opengl_dispatch_func)( int, int, unsigned int, unsigned int );
++static void *steam_overlay_opengl_handle;
++static void *steam_overlay_opengl_display;
++static BOOL steam_overlay_opengl_attached;
++static steam_overlay_opengl_attach_func steam_overlay_opengl_attach;
++static steam_overlay_opengl_dispatch_func steam_overlay_opengl_dispatch_func_ptr;
++
++static BOOL steam_overlay_opengl_enabled(void)
++{
++    const char *env;
++
++    if (!(env = getenv( "WINE_WAYLAND_STEAM_OVERLAY_LAYER" )) || !atoi( env )) return FALSE;
++    return !(env = getenv( "DISABLE_WINE_WAYLAND_STEAM_OVERLAY_LAYER" )) || !atoi( env );
++}
++
++static BOOL load_steam_overlay_opengl_bridge(void)
++{
++    if (steam_overlay_opengl_attach && steam_overlay_opengl_dispatch_func_ptr) return TRUE;
++    if (!steam_overlay_opengl_enabled()) return FALSE;
++
++    if (!steam_overlay_opengl_handle &&
++        !(steam_overlay_opengl_handle = dlopen( "liblsteamclient_overlay_bridge.so.1",
++                                                RTLD_NOW | RTLD_LOCAL )))
++    {
++        WARN( "Failed to load lsteamclient overlay bridge: %s.\n", dlerror() );
++        return FALSE;
++    }
++
++    steam_overlay_opengl_attach = (steam_overlay_opengl_attach_func)dlsym(
++        steam_overlay_opengl_handle, "ge_overlay_external_wayland_attach" );
++    steam_overlay_opengl_dispatch_func_ptr = (steam_overlay_opengl_dispatch_func)dlsym(
++        steam_overlay_opengl_handle, "ge_overlay_external_wayland_dispatch" );
++    if (!steam_overlay_opengl_attach || !steam_overlay_opengl_dispatch_func_ptr)
++    {
++        WARN( "lsteamclient overlay bridge entry points are unavailable.\n" );
++        steam_overlay_opengl_attach = NULL;
++        steam_overlay_opengl_dispatch_func_ptr = NULL;
++        return FALSE;
++    }
++
++    TRACE( "Loaded lsteamclient native overlay bridge for OpenGL.\n" );
++    return TRUE;
++}
++
++static void steam_overlay_opengl_dispatch( struct opengl_drawable *drawable )
++{
++    RECT rect, virtual_rect;
++    HWND hwnd;
++    UINT width, height;
++    UINT dpi;
++
++    if (!steam_overlay_opengl_dispatch_func_ptr ||
++        !(hwnd = drawable->client->hwnd))
++        return;
++
++    dpi = get_thread_dpi();
++    if (!get_client_rect_rel( hwnd, COORDS_SCREEN, &rect, dpi )) return;
++    rect = map_rect_virt_to_raw( rect, dpi );
++    virtual_rect = get_virtual_screen_rect( 0, MDT_RAW_DPI );
++    OffsetRect( &rect, -virtual_rect.left, -virtual_rect.top );
++    width = max( rect.right - rect.left, 1 );
++    height = max( rect.bottom - rect.top, 1 );
++
++    if (!steam_overlay_opengl_attached)
++    {
++        if (!steam_overlay_opengl_display || !steam_overlay_opengl_attach) return;
++        steam_overlay_opengl_attach( steam_overlay_opengl_display,
++                                     rect.left, rect.top, width, height );
++        steam_overlay_opengl_attached = TRUE;
++    }
++
++    steam_overlay_opengl_dispatch_func_ptr( rect.left, rect.top, width, height );
++}
++
+ static BOOL egl_init( const struct opengl_driver_funcs **driver_funcs )
+ {
+     struct opengl_funcs *funcs = &display_funcs;
+@@ -1549,6 +1632,8 @@ static BOOL init_egl_platform( struct egl_platform *egl, const struct opengl_fun
+     egl->has_EGL_KHR_gl_texture_2D_image = has_extension( extensions, "EGL_KHR_gl_texture_2D_image" );
+     egl->has_EGL_KHR_image = has_extension( extensions, "EGL_KHR_image" );
+     egl->has_EGL_MESA_image_dma_buf_export = has_extension( extensions, "EGL_MESA_image_dma_buf_export" );
++    if (egl->type == EGL_PLATFORM_WAYLAND_KHR && load_steam_overlay_opengl_bridge())
++        steam_overlay_opengl_display = egl->native_display;
+     return TRUE;
+ }
+ 

@@ -6,6 +6,12 @@
 struct wl_display;
 struct wl_surface;
 
+#if defined(__GNUC__)
+#define GE_OVERLAY_API __attribute__((visibility("default")))
+#else
+#define GE_OVERLAY_API
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -52,19 +58,30 @@ struct ge_steam_overlay_pointer_frame
 
 struct ge_overlay_wayland_surface;
 
-void ge_overlay_focus_proxy_instance_created(void);
-void ge_overlay_focus_proxy_instance_destroyed(void);
+GE_OVERLAY_API void ge_overlay_focus_proxy_instance_created(void);
+GE_OVERLAY_API void ge_overlay_focus_proxy_instance_destroyed(void);
 
-struct ge_overlay_wayland_surface *ge_overlay_wayland_surface_create(
+GE_OVERLAY_API struct ge_overlay_wayland_surface *ge_overlay_wayland_surface_create(
     struct wl_display *display, struct wl_surface *surface);
-void ge_overlay_wayland_surface_destroy(struct ge_overlay_wayland_surface *surface);
-void ge_overlay_wayland_surface_dispatch(struct ge_overlay_wayland_surface *surface);
+GE_OVERLAY_API void ge_overlay_wayland_surface_destroy(struct ge_overlay_wayland_surface *surface);
+GE_OVERLAY_API void ge_overlay_wayland_surface_dispatch(struct ge_overlay_wayland_surface *surface);
 void ge_overlay_wayland_set_cursor_shape(uint32_t shape);
 void ge_overlay_wayland_set_cursor_position(int32_t x, int32_t y);
 void ge_overlay_wayland_set_overlay_active(int active);
 
+GE_OVERLAY_API void ge_overlay_external_wayland_attach(
+    struct wl_display *display, int32_t x, int32_t y,
+    uint32_t width, uint32_t height);
+GE_OVERLAY_API void ge_overlay_external_wayland_dispatch(
+    int32_t x, int32_t y, uint32_t width, uint32_t height);
+
 void ge_overlay_bridge_surface_created(void);
 void ge_overlay_bridge_surface_destroyed(void);
+void ge_overlay_bridge_enable_opengl_presenter(int32_t x, int32_t y,
+                                               uint32_t width,
+                                               uint32_t height);
+void ge_overlay_bridge_present_opengl(int32_t x, int32_t y,
+                                      uint32_t width, uint32_t height);
 void ge_overlay_bridge_focus(int focused);
 int ge_overlay_bridge_filter_key(uint32_t time, uint32_t key, int pressed,
                                  uint32_t utf32);

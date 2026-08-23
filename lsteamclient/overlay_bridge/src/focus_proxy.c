@@ -1,5 +1,5 @@
 /*
- * Early X11 focus proxy owned by the Vulkan layer.
+ * Early X11 focus proxy owned by the lsteamclient overlay bridge.
  *
  * win32u creates a host Vulkan instance before a Wine-Wayland process has a
  * presentation surface.  Use that instance creation to advertise the
@@ -9,6 +9,7 @@
 
 #include "steam_overlay_bridge.h"
 
+#include <dlfcn.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -36,6 +37,42 @@ static unsigned int proxy_instance_count;
 static enum proxy_thread_state proxy_state;
 static int proxy_enabled;
 static int proxy_stop;
+
+struct direct_xlib
+{
+    Display *(*open_display)(const char *);
+    Window (*create_window)(Display *, Window, int, int, unsigned int,
+                            unsigned int, unsigned int, int, unsigned int,
+                            Visual *, unsigned long, XSetWindowAttributes *);
+    int (*map_window)(Display *, Window);
+    int (*destroy_window)(Display *, Window);
+    int (*close_display)(Display *);
+};
+
+static int load_direct_xlib(struct direct_xlib *xlib)
+{
+    memset(xlib, 0, sizeof(*xlib));
+    /* gameoverlayrenderer interposes dlsym as well as Xlib. Looking symbols
+     * up through a libX11 dlopen handle therefore still returns Steam's
+     * wrappers. Its RTLD_NEXT path deliberately returns the underlying Xlib
+     * entry points, which keeps this temporary bootstrap window from being
+     * mistaken for the game's render target. */
+    xlib->open_display = (Display *(*)(const char *))dlsym(
+        RTLD_NEXT, "XOpenDisplay");
+    xlib->create_window = (Window (*)(Display *, Window, int, int,
+                                      unsigned int, unsigned int, unsigned int,
+                                      int, unsigned int, Visual *, unsigned long,
+                                      XSetWindowAttributes *))dlsym(
+        RTLD_NEXT, "XCreateWindow");
+    xlib->map_window = (int (*)(Display *, Window))dlsym(
+        RTLD_NEXT, "XMapWindow");
+    xlib->destroy_window = (int (*)(Display *, Window))dlsym(
+        RTLD_NEXT, "XDestroyWindow");
+    xlib->close_display = (int (*)(Display *))dlsym(
+        RTLD_NEXT, "XCloseDisplay");
+    return xlib->open_display && xlib->create_window && xlib->map_window &&
+           xlib->destroy_window && xlib->close_display;
+}
 
 static int env_enabled(const char *name, int default_value)
 {
@@ -76,6 +113,7 @@ static int proxy_should_stop(void)
 
 static void *run_focus_proxy(void *arg)
 {
+    struct direct_xlib xlib;
     XSetWindowAttributes attributes = {0};
     struct timespec sleep_time = {0, 50 * 1000 * 1000};
     XClassHint class_hint;
@@ -95,17 +133,24 @@ static void *run_focus_proxy(void *arg)
 
     (void)arg;
     XInitThreads();
-    if (!appid || !display_name || !(display = XOpenDisplay(display_name)))
+    /* This bootstrap window exists only to associate Steam Input with a
+     * native Wayland process before its render surface exists. Keep its X11
+     * lifecycle out of gameoverlayrenderer: otherwise Steam selects this 1x1
+     * InputOnly window as the first game target, then loses its passive HUD
+     * state when the proxy is replaced by the real GLX presenter. */
+    if (!appid || !display_name || !load_direct_xlib(&xlib))
+        return NULL;
+    if (!(display = xlib.open_display(display_name)))
         return NULL;
 
     root = DefaultRootWindow(display);
     attributes.override_redirect = True;
-    window = XCreateWindow(display, root, -1, -1, 1, 1, 0, 0,
-                           InputOnly, CopyFromParent, CWOverrideRedirect,
-                           &attributes);
+    window = xlib.create_window(display, root, -1, -1, 1, 1, 0, 0,
+                                InputOnly, CopyFromParent, CWOverrideRedirect,
+                                &attributes);
     if (!window)
     {
-        XCloseDisplay(display);
+        xlib.close_display(display);
         return NULL;
     }
 
@@ -121,7 +166,7 @@ static void *run_focus_proxy(void *arg)
     net_wm_pid = XInternAtom(display, "_NET_WM_PID", False);
     XChangeProperty(display, window, net_wm_pid, XA_CARDINAL, 32,
                     PropModeReplace, (unsigned char *)&pid, 1);
-    XMapWindow(display, window);
+    xlib.map_window(display, window);
 
     /* Every Wine process creates an instance. Only bootstrap focus when no
      * process in this app already owns the per-game target. A focused Wayland
@@ -159,9 +204,9 @@ static void *run_focus_proxy(void *arg)
     XGetInputFocus(display, &current_focus, &revert_to);
     if (current_focus == window)
         XSetInputFocus(display, PointerRoot, RevertToPointerRoot, CurrentTime);
-    XDestroyWindow(display, window);
+    xlib.destroy_window(display, window);
     XSync(display, False);
-    XCloseDisplay(display);
+    xlib.close_display(display);
 
     if (owns_selection && debug_enabled())
         fputs("steam-overlay-wayland: in-process focus proxy released ownership\n",

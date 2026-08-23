@@ -7,41 +7,16 @@ project(steam_overlay_wayland
 
 include(GNUInstallDirs)
 
-find_package(Threads REQUIRED)
-find_package(X11 REQUIRED)
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(Wayland REQUIRED IMPORTED_TARGET wayland-client wayland-cursor)
-pkg_check_modules(Xkbcommon REQUIRED IMPORTED_TARGET xkbcommon)
-
-find_program(WAYLAND_SCANNER_EXECUTABLE NAMES wayland-scanner)
-if(NOT WAYLAND_SCANNER_EXECUTABLE)
-    message(FATAL_ERROR "wayland-scanner is required")
+set(LSTEAMCLIENT_OVERLAY_BRIDGE_SOURCE_DIR "" CACHE PATH
+    "Path to lsteamclient's native Steam overlay bridge")
+if(NOT EXISTS "${LSTEAMCLIENT_OVERLAY_BRIDGE_SOURCE_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR
+        "LSTEAMCLIENT_OVERLAY_BRIDGE_SOURCE_DIR must contain CMakeLists.txt")
 endif()
 
-set(PROTOCOL_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/protocols")
-set(RELATIVE_POINTER_PROTOCOL_XML
-    "${CMAKE_CURRENT_SOURCE_DIR}/protocols/relative-pointer-unstable-v1.xml")
-set(RELATIVE_POINTER_PROTOCOL_HEADER
-    "${PROTOCOL_GENERATED_DIR}/relative-pointer-unstable-v1-client-protocol.h")
-set(RELATIVE_POINTER_PROTOCOL_CODE
-    "${PROTOCOL_GENERATED_DIR}/relative-pointer-unstable-v1-protocol.c")
-
-file(MAKE_DIRECTORY "${PROTOCOL_GENERATED_DIR}")
-add_custom_command(
-    OUTPUT "${RELATIVE_POINTER_PROTOCOL_HEADER}"
-    COMMAND "${WAYLAND_SCANNER_EXECUTABLE}" client-header
-            "${RELATIVE_POINTER_PROTOCOL_XML}"
-            "${RELATIVE_POINTER_PROTOCOL_HEADER}"
-    DEPENDS "${RELATIVE_POINTER_PROTOCOL_XML}"
-    VERBATIM
-)
-add_custom_command(
-    OUTPUT "${RELATIVE_POINTER_PROTOCOL_CODE}"
-    COMMAND "${WAYLAND_SCANNER_EXECUTABLE}" private-code
-            "${RELATIVE_POINTER_PROTOCOL_XML}"
-            "${RELATIVE_POINTER_PROTOCOL_CODE}"
-    DEPENDS "${RELATIVE_POINTER_PROTOCOL_XML}"
-    VERBATIM
+add_subdirectory(
+    "${LSTEAMCLIENT_OVERLAY_BRIDGE_SOURCE_DIR}"
+    "${CMAKE_CURRENT_BINARY_DIR}/lsteamclient-overlay-bridge"
 )
 
 set(VULKAN_HEADERS_INCLUDE_DIR "" CACHE PATH "Directory containing Vulkan headers")
@@ -55,12 +30,7 @@ if(NOT EXISTS "${VKROOTS_INCLUDE_DIR}/vkroots.h")
 endif()
 
 add_library(VkLayer_GE_Wayland_SteamOverlay SHARED
-    ${RELATIVE_POINTER_PROTOCOL_CODE}
-    ${RELATIVE_POINTER_PROTOCOL_HEADER}
-    src/focus_proxy.c
-    src/steam_overlay_bridge.c
     src/vulkan_layer.cpp
-    src/wayland_input.c
 )
 
 target_compile_features(VkLayer_GE_Wayland_SteamOverlay PRIVATE
@@ -76,22 +46,15 @@ target_compile_options(VkLayer_GE_Wayland_SteamOverlay PRIVATE
     $<$<COMPILE_LANGUAGE:C>:-Wstrict-prototypes>
 )
 target_include_directories(VkLayer_GE_Wayland_SteamOverlay PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${PROTOCOL_GENERATED_DIR}
     ${VULKAN_HEADERS_INCLUDE_DIR}
     ${VKROOTS_INCLUDE_DIR}
-    ${X11_INCLUDE_DIR}
 )
 target_link_libraries(VkLayer_GE_Wayland_SteamOverlay PRIVATE
-    PkgConfig::Wayland
-    PkgConfig::Xkbcommon
-    Threads::Threads
-    ${X11_LIBRARIES}
-    ${CMAKE_DL_LIBS}
-    m
+    lsteamclient_overlay_bridge
 )
 set_target_properties(VkLayer_GE_Wayland_SteamOverlay PROPERTIES
     C_VISIBILITY_PRESET hidden
+    INSTALL_RPATH "$ORIGIN"
     VISIBILITY_INLINES_HIDDEN YES
 )
 
