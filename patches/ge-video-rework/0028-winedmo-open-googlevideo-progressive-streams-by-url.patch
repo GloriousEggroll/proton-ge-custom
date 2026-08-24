@@ -12,6 +12,11 @@ Open signed Googlevideo streams directly with FFmpeg, as already done for
 remote HLS playlists.  Do not run custom-IStream MP4 metadata parsing for a
 direct URL because FFmpeg owns that AVIO context.
 
+Allow FFmpeg to resume interrupted Googlevideo byte-range requests.  Some
+replay connections are reset by the peer before the advertised media end;
+without HTTP reconnect support winedmo mistakes AVERROR(EIO) for media EOF
+and ends the replay early.
+
 Do not synchronously open the same Googlevideo URL through URLMon first.  The
 scheme handler only needs a placeholder byte stream for direct FFmpeg inputs;
 opening a large DASH stream through URLMon blocks source creation before the
@@ -22,9 +27,9 @@ the caller with a dangling context causes the demuxer failure cleanup to free
 it again.
 ---
  dlls/winedmo/media_source.c            |  9 ++++++++-
- dlls/winedmo/unix_demuxer.c           | 26 ++++++++++++++++----------
+ dlls/winedmo/unix_demuxer.c           | 37 ++++++++++++++++++++++++++++---------
  dlls/winedmo/unix_demuxer_mediaconv.c |  3 +++
- 3 files changed, 27 insertions(+), 11 deletions(-)
+ 3 files changed, 39 insertions(+), 10 deletions(-)
 
 diff --git a/dlls/winedmo/media_source.c b/dlls/winedmo/media_source.c
 --- a/dlls/winedmo/media_source.c
@@ -63,7 +68,7 @@ diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
  static void demuxer_free_context( struct demuxer *demuxer )
  {
      if (!demuxer->ctx) return;
-@@ -801,18 +808,17 @@ NTSTATUS demuxer_create( void *arg )
+@@ -801,18 +808,30 @@ NTSTATUS demuxer_create( void *arg )
      demuxer->stream_context = params->context;
  
      if (!(demuxer->ctx = avformat_alloc_context())) goto failed;
@@ -71,7 +76,9 @@ diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
 +    if (is_http_hls_url( params->url ) || is_googlevideo_url( params->url ))
      {
 -        const AVInputFormat *hls = av_find_input_format( "hls" );
-+        const AVInputFormat *format = is_http_hls_url( params->url ) ? av_find_input_format( "hls" ) : NULL;
++        BOOL googlevideo = is_googlevideo_url( params->url );
++        AVDictionary *options = NULL;
++        const AVInputFormat *format = googlevideo ? NULL : av_find_input_format( "hls" );
  
 -        /* HLS playlists need the source URL as their base URI so relative
 -         * segment URLs can be resolved.  The custom bytestream path only
@@ -82,7 +89,18 @@ diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
 +         * Let FFmpeg handle both remote YouTube source forms directly. */
          demuxer->direct_url = TRUE;
 -        if ((ret = avformat_open_input( &demuxer->ctx, params->url, hls, NULL )) < 0)
-+        if ((ret = avformat_open_input( &demuxer->ctx, params->url, format, NULL )) < 0)
++        if (googlevideo)
++        {
++            /* Replayed byte-range requests can be reset before media EOF. */
++            av_dict_set( &options, "reconnect", "1", 0 );
++            av_dict_set( &options, "reconnect_streamed", "1", 0 );
++            av_dict_set( &options, "reconnect_on_network_error", "1", 0 );
++            av_dict_set( &options, "reconnect_delay_max", "5", 0 );
++        }
++
++        ret = avformat_open_input( &demuxer->ctx, params->url, format, &options );
++        av_dict_free( &options );
++        if (ret < 0)
          {
 -            ERR( "Failed to open HLS URL, error %s.\n", debugstr_averr(ret) );
 +            ERR( "Failed to open remote URL, error %s.\n", debugstr_averr(ret) );
