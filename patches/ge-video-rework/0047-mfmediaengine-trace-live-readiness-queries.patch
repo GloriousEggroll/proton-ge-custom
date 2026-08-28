@@ -1,0 +1,395 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@proton.me>
+Date: Thu, 27 Aug 2026 11:40:00 -0600
+Subject: [PATCH] mfmediaengine: Trace live readiness queries
+
+Temporarily trace the bounded set of Media Engine state queries made by
+frame-server clients after live playback starts. This distinguishes an
+AVPro readiness or metadata rejection from a decoder or frame-transfer
+failure without enabling the timing-sensitive full mfplat trace channel.
+---
+ dlls/mfmediaengine/main.c | 170 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 166 insertions(+), 4 deletions(-)
+
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -1795,6 +1795,10 @@
+ static HRESULT WINAPI media_engine_GetError(IMFMediaEngineEx *iface, IMFMediaError **error)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
++    static LONG live_get_error_count;
++    MF_MEDIA_ENGINE_ERR error_code;
++    HRESULT extended_code;
++    double duration;
+     HRESULT hr = S_OK;
+ 
+     TRACE("%p, %p.\n", iface, error);
+@@ -1812,8 +1816,20 @@
+             IMFMediaError_SetExtendedErrorCode(*error, engine->extended_code);
+         }
+     }
++    error_code = engine->error_code;
++    extended_code = engine->extended_code;
++    duration = engine->duration;
+     LeaveCriticalSection(&engine->cs);
+ 
++    if (isinf(duration))
++    {
++        LONG count = InterlockedIncrement(&live_get_error_count);
++
++        if (count <= 16 || error_code || FAILED(hr))
++            WARN("Live GetError call %ld: hr %#lx, error %u, extended %#lx, object %p.\n",
++                    count, hr, error_code, extended_code, *error);
++    }
++
+     return hr;
+ }
+ 
+@@ -1977,14 +1993,25 @@
+ static USHORT WINAPI media_engine_GetNetworkState(IMFMediaEngineEx *iface)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
++    static LONG live_network_count;
+     MF_MEDIA_ENGINE_NETWORK state;
++    double duration;
+     unsigned int flags;
+ 
+     EnterCriticalSection(&engine->cs);
+     state = engine->network_state;
++    duration = engine->duration;
+     flags = engine->flags;
+     LeaveCriticalSection(&engine->cs);
+ 
++    if (isinf(duration))
++    {
++        LONG count = InterlockedIncrement(&live_network_count);
++
++        if (count <= 16 || !(count % 120))
++            WARN("Live network-state call %ld: %u, flags %#x.\n", count, state, flags);
++    }
++
+     TRACE("%p returning %u flags %#x.\n", iface, state, flags);
+ 
+     return state;
+@@ -2020,6 +2047,9 @@
+ static HRESULT WINAPI media_engine_GetBuffered(IMFMediaEngineEx *iface, IMFMediaTimeRange **range)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
++    static LONG live_buffered_count;
++    unsigned int flags;
++    double duration;
+     HRESULT hr;
+ 
+     TRACE("%p, %p.\n", iface, range);
+@@ -2034,8 +2064,20 @@
+     else if (!isnan(engine->duration))
+         hr = IMFMediaTimeRange_AddRange(*range, 0.0, engine->duration);
+ 
++    duration = engine->duration;
++    flags = engine->flags;
++
+     LeaveCriticalSection(&engine->cs);
+ 
++    if (isinf(duration))
++    {
++        LONG count = InterlockedIncrement(&live_buffered_count);
++
++        if (count <= 16 || !(count % 120) || FAILED(hr))
++            WARN("Live buffered call %ld: hr %#lx, range %p, duration %.6f, flags %#x.\n",
++                    count, hr, *range, duration, flags);
++    }
++
+     return hr;
+ }
+ 
+@@ -2437,27 +2479,51 @@
+ static double WINAPI media_engine_GetDuration(IMFMediaEngineEx *iface)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
++    static LONG live_duration_count;
++    unsigned int flags;
+     double value;
+ 
+     TRACE("%p.\n", iface);
+ 
+     EnterCriticalSection(&engine->cs);
+     value = engine->duration;
++    flags = engine->flags;
+     LeaveCriticalSection(&engine->cs);
+ 
++    if (isinf(value))
++    {
++        LONG count = InterlockedIncrement(&live_duration_count);
++
++        if (count <= 16 || !(count % 120))
++            WARN("Live duration call %ld: %.6f, flags %#x.\n", count, value, flags);
++    }
++
+     return value;
+ }
+ 
+ static BOOL WINAPI media_engine_IsPaused(IMFMediaEngineEx *iface)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
++    static LONG live_paused_count;
++    double duration;
++    unsigned int flags;
+     BOOL value;
+ 
+     EnterCriticalSection(&engine->cs);
+     value = !!(engine->flags & FLAGS_ENGINE_PAUSED);
+-    TRACE("%p returning %d flags %#x.\n", iface, value, engine->flags);
++    duration = engine->duration;
++    flags = engine->flags;
++    TRACE("%p returning %d flags %#x.\n", iface, value, flags);
+     LeaveCriticalSection(&engine->cs);
+ 
++    if (isinf(duration))
++    {
++        LONG count = InterlockedIncrement(&live_paused_count);
++
++        if (count <= 16 || !(count % 120) || value)
++            WARN("Live paused call %ld: %u, flags %#x.\n", count, value, flags);
++    }
++
+     return value;
+ }
+ 
+@@ -2532,6 +2598,9 @@
+ static HRESULT WINAPI media_engine_GetPlayed(IMFMediaEngineEx *iface, IMFMediaTimeRange **played)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
++    static LONG live_played_count;
++    unsigned int flags;
++    double duration;
+     HRESULT hr = E_NOTIMPL;
+ 
+     FIXME("(%p, %p): stub.\n", iface, played);
+@@ -2541,15 +2610,30 @@
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+ 
++    duration = engine->duration;
++    flags = engine->flags;
++
+     LeaveCriticalSection(&engine->cs);
+ 
++    if (isinf(duration))
++    {
++        LONG count = InterlockedIncrement(&live_played_count);
++
++        if (count <= 16 || !(count % 120))
++            WARN("Live played call %ld: hr %#lx, output %p, flags %#x.\n",
++                    count, hr, played, flags);
++    }
++
+     return hr;
+ }
+ 
+ static HRESULT WINAPI media_engine_GetSeekable(IMFMediaEngineEx *iface, IMFMediaTimeRange **seekable)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
++    static LONG live_seekable_count;
+     IMFMediaTimeRange *time_range = NULL;
++    unsigned int engine_flags;
++    double duration;
+     DWORD flags;
+     HRESULT hr;
+ 
+@@ -2557,6 +2641,9 @@
+ 
+     EnterCriticalSection(&engine->cs);
+ 
++    duration = engine->duration;
++    engine_flags = engine->flags;
++
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+     else
+@@ -2578,6 +2665,16 @@
+         time_range = NULL;
+     }
+     *seekable = time_range;
++
++    if (isinf(duration))
++    {
++        LONG count = InterlockedIncrement(&live_seekable_count);
++
++        if (count <= 16 || !(count % 120) || FAILED(hr))
++            WARN("Live seekable call %ld: hr %#lx, range %p, flags %#x.\n",
++                    count, hr, time_range, engine_flags);
++    }
++
+     return hr;
+ }
+ 
+@@ -2851,6 +2948,10 @@
+ static HRESULT WINAPI media_engine_GetNativeVideoSize(IMFMediaEngineEx *iface, DWORD *cx, DWORD *cy)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
++    static LONG live_native_size_count;
++    unsigned int flags;
++    DWORD width = 0, height = 0;
++    double duration;
+     HRESULT hr = S_OK;
+ 
+     TRACE("%p, %p, %p.\n", iface, cx, cy);
+@@ -2866,18 +2967,36 @@
+         hr = E_FAIL;
+     else
+     {
+-        if (cx) *cx = engine->video_frame.size.cx;
+-        if (cy) *cy = engine->video_frame.size.cy;
++        width = engine->video_frame.size.cx;
++        height = engine->video_frame.size.cy;
++        if (cx) *cx = width;
++        if (cy) *cy = height;
+     }
+ 
++    duration = engine->duration;
++    flags = engine->flags;
++
+     LeaveCriticalSection(&engine->cs);
+ 
++    if (isinf(duration))
++    {
++        LONG count = InterlockedIncrement(&live_native_size_count);
++
++        if (count <= 16 || !(count % 120) || FAILED(hr))
++            WARN("Live native-size call %ld: hr %#lx, %lux%lu, flags %#x.\n",
++                    count, hr, width, height, flags);
++    }
++
+     return hr;
+ }
+ 
+ static HRESULT WINAPI media_engine_GetVideoAspectRatio(IMFMediaEngineEx *iface, DWORD *cx, DWORD *cy)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
++    static LONG live_aspect_ratio_count;
++    unsigned int flags;
++    DWORD width = 0, height = 0;
++    double duration;
+     HRESULT hr = S_OK;
+ 
+     TRACE("%p, %p, %p.\n", iface, cx, cy);
+@@ -2893,12 +3012,26 @@
+         hr = E_FAIL;
+     else
+     {
+-        if (cx) *cx = engine->video_frame.ratio.cx;
+-        if (cy) *cy = engine->video_frame.ratio.cy;
++        width = engine->video_frame.ratio.cx;
++        height = engine->video_frame.ratio.cy;
++        if (cx) *cx = width;
++        if (cy) *cy = height;
+     }
+ 
++    duration = engine->duration;
++    flags = engine->flags;
++
+     LeaveCriticalSection(&engine->cs);
+ 
++    if (isinf(duration))
++    {
++        LONG count = InterlockedIncrement(&live_aspect_ratio_count);
++
++        if (count <= 16 || !(count % 120) || FAILED(hr))
++            WARN("Live aspect-ratio call %ld: hr %#lx, %lu:%lu, flags %#x.\n",
++                    count, hr, width, height, flags);
++    }
++
+     return hr;
+ }
+ 
+@@ -3651,8 +3784,27 @@
+ 
+ static HRESULT WINAPI media_engine_GetStatistics(IMFMediaEngineEx *iface, MF_MEDIA_ENGINE_STATISTIC stat_id, PROPVARIANT *stat)
+ {
++    struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
++    static LONG live_statistics_count;
++    unsigned int flags;
++    double duration;
++
+     FIXME("%p, %x, %p stub.\n", iface, stat_id, stat);
+ 
++    EnterCriticalSection(&engine->cs);
++    duration = engine->duration;
++    flags = engine->flags;
++    LeaveCriticalSection(&engine->cs);
++
++    if (isinf(duration))
++    {
++        LONG count = InterlockedIncrement(&live_statistics_count);
++
++        if (count <= 32 || !(count % 120))
++            WARN("Live statistics call %ld: id %u, hr %#lx, output %p, flags %#x.\n",
++                    count, stat_id, E_NOTIMPL, stat, flags);
++    }
++
+     return E_NOTIMPL;
+ }
+ 
+@@ -3695,6 +3847,9 @@
+ static HRESULT WINAPI media_engine_GetResourceCharacteristics(IMFMediaEngineEx *iface, DWORD *flags)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
++    static LONG live_characteristics_count;
++    unsigned int engine_flags;
++    double duration;
+     HRESULT hr = E_FAIL;
+ 
+     TRACE("%p, %p.\n", iface, flags);
+@@ -3712,8 +3867,19 @@
+             hr = S_OK;
+         }
+     }
++    duration = engine->duration;
++    engine_flags = engine->flags;
+     LeaveCriticalSection(&engine->cs);
+ 
++    if (isinf(duration))
++    {
++        LONG count = InterlockedIncrement(&live_characteristics_count);
++
++        if (count <= 16 || !(count % 120) || FAILED(hr))
++            WARN("Live resource-characteristics call %ld: hr %#lx, value %#lx, flags %#x.\n",
++                    count, hr, SUCCEEDED(hr) && flags ? *flags : 0, engine_flags);
++    }
++
+     return hr;
+ }
+ 
+@@ -3721,6 +3887,9 @@
+         PROPVARIANT *value)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
++    static LONG live_presentation_attribute_count;
++    unsigned int flags;
++    double duration;
+     HRESULT hr = E_FAIL;
+ 
+     TRACE("%p, %s, %p.\n", iface, debugstr_guid(attribute), value);
+@@ -3730,8 +3899,19 @@
+         hr = MF_E_SHUTDOWN;
+     else if (engine->presentation.pd)
+         hr = IMFPresentationDescriptor_GetItem(engine->presentation.pd, attribute, value);
++    duration = engine->duration;
++    flags = engine->flags;
+     LeaveCriticalSection(&engine->cs);
+ 
++    if (isinf(duration))
++    {
++        LONG count = InterlockedIncrement(&live_presentation_attribute_count);
++
++        if (count <= 32 || !(count % 120) || FAILED(hr))
++            WARN("Live presentation-attribute call %ld: %s, hr %#lx, vt %u, flags %#x.\n",
++                    count, debugstr_guid(attribute), hr, SUCCEEDED(hr) && value ? value->vt : VT_EMPTY, flags);
++    }
++
+     return hr;
+ }
+ 
+-- 
+2.52.0

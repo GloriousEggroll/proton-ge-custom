@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@proton.me>
+Date: Thu, 27 Aug 2026 16:35:00 -0600
+Subject: [PATCH] mfmediaengine: Diagnose live texture pixels
+
+Read back sparse pixel samples from both sides of the first four same-device
+live video transfers. This distinguishes an empty decoded texture from a
+failed copy or a later shared-texture visibility problem. Keep the synchronous
+diagnostic bounded so it cannot affect steady-state playback.
+---
+ dlls/mfmediaengine/main.c | 95 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 95 insertions(+)
+
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -3392,6 +3392,87 @@ done:
+     return hr;
+ }
+ 
++static void media_engine_diagnose_live_texture_pixels(ID3D11Device *device,
++        ID3D11DeviceContext *context, ID3D11Texture2D *texture, UINT subresource,
++        const D3D11_TEXTURE2D_DESC *desc, const D3D11_BOX *box,
++        LONG diagnostic_id, const char *name)
++{
++    D3D11_TEXTURE2D_DESC staging_desc = {0};
++    D3D11_MAPPED_SUBRESOURCE mapped = {0};
++    ID3D11Texture2D *staging = NULL;
++    ULONGLONG rgb_sum = 0, alpha_sum = 0;
++    DWORD nonblack = 0, pixel_count = 0;
++    UINT format_size, width, height;
++    BOOL mapped_texture = FALSE;
++    UINT x, y;
++    HRESULT hr = S_OK;
++
++    width = box->right - box->left;
++    height = box->bottom - box->top;
++    if (!(format_size = media_engine_get_d3d11_format_size(desc->Format))
++            || desc->SampleDesc.Count != 1 || !width || !height)
++    {
++        hr = MF_E_INVALIDMEDIATYPE;
++        goto done;
++    }
++
++    staging_desc.Width = width;
++    staging_desc.Height = height;
++    staging_desc.MipLevels = 1;
++    staging_desc.ArraySize = 1;
++    staging_desc.Format = desc->Format;
++    staging_desc.SampleDesc.Count = 1;
++    staging_desc.Usage = D3D11_USAGE_STAGING;
++    staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++
++    if (FAILED(hr = ID3D11Device_CreateTexture2D(device, &staging_desc, NULL, &staging)))
++        goto done;
++
++    ID3D11DeviceContext_CopySubresourceRegion(context, (ID3D11Resource *)staging, 0,
++            0, 0, 0, (ID3D11Resource *)texture, subresource, box);
++    if (FAILED(hr = ID3D11DeviceContext_Map(context, (ID3D11Resource *)staging,
++            0, D3D11_MAP_READ, 0, &mapped)))
++        goto done;
++    mapped_texture = TRUE;
++
++    if (mapped.RowPitch < width * format_size)
++    {
++        hr = MF_E_UNEXPECTED;
++        goto done;
++    }
++
++    for (y = 0; y < height; y += 32)
++    {
++        const BYTE *row = (const BYTE *)mapped.pData + y * mapped.RowPitch;
++
++        for (x = 0; x < width; x += 32)
++        {
++            const BYTE *pixel = row + x * format_size;
++            DWORD rgb = pixel[0] + pixel[1] + pixel[2];
++
++            rgb_sum += rgb;
++            alpha_sum += pixel[3];
++            nonblack += !!rgb;
++            ++pixel_count;
++        }
++    }
++
++done:
++    if (SUCCEEDED(hr))
++        WARN("Live DXGI transfer %ld %s pixels: RGB sum %s, alpha sum %s, "
++                "nonblack %lu/%lu, row pitch %u.\n", diagnostic_id, name,
++                wine_dbgstr_longlong(rgb_sum), wine_dbgstr_longlong(alpha_sum),
++                nonblack, pixel_count, mapped.RowPitch);
++    else
++        WARN("Live DXGI transfer %ld could not read back %s pixels, hr %#lx.\n",
++                diagnostic_id, name, hr);
++
++    if (mapped_texture)
++        ID3D11DeviceContext_Unmap(context, (ID3D11Resource *)staging, 0);
++    if (staging)
++        ID3D11Texture2D_Release(staging);
++}
++
+ static HRESULT media_engine_transfer_d3d11(struct media_engine *engine, ID3D11Texture2D *dst_texture,
+         const MFVideoNormalizedRect *src_rect, const RECT *dst_rect, const MFARGB *color)
+ {
+@@ -3402,6 +3483,7 @@ static HRESULT media_engine_transfer_d3d11(struct media_engine *engine, ID3D11Te
+     ID3D11DeviceContext *context;
+     ID3D11Texture2D *src_texture;
+     RECT dst_rect_default = {0};
++    D3D11_BOX dst_box = {0};
+     D3D11_BOX src_box = {0};
+     ID3D11Device *device, *src_device, *dst_device;
+     BOOL device_mismatch;
+@@ -3490,10 +3572,23 @@ static HRESULT media_engine_transfer_d3d11(struct media_engine *engine, ID3D11Te
+     }
+ 
+     ID3D11Device_GetImmediateContext(device, &context);
++    if (diagnostic_id && diagnostic_id <= 4)
++        media_engine_diagnose_live_texture_pixels(device, context, src_texture, subresource,
++                &src_desc, &src_box, diagnostic_id, "source");
+     ID3D11DeviceContext_CopySubresourceRegion(context, (ID3D11Resource *)dst_texture, 0,
+             dst_rect->left, dst_rect->top, 0, (ID3D11Resource *)src_texture, subresource, &src_box);
+     if (diagnostic_id && diagnostic_id <= 4)
++    {
++        dst_box.left = dst_rect->left;
++        dst_box.top = dst_rect->top;
++        dst_box.front = 0;
++        dst_box.right = dst_rect->left + src_box.right - src_box.left;
++        dst_box.bottom = dst_rect->top + src_box.bottom - src_box.top;
++        dst_box.back = 1;
++        media_engine_diagnose_live_texture_pixels(device, context, dst_texture, 0,
++                &dst_desc, &dst_box, diagnostic_id, "destination");
+         WARN("Live DXGI transfer %ld queued the same-device copy through device %p.\n", diagnostic_id, device);
++    }
+     ID3D11DeviceContext_Release(context);
+ 
+     media_engine_unlock_d3d_device(engine, device);
+-- 
+2.52.0

@@ -1,0 +1,190 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@proton.me>
+Date: Thu, 27 Aug 2026 15:30:00 -0600
+Subject: [PATCH] mfmediaengine: Diagnose live DXGI frame transfers
+
+Bound diagnostics to the first four live frames and report the texture
+descriptors, device relationship, selected copy path, and existing
+cross-device buffer lock results. This identifies where a successful
+TransferVideoFrame can leave a live HLS destination blank without adding GPU
+flushes or destination readbacks that alter playback timing.
+---
+ dlls/mfmediaengine/main.c | 66 +++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 64 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -3208,7 +3208,7 @@
+ 
+ static HRESULT media_engine_transfer_d3d11_cross_device(IMFSample *sample, ID3D11Texture2D *dst_texture,
+         const D3D11_TEXTURE2D_DESC *src_desc, const D3D11_TEXTURE2D_DESC *dst_desc,
+-        const D3D11_BOX *src_box, const RECT *dst_rect)
++        const D3D11_BOX *src_box, const RECT *dst_rect, LONG diagnostic_id)
+ {
+     ID3D11DeviceContext *dst_context = NULL;
+     ID3D11Device *dst_device = NULL;
+@@ -3221,6 +3221,7 @@
+     const BYTE *src_data;
+     LONG pitch;
+     BOOL locked = FALSE;
++    const char *stage;
+     HRESULT hr;
+ 
+     if (src_desc->Format != dst_desc->Format
+@@ -3230,15 +3231,19 @@
+         return MF_E_UNEXPECTED;
+     }
+ 
++    stage = "IMFSample_GetBufferByIndex";
+     if (FAILED(hr = IMFSample_GetBufferByIndex(sample, 0, &media_buffer)))
+         goto done;
++    stage = "IMFMediaBuffer_QueryInterface(IMF2DBuffer2)";
+     if (FAILED(hr = IMFMediaBuffer_QueryInterface(media_buffer, &IID_IMF2DBuffer2, (void **)&buffer_2d)))
+         goto done;
++    stage = "IMF2DBuffer2_Lock2DSize";
+     if (FAILED(hr = IMF2DBuffer2_Lock2DSize(buffer_2d, MF2DBuffer_LockFlags_Read,
+             &scanline, &pitch, &buffer_start, &buffer_length)))
+         goto done;
+     locked = TRUE;
+ 
++    stage = "source pitch validation";
+     if (pitch <= 0 || (unsigned int)pitch < src_desc->Width * format_size)
+     {
+         WARN("Unexpected cross-device source pitch %ld.\n", pitch);
+@@ -3246,6 +3251,32 @@
+         goto done;
+     }
+ 
++    if (diagnostic_id && diagnostic_id <= 4)
++    {
++        ULONGLONG rgb_sum = 0, alpha_sum = 0;
++        DWORD nonblack = 0, pixel_count = 0;
++        UINT x, y;
++
++        for (y = src_box->top; y < src_box->bottom; y += 64)
++        {
++            const BYTE *row = scanline + y * pitch;
++
++            for (x = src_box->left; x < src_box->right; x += 64)
++            {
++                const BYTE *pixel = row + x * format_size;
++                DWORD rgb = pixel[0] + pixel[1] + pixel[2];
++
++                rgb_sum += rgb;
++                alpha_sum += pixel[3];
++                nonblack += !!rgb;
++                ++pixel_count;
++            }
++        }
++        WARN("Live DXGI transfer %ld cross-device source: pitch %ld, buffer %lu, RGB sum %s, "
++                "alpha sum %s, nonblack %lu/%lu.\n", diagnostic_id, pitch, buffer_length,
++                wine_dbgstr_longlong(rgb_sum), wine_dbgstr_longlong(alpha_sum), nonblack, pixel_count);
++    }
++
+     src_data = scanline + src_box->top * pitch + src_box->left * format_size;
+     dst_box.left = dst_rect->left;
+     dst_box.top = dst_rect->top;
+@@ -3256,11 +3287,16 @@
+ 
+     ID3D11Texture2D_GetDevice(dst_texture, &dst_device);
+     ID3D11Device_GetImmediateContext(dst_device, &dst_context);
++    stage = "ID3D11DeviceContext_UpdateSubresource";
+     ID3D11DeviceContext_UpdateSubresource(dst_context, (ID3D11Resource *)dst_texture,
+             0, &dst_box, src_data, pitch, 0);
+     hr = S_OK;
++    if (diagnostic_id && diagnostic_id <= 4)
++        WARN("Live DXGI transfer %ld queued the cross-device upload.\n", diagnostic_id);
+ 
+ done:
++    if (diagnostic_id && diagnostic_id <= 4 && FAILED(hr))
++        WARN("Live DXGI transfer %ld failed at %s, hr %#lx.\n", diagnostic_id, stage, hr);
+     if (dst_context)
+         ID3D11DeviceContext_Release(dst_context);
+     if (dst_device)
+@@ -3357,6 +3393,7 @@
+ static HRESULT media_engine_transfer_d3d11(struct media_engine *engine, ID3D11Texture2D *dst_texture,
+         const MFVideoNormalizedRect *src_rect, const RECT *dst_rect, const MFARGB *color)
+ {
++    static LONG live_dxgi_transfer_count;
+     MFVideoNormalizedRect src_rect_default = {0.0, 0.0, 1.0, 1.0};
+     MFARGB color_default = {0, 0, 0, 0};
+     D3D11_TEXTURE2D_DESC src_desc, dst_desc;
+@@ -3368,6 +3405,7 @@
+     BOOL device_mismatch;
+     IMFSample *sample;
+     UINT subresource;
++    LONG diagnostic_id = 0;
+     HRESULT hr;
+ 
+     if (!src_rect)
+@@ -3389,6 +3427,18 @@
+ 
+     ID3D11Texture2D_GetDesc(src_texture, &src_desc);
+     ID3D11Texture2D_GetDesc(dst_texture, &dst_desc);
++    if (isinf(engine->duration))
++        diagnostic_id = InterlockedIncrement(&live_dxgi_transfer_count);
++    if (diagnostic_id && diagnostic_id <= 4)
++        WARN("Live DXGI transfer %ld: source %ux%u format %#x, usage %u, bind %#x, cpu %#x, misc %#x, "
++                "mips %u, array %u, samples %u/%u, subresource %u; destination %ux%u format %#x, "
++                "usage %u, bind %#x, cpu %#x, misc %#x, mips %u, array %u, samples %u/%u.\n",
++                diagnostic_id, src_desc.Width, src_desc.Height, src_desc.Format, src_desc.Usage,
++                src_desc.BindFlags, src_desc.CPUAccessFlags, src_desc.MiscFlags, src_desc.MipLevels,
++                src_desc.ArraySize, src_desc.SampleDesc.Count, src_desc.SampleDesc.Quality, subresource,
++                dst_desc.Width, dst_desc.Height, dst_desc.Format, dst_desc.Usage, dst_desc.BindFlags,
++                dst_desc.CPUAccessFlags, dst_desc.MiscFlags, dst_desc.MipLevels, dst_desc.ArraySize,
++                dst_desc.SampleDesc.Count, dst_desc.SampleDesc.Quality);
+ 
+     src_box.left = src_rect->left * src_desc.Width;
+     src_box.top = src_rect->top * src_desc.Height;
+@@ -3400,6 +3450,11 @@
+     if (dst_rect->left + src_box.right - src_box.left > dst_desc.Width ||
+             dst_rect->top + src_box.bottom - src_box.top > dst_desc.Height)
+     {
++        if (diagnostic_id && diagnostic_id <= 4)
++            WARN("Live DXGI transfer %ld rejected by geometry: source (%u,%u)-(%u,%u), "
++                    "destination origin (%ld,%ld), size %ux%u.\n", diagnostic_id,
++                    src_box.left, src_box.top, src_box.right, src_box.bottom,
++                    dst_rect->left, dst_rect->top, dst_desc.Width, dst_desc.Height);
+         IMFSample_Release(sample);
+         ID3D11Texture2D_Release(src_texture);
+         return MF_E_UNEXPECTED;
+@@ -3408,6 +3463,9 @@
+     ID3D11Texture2D_GetDevice(src_texture, &src_device);
+     ID3D11Texture2D_GetDevice(dst_texture, &dst_device);
+     device_mismatch = src_device != dst_device;
++    if (diagnostic_id && diagnostic_id <= 4)
++        WARN("Live DXGI transfer %ld uses source device %p and destination device %p; path %s.\n",
++                diagnostic_id, src_device, dst_device, device_mismatch ? "cross-device" : "same-device");
+     ID3D11Device_Release(dst_device);
+     ID3D11Device_Release(src_device);
+ 
+@@ -3416,7 +3474,7 @@
+         TRACE("Bridging a cross-device video frame, format %#x, size %ux%u.\n",
+                 src_desc.Format, src_box.right - src_box.left, src_box.bottom - src_box.top);
+         hr = media_engine_transfer_d3d11_cross_device(sample, dst_texture,
+-                &src_desc, &dst_desc, &src_box, dst_rect);
++                &src_desc, &dst_desc, &src_box, dst_rect, diagnostic_id);
+         IMFSample_Release(sample);
+         ID3D11Texture2D_Release(src_texture);
+         return hr;
+@@ -3424,6 +3482,8 @@
+ 
+     if (FAILED(hr = media_engine_lock_d3d_device(engine, &device)))
+     {
++        if (diagnostic_id && diagnostic_id <= 4)
++            WARN("Live DXGI transfer %ld could not lock the same-device path, hr %#lx.\n", diagnostic_id, hr);
+         IMFSample_Release(sample);
+         ID3D11Texture2D_Release(src_texture);
+         return hr;
+@@ -3432,6 +3492,8 @@
+     ID3D11Device_GetImmediateContext(device, &context);
+     ID3D11DeviceContext_CopySubresourceRegion(context, (ID3D11Resource *)dst_texture, 0,
+             dst_rect->left, dst_rect->top, 0, (ID3D11Resource *)src_texture, subresource, &src_box);
++    if (diagnostic_id && diagnostic_id <= 4)
++        WARN("Live DXGI transfer %ld queued the same-device copy through device %p.\n", diagnostic_id, device);
+     ID3D11DeviceContext_Release(context);
+ 
+     media_engine_unlock_d3d_device(engine, device);
+-- 
+2.52.0

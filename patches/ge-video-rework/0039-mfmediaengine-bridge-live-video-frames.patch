@@ -1,44 +1,140 @@
 From 2e2f4ddc48bd2b5f81fd77948202fb6cae66fbd7 Mon Sep 17 00:00:00 2001
 From: GloriousEggroll <gloriouseggroll@gmail.com>
 Date: Thu, 20 Aug 2026 04:00:00 -0600
-Subject: [PATCH] mfmediaengine: Prefer the render path for live video frames
+Subject: [PATCH] mfmediaengine: Transfer system-memory video frames directly
 
-Some frame-server clients use shared destination textures for live playback.
-CopySubresourceRegion has no return value, so a failed shared-resource copy can
-silently report success while leaving the destination unchanged. This is
-visible with Twitch HLS streams in VRChat: demuxing, decoding, audio, the media
-clock, and TransferVideoFrame all continue while the displayed video remains
-blank.
+The video processor can deliver RGB frames in a regular IMFMediaBuffer even
+when Media Engine has a D3D device manager. In that case the normal direct
+transfer rejects the sample because it does not expose IMFDXGIBuffer. The
+render fallback first uploads the sample to an intermediate texture and then
+draws it into the client's target, which can silently leave live HLS video
+blank while TransferVideoFrame still returns success.
 
-Unknown-duration live sources can be identified by their infinite Media Engine
-duration. Prefer Media Engine's render-target transfer for those sources. That
-path performs the complete shader transfer on the destination device instead
-of relying on a silent resource copy. If the render path is unavailable, fall
-back to the direct transfer, including its cross-device CPU bridge. Keep finite
-media on the existing path.
+Upload compatible packed system-memory frames directly into the destination
+texture. This also handles destination textures owned by the client's D3D11
+device without shared-resource handles. Keep the render path as the existing
+fallback when formats, dimensions, or scaling requirements are incompatible.
 ---
- dlls/mfmediaengine/main.c | 9 ++++++++-
- 1 file changed, 8 insertions(+), 1 deletion(-)
+ dlls/mfmediaengine/main.c | 81 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 81 insertions(+)
 
 diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
-index 6caa31f9b84..bf4a3f32834 100644
 --- a/dlls/mfmediaengine/main.c
 +++ b/dlls/mfmediaengine/main.c
-@@ -3447,7 +3447,14 @@ static HRESULT WINAPI media_engine_TransferVideoFrame(IMFMediaEngineEx *iface, I
+@@ -3269,16 +3269,96 @@ done:
+         IMF2DBuffer2_Unlock2D(buffer_2d);
+     if (buffer_2d)
+         IMF2DBuffer2_Release(buffer_2d);
+     if (media_buffer)
+         IMFMediaBuffer_Release(media_buffer);
+     return hr;
+ }
  
-     if (SUCCEEDED(IUnknown_QueryInterface(surface, &IID_ID3D11Texture2D, (void **)&texture)))
++static HRESULT media_engine_transfer_d3d11_memory(struct media_engine *engine, IMFSample *sample,
++        ID3D11Texture2D *dst_texture, const MFVideoNormalizedRect *src_rect, const RECT *dst_rect)
++{
++    MFVideoNormalizedRect src_rect_default = {0.0, 0.0, 1.0, 1.0};
++    RECT dst_rect_default = {0};
++    D3D11_TEXTURE2D_DESC dst_desc;
++    ID3D11DeviceContext *context = NULL;
++    ID3D11Device *device = NULL;
++    IMFMediaBuffer *buffer = NULL;
++    D3D11_BOX dst_box;
++    BYTE *data = NULL;
++    DWORD current_length = 0;
++    UINT format_size, src_pitch;
++    UINT src_width = engine->video_frame.size.cx;
++    UINT src_height = engine->video_frame.size.cy;
++    UINT src_left, src_top, src_right, src_bottom;
++    BOOL locked = FALSE;
++    HRESULT hr;
++
++    if (!src_rect)
++        src_rect = &src_rect_default;
++    if (!dst_rect)
++        dst_rect = &dst_rect_default;
++
++    ID3D11Texture2D_GetDesc(dst_texture, &dst_desc);
++    if (dst_desc.Format != engine->video_frame.output_format
++            || !(format_size = media_engine_get_d3d11_format_size(engine->video_frame.output_format)))
++        return MF_E_UNEXPECTED;
++
++    src_left = src_rect->left * src_width;
++    src_top = src_rect->top * src_height;
++    src_right = src_rect->right * src_width;
++    src_bottom = src_rect->bottom * src_height;
++    if (src_left >= src_right || src_top >= src_bottom || src_right > src_width || src_bottom > src_height
++            || dst_rect->left < 0 || dst_rect->top < 0
++            || dst_rect->left + src_right - src_left > dst_desc.Width
++            || dst_rect->top + src_bottom - src_top > dst_desc.Height)
++        return MF_E_UNEXPECTED;
++
++    if (FAILED(hr = IMFSample_ConvertToContiguousBuffer(sample, &buffer)))
++        goto done;
++    if (FAILED(hr = IMFMediaBuffer_Lock(buffer, &data, NULL, &current_length)))
++        goto done;
++    locked = TRUE;
++
++    src_pitch = src_width * format_size;
++    if (current_length < (UINT64)src_pitch * src_height)
++    {
++        WARN("System-memory video frame is too small, got %lu, expected %s.\n",
++                current_length, wine_dbgstr_longlong((UINT64)src_pitch * src_height));
++        hr = MF_E_UNEXPECTED;
++        goto done;
++    }
++
++    data += src_top * src_pitch + src_left * format_size;
++    dst_box.left = dst_rect->left;
++    dst_box.top = dst_rect->top;
++    dst_box.front = 0;
++    dst_box.right = dst_rect->left + src_right - src_left;
++    dst_box.bottom = dst_rect->top + src_bottom - src_top;
++    dst_box.back = 1;
++
++    ID3D11Texture2D_GetDevice(dst_texture, &device);
++    ID3D11Device_GetImmediateContext(device, &context);
++    ID3D11DeviceContext_UpdateSubresource(context, (ID3D11Resource *)dst_texture,
++            0, &dst_box, data, src_pitch, 0);
++    hr = S_OK;
++
++done:
++    if (context)
++        ID3D11DeviceContext_Release(context);
++    if (device)
++        ID3D11Device_Release(device);
++    if (locked)
++        IMFMediaBuffer_Unlock(buffer);
++    if (buffer)
++        IMFMediaBuffer_Release(buffer);
++    return hr;
++}
++
+ static HRESULT media_engine_transfer_d3d11(struct media_engine *engine, ID3D11Texture2D *dst_texture,
+         const MFVideoNormalizedRect *src_rect, const RECT *dst_rect, const MFARGB *color)
+ {
+     MFVideoNormalizedRect src_rect_default = {0.0, 0.0, 1.0, 1.0};
+     MFARGB color_default = {0, 0, 0, 0};
+     D3D11_TEXTURE2D_DESC src_desc, dst_desc;
+     ID3D11DeviceContext *context;
+     ID3D11Texture2D *src_texture;
+@@ -3297,16 +3377,17 @@ static HRESULT media_engine_transfer_d3d11(struct media_engine *engine, ID3D11Te
+     if (!color)
+         color = &color_default;
+
+     if (!video_frame_sink_get_sample(engine->presentation.frame_sink, &sample))
+         return MF_E_UNEXPECTED;
+     hr = get_d3d11_resource_from_sample(sample, &src_texture, &subresource);
+     if (FAILED(hr))
      {
--        if (!engine->device_manager
-+        if (isinf(engine->duration))
-+        {
-+            TRACE("Using the render-target transfer path for a live video frame.\n");
-+            hr = media_engine_transfer_to_d3d11_texture(engine, texture, src_rect, dst_rect, color);
-+            if (FAILED(hr))
-+                hr = media_engine_transfer_d3d11(engine, texture, src_rect, dst_rect, color);
-+        }
-+        else if (!engine->device_manager
-                 || engine->video_frame.format_mismatch
-                 || FAILED(hr = media_engine_transfer_d3d11(engine, texture, src_rect, dst_rect, color)))
-             hr = media_engine_transfer_to_d3d11_texture(engine, texture, src_rect, dst_rect, color);
++        hr = media_engine_transfer_d3d11_memory(engine, sample, dst_texture, src_rect, dst_rect);
+         IMFSample_Release(sample);
+         return hr;
+     }
+
+     ID3D11Texture2D_GetDesc(src_texture, &src_desc);
+     ID3D11Texture2D_GetDesc(dst_texture, &dst_desc);
+
+     src_box.left = src_rect->left * src_desc.Width;
 -- 
 2.51.0

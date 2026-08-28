@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@proton.me>
+Date: Thu, 27 Aug 2026 09:30:00 -0600
+Subject: [PATCH] mfmediaengine: Diagnose live video readiness
+
+Temporarily record the boundaries used by Media Engine frame-server clients
+to decide whether live video is ready.  Keep the output bounded so VRChat can
+run without the timing changes caused by the full mfplat trace channel.
+---
+ dlls/mfmediaengine/main.c            | 12 ++++++++++++
+ dlls/mfmediaengine/video_frame_sink.c |  2 ++
+ dlls/winedmo/unix_demuxer.c          |  9 +++++++++
+ 3 files changed, 23 insertions(+)
+
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -1249,6 +1249,9 @@ static HRESULT WINAPI media_engine_sink_events_Invoke(IMFAsyncCallback *iface,
+ 
+     EnterCriticalSection(&engine->cs);
+ 
++    WARN("Media Engine sink event %u, flags %#x, ready %u, network %u, duration %.6f.\n",
++            event, engine->flags, engine->ready_state, engine->network_state, engine->duration);
++
+     switch (event)
+     {
+         case MF_MEDIA_ENGINE_EVENT_FIRSTFRAMEREADY:
+@@ -2188,6 +2191,7 @@ static double WINAPI media_engine_GetCurrentTime(IMFMediaEngineEx *iface)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
+     double ret = 0.0;
++    static LONG live_call_count;
+     MFTIME clocktime;
+ 
+     EnterCriticalSection(&engine->cs);
+@@ -2230,5 +2234,13 @@ static double WINAPI media_engine_GetCurrentTime(IMFMediaEngineEx *iface)
+             wine_dbgstr_longlong(engine->presentation.start_position.vt == VT_I8
+                     ? engine->presentation.start_position.hVal.QuadPart : 0));
++    if (isinf(engine->duration))
++    {
++        LONG count = InterlockedIncrement(&live_call_count);
++
++        if (count <= 16 || !(count % 120))
++            WARN("Live current time call %ld: %.6f, flags %#x, ready %u, network %u.\n",
++                    count, ret, engine->flags, engine->ready_state, engine->network_state);
++    }
+     LeaveCriticalSection(&engine->cs);
+ 
+     return ret;
+diff --git a/dlls/mfmediaengine/video_frame_sink.c b/dlls/mfmediaengine/video_frame_sink.c
+--- a/dlls/mfmediaengine/video_frame_sink.c
++++ b/dlls/mfmediaengine/video_frame_sink.c
+@@ -420,6 +420,8 @@ static HRESULT WINAPI video_frame_sink_stream_ProcessSample(IMFStreamSink *ifac
+         {
+             if (!(sink->flags & FLAGS_FIRST_FRAME))
+             {
++                WARN("Video sink first frame: time %s, state %u, rate %.3f, requested %u.\n",
++                        debugstr_time(sampletime), sink->state, sink->rate, requested);
+                 video_frame_sink_notify(sink, MF_MEDIA_ENGINE_EVENT_FIRSTFRAMEREADY);
+                 video_frame_sink_set_flag(sink, FLAGS_FIRST_FRAME, TRUE);
+                 first_frame = TRUE;
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -1177,7 +1177,16 @@ NTSTATUS demuxer_stream_type( void *arg )
+ 
+     TRACE( "demuxer %p, stream %u, stream %p, index %u\n", demuxer, params->stream, stream, stream->index );
+     if (par->codec_type == AVMEDIA_TYPE_VIDEO)
++    {
++        AVRational guessed = av_guess_frame_rate( demuxer->ctx, stream, NULL );
++
+         fps = get_video_display_frame_rate( demuxer->ctx, stream );
++        if (demuxer->duration == AV_NOPTS_VALUE)
++            WARN( "Live video type: format %s, size %dx%d, fps %d/%d, avg %d/%d, guessed %d/%d, r %d/%d, time base %d/%d.\n",
++                    demuxer->ctx->iformat ? demuxer->ctx->iformat->name : "(null)", par->width, par->height,
++                    fps.num, fps.den, stream->avg_frame_rate.num, stream->avg_frame_rate.den, guessed.num, guessed.den,
++                    stream->r_frame_rate.num, stream->r_frame_rate.den, stream->time_base.num, stream->time_base.den );
++    }
+     else
+         fps = stream->avg_frame_rate;
+     return media_type_from_codec_params( par, &stream->sample_aspect_ratio, &fps, 0, &params->media_type );
+-- 
+2.52.0

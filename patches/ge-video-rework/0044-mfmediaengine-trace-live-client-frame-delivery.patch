@@ -1,0 +1,164 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@proton.me>
+Date: Thu, 27 Aug 2026 10:05:00 -0600
+Subject: [PATCH] mfmediaengine: Trace live client frame delivery
+
+Temporarily record the Media Engine state and frame-server calls made by
+clients during live playback. Keep high-frequency output bounded so the
+diagnostics do not materially alter VRChat playback timing.
+
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -2149,10 +2149,19 @@
+ static USHORT WINAPI media_engine_GetReadyState(IMFMediaEngineEx *iface)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
++    static LONG live_ready_count;
+     unsigned short state;
+ 
+     EnterCriticalSection(&engine->cs);
+     state = engine->ready_state;
++    if (isinf(engine->duration))
++    {
++        LONG count = InterlockedIncrement(&live_ready_count);
++
++        if (count <= 16 || !(count % 120))
++            WARN("Live ready-state call %ld: %u, flags %#x, network %u.\n",
++                    count, state, engine->flags, engine->network_state);
++    }
+     TRACE("%p returning %u flags %#x.\n", iface, state, engine->flags);
+     LeaveCriticalSection(&engine->cs);
+ 
+@@ -2162,10 +2171,19 @@
+ static BOOL WINAPI media_engine_IsSeeking(IMFMediaEngineEx *iface)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
++    static LONG live_seeking_count;
+     BOOL value;
+ 
+     EnterCriticalSection(&engine->cs);
+     value = !!(engine->flags & (FLAGS_ENGINE_SEEKING | FLAGS_ENGINE_DEFERRED_SEEK));
++    if (isinf(engine->duration))
++    {
++        LONG count = InterlockedIncrement(&live_seeking_count);
++
++        if (count <= 16 || !(count % 120) || value)
++            WARN("Live seeking call %ld: %u, flags %#x, ready %u, network %u.\n",
++                    count, value, engine->flags, engine->ready_state, engine->network_state);
++    }
+     TRACE("%p returning %d flags %#x.\n", iface, value, engine->flags);
+     LeaveCriticalSection(&engine->cs);
+ 
+@@ -2789,12 +2807,20 @@
+ static BOOL WINAPI media_engine_HasVideo(IMFMediaEngineEx *iface)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
++    static LONG live_has_video_count;
+     BOOL value;
+ 
+     TRACE("%p.\n", iface);
+ 
+     EnterCriticalSection(&engine->cs);
+     value = !!(engine->flags & FLAGS_ENGINE_HAS_VIDEO);
++    if (isinf(engine->duration))
++    {
++        LONG count = InterlockedIncrement(&live_has_video_count);
++
++        if (count <= 8 || !(count % 120))
++            WARN("Live HasVideo call %ld: %u, flags %#x.\n", count, value, engine->flags);
++    }
+     LeaveCriticalSection(&engine->cs);
+ 
+     return value;
+@@ -2803,12 +2829,20 @@
+ static BOOL WINAPI media_engine_HasAudio(IMFMediaEngineEx *iface)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
++    static LONG live_has_audio_count;
+     BOOL value;
+ 
+     TRACE("%p.\n", iface);
+ 
+     EnterCriticalSection(&engine->cs);
+     value = !!(engine->flags & FLAGS_ENGINE_HAS_AUDIO);
++    if (isinf(engine->duration))
++    {
++        LONG count = InterlockedIncrement(&live_has_audio_count);
++
++        if (count <= 8 || !(count % 120))
++            WARN("Live HasAudio call %ld: %u, flags %#x.\n", count, value, engine->flags);
++    }
+     LeaveCriticalSection(&engine->cs);
+ 
+     return value;
+@@ -3459,6 +3501,7 @@
+         const MFVideoNormalizedRect *src_rect, const RECT *dst_rect, const MFARGB *color)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
++    static LONG live_transfer_count;
+     ID3D11Texture2D *texture;
+     HRESULT hr = E_NOINTERFACE;
+     IWICBitmap *bitmap;
+@@ -3495,6 +3538,15 @@
+         FIXME("Unsupported destination type.\n");
+     }
+ 
++    if (isinf(engine->duration))
++    {
++        LONG count = InterlockedIncrement(&live_transfer_count);
++
++        if (count <= 16 || !(count % 120) || FAILED(hr))
++            WARN("Live frame transfer %ld: hr %#lx, pts %s, flags %#x.\n", count, hr,
++                    wine_dbgstr_longlong(engine->video_frame.pts), engine->flags);
++    }
++
+     LeaveCriticalSection(&engine->cs);
+ 
+     return hr;
+@@ -3503,6 +3555,8 @@
+ static HRESULT WINAPI media_engine_OnVideoStreamTick(IMFMediaEngineEx *iface, LONGLONG *pts)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
++    static LONG live_tick_count;
++    MFTIME clocktime = MINLONGLONG;
+     HRESULT hr;
+ 
+     TRACE("%p, %p.\n", iface, pts);
+@@ -3515,7 +3569,6 @@
+         hr = E_POINTER;
+     else
+     {
+-        MFTIME clocktime;
+         *pts = MINLONGLONG;
+         if (SUCCEEDED(IMFPresentationClock_GetTime(engine->clock, &clocktime)))
+         {
+@@ -3568,6 +3621,16 @@
+             hr = S_FALSE;
+     }
+ 
++    if (isinf(engine->duration))
++    {
++        LONG count = InterlockedIncrement(&live_tick_count);
++
++        if (count <= 16 || !(count % 120) || FAILED(hr))
++            WARN("Live video tick %ld: hr %#lx, pts %s, clock %s, flags %#x.\n", count, hr,
++                    pts && (hr == S_OK || hr == S_FALSE) ? wine_dbgstr_longlong(*pts) : "(unset)",
++                    clocktime != MINLONGLONG ? wine_dbgstr_longlong(clocktime) : "(unset)", engine->flags);
++    }
++
+     LeaveCriticalSection(&engine->cs);
+ 
+     return hr;
+@@ -3719,6 +3782,9 @@
+             IMFStreamDescriptor_Release(sd);
+         }
+     }
++    if (isinf(engine->duration))
++        WARN("Live stream attribute: stream %lu, attribute %s, hr %#lx, vt %u.\n", stream_index,
++                debugstr_guid(attribute), hr, SUCCEEDED(hr) && value ? value->vt : VT_EMPTY);
+     LeaveCriticalSection(&engine->cs);
+ 
+     return hr;
+-- 
+2.52.0

@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@proton.me>
+Date: Fri, 28 Aug 2026 07:25:00 -0600
+Subject: [PATCH] mfmediaengine: Preserve GStreamer live HLS duration semantics
+
+The former winegstreamer media source stores GStreamer's unknown live HLS
+duration as zero and always attaches MF_PD_DURATION to its presentation
+descriptor.  Native AVPro therefore observes GetDuration() == 0 and a
+single [0, 0] buffered range.  The winedmo source instead omits
+MF_PD_DURATION, which makes Media Engine expose positive infinity and a
+[0, +inf] range.  VRChat's AVPro wrapper never accepts that player as ready
+and retries it after eight seconds even though frames are decoded and copied
+successfully.
+
+Keep the internal infinite duration used to identify and schedule a live
+source, but preserve the old client-visible contract for live HLS URLs.  This
+does not affect finite HLS media or other unknown-duration source types.
+---
+ dlls/mfmediaengine/main.c | 27 +++++++++++++++++++--------
+ 1 file changed, 19 insertions(+), 8 deletions(-)
+
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -224,6 +224,14 @@ struct media_engine
+     CRITICAL_SECTION cs;
+ };
+ 
++static double media_engine_get_client_duration(const struct media_engine *engine)
++{
++    if (isinf(engine->duration) && engine->current_source
++            && wcsstr(engine->current_source, L".m3u8"))
++        return 0.0;
++    return engine->duration;
++}
++
+ static HRESULT media_engine_notify_live_event(struct media_engine *engine,
+         MF_MEDIA_ENGINE_EVENT event, DWORD_PTR param1, DWORD param2)
+ {
+@@ -2085,6 +2093,6 @@ static HRESULT WINAPI media_engine_GetBuffered(IMFMediaEngineEx *iface, IMFMedia
+     static LONG live_buffered_count;
+     unsigned int flags;
+-    double duration;
++    double duration, client_duration;
+     HRESULT hr;
+ 
+     TRACE("%p, %p.\n", iface, range);
+@@ -2095,12 +2103,13 @@ static HRESULT WINAPI media_engine_GetBuffered(IMFMediaEngineEx *iface, IMFMedia
+ 
+     EnterCriticalSection(&engine->cs);
+ 
++    duration = engine->duration;
++    client_duration = media_engine_get_client_duration(engine);
+     if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
+         hr = MF_E_SHUTDOWN;
+-    else if (!isnan(engine->duration))
+-        hr = IMFMediaTimeRange_AddRange(*range, 0.0, engine->duration);
++    else if (!isnan(client_duration))
++        hr = IMFMediaTimeRange_AddRange(*range, 0.0, client_duration);
+ 
+-    duration = engine->duration;
+     flags = engine->flags;
+     if (isinf(duration))
+         impl_from_IMFMediaTimeRange(*range)->trace_live_buffered = TRUE;
+@@ -2518,7 +2527,7 @@ static double WINAPI media_engine_GetDuration(IMFMediaEngineEx *iface)
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
+     static LONG live_duration_count;
+     unsigned int flags;
+-    double value;
++    double duration, value;
+ 
+     TRACE("%p.\n", iface);
+ 
+@@ -2526,14 +2535,16 @@ static double WINAPI media_engine_GetDuration(IMFMediaEngineEx *iface)
+     EnterCriticalSection(&engine->cs);
+-    value = engine->duration;
++    duration = engine->duration;
++    value = media_engine_get_client_duration(engine);
+     flags = engine->flags;
+     LeaveCriticalSection(&engine->cs);
+ 
+-    if (isinf(value))
++    if (isinf(duration))
+     {
+         LONG count = InterlockedIncrement(&live_duration_count);
+ 
+         if (count <= 16 || !(count % 120))
+-            WARN("Live duration call %ld: %.6f, flags %#x.\n", count, value, flags);
++            WARN("Live duration call %ld: internal %.6f, client %.6f, flags %#x.\n",
++                    count, duration, value, flags);
+     }
+ 
+     return value;
+-- 
+2.52.0
