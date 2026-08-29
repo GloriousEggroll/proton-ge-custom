@@ -1,0 +1,518 @@
+From: atty303 <atty303@users.noreply.github.com>
+Date: Wed, 26 Aug 2026 20:00:00 +0900
+Subject: [PATCH] mfreadwrite: drain Source Reader transforms on demand
+
+Keep a stream in an explicit draining state after the media source reaches
+EOS. Send MFT_MESSAGE_COMMAND_DRAIN once per transform, but service the chain
+only while a Source Reader request is pending. If downstream backpressure
+outlives that request, retain the unsubmitted sample and resume it from the
+next ReadSample call. Publish EOS only after the final transform reports that
+it needs more input or has reached end of stream.
+
+This preserves normal Source Reader backpressure for video and other media
+while allowing split decoder output, including the final WMA frame, to be
+returned over subsequent ReadSample calls instead of being discarded behind
+EOS. Continue servicing selected streams after MEEndOfPresentation until each
+stream has completed its transform drain. Return drain failures as Source
+Reader errors with the original HRESULT.
+
+diff --git a/dlls/mfreadwrite/reader.c b/dlls/mfreadwrite/reader.c
+index 3b9e89174..8fa723698 100644
+--- a/dlls/mfreadwrite/reader.c
++++ b/dlls/mfreadwrite/reader.c
+@@ -56,6 +56,7 @@
+ enum media_stream_state
+ {
+     STREAM_STATE_READY = 0,
++    STREAM_STATE_DRAINING,
+     STREAM_STATE_EOS,
+ };
+ 
+@@ -113,6 +114,9 @@
+     BOOL have_sample_ts;
+     BOOL is_new_stream;
+     BOOL unthrottled_audio_output;
++    struct transform_entry *draining_transform;
++    struct transform_entry *draining_sample_transform;
++    IMFSample *draining_sample;
+     struct list retained_audio_samples;
+     struct source_reader *reader;
+ };
+@@ -230,10 +234,11 @@
+ 
+ static void source_reader_release_responses(struct source_reader *reader, struct media_stream *stream);
+ static HRESULT source_reader_get_stream_selection(const struct source_reader *reader, DWORD index, BOOL *selected);
+-static HRESULT source_reader_drain_transform_samples(struct source_reader *reader, struct media_stream *stream,
+-        struct transform_entry *entry);
++static HRESULT source_reader_begin_stream_drain(struct source_reader *reader, struct media_stream *stream);
++static HRESULT source_reader_service_stream_drain(struct source_reader *reader, struct media_stream *stream);
+ static HRESULT source_reader_flush_transform_samples(struct source_reader *reader, struct media_stream *stream,
+         struct transform_entry *entry);
++static void source_reader_cancel_stream_drain(struct media_stream *stream, enum media_stream_state state);
+ 
+ static ULONG source_reader_addref(struct source_reader *reader)
+ {
+@@ -266,6 +271,8 @@
+ {
+     struct transform_entry *entry, *next;
+ 
++    if (stream->draining_sample)
++        IMFSample_Release(stream->draining_sample);
+     media_stream_release_retained_audio_samples(stream);
+ 
+     LIST_FOR_EACH_ENTRY_SAFE(entry, next, &stream->transforms, struct transform_entry, entry)
+@@ -676,21 +683,28 @@
+     return hr == MF_E_END_OF_STREAM;
+ }
+ 
++static HRESULT source_reader_end_stream(struct source_reader *reader, struct media_stream *stream)
++{
++    if (stream->state != STREAM_STATE_READY)
++        return S_OK;
++
++    return source_reader_begin_stream_drain(reader, stream);
++}
++
+ static HRESULT source_reader_request_sample(struct source_reader *reader, struct media_stream *stream)
+ {
+     HRESULT hr = S_OK;
+ 
++    if (stream->state == STREAM_STATE_DRAINING)
++        return source_reader_service_stream_drain(reader, stream);
++
+     if (stream->stream && !(stream->flags & STREAM_FLAG_SAMPLE_REQUESTED))
+     {
+         if (FAILED(hr = IMFMediaStream_RequestSample(stream->stream, NULL)))
+         {
+             if (source_reader_request_sample_eos(hr))
+             {
+-                stream->state = STREAM_STATE_EOS;
+-                stream->flags &= ~(STREAM_FLAG_SAMPLE_REQUESTED | STREAM_FLAG_EOS_REPORTED);
+-                while (stream->requests)
+-                    source_reader_queue_response(reader, stream, S_OK, MF_SOURCE_READERF_ENDOFSTREAM, 0, NULL);
+-                hr = S_OK;
++                hr = source_reader_end_stream(reader, stream);
+             }
+             else
+                 WARN("Sample request failed, hr %#lx.\n", hr);
+@@ -740,6 +754,8 @@
+                 source_reader_release_responses(reader, &reader->streams[i]);
+                 reader->next_stream_eos_index = 0;
+ 
++                source_reader_cancel_stream_drain(&reader->streams[i], STREAM_STATE_READY);
++
+                 if ((ptr = list_head(&reader->streams[i].transforms)))
+                 {
+                     struct transform_entry *entry = LIST_ENTRY(ptr, struct transform_entry, entry);
+@@ -1097,7 +1113,7 @@
+ }
+ 
+ static HRESULT source_reader_pull_transform_samples(struct source_reader *reader, struct media_stream *stream,
+-        struct transform_entry *entry);
++        struct transform_entry *entry, BOOL draining);
+ static inline BOOL source_reader_is_nonfatal_transform_status(HRESULT hr)
+ {
+     return hr == MF_E_TRANSFORM_NEED_MORE_INPUT || hr == MF_E_END_OF_STREAM;
+@@ -1156,20 +1172,50 @@
+ 
+     do
+     {
+-        if (FAILED(hr = source_reader_pull_transform_samples(reader, stream, entry))
++        if (FAILED(hr = source_reader_pull_transform_samples(reader, stream, entry, FALSE))
+                 && !source_reader_is_nonfatal_transform_status(hr))
+             return hr;
+         if (SUCCEEDED(hr = IMFTransform_ProcessInput(entry->transform, 0, sample, 0)))
+         {
+-            hr = source_reader_pull_transform_samples(reader, stream, entry);
++            hr = source_reader_pull_transform_samples(reader, stream, entry, FALSE);
+             return hr == MF_E_TRANSFORM_NEED_MORE_INPUT ? S_OK : hr;
+         }
+     }
+     while (hr == MF_E_NOTACCEPTING);
+ 
+     return hr;
+ }
+ 
++static HRESULT source_reader_push_drain_sample(struct source_reader *reader, struct media_stream *stream,
++        struct transform_entry *entry, IMFSample *sample, BOOL *accepted)
++{
++    unsigned int attempt;
++    HRESULT hr;
++
++    *accepted = FALSE;
++    for (attempt = 1; attempt <= 2; ++attempt)
++    {
++        hr = IMFTransform_ProcessInput(entry->transform, 0, sample, 0);
++        if (SUCCEEDED(hr))
++        {
++            *accepted = TRUE;
++            return source_reader_pull_transform_samples(reader, stream, entry, TRUE);
++        }
++        if (hr != MF_E_NOTACCEPTING)
++            return hr;
++        if (!stream->requests)
++            return S_OK;
++
++        hr = source_reader_pull_transform_samples(reader, stream, entry, TRUE);
++        if (FAILED(hr) && !source_reader_is_nonfatal_transform_status(hr))
++            return hr;
++        if (!stream->requests)
++            return S_OK;
++    }
++
++    return MF_E_NOTACCEPTING;
++}
++
+ /* update the transform output type while keeping subtype which matches the desired type */
+ static HRESULT set_matching_transform_output_type(IMFTransform *transform, IMFMediaType *old_output_type)
+ {
+@@ -1277,7 +1323,7 @@
+ }
+ 
+ static HRESULT source_reader_pull_transform_samples(struct source_reader *reader, struct media_stream *stream,
+-        struct transform_entry *entry)
++        struct transform_entry *entry, BOOL draining)
+ {
+     MFT_OUTPUT_STREAM_INFO stream_info = {0};
+     struct transform_entry *next = NULL;
+@@ -1298,6 +1344,9 @@
+         return hr;
+     stream_info.cbSize = max(stream_info.cbSize, entry->min_buffer_size);
+ 
++    if (draining && !stream->requests)
++        return S_OK;
++
+     while (SUCCEEDED(hr))
+     {
+         MFT_OUTPUT_DATA_BUFFER out_buffer = {0};
+@@ -1322,6 +1371,25 @@
+ 
+             if (FAILED(hr))
+                 source_reader_queue_response(reader, stream, hr, MF_SOURCE_READERF_ERROR, 0, NULL);
++            else if (next && draining)
++            {
++                BOOL accepted;
++
++                hr = source_reader_push_drain_sample(reader, stream, next, out_buffer.pSample, &accepted);
++                if (SUCCEEDED(hr) && !accepted)
++                {
++                    if (stream->draining_sample)
++                        hr = E_UNEXPECTED;
++                    else
++                    {
++                        stream->draining_sample = out_buffer.pSample;
++                        stream->draining_sample_transform = next;
++                        IMFSample_AddRef(stream->draining_sample);
++                    }
++                }
++                else if (source_reader_is_nonfatal_transform_status(hr))
++                    hr = S_OK;
++            }
+             else if (next)
+                 hr = source_reader_push_transform_samples(reader, stream, next, out_buffer.pSample);
+             else
+@@ -1347,7 +1415,9 @@
+         if (out_buffer.pEvents)
+             IMFCollection_Release(out_buffer.pEvents);
+ 
+-        if (!reader->async_callback && stream->responses && !stream->requests
++        if (draining && !stream->requests)
++            break;
++        if (!draining && !reader->async_callback && stream->responses && !stream->requests
+                 && (!source_reader_stream_is_audio(stream) || !stream->unthrottled_audio_output))
+             break;
+     }
+@@ -1355,23 +1425,154 @@
+     return hr;
+ }
+ 
+-static HRESULT source_reader_drain_transform_samples(struct source_reader *reader, struct media_stream *stream,
+-        struct transform_entry *entry)
++static void source_reader_clear_drain_sample(struct media_stream *stream)
++{
++    if (stream->draining_sample)
++        IMFSample_Release(stream->draining_sample);
++    stream->draining_sample = NULL;
++    stream->draining_sample_transform = NULL;
++}
++
++static void source_reader_cancel_stream_drain(struct media_stream *stream, enum media_stream_state state)
++{
++    stream->state = state;
++    stream->draining_transform = NULL;
++    source_reader_clear_drain_sample(stream);
++}
++
++static HRESULT source_reader_finish_stream_drain(struct source_reader *reader, struct media_stream *stream)
++{
++    HRESULT hr = S_OK, queue_hr;
++
++    source_reader_cancel_stream_drain(stream, STREAM_STATE_EOS);
++    while (stream->requests)
++    {
++        queue_hr = source_reader_queue_response(reader, stream, S_OK, MF_SOURCE_READERF_ENDOFSTREAM, 0, NULL);
++        if (FAILED(queue_hr))
++        {
++            hr = queue_hr;
++            break;
++        }
++    }
++
++    return hr;
++}
++
++static HRESULT source_reader_fail_stream_drain(struct source_reader *reader, struct media_stream *stream,
++        HRESULT status)
++{
++    HRESULT hr = S_OK, queue_hr;
++
++    source_reader_cancel_stream_drain(stream, STREAM_STATE_EOS);
++    while (stream->requests)
++    {
++        queue_hr = source_reader_queue_response(reader, stream, status, MF_SOURCE_READERF_ERROR, 0, NULL);
++        if (FAILED(queue_hr))
++        {
++            hr = queue_hr;
++            break;
++        }
++    }
++
++    return hr;
++}
++
++static HRESULT source_reader_start_transform_drain(struct transform_entry *entry)
++{
++    HRESULT hr;
++
++    hr = IMFTransform_ProcessMessage(entry->transform, MFT_MESSAGE_COMMAND_DRAIN, 0);
++    if (FAILED(hr))
++        WARN("Failed to drain transform %p, hr %#lx\n", entry->transform, hr);
++
++    return hr;
++}
++
++static HRESULT source_reader_begin_stream_drain(struct source_reader *reader, struct media_stream *stream)
+ {
+-    struct transform_entry *next = NULL;
+     struct list *ptr;
+     HRESULT hr;
+ 
+-    if ((ptr = list_next(&stream->transforms, &entry->entry)))
+-        next = LIST_ENTRY(ptr, struct transform_entry, entry);
++    stream->flags &= ~(STREAM_FLAG_SAMPLE_REQUESTED | STREAM_FLAG_EOS_REPORTED);
++    stream->state = STREAM_STATE_DRAINING;
++    stream->draining_transform = NULL;
++    source_reader_clear_drain_sample(stream);
+ 
+-    if (FAILED(hr = IMFTransform_ProcessMessage(entry->transform, MFT_MESSAGE_COMMAND_DRAIN, 0)))
+-        WARN("Failed to drain transform %p, hr %#lx\n", entry->transform, hr);
+-    if (FAILED(hr = source_reader_pull_transform_samples(reader, stream, entry))
+-            && !source_reader_is_nonfatal_transform_status(hr))
+-        WARN("Failed to pull pending samples, hr %#lx.\n", hr);
++    if (!(ptr = list_head(&stream->transforms)))
++        return source_reader_finish_stream_drain(reader, stream);
+ 
+-    return next ? source_reader_drain_transform_samples(reader, stream, next) : S_OK;
++    stream->draining_transform = LIST_ENTRY(ptr, struct transform_entry, entry);
++    if (FAILED(hr = source_reader_start_transform_drain(stream->draining_transform)))
++        return source_reader_fail_stream_drain(reader, stream, hr);
++    return source_reader_service_stream_drain(reader, stream);
++}
++
++static HRESULT source_reader_service_stream_drain(struct source_reader *reader, struct media_stream *stream)
++{
++    struct transform_entry *entry;
++    struct list *ptr;
++    HRESULT hr = S_OK;
++
++    while (stream->state == STREAM_STATE_DRAINING && stream->requests)
++    {
++        if (stream->draining_sample)
++        {
++            struct transform_entry *sample_transform = stream->draining_sample_transform;
++            IMFSample *sample = stream->draining_sample;
++            BOOL accepted;
++
++            stream->draining_sample = NULL;
++            stream->draining_sample_transform = NULL;
++            hr = source_reader_push_drain_sample(reader, stream, sample_transform, sample, &accepted);
++            if (!accepted && SUCCEEDED(hr))
++            {
++                stream->draining_sample = sample;
++                stream->draining_sample_transform = sample_transform;
++                break;
++            }
++            IMFSample_Release(sample);
++            if (FAILED(hr) && !source_reader_is_nonfatal_transform_status(hr))
++            {
++                WARN("Failed to submit retained drain sample, hr %#lx.\n", hr);
++                hr = source_reader_fail_stream_drain(reader, stream, hr);
++                break;
++            }
++            if (!stream->requests)
++                break;
++        }
++
++        entry = stream->draining_transform;
++        if (!entry)
++        {
++            hr = source_reader_fail_stream_drain(reader, stream, E_UNEXPECTED);
++            break;
++        }
++        hr = source_reader_pull_transform_samples(reader, stream, entry, TRUE);
++        if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT || hr == MF_E_END_OF_STREAM)
++        {
++            if ((ptr = list_next(&stream->transforms, &entry->entry)))
++            {
++                stream->draining_transform = LIST_ENTRY(ptr, struct transform_entry, entry);
++                if (FAILED(hr = source_reader_start_transform_drain(stream->draining_transform)))
++                {
++                    hr = source_reader_fail_stream_drain(reader, stream, hr);
++                    break;
++                }
++                continue;
++            }
++
++            hr = source_reader_finish_stream_drain(reader, stream);
++            break;
++        }
++        if (FAILED(hr))
++        {
++            WARN("Failed to pull pending samples, hr %#lx.\n", hr);
++            hr = source_reader_fail_stream_drain(reader, stream, hr);
++            break;
++        }
++    }
++
++    return FAILED(hr) && !source_reader_is_nonfatal_transform_status(hr) ? hr : S_OK;
+ }
+ 
+ static HRESULT source_reader_flush_transform_samples(struct source_reader *reader, struct media_stream *stream,
+@@ -1507,22 +1708,10 @@
+             switch (event_type)
+             {
+                 case MEEndOfStream:
+-                    stream->state = STREAM_STATE_EOS;
+-                    stream->flags &= ~(STREAM_FLAG_SAMPLE_REQUESTED | STREAM_FLAG_EOS_REPORTED);
+-
+-                    if ((ptr = list_head(&stream->transforms)))
+-                    {
+-                        struct transform_entry *entry = LIST_ENTRY(ptr, struct transform_entry, entry);
+-                        if (FAILED(hr = source_reader_drain_transform_samples(reader, stream, entry)))
+-                            WARN("Failed to drain pending samples, hr %#lx.\n", hr);
+-                    }
+-
+-                    while (stream->requests)
+-                        source_reader_queue_response(reader, stream, S_OK, MF_SOURCE_READERF_ENDOFSTREAM, 0, NULL);
+-
++                    hr = source_reader_end_stream(reader, stream);
+                     break;
+                 case MEStreamSeeked:
+-                    stream->state = STREAM_STATE_READY;
++                    source_reader_cancel_stream_drain(stream, STREAM_STATE_READY);
+                     stream->flags &= ~(STREAM_FLAG_SAMPLE_REQUESTED | STREAM_FLAG_EOS_REPORTED | STREAM_FLAG_STOPPED);
+                     source_reader_reset_stream_timing(stream);
+ 
+@@ -1536,7 +1725,7 @@
+                     }
+                     break;
+                 case MEStreamStarted:
+-                    stream->state = STREAM_STATE_READY;
++                    source_reader_cancel_stream_drain(stream, STREAM_STATE_READY);
+                     stream->flags &= ~(STREAM_FLAG_SAMPLE_REQUESTED | STREAM_FLAG_EOS_REPORTED | STREAM_FLAG_STOPPED);
+                     source_reader_reset_stream_timing(stream);
+ 
+@@ -1837,7 +2026,7 @@
+     if (!(response = source_reader_peek_response_for_stream(reader, stream)) || !response->sample)
+         return;
+ 
+-    if ((audio = source_reader_get_selected_audio_stream(reader)) && audio->state != STREAM_STATE_EOS
++    if ((audio = source_reader_get_selected_audio_stream(reader)) && audio->state == STREAM_STATE_READY
+             && audio->unthrottled_audio_output)
+     {
+         audio_lead = response->timestamp - audio->delivered_sample_ts;
+@@ -1858,7 +2047,7 @@
+ 
+     if (!reader->flag_eos_for_all_streams || reader->async_callback)
+         return;
+-    if ((flags & MF_SOURCE_READER_CONTROLF_DRAIN) || stream->state == STREAM_STATE_EOS)
++    if ((flags & MF_SOURCE_READER_CONTROLF_DRAIN) || stream->state != STREAM_STATE_READY)
+         return;
+     if (source_reader_stream_is_audio(stream))
+         max_responses = 8;
+@@ -1902,10 +2091,9 @@
+ 
+     for (i = 0; i < reader->stream_count; ++i)
+     {
+-        if (reader->flag_eos_for_all_streams && reader->presentation_ended)
++        if (FAILED(source_reader_get_stream_selection(reader, i, &selected)) || !selected)
+             continue;
+-        if (SUCCEEDED(source_reader_get_stream_selection(reader, i, &selected)) && selected
+-                && reader->streams[i].state != STREAM_STATE_EOS)
++        if (reader->streams[i].state != STREAM_STATE_EOS)
+             return FALSE;
+     }
+ 
+@@ -1946,7 +2134,7 @@
+ 
+         if (FAILED(source_reader_get_stream_selection(reader, index, &selected)) || !selected)
+             continue;
+-        if (stream->state != STREAM_STATE_EOS && !(reader->flag_eos_for_all_streams && reader->presentation_ended))
++        if (stream->state != STREAM_STATE_EOS)
+             continue;
+         if (stream->flags & STREAM_FLAG_EOS_REPORTED)
+             continue;
+@@ -2211,9 +2399,6 @@
+ 
+ static HRESULT source_reader_request_selected_stream_samples(struct source_reader *reader)
+ {
+-    if (reader->flag_eos_for_all_streams && reader->presentation_ended)
+-        return S_OK;
+-
+     if (reader->flag_eos_for_all_streams)
+         return source_reader_request_windows_media_stream_sample(reader);
+ 
+@@ -2272,6 +2457,14 @@
+ 
+     source_reader_release_responses(reader, stream);
+ 
++    if (stream->state == STREAM_STATE_DRAINING)
++        source_reader_cancel_stream_drain(stream, STREAM_STATE_EOS);
++    else
++    {
++        stream->draining_transform = NULL;
++        source_reader_clear_drain_sample(stream);
++    }
++
+     if ((ptr = list_head(&stream->transforms)))
+     {
+         struct transform_entry *entry = LIST_ENTRY(ptr, struct transform_entry, entry);
+@@ -2591,6 +2784,8 @@
+     {
+         for (i = 0; i < reader->stream_count; ++i)
+         {
++            if (reader->streams[i].state == STREAM_STATE_DRAINING)
++                source_reader_flush_stream(reader, i);
+             source_reader_reset_stream_timing(&reader->streams[i]);
+         }
+     }
+@@ -2785,6 +2980,9 @@
+     if (flags & MF_MEDIATYPE_EQUAL_FORMAT_DATA)
+         return S_OK;
+ 
++    if (stream->state == STREAM_STATE_DRAINING)
++        source_reader_flush_stream(reader, index);
++
+     if (stream->transform_service)
+     {
+         IMFTransform_Release(stream->transform_service);
+@@ -3186,7 +3384,8 @@
+     {
+         for (i = 0; i < reader->stream_count; ++i)
+         {
+-            source_reader_release_responses(reader, &reader->streams[i]);
++            source_reader_flush_stream(reader, i);
++            reader->streams[i].state = STREAM_STATE_READY;
+             source_reader_reset_stream_timing(&reader->streams[i]);
+         }
+ 
