@@ -12,6 +12,7 @@
 #include <xkbcommon/xkbcommon-compose.h>
 #include <xkbcommon/xkbcommon.h>
 
+#include "fractional-scale-v1-client-protocol.h"
 #include "relative-pointer-unstable-v1-client-protocol.h"
 #include "steam_overlay_bridge.h"
 
@@ -33,8 +34,9 @@ struct ge_overlay_wayland_surface
     struct wl_pointer *pointer;
     struct zwp_relative_pointer_manager_v1 *relative_pointer_manager;
     struct zwp_relative_pointer_v1 *relative_pointer;
+    struct wp_fractional_scale_manager_v1 *fractional_scale_manager;
+    struct wp_fractional_scale_v1 *overlay_fractional_scale;
     struct wl_cursor_theme *cursor_theme;
-    struct wl_surface *cursor_surface;
     struct wl_surface *overlay_cursor_surface;
     struct wl_subsurface *overlay_cursor_subsurface;
     struct xkb_context *xkb_context;
@@ -45,6 +47,7 @@ struct ge_overlay_wayland_surface
     uint32_t seat_name;
     uint32_t subcompositor_name;
     uint32_t relative_pointer_manager_name;
+    uint32_t fractional_scale_manager_name;
     uint32_t pointer_serial;
     int relative_motion_seen;
     int bridge_registered;
@@ -56,6 +59,7 @@ struct ge_overlay_wayland_surface
     int cursor_hotspot_x;
     int cursor_hotspot_y;
     int overlay_cursor_active;
+    double pointer_scale;
     unsigned int refs;
     uint8_t keys[256];
     struct ge_steam_overlay_pointer_frame frame;
@@ -148,38 +152,13 @@ static struct wl_cursor_image *get_cursor_image(
     return cursor->images[0];
 }
 
-static void apply_hardware_cursor_shape(
-    struct ge_overlay_wayland_surface *surface, uint32_t shape)
-{
-    struct wl_cursor_image *image;
-
-    if (!surface || !surface->pointer || !surface->pointer_serial ||
-        !surface->compositor || !(image = get_cursor_image(surface, shape)))
-        return;
-
-    if (!surface->cursor_surface)
-    {
-        surface->cursor_surface =
-            wl_compositor_create_surface(surface->compositor);
-        if (!surface->cursor_surface) return;
-        wl_proxy_set_queue((struct wl_proxy *)surface->cursor_surface,
-                           surface->queue);
-    }
-
-    wl_pointer_set_cursor(surface->pointer, surface->pointer_serial,
-                          surface->cursor_surface,
-                          (int32_t)image->hotspot_x,
-                          (int32_t)image->hotspot_y);
-    wl_surface_attach(surface->cursor_surface,
-                      wl_cursor_image_get_buffer(image), 0, 0);
-    wl_surface_damage(surface->cursor_surface, 0, 0,
-                      (int32_t)image->width, (int32_t)image->height);
-    wl_surface_commit(surface->cursor_surface);
-    wl_display_flush(surface->display);
-}
-
 static void destroy_overlay_cursor(struct ge_overlay_wayland_surface *surface)
 {
+    if (surface->overlay_fractional_scale)
+    {
+        wp_fractional_scale_v1_destroy(surface->overlay_fractional_scale);
+        surface->overlay_fractional_scale = NULL;
+    }
     if (surface->overlay_cursor_subsurface)
     {
         wl_subsurface_destroy(surface->overlay_cursor_subsurface);
@@ -191,6 +170,36 @@ static void destroy_overlay_cursor(struct ge_overlay_wayland_surface *surface)
         surface->overlay_cursor_surface = NULL;
     }
 }
+
+static void fractional_scale_preferred(
+    void *data, struct wp_fractional_scale_v1 *fractional_scale,
+    uint32_t scale)
+{
+    struct ge_overlay_wayland_surface *surface = data;
+    struct ge_steam_overlay_pointer_frame frame = {0};
+
+    (void)fractional_scale;
+    if (!scale) return;
+    surface->pointer_scale = scale / 120.0;
+    if (overlay_debug_enabled())
+        fprintf(stderr, "steam-overlay-wayland: pointer scale is %.3f\n",
+                surface->pointer_scale);
+
+    if (surface->pointer_focus)
+    {
+        frame.x = surface->pointer_x;
+        frame.y = surface->pointer_y;
+        frame.scale_x = surface->pointer_scale;
+        frame.scale_y = surface->pointer_scale;
+        frame.flags = GE_STEAM_OVERLAY_FRAME_ABSOLUTE;
+        ge_overlay_bridge_filter_pointer_frame(&frame);
+    }
+}
+
+static const struct wp_fractional_scale_v1_listener fractional_scale_listener =
+{
+    .preferred_scale = fractional_scale_preferred,
+};
 
 static int ensure_overlay_cursor(struct ge_overlay_wayland_surface *surface)
 {
@@ -210,6 +219,23 @@ static int ensure_overlay_cursor(struct ge_overlay_wayland_surface *surface)
     if (!surface->overlay_cursor_surface) return 0;
     wl_proxy_set_queue((struct wl_proxy *)surface->overlay_cursor_surface,
                        surface->queue);
+
+    if (surface->fractional_scale_manager)
+    {
+        surface->overlay_fractional_scale =
+            wp_fractional_scale_manager_v1_get_fractional_scale(
+                surface->fractional_scale_manager,
+                surface->overlay_cursor_surface);
+        if (surface->overlay_fractional_scale)
+        {
+            wl_proxy_set_queue(
+                (struct wl_proxy *)surface->overlay_fractional_scale,
+                surface->queue);
+            wp_fractional_scale_v1_add_listener(
+                surface->overlay_fractional_scale,
+                &fractional_scale_listener, surface);
+        }
+    }
 
     surface->overlay_cursor_subsurface = wl_subcompositor_get_subsurface(
         surface->subcompositor, surface->overlay_cursor_surface,
@@ -308,8 +334,7 @@ void ge_overlay_wayland_set_overlay_active(int active)
         else
         {
             destroy_overlay_cursor(focused_pointer);
-            apply_hardware_cursor_shape(focused_pointer,
-                                        GE_STEAM_OVERLAY_CURSOR_DEFAULT);
+            wl_display_flush(focused_pointer->display);
         }
     }
     pthread_mutex_unlock(&focused_pointer_mutex);
@@ -558,6 +583,8 @@ static void pointer_enter(void *data, struct wl_pointer *pointer,
     surface->frame.time = 0;
     surface->frame.x = surface->pointer_x;
     surface->frame.y = surface->pointer_y;
+    surface->frame.scale_x = surface->pointer_scale;
+    surface->frame.scale_y = surface->pointer_scale;
     surface->frame.flags |= GE_STEAM_OVERLAY_FRAME_ABSOLUTE;
 
     pthread_mutex_lock(&focused_pointer_mutex);
@@ -607,6 +634,8 @@ static void pointer_motion(void *data, struct wl_pointer *pointer,
     surface->frame.time = time;
     surface->frame.x = surface->pointer_x;
     surface->frame.y = surface->pointer_y;
+    surface->frame.scale_x = surface->pointer_scale;
+    surface->frame.scale_y = surface->pointer_scale;
     surface->frame.flags |= GE_STEAM_OVERLAY_FRAME_ABSOLUTE;
 }
 
@@ -734,6 +763,8 @@ static void relative_pointer_motion(
 
     frame.dx = wl_fixed_to_double(dx);
     frame.dy = wl_fixed_to_double(dy);
+    frame.scale_x = surface->pointer_scale;
+    frame.scale_y = surface->pointer_scale;
     frame.flags = GE_STEAM_OVERLAY_FRAME_RELATIVE;
     ge_overlay_bridge_filter_pointer_frame(&frame);
 }
@@ -905,6 +936,15 @@ static void registry_global(void *data, struct wl_registry *registry,
                            surface->queue);
         create_relative_pointer(surface);
     }
+    else if (!strcmp(interface, wp_fractional_scale_manager_v1_interface.name) &&
+             !surface->fractional_scale_manager)
+    {
+        surface->fractional_scale_manager_name = name;
+        surface->fractional_scale_manager = wl_registry_bind(
+            registry, name, &wp_fractional_scale_manager_v1_interface, 1);
+        wl_proxy_set_queue((struct wl_proxy *)surface->fractional_scale_manager,
+                           surface->queue);
+    }
 }
 
 static void registry_global_remove(void *data, struct wl_registry *registry,
@@ -928,6 +968,15 @@ static void registry_global_remove(void *data, struct wl_registry *registry,
             surface->relative_pointer_manager);
         surface->relative_pointer_manager = NULL;
         surface->relative_pointer_manager_name = 0;
+    }
+    if (surface->fractional_scale_manager_name == name)
+    {
+        destroy_overlay_cursor(surface);
+        wp_fractional_scale_manager_v1_destroy(
+            surface->fractional_scale_manager);
+        surface->fractional_scale_manager = NULL;
+        surface->fractional_scale_manager_name = 0;
+        surface->pointer_scale = 1.0;
     }
 }
 
@@ -967,6 +1016,7 @@ struct ge_overlay_wayland_surface *ge_overlay_wayland_surface_create(
 
     surface->display = display;
     surface->target_surface = target_surface;
+    surface->pointer_scale = 1.0;
     surface->refs = 1;
     if (!(surface->queue = wl_display_create_queue(display))) goto fail;
 
@@ -994,8 +1044,10 @@ fail:
     if (surface->relative_pointer_manager)
         zwp_relative_pointer_manager_v1_destroy(
             surface->relative_pointer_manager);
-    if (surface->cursor_surface) wl_surface_destroy(surface->cursor_surface);
     destroy_overlay_cursor(surface);
+    if (surface->fractional_scale_manager)
+        wp_fractional_scale_manager_v1_destroy(
+            surface->fractional_scale_manager);
     if (surface->cursor_theme) wl_cursor_theme_destroy(surface->cursor_theme);
     if (surface->shm) wl_shm_destroy(surface->shm);
     if (surface->compositor) wl_compositor_destroy(surface->compositor);
@@ -1037,8 +1089,10 @@ void ge_overlay_wayland_surface_destroy(struct ge_overlay_wayland_surface *surfa
     if (surface->relative_pointer_manager)
         zwp_relative_pointer_manager_v1_destroy(
             surface->relative_pointer_manager);
-    if (surface->cursor_surface) wl_surface_destroy(surface->cursor_surface);
     destroy_overlay_cursor(surface);
+    if (surface->fractional_scale_manager)
+        wp_fractional_scale_manager_v1_destroy(
+            surface->fractional_scale_manager);
     if (surface->cursor_theme) wl_cursor_theme_destroy(surface->cursor_theme);
     if (surface->shm) wl_shm_destroy(surface->shm);
     if (surface->compositor) wl_compositor_destroy(surface->compositor);

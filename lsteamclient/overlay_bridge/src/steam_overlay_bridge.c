@@ -164,6 +164,7 @@ typedef void (*vulkan_steam_overlay_set_window_type_fn)(uintptr_t, int);
 typedef int (*overlay_needs_present_fn)(void);
 typedef int (*overlay_is_enabled_fn)(void);
 typedef void (*overlay_input_stream_write_fn)(void *, const void *, size_t);
+typedef void (*wine_reapply_cursor_fn)(void);
 
 #define STEAM_OVERLAY_WINDOW_TYPE_XLIB 2
 #define STEAM_OVERLAY_INPUT_SOURCE_X11 2
@@ -176,6 +177,8 @@ extern int _XPutBackEvent(Display *display, XEvent *event);
 
 static pthread_mutex_t overlay_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t cursor_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t wine_cursor_api_once = PTHREAD_ONCE_INIT;
+static wine_reapply_cursor_fn wine_reapply_cursor;
 static pthread_once_t overlay_event_api_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t overlay_event_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct wine_ntdll_api wine_ntdll;
@@ -211,6 +214,10 @@ static uint64_t overlay_next_init_retry_ms;
 static int overlay_wait_logged;
 static int pointer_x;
 static int pointer_y;
+static double pointer_surface_x;
+static double pointer_surface_y;
+static double pointer_scale_x = 1.0;
+static double pointer_scale_y = 1.0;
 static struct overlay_cursor_entry overlay_cursor_map[GE_CURSOR_MAP_SIZE];
 static uint32_t overlay_cursor_shape = GE_STEAM_OVERLAY_CURSOR_DEFAULT;
 static int overlay_cursor_dirty;
@@ -252,6 +259,25 @@ static void overlay_trace(const char *format, ...)
     va_start(args, format);
     vfprintf(stderr, format, args);
     va_end(args);
+}
+
+static void load_wine_cursor_api(void)
+{
+    void *module;
+
+    if (!(module = dlopen("win32u.so", RTLD_NOW | RTLD_NOLOAD))) return;
+    wine_reapply_cursor = (wine_reapply_cursor_fn)dlsym(
+        module, "__wine_reapply_driver_cursor");
+    if (!wine_reapply_cursor) dlclose(module);
+}
+
+static void reapply_wine_game_cursor(void)
+{
+    pthread_once(&wine_cursor_api_once, load_wine_cursor_api);
+    if (!wine_reapply_cursor) return;
+
+    overlay_trace("reapplying Wine game cursor\n");
+    wine_reapply_cursor();
 }
 
 static void load_wine_ntdll_api(void)
@@ -1158,6 +1184,7 @@ static int update_overlay_active(void)
         overlay_trace("overlay is now %s\n", active ? "active" : "inactive");
         if (active) bridge_set_cursor_shape(GE_STEAM_OVERLAY_CURSOR_DEFAULT);
         ge_overlay_wayland_set_overlay_active(active);
+        if (!active) reapply_wine_game_cursor();
     }
 
     return active;
@@ -1739,26 +1766,46 @@ int ge_overlay_bridge_filter_pointer_frame(
     int horz_scroll = 0;
     int motion_x = 0;
     int motion_y = 0;
+    double scale_x;
+    double scale_y;
 
     if (!frame || !init_overlay_bridge(0)) return 0;
     update_overlay_focus();
 
+    scale_x = frame->scale_x > 0.0 ? frame->scale_x : 1.0;
+    scale_y = frame->scale_y > 0.0 ? frame->scale_y : 1.0;
+
     if (frame->flags & GE_STEAM_OVERLAY_FRAME_ABSOLUTE)
     {
         pthread_mutex_lock(&overlay_mutex);
-        pointer_x = frame->x;
-        pointer_y = frame->y;
+        pointer_surface_x = frame->x;
+        pointer_surface_y = frame->y;
+        pointer_scale_x = scale_x;
+        pointer_scale_y = scale_y;
+        pointer_x = (int)round(pointer_surface_x * pointer_scale_x);
+        pointer_y = (int)round(pointer_surface_y * pointer_scale_y);
         pthread_mutex_unlock(&overlay_mutex);
     }
     else if (frame->flags & GE_STEAM_OVERLAY_FRAME_RELATIVE)
     {
         pthread_mutex_lock(&overlay_mutex);
-        pointer_x += (int)round(frame->dx);
-        pointer_y += (int)round(frame->dy);
+        if (pointer_scale_x != scale_x || pointer_scale_y != scale_y)
+        {
+            pointer_scale_x = scale_x;
+            pointer_scale_y = scale_y;
+            pointer_x = (int)round(pointer_surface_x * pointer_scale_x);
+            pointer_y = (int)round(pointer_surface_y * pointer_scale_y);
+        }
+        pointer_surface_x += frame->dx;
+        pointer_surface_y += frame->dy;
+        pointer_x += (int)round(frame->dx * pointer_scale_x);
+        pointer_y += (int)round(frame->dy * pointer_scale_y);
         pointer_x = fmax(0, fmin(pointer_x,
             DisplayWidth(overlay_display, DefaultScreen(overlay_display)) - 1));
         pointer_y = fmax(0, fmin(pointer_y,
             DisplayHeight(overlay_display, DefaultScreen(overlay_display)) - 1));
+        pointer_surface_x = pointer_x / pointer_scale_x;
+        pointer_surface_y = pointer_y / pointer_scale_y;
         pthread_mutex_unlock(&overlay_mutex);
     }
 
@@ -1777,8 +1824,8 @@ int ge_overlay_bridge_filter_pointer_frame(
         event.xmotion.state = overlay_state;
         event.xmotion.is_hint = NotifyNormal;
         event.xmotion.same_screen = True;
-        motion_x = pointer_x;
-        motion_y = pointer_y;
+        motion_x = (int)round(pointer_surface_x);
+        motion_y = (int)round(pointer_surface_y);
         pthread_mutex_unlock(&overlay_mutex);
         consumed = dispatch_overlay_event(&event);
         ge_overlay_wayland_set_cursor_position(motion_x, motion_y);
@@ -1889,6 +1936,10 @@ static void destroy_overlay_bridge(void)
     overlay_screen_size_scanned = 0;
     pointer_x = 0;
     pointer_y = 0;
+    pointer_surface_x = 0.0;
+    pointer_surface_y = 0.0;
+    pointer_scale_x = 1.0;
+    pointer_scale_y = 1.0;
 
     pthread_mutex_lock(&cursor_mutex);
     memset(overlay_cursor_map, 0, sizeof(overlay_cursor_map));
@@ -1898,6 +1949,7 @@ static void destroy_overlay_bridge(void)
     pthread_mutex_unlock(&overlay_mutex);
 
     ge_overlay_wayland_set_overlay_active(0);
+    reapply_wine_game_cursor();
     ge_overlay_wayland_set_cursor_shape(GE_STEAM_OVERLAY_CURSOR_DEFAULT);
     overlay_trace("destroyed X11 overlay bridge window\n");
 }

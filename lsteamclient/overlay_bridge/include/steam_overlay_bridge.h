@@ -53,6 +53,8 @@ struct ge_steam_overlay_pointer_frame
     double horz_axis;
     int32_t scroll;
     int32_t horz_scroll;
+    double scale_x;
+    double scale_y;
     uint32_t flags;
 };
 
