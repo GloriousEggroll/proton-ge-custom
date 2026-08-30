@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Sun, 30 Aug 2026 10:00:00 -0600
+Subject: [PATCH] winewayland: Fix output removal locking and lifetime
+
+Make wayland_output_remove() own the complete output lookup and array
+removal transaction. The registry callback previously locked output_mutex
+before calling a helper which locked it again, permanently deadlocking the
+Wayland event thread when a wl_output global disappeared.
+
+Save the removed output before replacing its array slot with the final
+entry. Releasing the slot after the swap could instead destroy the
+replacement output and retain a dangling pointer in multi-monitor setups.
+
+Destroy the removed protocol objects and notify display-device handling only
+after releasing output_mutex.
+
+Fixes: 80e0cd6a6f2834c3eb46ca5c55380a020b6a03e1
+Reported-by: Martin Stark <901824+martinstark@users.noreply.github.com>
+Issue: https://github.com/GloriousEggroll/proton-ge-custom/issues/731
+---
+diff --git a/dlls/winewayland.drv/wayland.c b/dlls/winewayland.drv/wayland.c
+--- a/dlls/winewayland.drv/wayland.c
++++ b/dlls/winewayland.drv/wayland.c
+@@ -591,7 +591,6 @@ static void registry_handle_global_remove(void *data, struct wl_registry *registr
+ static void registry_handle_global_remove(void *data, struct wl_registry *registry,
+                                           uint32_t id)
+ {
+-    struct wayland_output **output;
+     struct wayland_seat *seat;
+ 
+     TRACE("id=%u\n", id);
+@@ -601,17 +600,7 @@ static void registry_handle_global_remove(void *data, struct wl_registry *registr
+         wl_fixes_ack_global_remove(process_wayland.wl_fixes, registry, id);
+ #endif
+ 
+-    pthread_mutex_lock(&process_wayland.output_mutex);
+-    wl_array_for_each(output, &process_wayland.output_array)
+-    {
+-        if ((*output)->global_id == id)
+-        {
+-            TRACE("removing output->name=%s\n", (*output)->current.name);
+-            wayland_output_remove(output);
+-            return;
+-        }
+-    }
+-    pthread_mutex_unlock(&process_wayland.output_mutex);
++    if (wayland_output_remove(id)) return;
+ 
+     seat = &process_wayland.seat;
+     if (seat->wl_seat && seat->global_id == id)
+diff --git a/dlls/winewayland.drv/wayland_output.c b/dlls/winewayland.drv/wayland_output.c
+--- a/dlls/winewayland.drv/wayland_output.c
++++ b/dlls/winewayland.drv/wayland_output.c
+@@ -652,28 +652,34 @@ static void wayland_output_state_deinit(struct wayland_output_state *state)
+  *
+  *  Drops ref of wayland output from the output list, and updates display devices.
+  */
+-void wayland_output_remove(struct wayland_output **output)
++BOOL wayland_output_remove(uint32_t id)
+ {
+     struct wl_array *output_array = &process_wayland.output_array;
+-    struct wayland_output **end, *temp;
++    struct wayland_output **output, **end;
++    struct wayland_output *removed = NULL;
+ 
+     pthread_mutex_lock(&process_wayland.output_mutex);
+-    if ((end = output_array->data) && output_array->size)
++    wl_array_for_each(output, output_array)
+     {
++        if ((*output)->global_id != id) continue;
++
++        removed = *output;
++        end = output_array->data;
+         end += (output_array->size / sizeof(*output)) - 1;
+-        /* swap current element and back element */
+-        temp = *end;
+-        *end = *output;
+-        *output = temp;
+-        /* then reduce the size of the array */
++        if (output != end) *output = *end;
+         output_array->size -= sizeof(*output);
++        wayland_output_array_arrange_physical_coords();
++        break;
+     }
+-    wayland_output_array_arrange_physical_coords();
+     pthread_mutex_unlock(&process_wayland.output_mutex);
+ 
+-    wayland_output_release(*output);
++    if (!removed) return FALSE;
++
++    TRACE("removing output->name=%s\n", removed->current.name);
++    wayland_output_release(removed);
+ 
+     maybe_init_display_devices();
++    return TRUE;
+ }
+ 
+ void wayland_output_add_ref(struct wayland_output *output)
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -558,7 +558,7 @@ BOOL wayland_process_init(void);
+ void wayland_output_add_ref(struct wayland_output *output);
+ BOOL wayland_output_create(uint32_t id, uint32_t version);
+ void wayland_output_release(struct wayland_output *output);
+-void wayland_output_remove(struct wayland_output **output);
++BOOL wayland_output_remove(uint32_t id);
+ void wayland_output_use_xdg_extension(struct wayland_output *output);
+ void wayland_output_use_image_description(struct wayland_output *output);
+ struct wayland_output *wayland_output_for_rect(const RECT *rect);
+-- 
+2.51.0
