@@ -1,0 +1,106 @@
+From 047a5d76aeccf4c5d976ec6daeac7f542ffd4a8a Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Thu, 30 Jul 2026 23:06:54 +0200
+Subject: [PATCH] winewayland: Use a single-pixel opaque carrier
+
+When an opaque client covers the presentation area from above the parent,
+the carrier is entirely hidden. Attach a 1x1 XRGB buffer and use the
+existing viewport destination to cover the parent.
+
+This avoids allocating and clearing a full-size SHM buffer. More
+importantly, it prevents a compositor from selecting the black parent
+carrier instead of the game client as a fullscreen scanout candidate. Such
+selection could turn the game black after it had already presented normally,
+until recording or a fullscreen transition forced composition again.
+
+This is a scoped backport for the carrier implementation introduced by the
+existing issue #725 fixes. The original change is from:
+https://github.com/nanomatters/wine-wineland/commit/047a5d76aeccf4c5d976ec6daeac7f542ffd4a8a
+
+Issue: https://github.com/GloriousEggroll/proton-ge-custom/issues/725
+---
+ dlls/winewayland.drv/wayland_surface.c | 18 +++++++++++++-----
+ dlls/winewayland.drv/waylanddrv.h      |  1 +
+ 2 files changed, 14 insertions(+), 5 deletions(-)
+
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -2011,6 +2011,7 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
+     wayland_surface_clear_child_surfaces(surface);
+     surface->carrier_attached = FALSE;
+     surface->carrier_opaque = FALSE;
++    surface->carrier_single_pixel = FALSE;
+     surface->carrier_width = surface->carrier_height = 0;
+ 
+     /* some objects are shared between several roles */
+@@ -3452,24 +3453,29 @@ static const struct wl_buffer_listener carrier_buffer_listener =
+     carrier_buffer_release
+ };
+ 
+-static BOOL wayland_surface_attach_carrier(struct wayland_surface *surface, BOOL opaque)
++static BOOL wayland_surface_attach_carrier(struct wayland_surface *surface, BOOL opaque,
++                                           BOOL single_pixel)
+ {
+     struct wayland_shm_buffer *shm_buffer;
+     struct wl_region *region = NULL;
+     enum wl_shm_format format;
+-    int width, height;
++    int width, height, buffer_width, buffer_height;
+ 
+     width = max(1, surface->window.rect.right - surface->window.rect.left);
+     height = max(1, surface->window.rect.bottom - surface->window.rect.top);
++    /* The viewport stretches a single black pixel over the parent. */
++    buffer_width = single_pixel ? 1 : width;
++    buffer_height = single_pixel ? 1 : height;
+ 
+     if (surface->carrier_attached && surface->carrier_opaque == opaque &&
++        surface->carrier_single_pixel == single_pixel &&
+         surface->carrier_width == width && surface->carrier_height == height)
+         return TRUE;
+ 
+     if (!wayland_surface_reconfigure(surface)) return FALSE;
+ 
+     format = opaque ? WL_SHM_FORMAT_XRGB8888 : WL_SHM_FORMAT_ARGB8888;
+-    if (!(shm_buffer = wayland_shm_buffer_create(width, height, format)))
++    if (!(shm_buffer = wayland_shm_buffer_create(buffer_width, buffer_height, format)))
+         return FALSE;
+ 
+     if (opaque && !(region = wl_compositor_create_region(process_wayland.wl_compositor)))
+@@ -3492,6 +3498,8 @@ static BOOL wayland_surface_attach_carrier(struct wayland_surface *surface, BOOL
+     wayland_shm_buffer_unref(shm_buffer);
+     surface->carrier_attached = TRUE;
+     surface->carrier_opaque = opaque;
++    surface->carrier_single_pixel = single_pixel;
++    /* Cache the viewport destination, not the backing buffer size. */
+     surface->carrier_width = width;
+     surface->carrier_height = height;
+     return TRUE;
+@@ -3499,12 +3507,12 @@ static BOOL wayland_surface_attach_carrier(struct wayland_surface *surface, BOOL
+ 
+ BOOL wayland_surface_attach_transparent_carrier(struct wayland_surface *surface)
+ {
+-    return wayland_surface_attach_carrier(surface, FALSE);
++    return wayland_surface_attach_carrier(surface, FALSE, FALSE);
+ }
+ 
+ static BOOL wayland_surface_attach_opaque_carrier(struct wayland_surface *surface)
+ {
+-    return wayland_surface_attach_carrier(surface, TRUE);
++    return wayland_surface_attach_carrier(surface, TRUE, TRUE);
+ }
+ 
+ static BOOL wayland_surface_replace_direct_dmabuf_with_transparent_shm(struct wayland_surface *surface)
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -532,6 +532,7 @@ struct wayland_surface
+     struct wl_surface *dmabuf_bottom;
+     BOOL carrier_attached;
+     BOOL carrier_opaque;
++    BOOL carrier_single_pixel;
+     int carrier_width, carrier_height;
+     HRGN child_region;
+     BOOL shaped;
+-- 
+2.51.0
