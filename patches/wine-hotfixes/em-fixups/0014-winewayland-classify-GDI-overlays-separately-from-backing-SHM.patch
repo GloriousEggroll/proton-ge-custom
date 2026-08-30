@@ -1,0 +1,164 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Sun, 30 Aug 2026 00:00:00 -0600
+Subject: [PATCH] winewayland: Classify GDI overlays separately from backing SHM
+
+Issue: https://github.com/GloriousEggroll/proton-ge-custom/issues/725
+
+The guarded opaque-client stacking path treated any parent window SHM buffer
+as content which had to remain above accelerated client content. Window
+surfaces normally retain a backing SHM buffer, however, so fullscreen Vulkan
+clients stayed below the parent. Compositors which optimize square fullscreen
+surfaces could then display that parent as black while the game continued to
+present underneath it.
+
+The child-rendering implementation already transports actual GDI-over-producer
+pixels through a dedicated overlay surface. Track whether that transport has
+active slots and use it for the stacking decision instead of the existence of
+an ordinary parent backing buffer. Reclassify the client whenever real GDI
+overlay content appears or disappears.
+
+This keeps full-size opaque clients above their parent while preserving the
+below-parent path for real GDI overlays, alpha/layered windows, shaped or
+clipped surfaces, and child content.
+---
+ dlls/winewayland.drv/wayland_surface.c |  6 +++---
+ dlls/winewayland.drv/waylanddrv.h      |  5 ++++-
+ dlls/winewayland.drv/window.c          | 10 ++++++++--
+ dlls/winewayland.drv/window_surface.c  |  8 ++++++--
+ 4 files changed, 21 insertions(+), 8 deletions(-)
+
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -2425,12 +2425,12 @@ static void wayland_surface_reconfigure_size(struct wayland_surface *surface,
+  */
+ static BOOL wayland_client_surface_should_stack_above_parent(
+         struct wayland_surface *surface, struct wayland_client_surface *client,
+-        HWND hwnd, HWND toplevel, BOOL has_window_contents)
++        HWND hwnd, HWND toplevel, BOOL content_over_producer)
+ {
+     /* A single opaque client surface covering the whole toplevel can sit above
+      * an opaque parent carrier without using transparent punch-through. */
+     if (hwnd != toplevel) return FALSE;
+-    if (has_window_contents || ReadAcquire(&client->has_alpha)) return FALSE;
++    if (content_over_producer || ReadAcquire(&client->has_alpha)) return FALSE;
+     if (surface->window.exstyle & WS_EX_LAYERED) return FALSE;
+     if (!wayland_surface_is_toplevel(surface) || surface->window.minimized) return FALSE;
+     if (!EqualRect(&surface->window.window_rect, &surface->window.client_rect)) return FALSE;
+@@ -3887,7 +3887,7 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
+     {
+         BOOL stack_above_parent = wayland_client_surface_should_stack_above_parent(
+                 surface, data->client_surface, data->client_surface->client.hwnd,
+-                surface->hwnd, data->window_contents != NULL);
++                surface->hwnd, data->content_over_producer);
+ 
+         wayland_client_surface_stack(surface, data->client_surface, stack_above_parent);
+         any_new = TRUE;
+@@ -4743,7 +4743,7 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
+     }
+ 
+     stack_above_parent = wayland_client_surface_should_stack_above_parent(
+-            surface, client, hwnd, toplevel, toplevel_data->window_contents != NULL);
++            surface, client, hwnd, toplevel, toplevel_data->content_over_producer);
+ 
+     if (client->toplevel != toplevel ||
+         client->toplevel_wl_surface != surface->wl_surface)
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -666,6 +666,8 @@ struct wayland_win_data
+     HWND hwnd;
+     /* last buffer that was set as window contents */
+     struct wayland_shm_buffer *window_contents;
++    /* whether GDI pixels need to be composited above accelerated content */
++    BOOL content_over_producer;
+     /* wayland surface (if any) for this window */
+     struct wayland_surface *wayland_surface;
+     /* wayland client surface (if any) for this window */
+@@ -695,7 +697,8 @@ struct wayland_win_data *wayland_win_data_get(HWND hwnd);
+ 
+ struct wayland_client_surface *get_client_surface(HWND hwnd);
+ void set_client_surface(HWND hwnd, struct wayland_client_surface *client);
+-BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region);
++BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer,
++                                 HRGN damage_region, BOOL content_over_producer);
+ struct wayland_shm_buffer *get_window_surface_contents(HWND hwnd);
+ void ensure_window_surface_contents(HWND hwnd);
+ void wayland_window_init(void);
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -1636,15 +1636,20 @@ static BOOL window_surface_has_hwnd_dmabuf_content(HWND hwnd)
+     return ret;
+ }
+ 
+-BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region)
++BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer,
++                                 HRGN damage_region, BOOL content_over_producer)
+ {
+     struct wayland_surface *wayland_surface;
+     struct wayland_win_data *data;
+     HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
+     BOOL committed = FALSE;
++    BOOL content_over_changed;
+ 
+     if (!(data = wayland_win_data_get(hwnd))) return FALSE;
+ 
++    content_over_changed = data->content_over_producer != content_over_producer;
++    data->content_over_producer = content_over_producer;
++
+     if ((wayland_surface = data->wayland_surface))
+     {
+         if (wayland_surface_reconfigure(wayland_surface))
+@@ -1699,7 +1704,8 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
+     {
+         if (window_client_surface_attached(data))
+         {
+-            if (data->client_surface->stack_above_parent || !shm_buffer)
++            if (!shm_buffer || content_over_changed ||
++                (content_over_producer && data->client_surface->stack_above_parent))
+                 wayland_client_surface_attach(data->client_surface, toplevel);
+         }
+         else if (shm_buffer)
+diff --git a/dlls/winewayland.drv/window_surface.c b/dlls/winewayland.drv/window_surface.c
+--- a/dlls/winewayland.drv/window_surface.c
++++ b/dlls/winewayland.drv/window_surface.c
+@@ -1173,6 +1173,7 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface,
+     struct wayland_shm_buffer *shm_buffer = NULL, *latest_buffer = NULL;
+     BOOL flushed = FALSE;
+     BOOL overlay_flushed;
++    BOOL content_over_producer;
+     HRGN surface_damage_region = NULL;
+     HRGN occluded_region = NULL;
+     HRGN merged_gdi_over_region = NULL;
+@@ -1183,7 +1184,7 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface,
+     if (!window_surface->app_painted_full && !window_surface->app_painted_region)
+     {
+         if (shape_changed) wayland_window_surface_sync_regions(window_surface);
+-        flushed = set_window_surface_contents(window_surface->hwnd, NULL, NULL);
++        flushed = set_window_surface_contents(window_surface->hwnd, NULL, NULL, FALSE);
+         wl_display_flush(process_wayland.wl_display);
+         goto done;
+     }
+@@ -1277,6 +1278,8 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface,
+ 
+     overlay_flushed = wayland_gdi_overlay_update(window_surface->hwnd, &wws->gdi_overlay, shm_buffer, dirty,
+                                                  gdi_over_region, gdi_over_paint_region);
++    /* Slots exist only while GDI pixels need their own above-producer surface. */
++    content_over_producer = wws->gdi_overlay.slots_created;
+     if (wws->occlusion_clipped)
+         wayland_shm_buffer_clear_outside_clip(shm_buffer, dirty, window_surface->clip_region);
+ 
+@@ -1288,7 +1291,8 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface,
+      * cannot publish yet, leave the surface dirty so the next idle flush
+      * retries both together. */
+     if (overlay_flushed)
+-        flushed = set_window_surface_contents(window_surface->hwnd, shm_buffer, surface_damage_region);
++        flushed = set_window_surface_contents(window_surface->hwnd, shm_buffer,
++                                              surface_damage_region, content_over_producer);
+     wl_display_flush(process_wayland.wl_display);
+ 
+ done:
+-- 
+2.51.0

@@ -1,0 +1,441 @@
+From deb19299cdd9fc3b5fe443c2cc147917bd8cfdd1 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Wed, 22 Jul 2026 08:50:14 +0200
+Subject: [PATCH] winewayland: Stack opaque toplevel clients above their carrier
+
+This is a scoped backport of the client stacking and carrier handling from:
+https://github.com/nanomatters/wine-wineland/commit/deb19299cdd9fc3b5fe443c2cc147917bd8cfdd1
+
+Punch-through composition normally keeps client surfaces below the parent so
+Wine can preserve GDI pixels above self-presenting child windows.  A full-size
+opaque client belonging to the toplevel itself does not need punch-through when
+there is no GDI content to preserve.  Keeping that client below a transparent
+carrier can produce a black window on compositors which optimize undecorated or
+unrounded toplevels.
+
+Place only eligible own-client surfaces above an opaque parent carrier.  Keep
+layered, alpha, shaped, clipped, partial, child, and mixed-GDI surfaces on the
+existing punch-through path.  Track stack state independently from geometry,
+restore a transparent carrier when the client detaches, and reclassify the
+surface when GDI content or cross-process child content changes.
+---
+ dlls/winewayland.drv/wayland_surface.c | 171 +++++++++++++++++++++------------
+ dlls/winewayland.drv/waylanddrv.h      |   7 +-
+ dlls/winewayland.drv/window.c          |  31 ++++--
+ 3 files changed, 156 insertions(+), 53 deletions(-)
+
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 47212f7de10..f1c2de4d67c 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -1977,8 +1977,9 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
+ 
+     /* Keep input state across role churn; it follows wl_surface enter/leave. */
+     wayland_surface_clear_child_surfaces(surface);
+-    surface->transparent_carrier_attached = FALSE;
+-    surface->transparent_carrier_width = surface->transparent_carrier_height = 0;
++    surface->carrier_attached = FALSE;
++    surface->carrier_opaque = FALSE;
++    surface->carrier_width = surface->carrier_height = 0;
+ 
+     /* some objects are shared between several roles */
+ 
+@@ -2422,11 +2423,43 @@ void wayland_surface_reconfigure_size(struct wayland_surface *surface,
+  *
+  * Reconfigures the subsurface covering the client area.
+  */
++static BOOL wayland_client_surface_should_stack_above_parent(
++        struct wayland_surface *surface, struct wayland_client_surface *client,
++        HWND hwnd, HWND toplevel, BOOL has_window_contents)
++{
++    /* A single opaque client surface covering the whole toplevel can sit above
++     * an opaque parent carrier without using transparent punch-through. */
++    if (hwnd != toplevel) return FALSE;
++    if (has_window_contents || ReadAcquire(&client->has_alpha)) return FALSE;
++    if (surface->window.exstyle & WS_EX_LAYERED) return FALSE;
++    if (!wayland_surface_is_toplevel(surface) || surface->window.minimized) return FALSE;
++    if (!EqualRect(&surface->window.window_rect, &surface->window.client_rect)) return FALSE;
++    if (surface->shaped || surface->occlusion_clipped) return FALSE;
++    if (wayland_surface_dmabuf_stack_bottom(surface)) return FALSE;
++    return TRUE;
++}
++
++static void wayland_client_surface_stack(struct wayland_surface *surface,
++                                         struct wayland_client_surface *client,
++                                         BOOL stack_above_parent)
++{
++    if (!client->wl_subsurface) return;
++
++    if (stack_above_parent)
++        wl_subsurface_place_above(client->wl_subsurface, surface->wl_surface);
++    else
++        wl_subsurface_place_below(client->wl_subsurface,
++                                  wayland_surface_client_stack_anchor(surface));
++    client->stack_above_parent = stack_above_parent;
++}
++
+ static void wayland_surface_reconfigure_client(struct wayland_surface *surface,
+                                                struct wayland_client_surface *client,
+-                                               const RECT *client_rect)
++                                               const RECT *client_rect,
++                                               BOOL stack_above_parent)
+ {
+     struct wayland_window_config *window = &surface->window;
++    BOOL rect_changed, stack_changed;
+     RECT rect = *client_rect;
+ 
+     /* The offset of the client area origin relatively to the window origin. */
+@@ -2436,22 +2469,27 @@ static void wayland_surface_reconfigure_client(struct wayland_surface *surface,
+ 
+     TRACE("hwnd=%p rect=%s\n", surface->hwnd, wine_dbgstr_rect(&rect));
+ 
+-    if (!EqualRect(&client->rect, &rect))
+-    {
+-        client->rect = rect;
++    rect_changed = !EqualRect(&client->rect, &rect);
++    stack_changed = client->stack_above_parent != stack_above_parent;
+ 
++    if (rect_changed || stack_changed)
++    {
+         if (client->wl_subsurface)
+         {
+-            wl_subsurface_set_position(client->wl_subsurface, rect.left, rect.top);
+-            wl_subsurface_place_below(client->wl_subsurface,
+-                                      wayland_surface_client_stack_anchor(surface));
++            if (rect_changed)
++                wl_subsurface_set_position(client->wl_subsurface, rect.left, rect.top);
++            wayland_client_surface_stack(surface, client, stack_above_parent);
+         }
+ 
+-        if (rect.left != rect.right && rect.top != rect.bottom)
+-            wp_viewport_set_destination(client->wp_viewport,
+-                                        rect.right - rect.left, rect.bottom - rect.top);
+-        else /* We can't have a 0x0 destination, use 1x1 instead. */
+-            wp_viewport_set_destination(client->wp_viewport, 1, 1);
++        if (rect_changed)
++        {
++            client->rect = rect;
++            if (rect.left != rect.right && rect.top != rect.bottom)
++                wp_viewport_set_destination(client->wp_viewport,
++                                            rect.right - rect.left, rect.bottom - rect.top);
++            else /* We can't have a 0x0 destination, use 1x1 instead. */
++                wp_viewport_set_destination(client->wp_viewport, 1, 1);
++        }
+     }
+ }
+ 
+@@ -3358,13 +3396,13 @@ static BOOL wayland_surface_replace_direct_dmabuf_with_shm(struct wayland_surfac
+     wl_surface_set_opaque_region(surface->wl_surface, NULL);
+     wayland_surface_attach_shm(surface, data->window_contents,
+                                data->window_contents->damage_region);
+-    surface->transparent_carrier_attached = FALSE;
++    surface->carrier_attached = FALSE;
+     wl_surface_commit(surface->wl_surface);
+     wayland_hwnd_dmabuf_surface_destroy(direct);
+     return TRUE;
+ }
+ 
+-static void transparent_carrier_buffer_release(void *data, struct wl_buffer *buffer)
++static void carrier_buffer_release(void *data, struct wl_buffer *buffer)
+ {
+     struct wayland_shm_buffer *shm_buffer = data;
+ 
+@@ -3373,41 +3411,66 @@ static void transparent_carrier_buffer_release(void *data, struct wl_buffer *buf
+     wayland_shm_buffer_unref(shm_buffer);
+ }
+ 
+-static const struct wl_buffer_listener transparent_carrier_buffer_listener =
++static const struct wl_buffer_listener carrier_buffer_listener =
+ {
+-    transparent_carrier_buffer_release
++    carrier_buffer_release
+ };
+ 
+-BOOL wayland_surface_attach_transparent_carrier(struct wayland_surface *surface)
++static BOOL wayland_surface_attach_carrier(struct wayland_surface *surface, BOOL opaque)
+ {
+     struct wayland_shm_buffer *shm_buffer;
++    struct wl_region *region = NULL;
++    enum wl_shm_format format;
+     int width, height;
+ 
+     width = max(1, surface->window.rect.right - surface->window.rect.left);
+     height = max(1, surface->window.rect.bottom - surface->window.rect.top);
+ 
+-    if (surface->transparent_carrier_attached &&
+-        surface->transparent_carrier_width == width &&
+-        surface->transparent_carrier_height == height)
++    if (surface->carrier_attached && surface->carrier_opaque == opaque &&
++        surface->carrier_width == width && surface->carrier_height == height)
+         return TRUE;
+ 
+     if (!wayland_surface_reconfigure(surface)) return FALSE;
+ 
+-    if (!(shm_buffer = wayland_shm_buffer_create(width, height, WL_SHM_FORMAT_ARGB8888)))
++    format = opaque ? WL_SHM_FORMAT_XRGB8888 : WL_SHM_FORMAT_ARGB8888;
++    if (!(shm_buffer = wayland_shm_buffer_create(width, height, format)))
+         return FALSE;
+ 
++    if (opaque && !(region = wl_compositor_create_region(process_wayland.wl_compositor)))
++    {
++        wayland_shm_buffer_unref(shm_buffer);
++        return FALSE;
++    }
++
+     memset(shm_buffer->map_data, 0, shm_buffer->map_size);
+-    wl_buffer_add_listener(shm_buffer->wl_buffer, &transparent_carrier_buffer_listener, shm_buffer);
+-    wl_surface_set_opaque_region(surface->wl_surface, NULL);
++    wl_buffer_add_listener(shm_buffer->wl_buffer, &carrier_buffer_listener, shm_buffer);
++    if (region)
++    {
++        wl_region_add(region, 0, 0, width, height);
++        wl_surface_set_opaque_region(surface->wl_surface, region);
++        wl_region_destroy(region);
++    }
++    else wl_surface_set_opaque_region(surface->wl_surface, NULL);
+     wayland_surface_attach_shm(surface, shm_buffer, shm_buffer->damage_region);
+     wl_surface_commit(surface->wl_surface);
+     wayland_shm_buffer_unref(shm_buffer);
+-    surface->transparent_carrier_attached = TRUE;
+-    surface->transparent_carrier_width = width;
+-    surface->transparent_carrier_height = height;
++    surface->carrier_attached = TRUE;
++    surface->carrier_opaque = opaque;
++    surface->carrier_width = width;
++    surface->carrier_height = height;
+     return TRUE;
+ }
+ 
++BOOL wayland_surface_attach_transparent_carrier(struct wayland_surface *surface)
++{
++    return wayland_surface_attach_carrier(surface, FALSE);
++}
++
++static BOOL wayland_surface_attach_opaque_carrier(struct wayland_surface *surface)
++{
++    return wayland_surface_attach_carrier(surface, TRUE);
++}
++
+ static BOOL wayland_surface_replace_direct_dmabuf_with_transparent_shm(struct wayland_surface *surface)
+ {
+     struct wayland_hwnd_dmabuf_surface *direct = surface->direct_dmabuf_surface;
+@@ -3819,17 +3882,25 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
+         }
+     }
+ 
+-    if (data && !data->window_contents && wayland_surface_has_hwnd_dmabuf_content(surface))
+-        wayland_surface_attach_transparent_carrier(surface);
+-
+     if (any_new && data && data->client_surface && data->client_surface->wl_subsurface &&
+         data->client_surface->toplevel == surface->hwnd)
+     {
+-        wl_subsurface_place_below(data->client_surface->wl_subsurface,
+-                                  wayland_surface_client_stack_anchor(surface));
++        BOOL stack_above_parent = wayland_client_surface_should_stack_above_parent(
++                surface, data->client_surface, data->client_surface->client.hwnd,
++                surface->hwnd, data->window_contents != NULL);
++
++        wayland_client_surface_stack(surface, data->client_surface, stack_above_parent);
+         any_new = TRUE;
+     }
+ 
++    if (data && !data->window_contents)
++    {
++        if (data->client_surface && data->client_surface->stack_above_parent)
++            wayland_surface_attach_opaque_carrier(surface);
++        else if (wayland_surface_has_hwnd_dmabuf_content(surface))
++            wayland_surface_attach_transparent_carrier(surface);
++    }
++
+     /* Commit and arm the next vsync only when something changed. An idle window costs nothing. */
+     /* Commit the parent to apply subsurface stacking. No frame callback: import is
+      * paced by the producer, not by our toplevel being presented. */
+@@ -4587,9 +4658,12 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
+     HWND hwnd = client->client.hwnd;
+     RECT client_rect, dst;
+     struct wayland_child_visibility_info visibility;
++    BOOL stack_above_parent;
+ 
+     if (!toplevel)
+     {
++        HWND previous_toplevel = client->toplevel;
++
+         wayland_client_surface_cancel_frame_callback(client);
+ 
+         if (client->wl_subsurface)
+@@ -4602,6 +4676,16 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
+ 
+         SetRect(&client->viewport_rect, -INT32_MAX, 0, -INT32_MAX, 0);
+         client->toplevel = 0;
++        client->stack_above_parent = FALSE;
++
++        /* An opaque carrier is only valid while its full-size client covers it. */
++        if (previous_toplevel && (toplevel_data = wayland_win_data_get(previous_toplevel)))
++        {
++            surface = toplevel_data->wayland_surface;
++            if (surface && surface->carrier_attached && surface->carrier_opaque)
++                wayland_surface_attach_transparent_carrier(surface);
++            wayland_win_data_release(toplevel_data);
++        }
+         return;
+     }
+ 
+@@ -4619,6 +4703,9 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
+         return wayland_client_surface_attach(client, NULL);
+     }
+ 
++    stack_above_parent = wayland_client_surface_should_stack_above_parent(
++            surface, client, hwnd, toplevel, toplevel_data->window_contents != NULL);
++
+     if (client->toplevel != toplevel ||
+         client->toplevel_wl_surface != surface->wl_surface)
+     {
+@@ -4632,16 +4719,9 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
+ 
+         InterlockedIncrement(&client->attachment_generation);
+ 
+-        /* If the parent wl_surface changes, then the subsurface will be reattached.
+-         * So this place_above only need to be done once on attach. If two child windows
+-         * are on top of each other then the composition behavior depends on the clip rect
+-         * of each window rather than the Z-ordering of the child and parent. */
+-        wl_subsurface_place_above(client->wl_subsurface, surface->wl_surface);
+-
+         /* Present contents independently of the parent surface. */
+         wl_subsurface_set_desync(client->wl_subsurface);
+-        wl_subsurface_place_below(client->wl_subsurface,
+-                                  wayland_surface_client_stack_anchor(surface));
++        wayland_client_surface_stack(surface, client, stack_above_parent);
+ 
+         client->toplevel = toplevel;
+         client->toplevel_wl_surface = surface->wl_surface;
+@@ -4670,12 +4750,17 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
+     wayland_surface_classify_child_visibility(surface, &dst, &visibility);
+     wayland_surface_update_child_visibility(&dst, &visibility, &client->visual_constraint);
+ 
+-    wayland_surface_reconfigure_client(surface, client, &client_rect);
++    wayland_surface_reconfigure_client(surface, client, &client_rect, stack_above_parent);
+     /* Commit to apply subsurface positioning. */
+     wl_surface_commit(surface->wl_surface);
+ 
+     if (!toplevel_data->window_contents)
+-        wayland_surface_attach_transparent_carrier(surface);
++    {
++        if (stack_above_parent)
++            wayland_surface_attach_opaque_carrier(surface);
++        else
++            wayland_surface_attach_transparent_carrier(surface);
++    }
+ 
+ done:
+     wayland_win_data_release(toplevel_data);
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index ece1d41eb3f..9173c4941d8 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -423,6 +423,7 @@ struct wayland_window_config
+     RECT rect;
+     RECT window_rect;
+     RECT client_rect;
++    DWORD exstyle;
+     enum wayland_surface_config_state state;
+     /* The scale (i.e., normalized dpi) the window is rendering at. */
+     double scale;
+@@ -445,6 +446,7 @@ struct wayland_client_surface
+     struct wl_surface *wl_surface;
+     const struct wl_surface *toplevel_wl_surface;
+     struct wl_subsurface *wl_subsurface;
++    BOOL stack_above_parent;
+     struct wp_color_management_surface_v1 *wp_color_management_surface_v1;
+     struct wp_viewport *wp_viewport;
+     struct wp_content_type_v1 *wp_content_type_v1;
+@@ -526,8 +528,9 @@ struct wayland_surface
+     /* Bottom of the below-main dmabuf subsurface chain. Client subsurfaces
+      * anchor below this so children stay above their parent's client content. */
+     struct wl_surface *dmabuf_bottom;
+-    BOOL transparent_carrier_attached;
+-    int transparent_carrier_width, transparent_carrier_height;
++    BOOL carrier_attached;
++    BOOL carrier_opaque;
++    int carrier_width, carrier_height;
+     HRGN child_region;
+     BOOL shaped;
+     BOOL occlusion_clipped;
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index f3c8911eab2..44c67cdba77 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -205,6 +205,7 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
+     conf->client_rect = data->rects.client;
+     style = NtUserGetWindowLongW(data->hwnd, GWL_STYLE);
+     exstyle = NtUserGetWindowLongW(data->hwnd, GWL_EXSTYLE);
++    conf->exstyle = exstyle;
+ 
+     TRACE("window=%s style=%#x exstyle=%#x\n", wine_dbgstr_rect(&conf->rect), style, exstyle);
+ 
+@@ -1640,6 +1641,7 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer
+ {
+     struct wayland_surface *wayland_surface;
+     struct wayland_win_data *data;
++    HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
+     BOOL committed = FALSE;
+ 
+     if (!(data = wayland_win_data_get(hwnd))) return FALSE;
+@@ -1659,15 +1661,20 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer
+             if (shm_buffer)
+             {
+                 wayland_surface_prepare_direct_dmabuf_shm_commit(wayland_surface);
++                wl_surface_set_opaque_region(wayland_surface->wl_surface, NULL);
+                 wayland_surface_attach_shm(wayland_surface, shm_buffer, damage_region);
+-                wayland_surface->transparent_carrier_attached = FALSE;
++                wayland_surface->carrier_attached = FALSE;
+                 wl_surface_commit(wayland_surface->wl_surface);
+                 wayland_surface_finish_direct_dmabuf_shm_commit(wayland_surface);
+                 wayland_surface->ensured_contents = WAYLAND_SURFACE_ENSURED_FLUSH;
+                 wayland_surface_update_hwnd_dmabufs(wayland_surface);
+                 committed = TRUE;
+             }
+-            else committed = wayland_surface_attach_transparent_carrier(wayland_surface);
++            else if (data->client_surface && window_client_surface_attached(data) &&
++                     !window_client_surface_pending_first_frame(data))
++                committed = TRUE;
++            else
++                committed = wayland_surface_attach_transparent_carrier(wayland_surface);
+         }
+         else
+         {
+@@ -1675,12 +1682,6 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer
+         }
+     }
+ 
+-    /* An attached client stays attached on GDI commits. Detaching would flash
+-     * the empty GDI buffer. Lifecycle callbacks clear dead client surfaces. */
+-    if (committed && shm_buffer && data->client_surface && !window_client_surface_attached(data) &&
+-        !window_client_surface_pending_first_frame(data))
+-        wayland_client_surface_attach(data->client_surface, NULL);
+-
+     /* Update the latest window buffer for the wayland surface. Note that we
+      * only care whether the buffer contains the latest window contents,
+      * it's irrelevant if it was actually committed or not. */
+@@ -1693,6 +1694,20 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer
+         data->window_contents = shm_buffer;
+     }
+ 
++    /* Reclassify the client whenever GDI contents appear or disappear. The
++     * client attachment selects the matching opaque or transparent carrier. */
++    if (committed && data->client_surface &&
++        !window_client_surface_pending_first_frame(data))
++    {
++        if (window_client_surface_attached(data))
++        {
++            if (data->client_surface->stack_above_parent || !shm_buffer)
++                wayland_client_surface_attach(data->client_surface, toplevel);
++        }
++        else if (shm_buffer)
++            wayland_client_surface_attach(data->client_surface, NULL);
++    }
++
+     wayland_win_data_release(data);
+ 
+     return committed;
+-- 
+2.55.0
