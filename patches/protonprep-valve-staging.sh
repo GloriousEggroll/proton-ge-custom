@@ -47,6 +47,13 @@ apply_all_in_dir() {
     apply_all_in_dir "../patches/wineopenxr/"
     popd
 
+    pushd vklayers/low_latency_layer
+    git reset --hard HEAD
+    git clean -xdf
+    echo "LOW_LATENCY_LAYER: use relative library path"
+    apply_all_in_dir "../../patches/low_latency_layer"
+    popd
+
 ### END PREP SECTION ###
 
     git checkout steam_helper
