@@ -138,6 +138,9 @@ Adaptations made while importing:
   `vk_select_managed_modifiers()` and has no managed-swapchain color space or
   consumer wake eventfd, so the layout plumbing was inserted around those
   differences. `managed_create_image()` is otherwise identical to upstream.
+  It also adds `#include <limits.h>`, which upstream has in this file but this
+  base does not: the new `UINT_MAX` stride guard does not compile without it
+  under `-Werror`.
 - Patch 0083 (`19d4bf0c51eb`) adds only the image-count adjustment; the insertion
   point here has no `compositor_scaling` lookup.
 - `b9638444e73d` became `../em-fixups/0023-winewaylanddrv-Clear-carrier-state-when-replacing-conte.patch`
