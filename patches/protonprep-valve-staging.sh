@@ -258,6 +258,9 @@ apply_all_in_dir() {
     echo "WINE: -GAME FIXES- make MapleStory launch: accept SPI_SETSTICKYKEYS/SPI_SETFILTERKEYS"
     apply_patch "../patches/game-patches/maplestory-spi-stickykeys-filterkeys.patch"
 
+    echo "WINE: -GAME FIXES- repair NASCAR 25 protected loader state"
+    apply_patch "../patches/game-patches/nascar25-protector.patch"
+
 ### END GAME PATCH SECTION ###
 
 ### (2-5) WINE HOTFIX/BACKPORT SECTION ###
