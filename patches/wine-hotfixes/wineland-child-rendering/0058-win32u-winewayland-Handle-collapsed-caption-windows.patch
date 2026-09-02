@@ -1,0 +1,115 @@
+From f84f09ec1ae13e1008df719924f611dd65d8e708 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Tue, 28 Jul 2026 09:02:18 +0200
+Subject: [PATCH] win32u, winewayland: Handle collapsed-caption windows.
+
+Treat windows that collapse the caption while keeping resize borders as
+frameless for visible rect and decoration decisions.
+
+(cherry picked from commit f84f09ec1ae13e1008df719924f611dd65d8e708)
+[ GE-Proton adaptation: this base does not cache window style/frameless state in
+  struct wayland_win_data, so the server-decoration check queries the win32u
+  "__wine_win32u_frameless" window property directly instead. ]
+
+Source: https://github.com/nanomatters/wine-salkim/commit/f84f09ec1ae13e1008df719924f611dd65d8e708
+---
+ dlls/win32u/window.c          | 20 ++++++++++++++++++--
+ dlls/winewayland.drv/window.c |  3 ++-
+ dlls/winex11.drv/window.c     |  4 ++++
+ 3 files changed, 24 insertions(+), 3 deletions(-)
+
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index cf346dc9020..c3bf27004c0 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -2090,10 +2090,24 @@ static BOOL has_collapsed_frame( const RECT *window, const RECT *client, BOOL al
+            left <= 1 && top <= 1 && right <= 1 && bottom <= 1;
+ }
+ 
++/* Custom title bars can collapse the caption while keeping resize borders. */
++static BOOL has_collapsed_caption( UINT style, const RECT *window, const RECT *client )
++{
++    int top = client->top - window->top;
++
++    if ((style & WS_CAPTION) != WS_CAPTION) return FALSE;
++    if (style & WS_MAXIMIZE) return FALSE;
++    if (top < 0 || client->left < window->left ||
++        client->right > window->right || client->bottom > window->bottom)
++        return FALSE;
++    return top <= 1;
++}
++
+ static BOOL is_frameless_window( HWND hwnd, UINT style, const struct window_rects *rects )
+ {
+     if (!window_has_frame_style( style )) return FALSE;
+     if (NtUserGetProp( hwnd, frameless_window_prop )) return TRUE;
++    if (has_collapsed_caption( style, &rects->window, &rects->client )) return TRUE;
+     return get_custom_frame( hwnd ) && has_collapsed_frame( &rects->window, &rects->client, TRUE );
+ }
+ 
+@@ -2103,7 +2117,8 @@ static void update_frameless_window( HWND hwnd, WND *win )
+ 
+     if (win->dwStyle & WS_MAXIMIZE) return;
+     if (window_has_frame_style( win->dwStyle ))
+-        frameless = has_collapsed_frame( &win->rects.window, &win->rects.client, get_custom_frame( hwnd ) );
++        frameless = has_collapsed_frame( &win->rects.window, &win->rects.client, get_custom_frame( hwnd ) ) ||
++                    has_collapsed_caption( win->dwStyle, &win->rects.window, &win->rects.client );
+ 
+     if (frameless) NtUserSetProp( hwnd, frameless_window_prop, (HANDLE)1 );
+     else NtUserRemoveProp( hwnd, frameless_window_prop );
+@@ -2116,7 +2131,8 @@ static RECT get_visible_rect( HWND hwnd, BOOL shaped, UINT style, UINT ex_style,
+ 
+     if (get_present_rect( hwnd, &rect, get_thread_dpi() )) return rect;
+     if (IsRectEmpty( &rects->window ) || EqualRect( &rects->window, &rects->client ) || shaped || !decorated_mode) return rects->window;
+-    if (is_frameless_window( hwnd, style, rects )) return rects->window;
++    /* Kept borders are non-client space; present only the client area. */
++    if (is_frameless_window( hwnd, style, rects )) return rects->client;
+     if (!user_driver->pGetWindowStyleMasks( hwnd, style, ex_style, &style_mask, &ex_style_mask )) return rects->window;
+     if (!NtUserAdjustWindowRect( &rect, style & style_mask, FALSE, ex_style & ex_style_mask, dpi )) return rects->window;
+ 
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index 9e8a1e85595..45c3b683b65 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -380,6 +380,7 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
+     surface->ensured_contents = WAYLAND_SURFACE_NOT_ENSURED;
+ 
+     if (!EqualRect(&data->rects.visible, &data->rects.window)
++        && !NtUserGetProp(data->hwnd, frameless_window_prop)
+         && is_decoration_enabled(style, exstyle))
+     {
+         server_decor = TRUE;
+@@ -1025,7 +1026,7 @@ static void wayland_configure_window(HWND hwnd)
+         window_height += offset_y;
+         window_width += offset_x;
+     }
+-    else if (NtUserGetProp(hwnd, frameless_window_prop))
++    else if (data->frameless)
+     {
+         window_width += (data->rects.client.left - data->rects.window.left) +
+                         (data->rects.window.right - data->rects.client.right);
+diff --git a/dlls/winex11.drv/window.c b/dlls/winex11.drv/window.c
+index eb75e5377cd..f89ba9641ce 100644
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -115,6 +115,8 @@ static const WCHAR clip_window_prop[] =
+     {'_','_','w','i','n','e','_','x','1','1','_','c','l','i','p','_','w','i','n','d','o','w',0};
+ static const WCHAR focus_time_prop[] =
+     {'_','_','w','i','n','e','_','x','1','1','_','f','o','c','u','s','_','t','i','m','e',0};
++static const WCHAR frameless_window_prop[] =
++    {'_','_','w','i','n','e','_','w','i','n','3','2','u','_','f','r','a','m','e','l','e','s','s',0};
+ 
+ static const char *debugstr_mwm_hints( const MwmHints *hints )
+ {
+@@ -565,6 +567,8 @@ static unsigned long get_mwm_decorations_for_style( DWORD style, DWORD ex_style
+ static unsigned long get_mwm_decorations( struct x11drv_win_data *data, DWORD style, DWORD ex_style )
+ {
+     if (EqualRect( &data->rects.window, &data->rects.visible )) return 0;
++    /* Frameless windows may still keep non-client borders. */
++    if (NtUserGetProp( data->hwnd, frameless_window_prop )) return 0;
+     return get_mwm_decorations_for_style( style, ex_style );
+ }
+ 
+-- 
+2.55.0
+

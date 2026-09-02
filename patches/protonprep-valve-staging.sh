@@ -93,7 +93,7 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/em-fixups/0001-winewayland-add-SNI-tray-icons-and-native-context-me.patch"
 
     # Original work by Erhan Bilgili:
-    # https://github.com/nanomatters/wine-wineland/commits/wineland_20260713-reorg/
+    # https://github.com/nanomatters/wine-salkim/tree/wineland_20260713-reorg
     echo "WINE: -CUSTOM- WINELAND CROSS-PROCESS CHILD RENDERING"
     apply_all_in_dir "../patches/wine-hotfixes/wineland-child-rendering/"
 
