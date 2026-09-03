@@ -1,0 +1,1460 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gustavo Belo <gustavobelo28@gmail.com>
+Date: Tue, 1 Sep 2026 16:03:01 -0300
+Subject: [PATCH] ffx_fsr2_api_x64: Implement FSR2-to-FSR4 upscale translation.
+
+Adds a new builtin dll, ffx_fsr2_api_x64.dll, that implements the AMD
+FidelityFX Super Resolution 2 "context" convenience API
+(ffxFsr2ContextCreate/Dispatch/Destroy and friends) and drives FSR4
+upscaling under the hood, using the same "external provider" mechanism
+that dlls/amdxc64 already uses to upgrade FSR 3.1 games to FSR4.
+
+Games that dynamically load ffx_fsr2_api_x64.dll from their own install
+directory (confirmed via reverse engineering the frontend/backend split
+of Red Dead Redemption 2's FSR2 integration: the frontend only exports
+the context API and internally loads a DX12/VK backend dll to do so)
+can be redirected to this builtin with
+WINEDLLOVERRIDES=ffx_fsr2_api_x64=b, without needing any game-side
+binary patching. The game's own ffx_fsr2_api_dx12_x64.dll /
+ffx_fsr2_api_vk_x64.dll backends are left on disk but unused in this
+configuration; only the DX12 path is translated, because FSR4 ships as
+a DX12 provider only.
+
+Because the override replaces the frontend for every backend the game
+can pick, a context the shim cannot translate -- Vulkan, hardware
+without FP8/WMMA, a provider that fails to come up -- must not simply
+be refused: the game no longer has a frontend to fall back to, and
+carries on drawing through a context that was never initialised
+(observed in Red Dead Redemption 2's Vulkan renderer as heavily
+discoloured output). Those contexts are forwarded to the frontend the
+game shipped instead, which is copied to the prefix's temporary
+directory under a private name first -- loading it from its own path
+would hit the same module name and the same dll override, and hand the
+builtin straight back. Contexts are tagged so that dispatch and destroy
+can tell the two owners apart.
+
+The context/dispatch descriptor translation (FfxFsr2ContextDescription
+-> ffxCreateContextDescUpscale, FfxFsr2DispatchDescription ->
+ffxDispatchDescUpscale) follows the public FidelityFX SDK "upscale"
+effect ABI (Kits/FidelityFX/upscalers/include/ffx_upscale.h) and the
+FSR2 SDK's own public structures (ffx_fsr2.h / ffx_types.h), both MIT
+licensed. FfxResource -> FfxApiResource field/enum translation accounts
+for the differing resource type/state enumerations between the two
+SDKs (confirmed by reading both headers side by side). The
+ffxExternalProvider contract (structVersion, descType effect mask,
+unk_data chain) was confirmed by disassembling amdxcffx64.dll's
+UpdateFfxApiProviderEx export.
+
+Gated behind PROTON_FSR2_UPGRADE=1 (see accompanying protonfixes and
+proton script changes), and behind an in-dll FP8/WMMA hardware check
+via wine's own amdxc64.dll (reused rather than duplicated) so it is a
+no-op on unsupported hardware.
+
+The gate is what --prefer-native buys: without it wine's default load
+order puts this builtin ahead of the frontend the game ships, so every
+FSR2 game would get the translation whether or not it was asked for, and
+the dll override would be decoration. With the flag the builtin loads
+only when something asks for it by name, which is exactly what the
+option does.
+
+Known limitations / follow-ups for review:
+ - Only tested against Red Dead Redemption 2 on RDNA4 so far: FSR4 on
+   the DX12 renderer, and the passthrough to the game's own FSR2 on the
+   Vulkan renderer.
+ - viewSpaceToMetersFactor is defensively range-clamped since its
+   presence/offset in FfxFsr2DispatchDescription varies across FSR2
+   2.x point releases; older games may need this revisited.
+ - Motion vector scale/jitter conventions are passed through unchanged;
+   FSR2 and FSR3.1/4 are believed compatible here but this is the area
+   most likely to need tuning if ghosting/artifacts are observed.
+---
+ configure.ac                                |   1 +
+ dlls/ffx_fsr2_api_x64/Makefile.in           |   7 +
+ dlls/ffx_fsr2_api_x64/ffx_fsr2_api.h        | 491 +++++++++++++++++++++++++++++++++++
+ dlls/ffx_fsr2_api_x64/ffx_fsr2_api_x64.spec |  11 +
+ dlls/ffx_fsr2_api_x64/fsr2_to_fsr4.c        | 834 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 1344 insertions(+)
+ create mode 100644 dlls/ffx_fsr2_api_x64/Makefile.in
+ create mode 100644 dlls/ffx_fsr2_api_x64/ffx_fsr2_api.h
+ create mode 100644 dlls/ffx_fsr2_api_x64/ffx_fsr2_api_x64.spec
+ create mode 100644 dlls/ffx_fsr2_api_x64/fsr2_to_fsr4.c
+
+diff --git a/configure.ac b/configure.ac
+index 76657b72087..1da63b121a2 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -2793,6 +2793,7 @@ WINE_CONFIG_MAKEFILE(dlls/explorerframe/tests)
+ WINE_CONFIG_MAKEFILE(dlls/faultrep)
+ WINE_CONFIG_MAKEFILE(dlls/faultrep/tests)
+ WINE_CONFIG_MAKEFILE(dlls/feclient)
++WINE_CONFIG_MAKEFILE(dlls/ffx_fsr2_api_x64)
+ WINE_CONFIG_MAKEFILE(dlls/fltlib)
+ WINE_CONFIG_MAKEFILE(dlls/fltmgr.sys)
+ WINE_CONFIG_MAKEFILE(dlls/fntcache)
+diff --git a/dlls/ffx_fsr2_api_x64/Makefile.in b/dlls/ffx_fsr2_api_x64/Makefile.in
+new file mode 100644
+index 00000000000..07c5a74ae4d
+--- /dev/null
++++ b/dlls/ffx_fsr2_api_x64/Makefile.in
+@@ -0,0 +1,7 @@
++MODULE    = ffx_fsr2_api_x64.dll
++IMPORTS   = kernel32
++
++EXTRADLLFLAGS = -mno-cygwin -Wb,--prefer-native
++
++SOURCES = \
++	fsr2_to_fsr4.c
+diff --git a/dlls/ffx_fsr2_api_x64/ffx_fsr2_api.h b/dlls/ffx_fsr2_api_x64/ffx_fsr2_api.h
+new file mode 100644
+index 00000000000..293219a6e85
+--- /dev/null
++++ b/dlls/ffx_fsr2_api_x64/ffx_fsr2_api.h
+@@ -0,0 +1,491 @@
++/*
++ * ffx_fsr2_api_x64 ABI definitions
++ *
++ * These structures mirror the public FidelityFX SDK ABI:
++ *  - FSR2 "context" convenience API: AMD FidelityFX-FSR2 SDK
++ *    (https://github.com/GPUOpen-Effects/FidelityFX-FSR2),
++ *    src/ffx-fsr2-api/ffx_fsr2.h and ffx_types.h (MIT licensed).
++ *  - ffx_api generic context API and FSR "upscale" effect descriptors:
++ *    AMD FidelityFX SDK (https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK),
++ *    Kits/FidelityFX/api/include/ffx_api*.h and
++ *    Kits/FidelityFX/upscalers/include/ffx_upscale.h (MIT licensed).
++ *
++ * The "external provider" struct (struct ffxExternalProvider) is not public;
++ * its layout was reverse engineered from wine's own dlls/amdxc64
++ * (Copyright 2023 Etaash Mathamsetty, LGPL 2.1+) and cross-checked against a
++ * disassembly of amdxcffx64.dll's UpdateFfxApiProviderEx export.
++ *
++ * Copyright 2026 Gustavo Belo
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifndef __FFX_FSR2_API_H
++#define __FFX_FSR2_API_H
++
++#include <stdint.h>
++
++/* ---- FSR2 SDK types (ffx_types.h / ffx_fsr2.h) ---- */
++
++typedef int32_t FfxErrorCode;
++
++#define FFX_OK                          0
++#define FFX_ERROR_INVALID_POINTER       0x80000000u
++#define FFX_ERROR_INVALID_SIZE          0x80000002u
++#define FFX_ERROR_INCOMPLETE_INTERFACE  0x80000008u
++#define FFX_ERROR_INVALID_ENUM         0x80000009u
++#define FFX_ERROR_INVALID_ARGUMENT      0x8000000au
++#define FFX_ERROR_OUT_OF_RANGE          0x8000000bu
++#define FFX_ERROR_NULL_DEVICE           0x8000000cu
++#define FFX_ERROR_BACKEND_API_ERROR     0x8000000du
++
++typedef void *FfxDevice;
++typedef void *FfxCommandList;
++
++typedef struct FfxDimensions2D
++{
++    uint32_t width;
++    uint32_t height;
++} FfxDimensions2D;
++
++typedef struct FfxFloatCoords2D
++{
++    float x;
++    float y;
++} FfxFloatCoords2D;
++
++/* FfxResourceType: BUFFER=0, TEXTURE1D=1, TEXTURE2D=2, TEXTURE3D=3.
++ * Note: unlike the ffx_api version there is no TEXTURE_CUBE entry. */
++enum FfxResourceType
++{
++    FFX_RESOURCE_TYPE_BUFFER = 0,
++    FFX_RESOURCE_TYPE_TEXTURE1D = 1,
++    FFX_RESOURCE_TYPE_TEXTURE2D = 2,
++    FFX_RESOURCE_TYPE_TEXTURE3D = 3,
++};
++
++/* FfxResourceStates: bit flags, distinct numbering from FfxApiResourceState. */
++enum FfxResourceStates
++{
++    FFX_RESOURCE_STATE_UNORDERED_ACCESS = (1 << 0),
++    FFX_RESOURCE_STATE_COMPUTE_READ = (1 << 1),
++    FFX_RESOURCE_STATE_COPY_SRC = (1 << 2),
++    FFX_RESOURCE_STATE_COPY_DEST = (1 << 3),
++    FFX_RESOURCE_STATE_GENERIC_READ = (FFX_RESOURCE_STATE_COPY_SRC | FFX_RESOURCE_STATE_COMPUTE_READ),
++};
++
++/* FSR2 SDK ffx_types.h. Deliberately spelled out with explicit values: the
++ * ordering is load-bearing, since these arrive as raw integers from the game. */
++enum FfxSurfaceFormat
++{
++    FFX_SURFACE_FORMAT_UNKNOWN = 0,
++    FFX_SURFACE_FORMAT_R32G32B32A32_TYPELESS = 1,
++    FFX_SURFACE_FORMAT_R32G32B32A32_FLOAT = 2,
++    FFX_SURFACE_FORMAT_R16G16B16A16_FLOAT = 3,
++    FFX_SURFACE_FORMAT_R16G16B16A16_UNORM = 4,
++    FFX_SURFACE_FORMAT_R32G32_FLOAT = 5,
++    FFX_SURFACE_FORMAT_R32_UINT = 6,
++    FFX_SURFACE_FORMAT_R8G8B8A8_TYPELESS = 7,
++    FFX_SURFACE_FORMAT_R8G8B8A8_UNORM = 8,
++    FFX_SURFACE_FORMAT_R11G11B10_FLOAT = 9,
++    FFX_SURFACE_FORMAT_R16G16_FLOAT = 10,
++    FFX_SURFACE_FORMAT_R16G16_UINT = 11,
++    FFX_SURFACE_FORMAT_R16_FLOAT = 12,
++    FFX_SURFACE_FORMAT_R16_UINT = 13,
++    FFX_SURFACE_FORMAT_R16_UNORM = 14,
++    FFX_SURFACE_FORMAT_R16_SNORM = 15,
++    FFX_SURFACE_FORMAT_R8_UNORM = 16,
++    FFX_SURFACE_FORMAT_R8_UINT = 17,
++    FFX_SURFACE_FORMAT_R8G8_UNORM = 18,
++    FFX_SURFACE_FORMAT_R32_FLOAT = 19,
++};
++
++typedef struct FfxResourceDescription
++{
++    uint32_t type;      /* enum FfxResourceType */
++    uint32_t format;    /* enum FfxSurfaceFormat, see translate_surface_format() */
++    uint32_t width;
++    uint32_t height;
++    uint32_t depth;
++    uint32_t mipCount;
++    uint32_t flags;
++} FfxResourceDescription;
++
++typedef struct FfxResource
++{
++    void *resource;
++    uint16_t name[64];
++    FfxResourceDescription description;
++    uint32_t state;    /* enum FfxResourceStates */
++    int isDepth;
++    uint64_t descriptorData;
++} FfxResource;
++
++typedef enum FfxFsr2QualityMode
++{
++    FFX_FSR2_QUALITY_MODE_QUALITY = 1,
++    FFX_FSR2_QUALITY_MODE_BALANCED = 2,
++    FFX_FSR2_QUALITY_MODE_PERFORMANCE = 3,
++    FFX_FSR2_QUALITY_MODE_ULTRA_PERFORMANCE = 4,
++} FfxFsr2QualityMode;
++
++typedef enum FfxFsr2InitializationFlagBits
++{
++    FFX_FSR2_ENABLE_HIGH_DYNAMIC_RANGE = (1 << 0),
++    FFX_FSR2_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS = (1 << 1),
++    FFX_FSR2_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION = (1 << 2),
++    FFX_FSR2_ENABLE_DEPTH_INVERTED = (1 << 3),
++    FFX_FSR2_ENABLE_DEPTH_INFINITE = (1 << 4),
++    FFX_FSR2_ENABLE_AUTO_EXPOSURE = (1 << 5),
++    FFX_FSR2_ENABLE_DYNAMIC_RESOLUTION = (1 << 6),
++    FFX_FSR2_ENABLE_TEXTURE1D_USAGE = (1 << 7),
++    FFX_FSR2_ENABLE_DEBUG_CHECKING = (1 << 8),
++} FfxFsr2InitializationFlagBits;
++
++/* Opaque interface/message types: the real frontend fills `callbacks` itself
++ * from a backend dll; we never dereference it. */
++/* 12 function pointers followed by scratchBuffer/scratchBufferSize: 14
++ * pointer-sized, pointer-aligned members, so 112 bytes on x64 and 56 on
++ * x86. The size matters even though we never dereference it -- it is what
++ * places `device` and `fpMessage` in FfxFsr2ContextDescription. */
++typedef struct FfxFsr2Interface { void *opaque[14]; } FfxFsr2Interface;
++typedef void (*FfxFsr2Message)(uint32_t type, const wchar_t *message);
++
++typedef struct FfxFsr2ContextDescription
++{
++    uint32_t flags;
++    FfxDimensions2D maxRenderSize;
++    FfxDimensions2D displaySize;
++    FfxFsr2Interface callbacks;
++    FfxDevice device;
++    FfxFsr2Message fpMessage;
++} FfxFsr2ContextDescription;
++
++typedef struct FfxFsr2DispatchDescription
++{
++    FfxCommandList commandList;
++    FfxResource color;
++    FfxResource depth;
++    FfxResource motionVectors;
++    FfxResource exposure;
++    FfxResource reactive;
++    FfxResource transparencyAndComposition;
++    FfxResource output;
++    FfxFloatCoords2D jitterOffset;
++    FfxFloatCoords2D motionVectorScale;
++    FfxDimensions2D renderSize;
++    int enableSharpening;
++    float sharpness;
++    float frameTimeDelta;
++    float preExposure;
++    int reset;
++    float cameraNear;
++    float cameraFar;
++    float cameraFovAngleVertical;
++    float viewSpaceToMetersFactor;
++
++    /* EXPERIMENTAL reactive mask generation parameters (2.2+, may not be
++     * initialized by older games; we never read past preExposure/camera
++     * fields except viewSpaceToMetersFactor, which we clamp defensively). */
++    int enableAutoReactive;
++    FfxResource colorOpaqueOnly;
++    float autoTcThreshold;
++    float autoTcScale;
++    float autoReactiveScale;
++    float autoReactiveMax;
++} FfxFsr2DispatchDescription;
++
++/* FSR2 spells these as #defines in shaders/ffx_fsr2_resources.h rather than
++ * as an enum, which is why they are easy to miss when reading ffx_fsr2.h. */
++#define FFX_FSR2_AUTOREACTIVEFLAGS_APPLY_TONEMAP        0x1
++#define FFX_FSR2_AUTOREACTIVEFLAGS_APPLY_INVERSETONEMAP 0x2
++#define FFX_FSR2_AUTOREACTIVEFLAGS_APPLY_THRESHOLD      0x4
++#define FFX_FSR2_AUTOREACTIVEFLAGS_USE_COMPONENTS_MAX   0x8
++
++typedef struct FfxFsr2GenerateReactiveDescription
++{
++    FfxCommandList commandList;
++    FfxResource colorOpaqueOnly;
++    FfxResource colorPreUpscale;
++    FfxResource outReactive;
++    FfxDimensions2D renderSize;
++    float scale;
++    float cutoffThreshold;
++    float binaryValue;
++    uint32_t flags;
++} FfxFsr2GenerateReactiveDescription;
++
++#define FFX_FSR2_CONTEXT_SIZE 16536
++
++typedef struct FfxFsr2Context
++{
++    uint32_t data[FFX_FSR2_CONTEXT_SIZE];
++} FfxFsr2Context;
++
++/* ---- ffx_api generic (Kits/FidelityFX/api/include/ffx_api.h, ffx_api_types.h) ---- */
++
++typedef void *ffxContext;
++typedef uint32_t ffxReturnCode_t;
++
++enum FfxApiReturnCodes
++{
++    FFX_API_RETURN_OK = 0,
++    FFX_API_RETURN_ERROR = 1,
++    FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE = 2,
++    FFX_API_RETURN_ERROR_RUNTIME_ERROR = 3,
++    FFX_API_RETURN_NO_PROVIDER = 4,
++    FFX_API_RETURN_ERROR_MEMORY = 5,
++    FFX_API_RETURN_ERROR_PARAMETER = 6,
++};
++
++#define FFX_API_EFFECT_MASK 0x00ff0000u
++#define FFX_API_BACKEND_MASK 0xff000000u
++#define FFX_API_EFFECT_ID_UPSCALE 0x00010000u
++#define FFX_API_MAKE_EFFECT_SUB_ID(effectId, sub) (((effectId) & FFX_API_EFFECT_MASK) | ((sub) & ~FFX_API_EFFECT_MASK))
++#define FFX_API_BACKEND_ID_DX12 0x00000000u
++#define FFX_API_MAKE_BACKEND_SUB_ID(backendId, sub) (((backendId) & FFX_API_BACKEND_MASK) | ((sub) & ~FFX_API_BACKEND_MASK))
++
++typedef uint64_t ffxStructType_t;
++typedef struct ffxApiHeader
++{
++    ffxStructType_t type;
++    struct ffxApiHeader *pNext;
++} ffxApiHeader;
++
++typedef ffxApiHeader ffxCreateContextDescHeader;
++typedef ffxApiHeader ffxDispatchDescHeader;
++
++typedef void (*ffxApiMessage)(uint32_t type, const wchar_t *message);
++
++typedef struct FfxApiDimensions2D
++{
++    uint32_t width;
++    uint32_t height;
++} FfxApiDimensions2D;
++
++typedef struct FfxApiFloatCoords2D
++{
++    float x;
++    float y;
++} FfxApiFloatCoords2D;
++
++/* FfxApiResourceType: BUFFER=0, TEXTURE1D=1, TEXTURE2D=2, TEXTURE_CUBE=3, TEXTURE3D=4 */
++enum FfxApiResourceType
++{
++    FFX_API_RESOURCE_TYPE_BUFFER = 0,
++    FFX_API_RESOURCE_TYPE_TEXTURE1D = 1,
++    FFX_API_RESOURCE_TYPE_TEXTURE2D = 2,
++    FFX_API_RESOURCE_TYPE_TEXTURE_CUBE = 3,
++    FFX_API_RESOURCE_TYPE_TEXTURE3D = 4,
++};
++
++enum FfxApiResourceState
++{
++    FFX_API_RESOURCE_STATE_COMMON = (1 << 0),
++    FFX_API_RESOURCE_STATE_UNORDERED_ACCESS = (1 << 1),
++    FFX_API_RESOURCE_STATE_COMPUTE_READ = (1 << 2),
++    FFX_API_RESOURCE_STATE_COPY_SRC = (1 << 4),
++    FFX_API_RESOURCE_STATE_COPY_DEST = (1 << 5),
++    FFX_API_RESOURCE_STATE_GENERIC_READ = (FFX_API_RESOURCE_STATE_COPY_SRC | FFX_API_RESOURCE_STATE_COMPUTE_READ),
++};
++
++/* FfxApiSurfaceFormat is NOT a renumbering of FSR2's FfxSurfaceFormat: it
++ * interleaves entries the FSR2 enum has no member for (UINT/SNORM/SRGB/BGRA
++ * and R32G32B32_FLOAT), so the two orderings diverge from index 2 onwards and
++ * only UNKNOWN and R32G32B32A32_TYPELESS happen to coincide. Values must be
++ * mapped by name -- see translate_surface_format(). */
++enum FfxApiSurfaceFormat
++{
++    FFX_API_SURFACE_FORMAT_UNKNOWN = 0,
++    FFX_API_SURFACE_FORMAT_R32G32B32A32_TYPELESS = 1,
++    FFX_API_SURFACE_FORMAT_R32G32B32A32_UINT = 2,
++    FFX_API_SURFACE_FORMAT_R32G32B32A32_FLOAT = 3,
++    FFX_API_SURFACE_FORMAT_R16G16B16A16_FLOAT = 4,
++    FFX_API_SURFACE_FORMAT_R32G32B32_FLOAT = 5,
++    FFX_API_SURFACE_FORMAT_R32G32_FLOAT = 6,
++    FFX_API_SURFACE_FORMAT_R8_UINT = 7,
++    FFX_API_SURFACE_FORMAT_R32_UINT = 8,
++    FFX_API_SURFACE_FORMAT_R8G8B8A8_TYPELESS = 9,
++    FFX_API_SURFACE_FORMAT_R8G8B8A8_UNORM = 10,
++    FFX_API_SURFACE_FORMAT_R8G8B8A8_SNORM = 11,
++    FFX_API_SURFACE_FORMAT_R8G8B8A8_SRGB = 12,
++    FFX_API_SURFACE_FORMAT_B8G8R8A8_TYPELESS = 13,
++    FFX_API_SURFACE_FORMAT_B8G8R8A8_UNORM = 14,
++    FFX_API_SURFACE_FORMAT_B8G8R8A8_SRGB = 15,
++    FFX_API_SURFACE_FORMAT_R11G11B10_FLOAT = 16,
++    FFX_API_SURFACE_FORMAT_R10G10B10A2_UNORM = 17,
++    FFX_API_SURFACE_FORMAT_R16G16_FLOAT = 18,
++    FFX_API_SURFACE_FORMAT_R16G16_UINT = 19,
++    FFX_API_SURFACE_FORMAT_R16G16_SINT = 20,
++    FFX_API_SURFACE_FORMAT_R16_FLOAT = 21,
++    FFX_API_SURFACE_FORMAT_R16_UINT = 22,
++    FFX_API_SURFACE_FORMAT_R16_UNORM = 23,
++    FFX_API_SURFACE_FORMAT_R16_SNORM = 24,
++    FFX_API_SURFACE_FORMAT_R8_UNORM = 25,
++    FFX_API_SURFACE_FORMAT_R8G8_UNORM = 26,
++    FFX_API_SURFACE_FORMAT_R8G8_UINT = 27,
++    FFX_API_SURFACE_FORMAT_R32_FLOAT = 28,
++    FFX_API_SURFACE_FORMAT_R9G9B9E5_SHAREDEXP = 29,
++    FFX_API_SURFACE_FORMAT_R16G16B16A16_TYPELESS = 30,
++    FFX_API_SURFACE_FORMAT_R32G32_TYPELESS = 31,
++    FFX_API_SURFACE_FORMAT_R10G10B10A2_TYPELESS = 32,
++    FFX_API_SURFACE_FORMAT_R16G16_TYPELESS = 33,
++    FFX_API_SURFACE_FORMAT_R16_TYPELESS = 34,
++    FFX_API_SURFACE_FORMAT_R8_TYPELESS = 35,
++    FFX_API_SURFACE_FORMAT_R8G8_TYPELESS = 36,
++    FFX_API_SURFACE_FORMAT_R32_TYPELESS = 37,
++    FFX_API_SURFACE_FORMAT_R32G32_UINT = 38,
++    FFX_API_SURFACE_FORMAT_R8_SNORM = 39,
++};
++
++typedef struct FfxApiResourceDescription
++{
++    uint32_t type;
++    uint32_t format;
++    uint32_t width;
++    uint32_t height;
++    uint32_t depth;
++    uint32_t mipCount;
++    uint32_t flags;
++    uint32_t usage;
++} FfxApiResourceDescription;
++
++typedef struct FfxApiResource
++{
++    void *resource;
++    FfxApiResourceDescription description;
++    uint32_t state;
++} FfxApiResource;
++
++/* ---- ffx_api DX12 backend (Kits/FidelityFX/api/include/dx12/ffx_api_dx12.h) ---- */
++
++#define FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12 FFX_API_MAKE_BACKEND_SUB_ID(FFX_API_BACKEND_ID_DX12, 0x02)
++struct ffxCreateBackendDX12Desc
++{
++    ffxCreateContextDescHeader header;
++    void *device; /* ID3D12Device* */
++};
++
++/* ---- ffx_api upscale effect (Kits/FidelityFX/upscalers/include/ffx_upscale.h) ---- */
++
++enum FfxApiCreateContextUpscaleFlags
++{
++    FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE = (1 << 0),
++    FFX_UPSCALE_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS = (1 << 1),
++    FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION = (1 << 2),
++    FFX_UPSCALE_ENABLE_DEPTH_INVERTED = (1 << 3),
++    FFX_UPSCALE_ENABLE_DEPTH_INFINITE = (1 << 4),
++    FFX_UPSCALE_ENABLE_AUTO_EXPOSURE = (1 << 5),
++    FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION = (1 << 6),
++    FFX_UPSCALE_ENABLE_DEBUG_CHECKING = (1 << 7),
++};
++
++#define FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE FFX_API_MAKE_EFFECT_SUB_ID(FFX_API_EFFECT_ID_UPSCALE, 0x00)
++struct ffxCreateContextDescUpscale
++{
++    ffxCreateContextDescHeader header;
++    uint32_t flags;
++    FfxApiDimensions2D maxRenderSize;
++    FfxApiDimensions2D maxUpscaleSize;
++    ffxApiMessage fpMessage;
++};
++
++#define FFX_API_DISPATCH_DESC_TYPE_UPSCALE FFX_API_MAKE_EFFECT_SUB_ID(FFX_API_EFFECT_ID_UPSCALE, 0x01)
++struct ffxDispatchDescUpscale
++{
++    ffxDispatchDescHeader header;
++    void *commandList;
++    FfxApiResource color;
++    FfxApiResource depth;
++    FfxApiResource motionVectors;
++    FfxApiResource exposure;
++    FfxApiResource reactive;
++    FfxApiResource transparencyAndComposition;
++    FfxApiResource output;
++    FfxApiFloatCoords2D jitterOffset;
++    FfxApiFloatCoords2D motionVectorScale;
++    FfxApiDimensions2D renderSize;
++    FfxApiDimensions2D upscaleSize;
++    int enableSharpening;
++    float sharpness;
++    float frameTimeDelta;
++    float preExposure;
++    int reset;
++    float cameraNear;
++    float cameraFar;
++    float cameraFovAngleVertical;
++    float viewSpaceToMetersFactor;
++    uint32_t flags;
++};
++
++/* FfxApiDispatchUpscaleAutoreactiveFlags. These currently match the FSR2
++ * values one for one; translate_reactive_flags() maps them by name so that
++ * stays a checked property rather than an assumption. */
++enum FfxApiDispatchUpscaleAutoreactiveFlags
++{
++    FFX_UPSCALE_AUTOREACTIVEFLAGS_APPLY_TONEMAP = (1 << 0),
++    FFX_UPSCALE_AUTOREACTIVEFLAGS_APPLY_INVERSETONEMAP = (1 << 1),
++    FFX_UPSCALE_AUTOREACTIVEFLAGS_APPLY_THRESHOLD = (1 << 2),
++    FFX_UPSCALE_AUTOREACTIVEFLAGS_USE_COMPONENTS_MAX = (1 << 3),
++};
++
++#define FFX_API_DISPATCH_DESC_TYPE_UPSCALE_GENERATEREACTIVEMASK FFX_API_MAKE_EFFECT_SUB_ID(FFX_API_EFFECT_ID_UPSCALE, 0x06)
++struct ffxDispatchDescUpscaleGenerateReactiveMask
++{
++    ffxDispatchDescHeader header;
++    void *commandList;
++    FfxApiResource colorOpaqueOnly;
++    FfxApiResource colorPreUpscale;
++    FfxApiResource outReactive;
++    FfxApiDimensions2D renderSize;
++    float scale;
++    float cutoffThreshold;
++    float binaryValue;
++    uint32_t flags;
++};
++
++/* ---- external provider ABI (reverse engineered, see dlls/amdxc64/main.c) ---- */
++
++typedef ULONG (*pfnCreateContext)(void *context, void *desc, const void *allocator);
++typedef ULONG (*pfnDestroyContext)(void *context, const void *allocator);
++typedef ULONG (*pfnConfigure)(void *context, const void *desc);
++typedef ULONG (*pfnQuery)(void *context, void *desc);
++typedef ULONG (*pfnDispatch)(void *context, const void *desc);
++typedef ULONG (*pfnCanProvide)(uint64_t typeId);
++
++struct ffxExternalProvider
++{
++    ULONG structVersion;      /* must be 2 for UpdateFfxApiProviderEx */
++    ULONG64 descType;         /* effect id this provider blob advertises, e.g. FFX_API_EFFECT_ID_UPSCALE */
++    ULONG64 versionId;
++    const char *versionName;
++    pfnCanProvide canProvide;
++    pfnCreateContext createContext;
++    pfnDestroyContext destroyContext;
++    pfnConfigure configure;
++    pfnQuery query;
++    pfnDispatch dispatch;
++};
++
++struct unk_data
++{
++    int unk[4];
++    struct unk_data *next;
++};
++
++typedef HRESULT (__stdcall *updateffxapi_pfn)(void *, unsigned int);
++typedef HRESULT (__stdcall *updateffxapi_pfn_ex)(void *, unsigned int, void *);
++
++#endif /* __FFX_FSR2_API_H */
+diff --git a/dlls/ffx_fsr2_api_x64/ffx_fsr2_api_x64.spec b/dlls/ffx_fsr2_api_x64/ffx_fsr2_api_x64.spec
+new file mode 100644
+index 00000000000..8d85957370c
+--- /dev/null
++++ b/dlls/ffx_fsr2_api_x64/ffx_fsr2_api_x64.spec
+@@ -0,0 +1,11 @@
++@ cdecl ffxAssertReport(str long str str)
++@ cdecl ffxAssertSetPrintingCallback(ptr)
++@ cdecl ffxFsr2ContextCreate(ptr ptr)
++@ cdecl ffxFsr2ContextDestroy(ptr)
++@ cdecl ffxFsr2ContextDispatch(ptr ptr)
++@ cdecl ffxFsr2ContextGenerateReactiveMask(ptr ptr)
++@ cdecl ffxFsr2GetJitterOffset(ptr ptr long long)
++@ cdecl ffxFsr2GetJitterPhaseCount(long long)
++@ cdecl ffxFsr2GetRenderResolutionFromQualityMode(ptr ptr long long long)
++@ cdecl ffxFsr2GetUpscaleRatioFromQualityMode(long)
++@ cdecl ffxFsr2ResourceIsNull(ptr)
+diff --git a/dlls/ffx_fsr2_api_x64/fsr2_to_fsr4.c b/dlls/ffx_fsr2_api_x64/fsr2_to_fsr4.c
+new file mode 100644
+index 00000000000..d51e5469c16
+--- /dev/null
++++ b/dlls/ffx_fsr2_api_x64/fsr2_to_fsr4.c
+@@ -0,0 +1,834 @@
++/*
++ * ffx_fsr2_api_x64: translate the AMD FidelityFX Super Resolution 2 "context"
++ * API to FidelityFX Super Resolution 4 by driving amdxcffx64.dll's FFX API
++ * "external provider" mechanism directly (the same mechanism wine's
++ * dlls/amdxc64 uses to upgrade FSR 3.1 games to FSR4).
++ *
++ * Games that dynamically load ffx_fsr2_api_x64.dll (frontend) plus
++ * ffx_fsr2_api_dx12_x64.dll / ffx_fsr2_api_vk_x64.dll (backends) can be
++ * redirected to this builtin (WINEDLLOVERRIDES=ffx_fsr2_api_x64=b) to get
++ * FSR4 upscaling quality instead of native FSR2, without any game-side
++ * patching. Only the DX12 path is translated, because FSR4 ships as a DX12
++ * provider only; every other context is forwarded to the frontend the game
++ * shipped, so a game that can switch renderers at runtime keeps working with
++ * the option left enabled.
++ *
++ * Gated by PROTON_FSR2_UPGRADE=1 (see the `fsr2` compat_config handling in
++ * the `proton` script and protonfixes/upscalers.py).
++ *
++ * Copyright 2026 Gustavo Belo
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <string.h>
++#include <stddef.h>
++
++#include "ntstatus.h"
++#include "winerror.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winbase.h"
++#include "winternl.h"
++#include "wine/debug.h"
++
++#define COBJMACROS
++#include "initguid.h"
++#include "unknwn.h"
++
++#include "ffx_fsr2_api.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(ffx_fsr2);
++
++#ifdef _WIN64
++/* The layout the FSR2 SDK produces on x64, which is the ABI the game compiled
++ * against. These are not cosmetic: sizing FfxFsr2Interface wrong moves `device`
++ * past the end of the caller's descriptor, where it reads as NULL and the shim
++ * bails out of ffxFsr2ContextCreate before it can do anything. */
++C_ASSERT(sizeof(FfxFsr2Interface) == 112);
++C_ASSERT(offsetof(FfxFsr2ContextDescription, callbacks) == 24);
++C_ASSERT(offsetof(FfxFsr2ContextDescription, device) == 136);
++C_ASSERT(offsetof(FfxFsr2ContextDescription, fpMessage) == 144);
++C_ASSERT(sizeof(FfxFsr2ContextDescription) == 152);
++C_ASSERT(offsetof(FfxResource, description) == 136);
++C_ASSERT(offsetof(FfxResource, state) == 164);
++C_ASSERT(sizeof(FfxResource) == 184);
++C_ASSERT(offsetof(FfxFsr2DispatchDescription, output) == 1112);
++C_ASSERT(offsetof(FfxFsr2DispatchDescription, renderSize) == 1312);
++C_ASSERT(offsetof(FfxFsr2DispatchDescription, viewSpaceToMetersFactor) == 1352);
++#endif
++
++/* ---- minimal COM surface for amdxc64.dll's AGS-style extension interfaces ---- */
++
++DEFINE_GUID(IID_IAmdExtD3DFactory,        0x014937ec, 0x9288, 0x446f, 0xa9, 0xac, 0xd7, 0x5a, 0x8e, 0x3a, 0x98, 0x4f);
++DEFINE_GUID(IID_IAmdExtD3DShaderIntrinsics, 0xba019d53, 0xccab, 0x4cbd, 0xb5, 0x6a, 0x72, 0x30, 0xed, 0x43, 0x30, 0xad);
++
++typedef struct IAmdExtD3DFactory IAmdExtD3DFactory;
++typedef struct IAmdExtD3DFactoryVtbl
++{
++    HRESULT (STDMETHODCALLTYPE *QueryInterface)(IAmdExtD3DFactory *iface, REFIID iid, void **out);
++    ULONG (STDMETHODCALLTYPE *AddRef)(IAmdExtD3DFactory *iface);
++    ULONG (STDMETHODCALLTYPE *Release)(IAmdExtD3DFactory *iface);
++    HRESULT (STDMETHODCALLTYPE *CreateInterface)(IAmdExtD3DFactory *iface, IUnknown *outer, REFIID iid, void **out);
++} IAmdExtD3DFactoryVtbl;
++struct IAmdExtD3DFactory { const IAmdExtD3DFactoryVtbl *lpVtbl; };
++
++typedef struct IAmdExtD3DShaderIntrinsics IAmdExtD3DShaderIntrinsics;
++typedef struct IAmdExtD3DShaderIntrinsicsVtbl
++{
++    HRESULT (STDMETHODCALLTYPE *QueryInterface)(IAmdExtD3DShaderIntrinsics *iface, REFIID iid, void **out);
++    ULONG (STDMETHODCALLTYPE *AddRef)(IAmdExtD3DShaderIntrinsics *iface);
++    ULONG (STDMETHODCALLTYPE *Release)(IAmdExtD3DShaderIntrinsics *iface);
++    HRESULT (STDMETHODCALLTYPE *GetInfo)(IAmdExtD3DShaderIntrinsics *iface, void *info);
++    HRESULT (STDMETHODCALLTYPE *CheckSupport)(IAmdExtD3DShaderIntrinsics *iface, DWORD opcodeSupport);
++    HRESULT (STDMETHODCALLTYPE *Enable)(IAmdExtD3DShaderIntrinsics *iface);
++} IAmdExtD3DShaderIntrinsicsVtbl;
++struct IAmdExtD3DShaderIntrinsics { const IAmdExtD3DShaderIntrinsicsVtbl *lpVtbl; };
++
++#define AmdExtD3DShaderIntrinsicsSupport_Float8Conversion 0x20
++#define AmdExtD3DShaderIntrinsicsSupport_WaveMatrix       0x1F
++
++typedef HRESULT (CDECL *pfnAmdExtD3DCreateInterface)(IUnknown *outer, REFIID iid, void **obj);
++
++/* Query FP8/WMMA support through wine's own amdxc64.dll, exactly like the
++ * FSR 3.1-to-4 upgrade path does; avoids duplicating the vkd3d-proton
++ * extension probing here. */
++static BOOL check_fsr4_supported(void *device, BOOL *fp8, BOOL *wmma)
++{
++    HMODULE amdxc64;
++    pfnAmdExtD3DCreateInterface create;
++    IAmdExtD3DFactory *factory = NULL;
++    IAmdExtD3DShaderIntrinsics *intrinsics = NULL;
++    BOOL ret = FALSE;
++
++    if (fp8) *fp8 = FALSE;
++    if (wmma) *wmma = FALSE;
++
++    if (!(amdxc64 = LoadLibraryA("amdxc64.dll")))
++    {
++        ERR("Failed to load amdxc64.dll for FSR4 support detection!\n");
++        return FALSE;
++    }
++
++    create = (pfnAmdExtD3DCreateInterface)GetProcAddress(amdxc64, "AmdExtD3DCreateInterface");
++    if (!create) goto done;
++
++    if (FAILED(create((IUnknown *)device, &IID_IAmdExtD3DFactory, (void **)&factory)) || !factory)
++        goto done;
++
++    if (FAILED(factory->lpVtbl->CreateInterface(factory, (IUnknown *)device, &IID_IAmdExtD3DShaderIntrinsics, (void **)&intrinsics)) || !intrinsics)
++        goto done;
++
++    if (fp8 && SUCCEEDED(intrinsics->lpVtbl->CheckSupport(intrinsics, AmdExtD3DShaderIntrinsicsSupport_Float8Conversion)))
++        *fp8 = TRUE;
++    if (wmma && SUCCEEDED(intrinsics->lpVtbl->CheckSupport(intrinsics, AmdExtD3DShaderIntrinsicsSupport_WaveMatrix)))
++        *wmma = TRUE;
++
++    ret = TRUE;
++
++done:
++    if (intrinsics) intrinsics->lpVtbl->Release(intrinsics);
++    if (factory) factory->lpVtbl->Release(factory);
++    return ret;
++}
++
++/* Which backend did the game bind to?
++ *
++ * The FSR2 frontend API is renderer-agnostic: the game fills `callbacks` from
++ * whichever backend dll it loaded (ffx_fsr2_api_dx12_x64 or ffx_fsr2_api_vk_x64)
++ * and `device` means whatever that backend says it means. We only implement the
++ * DX12 path, where device is an ID3D12Device -- under Vulkan it is a VkDevice,
++ * and handing that to amdxc64's COM QueryInterface corrupts the game process
++ * rather than failing cleanly. The callbacks are function pointers into the
++ * backend dll, so the owning module names the backend. */
++static BOOL backend_is_dx12(const FfxFsr2Interface *callbacks, char *path)
++{
++    HMODULE mod = NULL;
++    const char *name;
++
++    *path = 0;
++
++    if (!callbacks->opaque[0])
++    {
++        WARN("No backend callbacks in the context description.\n");
++        return FALSE;
++    }
++
++    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
++            | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++            (const char *)callbacks->opaque[0], &mod) || !mod
++            || !GetModuleFileNameA(mod, path, MAX_PATH))
++    {
++        WARN("Could not identify the module owning the FSR2 backend callbacks.\n");
++        *path = 0;
++        return FALSE;
++    }
++
++    name = strrchr(path, '\\');
++    name = name ? name + 1 : path;
++
++    if (strstr(name, "_dx12_"))
++    {
++        TRACE("FSR2 DX12 backend (%s).\n", debugstr_a(name));
++        return TRUE;
++    }
++
++    /* Anything else, a statically linked backend included, is refused rather
++     * than guessed at: being wrong here is memory corruption, not a bad frame. */
++    WARN("FSR2 backend %s is not the DX12 one; only DX12 is translated to FSR4.\n",
++         debugstr_a(name));
++    return FALSE;
++}
++
++/* ---- fallback to the frontend the game shipped ---- */
++
++/* FSR4 is a DX12-only provider, but the dll override that puts this builtin in
++ * front of the game replaces the FSR2 frontend for every backend the game can
++ * pick. So a context this shim cannot translate -- Vulkan, an unsupported gpu,
++ * a provider that fails to come up -- must not just be refused: the game does
++ * not have a frontend to fall back to any more, and it carries on drawing
++ * through a context that was never initialised. That is what the broken
++ * colours are. Forward those contexts to the dll the game shipped instead.
++ *
++ * That dll cannot be loaded from its own path: same module name, same dll
++ * override, so the loader hands this builtin straight back. It is copied to
++ * the prefix's temporary directory under a private name first. */
++static void (CDECL *assert_callback)(const char *);
++
++static struct
++{
++    HMODULE module;
++    FfxErrorCode (CDECL *ContextCreate)(FfxFsr2Context *, const FfxFsr2ContextDescription *);
++    FfxErrorCode (CDECL *ContextDestroy)(FfxFsr2Context *);
++    FfxErrorCode (CDECL *ContextDispatch)(FfxFsr2Context *, const FfxFsr2DispatchDescription *);
++    FfxErrorCode (CDECL *ContextGenerateReactiveMask)(FfxFsr2Context *, const FfxFsr2GenerateReactiveDescription *);
++    void (CDECL *AssertSetPrintingCallback)(void (CDECL *)(const char *));
++    BOOL tried;
++} native_fsr2;
++
++static BOOL load_native_fsr2(const char *backend_path)
++{
++    static const char frontend[] = "ffx_fsr2_api_x64.dll";
++    char src[MAX_PATH], dst[MAX_PATH];
++    unsigned int hash = 5381;
++    const char *slash, *p;
++    size_t dir_len;
++    HMODULE mod;
++    DWORD len;
++
++    if (native_fsr2.tried)
++        return native_fsr2.module != NULL;
++    native_fsr2.tried = TRUE;
++
++    if (!*backend_path || !(slash = strrchr(backend_path, '\\')))
++    {
++        ERR("No FSR2 backend path to look for the game's own frontend next to.\n");
++        return FALSE;
++    }
++
++    dir_len = slash + 1 - backend_path;
++    if (dir_len + sizeof(frontend) > sizeof(src))
++        return FALSE;
++    memcpy(src, backend_path, dir_len);
++    memcpy(src + dir_len, frontend, sizeof(frontend));
++
++    /* Keyed on the install so two games never share one copy. */
++    for (p = src; *p; p++)
++        hash = hash * 33 + (unsigned char)*p;
++
++    len = GetTempPathA(sizeof(dst), dst);
++    if (!len || len + sizeof("proton_fsr2_native_00000000.dll") > sizeof(dst))
++    {
++        ERR("No usable temporary directory for the native FSR2 copy.\n");
++        return FALSE;
++    }
++    sprintf(dst + len, "proton_fsr2_native_%08x.dll", hash);
++
++    /* A copy an earlier run left behind is the same file and still loadable,
++     * so a failure here is only fatal if the load fails as well. */
++    if (!CopyFileA(src, dst, FALSE))
++        WARN("Could not refresh %s from %s (%lu).\n", debugstr_a(dst), debugstr_a(src), GetLastError());
++
++    if (!(mod = LoadLibraryA(dst)))
++    {
++        ERR("Could not load the game's own FSR2 frontend from %s (%lu).\n",
++            debugstr_a(dst), GetLastError());
++        return FALSE;
++    }
++
++    native_fsr2.ContextCreate = (void *)GetProcAddress(mod, "ffxFsr2ContextCreate");
++    native_fsr2.ContextDestroy = (void *)GetProcAddress(mod, "ffxFsr2ContextDestroy");
++    native_fsr2.ContextDispatch = (void *)GetProcAddress(mod, "ffxFsr2ContextDispatch");
++    native_fsr2.ContextGenerateReactiveMask = (void *)GetProcAddress(mod, "ffxFsr2ContextGenerateReactiveMask");
++    native_fsr2.AssertSetPrintingCallback = (void *)GetProcAddress(mod, "ffxAssertSetPrintingCallback");
++
++    if (!native_fsr2.ContextCreate || !native_fsr2.ContextDestroy || !native_fsr2.ContextDispatch
++            || !native_fsr2.ContextGenerateReactiveMask)
++    {
++        ERR("%s does not export the FSR2 context API.\n", debugstr_a(src));
++        FreeLibrary(mod);
++        return FALSE;
++    }
++
++    /* The game installed its printing callback on this builtin, back when
++     * there was no reason to load the shipped one. */
++    if (native_fsr2.AssertSetPrintingCallback && assert_callback)
++        native_fsr2.AssertSetPrintingCallback(assert_callback);
++
++    native_fsr2.module = mod;
++    TRACE("Forwarding FSR2 to the game's own %s.\n", debugstr_a(src));
++    return TRUE;
++}
++
++/* Hands the context back untouched, so the game's frontend initialises it
++ * from scratch exactly as it would have without the override. */
++static FfxErrorCode fall_back_to_native(FfxFsr2Context *context,
++        const FfxFsr2ContextDescription *desc, const char *backend_path)
++{
++    if (!load_native_fsr2(backend_path))
++        return FFX_ERROR_BACKEND_API_ERROR;
++
++    memset(context, 0, sizeof(*context));
++    return native_fsr2.ContextCreate(context, desc);
++}
++
++/* ---- provider acquisition ---- */
++
++/* amdxcffx64 does not load the FidelityFX SDK DX12 modules itself. Its
++ * UpdateFfxApiProviderEx looks them up with GetModuleHandleW and returns
++ * E_INVALIDARG when they are not already mapped into the process -- confirmed
++ * by disassembling the export. A FidelityFX 3.1 game satisfies that on its own
++ * because it drives the FidelityFX API directly; an FSR2 game never loads
++ * them, so the shim has to bring them in. protonfixes installs them under
++ * system32\umu for the ffx4 upscaler. */
++static BOOL load_ffx_sdk_modules(void)
++{
++    static const char *const modules[] =
++    {
++        "amd_fidelityfx_loader_dx12.dll",
++        "amd_fidelityfx_upscaler_dx12.dll",
++    };
++    char path[MAX_PATH];
++    unsigned int i;
++    UINT len;
++
++    if (!(len = GetSystemDirectoryA(path, ARRAY_SIZE(path))) || len >= ARRAY_SIZE(path))
++    {
++        ERR("Could not determine the system directory.\n");
++        return FALSE;
++    }
++
++    for (i = 0; i < ARRAY_SIZE(modules); ++i)
++    {
++        if (GetModuleHandleA(modules[i]))
++        {
++            TRACE("%s is already loaded.\n", debugstr_a(modules[i]));
++            continue;
++        }
++
++        if (snprintf(path + len, ARRAY_SIZE(path) - len, "\\umu\\%s", modules[i]) < 0)
++            return FALSE;
++
++        if (!LoadLibraryA(path))
++        {
++            ERR("Failed to load %s; FSR4 needs the FidelityFX SDK DX12 modules that "
++                "PROTON_FFX4_UPGRADE installs.\n", debugstr_a(path));
++            return FALSE;
++        }
++        TRACE("Loaded %s.\n", debugstr_a(path));
++    }
++    return TRUE;
++}
++
++static BOOL get_fsr4_provider(struct ffxExternalProvider *provider, BOOL fp8_supported)
++{
++    HMODULE amdffx;
++    updateffxapi_pfn_ex pfn_ex;
++    updateffxapi_pfn pfn;
++    struct unk_data unk_data[1] = {{{0, 1, 0, 0}, NULL}};
++    HRESULT hr;
++
++    memset(provider, 0, sizeof(*provider));
++    provider->structVersion = 2;
++    provider->descType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
++
++    if (fp8_supported) unk_data->unk[2] = 1;
++
++    if (!load_ffx_sdk_modules())
++        return FALSE;
++
++    if (!(amdffx = LoadLibraryA("amdxcffx64")))
++    {
++        WARN("Failed to load FSR4 dll (amdxcffx64); is PROTON_FSR4_UPGRADE / PROTON_FFX4_UPGRADE set up?\n");
++        return FALSE;
++    }
++
++    pfn_ex = (updateffxapi_pfn_ex)GetProcAddress(amdffx, "UpdateFfxApiProviderEx");
++    pfn = (updateffxapi_pfn)GetProcAddress(amdffx, "UpdateFfxApiProvider");
++
++    if (pfn_ex)
++        hr = pfn_ex(provider, sizeof(*provider), unk_data);
++    else if (pfn)
++        hr = pfn(provider, sizeof(*provider));
++    else
++    {
++        ERR("UpdateFfxApiProvider[Ex] symbol not found in amdxcffx64!\n");
++        return FALSE;
++    }
++
++    if (FAILED(hr) || !provider->createContext || !provider->dispatch)
++    {
++        ERR("amdxcffx64 did not return a usable FSR4 provider (hr=%#lx)\n", hr);
++        return FALSE;
++    }
++
++    TRACE("FSR4 provider acquired: version=%s\n", debugstr_a(provider->versionName));
++    return TRUE;
++}
++
++/* ---- resource / format translation ---- */
++
++static uint32_t translate_resource_type(uint32_t fsr2_type)
++{
++    switch (fsr2_type)
++    {
++        case FFX_RESOURCE_TYPE_BUFFER:    return FFX_API_RESOURCE_TYPE_BUFFER;
++        case FFX_RESOURCE_TYPE_TEXTURE1D: return FFX_API_RESOURCE_TYPE_TEXTURE1D;
++        case FFX_RESOURCE_TYPE_TEXTURE2D: return FFX_API_RESOURCE_TYPE_TEXTURE2D;
++        case FFX_RESOURCE_TYPE_TEXTURE3D: return FFX_API_RESOURCE_TYPE_TEXTURE3D;
++        default:
++            WARN("Unknown FfxResourceType %u, assuming TEXTURE2D\n", fsr2_type);
++            return FFX_API_RESOURCE_TYPE_TEXTURE2D;
++    }
++}
++
++static uint32_t translate_resource_state(uint32_t fsr2_state)
++{
++    uint32_t out = 0;
++
++    if (fsr2_state & FFX_RESOURCE_STATE_UNORDERED_ACCESS) out |= FFX_API_RESOURCE_STATE_UNORDERED_ACCESS;
++    if (fsr2_state & FFX_RESOURCE_STATE_COMPUTE_READ)     out |= FFX_API_RESOURCE_STATE_COMPUTE_READ;
++    if (fsr2_state & FFX_RESOURCE_STATE_COPY_SRC)         out |= FFX_API_RESOURCE_STATE_COPY_SRC;
++    if (fsr2_state & FFX_RESOURCE_STATE_COPY_DEST)        out |= FFX_API_RESOURCE_STATE_COPY_DEST;
++    if (!out) out = FFX_API_RESOURCE_STATE_COMMON;
++    return out;
++}
++
++/* FfxSurfaceFormat (FSR2, 20 entries) and FfxApiSurfaceFormat (ffx_api, 40)
++ * are not a renumbering of one another: ffx_api interleaves UINT/SNORM/SRGB,
++ * BGRA and R32G32B32_FLOAT entries that FSR2 has no member for. Only UNKNOWN
++ * and R32G32B32A32_TYPELESS share an index, so every format a game actually
++ * uses has to be mapped by name. */
++static uint32_t translate_surface_format(uint32_t fsr2_format)
++{
++    switch (fsr2_format)
++    {
++        case FFX_SURFACE_FORMAT_UNKNOWN:               return FFX_API_SURFACE_FORMAT_UNKNOWN;
++        case FFX_SURFACE_FORMAT_R32G32B32A32_TYPELESS: return FFX_API_SURFACE_FORMAT_R32G32B32A32_TYPELESS;
++        case FFX_SURFACE_FORMAT_R32G32B32A32_FLOAT:    return FFX_API_SURFACE_FORMAT_R32G32B32A32_FLOAT;
++        case FFX_SURFACE_FORMAT_R16G16B16A16_FLOAT:    return FFX_API_SURFACE_FORMAT_R16G16B16A16_FLOAT;
++        case FFX_SURFACE_FORMAT_R32G32_FLOAT:          return FFX_API_SURFACE_FORMAT_R32G32_FLOAT;
++        case FFX_SURFACE_FORMAT_R32_UINT:              return FFX_API_SURFACE_FORMAT_R32_UINT;
++        case FFX_SURFACE_FORMAT_R8G8B8A8_TYPELESS:     return FFX_API_SURFACE_FORMAT_R8G8B8A8_TYPELESS;
++        case FFX_SURFACE_FORMAT_R8G8B8A8_UNORM:        return FFX_API_SURFACE_FORMAT_R8G8B8A8_UNORM;
++        case FFX_SURFACE_FORMAT_R11G11B10_FLOAT:       return FFX_API_SURFACE_FORMAT_R11G11B10_FLOAT;
++        case FFX_SURFACE_FORMAT_R16G16_FLOAT:          return FFX_API_SURFACE_FORMAT_R16G16_FLOAT;
++        case FFX_SURFACE_FORMAT_R16G16_UINT:           return FFX_API_SURFACE_FORMAT_R16G16_UINT;
++        case FFX_SURFACE_FORMAT_R16_FLOAT:             return FFX_API_SURFACE_FORMAT_R16_FLOAT;
++        case FFX_SURFACE_FORMAT_R16_UINT:              return FFX_API_SURFACE_FORMAT_R16_UINT;
++        case FFX_SURFACE_FORMAT_R16_UNORM:             return FFX_API_SURFACE_FORMAT_R16_UNORM;
++        case FFX_SURFACE_FORMAT_R16_SNORM:             return FFX_API_SURFACE_FORMAT_R16_SNORM;
++        case FFX_SURFACE_FORMAT_R8_UNORM:              return FFX_API_SURFACE_FORMAT_R8_UNORM;
++        case FFX_SURFACE_FORMAT_R8_UINT:               return FFX_API_SURFACE_FORMAT_R8_UINT;
++        case FFX_SURFACE_FORMAT_R8G8_UNORM:            return FFX_API_SURFACE_FORMAT_R8G8_UNORM;
++        case FFX_SURFACE_FORMAT_R32_FLOAT:             return FFX_API_SURFACE_FORMAT_R32_FLOAT;
++
++        /* ffx_api has no R16G16B16A16_UNORM; the typeless entry of the same
++         * width is the closest thing that still describes the memory layout. */
++        case FFX_SURFACE_FORMAT_R16G16B16A16_UNORM:
++            WARN("No ffx_api equivalent for R16G16B16A16_UNORM, using the typeless format.\n");
++            return FFX_API_SURFACE_FORMAT_R16G16B16A16_TYPELESS;
++
++        default:
++            WARN("Unknown FfxSurfaceFormat %u, passing UNKNOWN through.\n", fsr2_format);
++            return FFX_API_SURFACE_FORMAT_UNKNOWN;
++    }
++}
++
++static FfxApiResource translate_resource(const FfxResource *in)
++{
++    FfxApiResource out = {0};
++
++    out.resource = in->resource;
++    out.state = translate_resource_state(in->state);
++    if (!in->resource) return out;
++
++    out.description.type = translate_resource_type(in->description.type);
++    out.description.format = translate_surface_format(in->description.format);
++    out.description.width = in->description.width;
++    out.description.height = in->description.height;
++    out.description.depth = in->description.depth;
++    out.description.mipCount = in->description.mipCount;
++    out.description.flags = in->description.flags;
++    /* FfxResourceDescription (FSR2) has no usage field; FSR4's backend
++     * derives usage requirements from context/dispatch state rather than
++     * from imported resource descriptions, so 0 (no extra usage hints) is
++     * the correct conservative default here. */
++    out.description.usage = 0;
++    return out;
++}
++
++static uint32_t translate_context_flags(uint32_t fsr2_flags)
++{
++    uint32_t out = 0;
++
++    if (fsr2_flags & FFX_FSR2_ENABLE_HIGH_DYNAMIC_RANGE) out |= FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE;
++    if (fsr2_flags & FFX_FSR2_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS) out |= FFX_UPSCALE_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS;
++    if (fsr2_flags & FFX_FSR2_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION) out |= FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION;
++    if (fsr2_flags & FFX_FSR2_ENABLE_DEPTH_INVERTED) out |= FFX_UPSCALE_ENABLE_DEPTH_INVERTED;
++    if (fsr2_flags & FFX_FSR2_ENABLE_DEPTH_INFINITE) out |= FFX_UPSCALE_ENABLE_DEPTH_INFINITE;
++    if (fsr2_flags & FFX_FSR2_ENABLE_AUTO_EXPOSURE) out |= FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
++    if (fsr2_flags & FFX_FSR2_ENABLE_DYNAMIC_RESOLUTION) out |= FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION;
++    /* FFX_FSR2_ENABLE_TEXTURE1D_USAGE has no FSR4 equivalent (deprecated upstream too) */
++    if (fsr2_flags & FFX_FSR2_ENABLE_DEBUG_CHECKING) out |= FFX_UPSCALE_ENABLE_DEBUG_CHECKING;
++    return out;
++}
++
++/* The four reactive-mask flags currently have the same values on both sides,
++ * so a passthrough would happen to work. Map them by name anyway: the surface
++ * format enums looked just as safe and diverged from index 2 onwards, and an
++ * accidental match is not something the next SDK bump is obliged to keep. */
++static uint32_t translate_reactive_flags(uint32_t fsr2_flags)
++{
++    static const uint32_t known = FFX_FSR2_AUTOREACTIVEFLAGS_APPLY_TONEMAP
++            | FFX_FSR2_AUTOREACTIVEFLAGS_APPLY_INVERSETONEMAP
++            | FFX_FSR2_AUTOREACTIVEFLAGS_APPLY_THRESHOLD
++            | FFX_FSR2_AUTOREACTIVEFLAGS_USE_COMPONENTS_MAX;
++    uint32_t out = 0;
++
++    if (fsr2_flags & FFX_FSR2_AUTOREACTIVEFLAGS_APPLY_TONEMAP)
++        out |= FFX_UPSCALE_AUTOREACTIVEFLAGS_APPLY_TONEMAP;
++    if (fsr2_flags & FFX_FSR2_AUTOREACTIVEFLAGS_APPLY_INVERSETONEMAP)
++        out |= FFX_UPSCALE_AUTOREACTIVEFLAGS_APPLY_INVERSETONEMAP;
++    if (fsr2_flags & FFX_FSR2_AUTOREACTIVEFLAGS_APPLY_THRESHOLD)
++        out |= FFX_UPSCALE_AUTOREACTIVEFLAGS_APPLY_THRESHOLD;
++    if (fsr2_flags & FFX_FSR2_AUTOREACTIVEFLAGS_USE_COMPONENTS_MAX)
++        out |= FFX_UPSCALE_AUTOREACTIVEFLAGS_USE_COMPONENTS_MAX;
++
++    if (fsr2_flags & ~known)
++        WARN("Ignoring unknown FSR2 reactive mask flags %#x.\n", fsr2_flags & ~known);
++
++    return out;
++}
++
++/* ---- internal context ---- */
++
++/* Stamped into the storage the game hands us so that dispatch and destroy can
++ * tell a translated context from one the shipped frontend owns, which matters
++ * as soon as both can exist (a renderer switch, a second device). The real
++ * FSR2 starts this storage with its context description -- flags and a render
++ * width -- so it can never collide. */
++#define FSR2_SHIM_MAGIC 0x5348494d46535232ull
++
++struct fsr2_shim_context
++{
++    UINT64 magic;
++    struct ffxExternalProvider provider;
++    ffxContext ffx_context;
++    FfxDimensions2D display_size;
++    FfxDimensions2D render_size;
++    BOOL valid;
++};
++
++typedef char fsr2_shim_context_size_check[(sizeof(struct fsr2_shim_context) <= sizeof(FfxFsr2Context)) ? 1 : -1];
++
++static struct fsr2_shim_context *get_shim_context(FfxFsr2Context *context)
++{
++    return (struct fsr2_shim_context *)context->data;
++}
++
++/* ---- exported FSR2 context API ---- */
++
++FfxErrorCode CDECL ffxFsr2ContextCreate(FfxFsr2Context *context, const FfxFsr2ContextDescription *desc)
++{
++    struct fsr2_shim_context *ctx;
++    struct ffxCreateBackendDX12Desc backend = {0};
++    struct ffxCreateContextDescUpscale upscale = {0};
++    char backend_path[MAX_PATH];
++    BOOL fp8 = FALSE;
++    ffxReturnCode_t rc;
++
++    if (!context || !desc)
++    {
++        ERR("Called with context %p, desc %p.\n", context, desc);
++        return FFX_ERROR_INVALID_POINTER;
++    }
++    if (!desc->device)
++    {
++        /* Reads as NULL when our FfxFsr2ContextDescription layout disagrees
++         * with the game's, which is silent otherwise -- keep it loud. */
++        ERR("No device in the context description (flags %#x, displaySize %ux%u); "
++            "FfxFsr2Interface layout mismatch?\n", desc->flags,
++            desc->displaySize.width, desc->displaySize.height);
++        return FFX_ERROR_NULL_DEVICE;
++    }
++
++    TRACE("flags %#x, maxRenderSize %ux%u, displaySize %ux%u.\n", desc->flags,
++          desc->maxRenderSize.width, desc->maxRenderSize.height,
++          desc->displaySize.width, desc->displaySize.height);
++
++    if (!backend_is_dx12(&desc->callbacks, backend_path))
++    {
++        WARN("PROTON_FSR2_UPGRADE only translates the DX12 backend; leaving this "
++             "context to the game's own FSR2.\n");
++        return fall_back_to_native(context, desc, backend_path);
++    }
++
++    if (!check_fsr4_supported(desc->device, &fp8, NULL) || !fp8)
++    {
++        WARN("FSR4 (FP8/WMMA) not supported on this device; PROTON_FSR2_UPGRADE will have no effect here.\n");
++        return fall_back_to_native(context, desc, backend_path);
++    }
++
++    memset(context, 0, sizeof(*context));
++    ctx = get_shim_context(context);
++
++    if (!get_fsr4_provider(&ctx->provider, fp8))
++        return fall_back_to_native(context, desc, backend_path);
++
++    backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
++    backend.device = desc->device;
++
++    upscale.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
++    upscale.header.pNext = &backend.header;
++    upscale.flags = translate_context_flags(desc->flags);
++    upscale.maxRenderSize.width = desc->maxRenderSize.width;
++    upscale.maxRenderSize.height = desc->maxRenderSize.height;
++    upscale.maxUpscaleSize.width = desc->displaySize.width;
++    upscale.maxUpscaleSize.height = desc->displaySize.height;
++    upscale.fpMessage = (ffxApiMessage)desc->fpMessage;
++
++    rc = ctx->provider.createContext(&ctx->ffx_context, &upscale, NULL);
++    if (rc != FFX_API_RETURN_OK)
++    {
++        ERR("FSR4 createContext failed: %u\n", rc);
++        return fall_back_to_native(context, desc, backend_path);
++    }
++
++    ctx->display_size = desc->displaySize;
++    ctx->magic = FSR2_SHIM_MAGIC;
++    ctx->valid = TRUE;
++
++    WARN("FSR2 upgraded to FSR4 (%s)\n", debugstr_a(ctx->provider.versionName));
++    return FFX_OK;
++}
++
++FfxErrorCode CDECL ffxFsr2ContextDestroy(FfxFsr2Context *context)
++{
++    struct fsr2_shim_context *ctx;
++
++    if (!context) return FFX_ERROR_INVALID_POINTER;
++    ctx = get_shim_context(context);
++    if (ctx->magic != FSR2_SHIM_MAGIC)
++        return native_fsr2.ContextDestroy ? native_fsr2.ContextDestroy(context) : FFX_OK;
++    if (!ctx->valid) return FFX_OK;
++
++    ctx->provider.destroyContext(&ctx->ffx_context, NULL);
++    ctx->valid = FALSE;
++    ctx->magic = 0;
++    return FFX_OK;
++}
++
++FfxErrorCode CDECL ffxFsr2ContextDispatch(FfxFsr2Context *context, const FfxFsr2DispatchDescription *desc)
++{
++    struct fsr2_shim_context *ctx;
++    struct ffxDispatchDescUpscale dispatch = {0};
++    ffxReturnCode_t rc;
++    float vsm;
++
++    if (!context || !desc) return FFX_ERROR_INVALID_POINTER;
++    ctx = get_shim_context(context);
++    if (ctx->magic != FSR2_SHIM_MAGIC)
++        return native_fsr2.ContextDispatch ? native_fsr2.ContextDispatch(context, desc)
++                                           : FFX_ERROR_BACKEND_API_ERROR;
++    if (!ctx->valid) return FFX_ERROR_BACKEND_API_ERROR;
++
++    dispatch.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
++    dispatch.commandList = desc->commandList;
++    dispatch.color = translate_resource(&desc->color);
++    dispatch.depth = translate_resource(&desc->depth);
++    dispatch.motionVectors = translate_resource(&desc->motionVectors);
++    dispatch.exposure = translate_resource(&desc->exposure);
++    dispatch.reactive = translate_resource(&desc->reactive);
++    dispatch.transparencyAndComposition = translate_resource(&desc->transparencyAndComposition);
++    dispatch.output = translate_resource(&desc->output);
++    dispatch.jitterOffset.x = desc->jitterOffset.x;
++    dispatch.jitterOffset.y = desc->jitterOffset.y;
++    dispatch.motionVectorScale.x = desc->motionVectorScale.x;
++    dispatch.motionVectorScale.y = desc->motionVectorScale.y;
++    dispatch.renderSize.width = desc->renderSize.width;
++    dispatch.renderSize.height = desc->renderSize.height;
++    dispatch.upscaleSize.width = ctx->display_size.width;
++    dispatch.upscaleSize.height = ctx->display_size.height;
++    dispatch.enableSharpening = desc->enableSharpening;
++    dispatch.sharpness = desc->sharpness;
++    dispatch.frameTimeDelta = desc->frameTimeDelta;
++    dispatch.preExposure = desc->preExposure > 0.0f ? desc->preExposure : 1.0f;
++    dispatch.reset = desc->reset;
++    dispatch.cameraNear = desc->cameraNear;
++    dispatch.cameraFar = desc->cameraFar;
++    dispatch.cameraFovAngleVertical = desc->cameraFovAngleVertical;
++
++    /* viewSpaceToMetersFactor was added to FfxFsr2DispatchDescription after
++     * some 2.x releases; clamp defensively in case the game's struct layout
++     * predates the field (would otherwise read uninitialized/adjacent data).
++     * The range comparisons below also reject NaN and +/-inf without
++     * needing isfinite(). */
++    vsm = desc->viewSpaceToMetersFactor;
++    dispatch.viewSpaceToMetersFactor = (vsm > 1e-6f && vsm < 1e6f) ? vsm : 1.0f;
++
++    if (ctx->render_size.width != desc->renderSize.width
++            || ctx->render_size.height != desc->renderSize.height)
++    {
++        ctx->render_size = desc->renderSize;
++        TRACE("Upscaling %ux%u -> %ux%u.\n", desc->renderSize.width, desc->renderSize.height,
++              ctx->display_size.width, ctx->display_size.height);
++    }
++
++    rc = ctx->provider.dispatch(&ctx->ffx_context, &dispatch);
++    if (rc != FFX_API_RETURN_OK)
++    {
++        ERR("FSR4 dispatch failed: %u\n", rc);
++        return FFX_ERROR_BACKEND_API_ERROR;
++    }
++    return FFX_OK;
++}
++
++FfxErrorCode CDECL ffxFsr2ContextGenerateReactiveMask(FfxFsr2Context *context, const FfxFsr2GenerateReactiveDescription *params)
++{
++    struct fsr2_shim_context *ctx;
++    struct ffxDispatchDescUpscaleGenerateReactiveMask dispatch = {0};
++    ffxReturnCode_t rc;
++
++    if (!context || !params) return FFX_ERROR_INVALID_POINTER;
++    ctx = get_shim_context(context);
++    if (ctx->magic != FSR2_SHIM_MAGIC)
++        return native_fsr2.ContextGenerateReactiveMask ? native_fsr2.ContextGenerateReactiveMask(context, params)
++                                                       : FFX_ERROR_BACKEND_API_ERROR;
++    if (!ctx->valid) return FFX_ERROR_BACKEND_API_ERROR;
++
++    dispatch.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE_GENERATEREACTIVEMASK;
++    dispatch.commandList = params->commandList;
++    dispatch.colorOpaqueOnly = translate_resource(&params->colorOpaqueOnly);
++    dispatch.colorPreUpscale = translate_resource(&params->colorPreUpscale);
++    dispatch.outReactive = translate_resource(&params->outReactive);
++    dispatch.renderSize.width = params->renderSize.width;
++    dispatch.renderSize.height = params->renderSize.height;
++    dispatch.scale = params->scale;
++    dispatch.cutoffThreshold = params->cutoffThreshold;
++    dispatch.binaryValue = params->binaryValue;
++    dispatch.flags = translate_reactive_flags(params->flags);
++
++    rc = ctx->provider.dispatch(&ctx->ffx_context, &dispatch);
++    return (rc == FFX_API_RETURN_OK) ? FFX_OK : FFX_ERROR_BACKEND_API_ERROR;
++}
++
++/* ---- pure helper exports (no FSR4 involvement, public FSR2 SDK formulas) ---- */
++
++float CDECL ffxFsr2GetUpscaleRatioFromQualityMode(FfxFsr2QualityMode qualityMode)
++{
++    switch (qualityMode)
++    {
++        case FFX_FSR2_QUALITY_MODE_QUALITY: return 1.5f;
++        case FFX_FSR2_QUALITY_MODE_BALANCED: return 1.7f;
++        case FFX_FSR2_QUALITY_MODE_PERFORMANCE: return 2.0f;
++        case FFX_FSR2_QUALITY_MODE_ULTRA_PERFORMANCE: return 3.0f;
++        default: return 0.0f;
++    }
++}
++
++FfxErrorCode CDECL ffxFsr2GetRenderResolutionFromQualityMode(uint32_t *renderWidth, uint32_t *renderHeight,
++        uint32_t displayWidth, uint32_t displayHeight, FfxFsr2QualityMode qualityMode)
++{
++    float ratio;
++
++    if (!renderWidth || !renderHeight) return FFX_ERROR_INVALID_POINTER;
++    if (qualityMode < FFX_FSR2_QUALITY_MODE_QUALITY || qualityMode > FFX_FSR2_QUALITY_MODE_ULTRA_PERFORMANCE)
++        return FFX_ERROR_INVALID_ENUM;
++
++    ratio = ffxFsr2GetUpscaleRatioFromQualityMode(qualityMode);
++    *renderWidth = (uint32_t)((float)displayWidth / ratio);
++    *renderHeight = (uint32_t)((float)displayHeight / ratio);
++    return FFX_OK;
++}
++
++int32_t CDECL ffxFsr2GetJitterPhaseCount(int32_t renderWidth, int32_t displayWidth)
++{
++    const float basePhaseCount = 8.0f;
++    const float ratio = (float)displayWidth / (float)renderWidth;
++    return (int32_t)(basePhaseCount * ratio * ratio);
++}
++
++static float halton(int32_t index, int32_t base)
++{
++    float f = 1.0f, r = 0.0f;
++
++    while (index > 0)
++    {
++        f /= base;
++        r += f * (index % base);
++        index /= base;
++    }
++    return r;
++}
++
++FfxErrorCode CDECL ffxFsr2GetJitterOffset(float *outX, float *outY, int32_t index, int32_t phaseCount)
++{
++    if (!outX || !outY) return FFX_ERROR_INVALID_POINTER;
++    if (phaseCount <= 0) return FFX_ERROR_INVALID_ARGUMENT;
++
++    *outX = halton((index % phaseCount) + 1, 2) - 0.5f;
++    *outY = halton((index % phaseCount) + 1, 3) - 0.5f;
++    return FFX_OK;
++}
++
++int CDECL ffxFsr2ResourceIsNull(FfxResource resource)
++{
++    return resource.resource == NULL;
++}
++
++/* ---- assert plumbing (mirrors ffx_assert.h; never breaks into a debugger) ---- */
++
++int CDECL ffxAssertReport(const char *file, int32_t line, const char *condition, const char *msg)
++{
++    ERR("FSR2 shim assertion failed: %s:%d %s%s%s\n", debugstr_a(file), line,
++        condition ? debugstr_a(condition) : "", condition && msg ? ": " : "", msg ? debugstr_a(msg) : "");
++    if (assert_callback) assert_callback(msg ? msg : condition);
++    return 0; /* never request a debug break */
++}
++
++void CDECL ffxAssertSetPrintingCallback(void (CDECL *callback)(const char *))
++{
++    assert_callback = callback;
++    if (native_fsr2.AssertSetPrintingCallback)
++        native_fsr2.AssertSetPrintingCallback(callback);
++}
++
++BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *reserved)
++{
++    return TRUE;
++}
