@@ -1,0 +1,225 @@
+From 74eb7ec15ef804fe36e874c03aeafca203464af7 Mon Sep 17 00:00:00 2001
+From: Alexandre Julliard <julliard@winehq.org>
+Date: Tue, 12 May 2026 10:28:22 +0200
+Subject: [PATCH] ntdll: Export PsCreateSystemThread.
+
+To allow creating a system thread that runs only on the Unix side.
+
+Adapted to the 11.0 thread machinery: PsCreateSystemThread clones the NtCreateThreadEx flow to create a TEB-ful thread that never runs PE code, and the x86_64 quit/usr1 handlers special-case such threads. The upstream thread_data refactor and the server-side system-thread support are not backported.
+
+(partially picked from commit 36f81d955dee6cd3a95fd6cb45c25f413170fef5)
+---
+ dlls/ntdll/unix/signal_x86_64.c |   9 ++-
+ dlls/ntdll/unix/thread.c        | 132 ++++++++++++++++++++++++++++++++
+ dlls/ntdll/unix/unix_private.h  |   1 +
+ include/winternl.h              |   5 ++
+ 4 files changed, 145 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index 0ddcf9ff26b..85e89c4e547 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -2741,7 +2741,8 @@ static void quit_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+ {
+     ucontext_t *ucontext = init_handler( sigcontext );
+ 
+-    if (!is_inside_syscall( RSP_sig(ucontext) )) user_mode_abort_thread( 0, get_syscall_frame() );
++    if (!ntdll_get_thread_data()->system_thread && !is_inside_syscall( RSP_sig(ucontext) ))
++        user_mode_abort_thread( 0, get_syscall_frame() );
+     abort_thread( 0 );
+ }
+ 
+@@ -2755,7 +2756,11 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+ {
+     ucontext_t *ucontext = init_handler( sigcontext );
+ 
+-    if (is_inside_syscall( RSP_sig(ucontext) ))
++    if (ntdll_get_thread_data()->system_thread)
++    {
++        server_select( NULL, 0, SELECT_INTERRUPTIBLE, 0, NULL, NULL );
++    }
++    else if (is_inside_syscall( RSP_sig(ucontext) ))
+     {
+         struct syscall_frame *frame = get_syscall_frame();
+         ULONG64 saved_compaction = 0;
+diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
+index b526ab30854..b4950d015e3 100644
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -1469,6 +1469,129 @@ done:
+ }
+ 
+ 
++/***********************************************************************
++ *           start_system_thread
++ *
++ * Startup routine for a thread that runs entirely on the Unix side.
++ */
++static void start_system_thread( TEB *teb )
++{
++    struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
++    BOOL suspend;
++
++    thread_data->syscall_table = KeServiceDescriptorTable;
++    thread_data->syscall_trace = TRACE_ON(syscall);
++    thread_data->pthread_id = pthread_self();
++    thread_data->system_thread = TRUE;
++    pthread_setspecific( teb_key, teb );
++    server_init_thread( NULL, &suspend );
++    pthread_sigmask( SIG_UNBLOCK, &server_block_set, NULL );
++    thread_data->start( thread_data->param );
++    PsTerminateSystemThread( 0 );
++}
++
++
++/***********************************************************************
++ *              PsCreateSystemThread   (ntdll.so)
++ */
++NTSTATUS WINAPI PsCreateSystemThread( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr,
++                                      HANDLE process, CLIENT_ID *id, PRTL_THREAD_START_ROUTINE start, void *param )
++{
++    sigset_t sigset;
++    pthread_t pthread_id;
++    pthread_attr_t pthread_attr;
++    data_size_t len;
++    struct object_attributes *objattr;
++    struct ntdll_thread_data *thread_data;
++    INITIAL_TEB stack;
++    DWORD tid = 0;
++    int request_pipe[2];
++    TEB *teb;
++    unsigned int status;
++
++    if ((status = alloc_object_attributes( attr, &objattr, &len ))) return status;
++
++    if (server_pipe( request_pipe ) == -1)
++    {
++        free( objattr );
++        return STATUS_TOO_MANY_OPENED_FILES;
++    }
++    wine_server_send_fd( request_pipe[0] );
++
++    if (!access) access = THREAD_ALL_ACCESS;
++
++    SERVER_START_REQ( new_thread )
++    {
++        req->process    = wine_server_obj_handle( NtCurrentProcess() );
++        req->access     = access;
++        req->flags      = THREAD_CREATE_FLAGS_BYPASS_PROCESS_FREEZE;
++        req->request_fd = request_pipe[0];
++        wine_server_add_data( req, objattr, len );
++        if (!(status = wine_server_call( req )))
++        {
++            *handle = wine_server_ptr_handle( reply->handle );
++            tid = reply->tid;
++        }
++        close( request_pipe[0] );
++    }
++    SERVER_END_REQ;
++
++    free( objattr );
++    if (status)
++    {
++        close( request_pipe[1] );
++        return status;
++    }
++
++    pthread_sigmask( SIG_BLOCK, &server_block_set, &sigset );
++
++    if ((status = virtual_alloc_teb( &teb ))) goto done;
++
++    /* kernel stack only, system threads never run PE code */
++    if ((status = virtual_alloc_thread_stack( &stack, limit_4g, 0, kernel_stack_size, kernel_stack_size, FALSE )))
++    {
++        virtual_free_teb( teb );
++        goto done;
++    }
++
++    set_thread_id( teb, GetCurrentProcessId(), tid );
++
++    thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
++    thread_data->request_fd   = request_pipe[1];
++    thread_data->kernel_stack = stack.DeallocationStack;
++    thread_data->start = start;
++    thread_data->param = param;
++
++    pthread_attr_init( &pthread_attr );
++    pthread_attr_setstack( &pthread_attr, thread_data->kernel_stack, kernel_stack_size );
++    pthread_attr_setguardsize( &pthread_attr, 0 );
++    pthread_attr_setscope( &pthread_attr, PTHREAD_SCOPE_SYSTEM ); /* force creating a kernel thread */
++    InterlockedIncrement( &nb_threads );
++    if (pthread_create( &pthread_id, &pthread_attr, (void * (*)(void *))start_system_thread, teb ))
++    {
++        InterlockedDecrement( &nb_threads );
++        virtual_free_teb( teb );
++        status = STATUS_NO_MEMORY;
++    }
++    pthread_attr_destroy( &pthread_attr );
++
++done:
++    pthread_sigmask( SIG_SETMASK, &sigset, NULL );
++    if (status)
++    {
++        NtClose( *handle );
++        close( request_pipe[1] );
++        return status;
++    }
++    if (id)
++    {
++        id->UniqueProcess = ULongToHandle( GetCurrentProcessId() );
++        id->UniqueThread  = ULongToHandle( tid );
++    }
++    return status;
++}
++
++
+ /***********************************************************************
+  *           abort_thread
+  */
+@@ -1774,6 +1897,15 @@ NTSTATUS WINAPI NtTerminateThread( HANDLE handle, LONG exit_code )
+ }
+ 
+ 
++/******************************************************************************
++ *              PsTerminateSystemThread  (ntdll.so)
++ */
++NTSTATUS WINAPI PsTerminateSystemThread( NTSTATUS exit_code )
++{
++    for (;;) exit_thread( exit_code );
++}
++
++
+ /******************************************************************************
+  *              NtQueueApcThreadEx2  (NTDLL.@)
+  */
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index 588afdbee22..6fbb5576fe2 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -116,6 +116,7 @@ struct ntdll_thread_data
+     PRTL_THREAD_START_ROUTINE start;         /* thread entry point */
+     void                     *param;         /* thread entry point parameter */
+     void                     *jmp_buf;       /* setjmp buffer for exception handling */
++    BOOL                      system_thread; /* thread runs only on the Unix side */
+     int                      *fsync_apc_futex;
+ };
+ 
+diff --git a/include/winternl.h b/include/winternl.h
+index 20d434fbb96..197ca36f95d 100644
+--- a/include/winternl.h
++++ b/include/winternl.h
+@@ -5413,6 +5413,11 @@ NTSYSAPI LONGLONG  WINAPI RtlLargeIntegerSubtract(LONGLONG,LONGLONG);
+ NTSYSAPI NTSTATUS  WINAPI RtlLargeIntegerToChar(const ULONGLONG *,ULONG,ULONG,PCHAR);
+ #endif
+ 
++#ifdef WINE_UNIX_LIB
++NTSYSAPI NTSTATUS  WINAPI PsCreateSystemThread(PHANDLE,ULONG,POBJECT_ATTRIBUTES,HANDLE,PCLIENT_ID,PRTL_THREAD_START_ROUTINE,PVOID);
++NTSYSAPI NTSTATUS  WINAPI PsTerminateSystemThread(NTSTATUS);
++#endif
++
+ /* Wine internal functions */
+ 
+ NTSYSAPI NTSTATUS WINAPI __wine_get_unix_env( const char *var, char *val, unsigned int buffer_len );
+-- 
+2.55.0
+
