@@ -20,7 +20,7 @@ are not imported. References to child "overlays" inside this series mean GDI
 child-window composition, not the Steam overlay. Direct-toplevel presentation
 and other unrelated Wine-Wineland work are also intentionally excluded.
 
-The 83 patches selectively cover the source commits below. Most
+The 84 patches selectively cover the source commits below. Most
 pending-producer changes from `64f5e7717f44` are folded into the following
 expose-order patch after rebasing; patch 0067 restores its managed Vulkan
 producer lifecycle, which must bracket image allocation and channel teardown.
@@ -41,6 +41,11 @@ Patch 0079 mirrors Wine's X11 EGL fallback-context handling for applications
 that release their WGL context before calling `SwapBuffers`, preventing Mesa
 from rejecting Chromium child-window presents with `EGL_BAD_CONTEXT` and
 `EGL_BAD_SURFACE`. It is based on Wine commit `de44bd7234b2c` by Paul Gofman.
+Patch 0084 adapts `093181906443` by attaching an active replacement WSI surface
+before its first present while retaining the selected surface's last frame.
+The imported tree now has the attachment-generation support that was missing
+when this commit was first evaluated, so the focused replacement handoff is
+portable without the later presentation-coordination rewrite.
 `a42482e82bcb` is omitted because its deadlock fix is already present in the
 rebased implementation. The portions of `a022197bcbd4` that overlap
 GE-Proton's separately applied NVIDIA Reflex patch are restored by patch 0065,
@@ -81,9 +86,9 @@ commits, in patch order:
 
 Patch 0045 replaces the older local adaptation (previously 0038) with the
 upstream commit `f70d57bb55d3`. Patch 0069 (`cd4699994c7a`, "winewayland: Unmap
-hidden toplevels") is the relevant fix for the NCSOFT Purple launcher hanging
-under Wayland: an explicitly hidden launcher window stayed mapped, and its
-stale input surface could take focus away from the game window.
+hidden toplevels") prevents an explicitly hidden launcher window from
+remaining mapped and taking focus away from the game window. It does not fix
+Purple's separate CEF navigation repaint stall.
 
 Adaptations made while importing:
 
@@ -113,7 +118,7 @@ Adaptations made while importing:
 
 ## Bug fixes ported from the skipped set (2026-09-01)
 
-Five of the probed commits became portable once their hunks were re-derived
+Six of the probed commits became portable once their hunks were re-derived
 against the tree GE-Proton actually has at each apply step. They are real
 cherry-picks with the upstream author, date and `Source:` trailer preserved:
 
@@ -122,8 +127,29 @@ cherry-picks with the upstream author, date and `Source:` trailer preserved:
 0081 b8496ab03011  winewayland: Derive toplevel resizeability from window state.
 0082 1261111b60ec  win32u: Fall back to linear dma-buf images.
 0083 19d4bf0c51eb  win32u: Request an extra Vulkan swapchain image.
+0084 093181906443  winewayland.drv: Attach replacement surfaces before first present.
 ../em-fixups/0023 b9638444e73d  winewayland.drv: Clear carrier state when replacing contents.
 ```
+
+## GE-Proton local fixups (2026-09-02)
+
+Patch 0085 is not part of the upstream import; it is a GE-Proton follow-up
+for the fast path introduced by patch 0021. Acking a fullscreen configure
+from the requested state bypasses `wayland_configure_window()`, so an
+application that strips its frame styles before entering the state can keep
+stale frame insets in the Win32 client rect. This matches the failed display
+mode transitions reported for Black Desert Online in GE issue 721. 0085 asks
+the window thread to refresh the client rect with a geometry-neutral
+frame-changed `SetWindowPos`. It only acts on a live, non-minimized,
+borderless window that remains in the true Wayland fullscreen state and whose
+live Win32 client dimensions do not match its live window dimensions.
+
+`../em-fixups/0024` handles a separate shaped-window repaint failure found in
+the NCSOFT Purple launcher. A near-full GDI navigation update can leave its
+attached accelerated client idle until a native move exposes the child
+hierarchy. The fix recognizes that narrow surface state and requests one
+Win32 hierarchy repaint, with a latch reset by smaller damage rather than a
+timer or executable-specific workaround.
 
 Adaptations made while importing:
 
@@ -160,7 +186,7 @@ fixup loop instead of in the middle of this series.
 
 ## Skipped upstream commits
 
-The 44 commits below were probed and deliberately not imported; the five
+The 43 commits below were probed and deliberately not imported; the six
 fixes above came out of this list once they were ported. Almost all of the
 remainder are built on subsystems this Wine base predates: cached `win_data`
 window state
@@ -235,8 +261,6 @@ db07d99ea645  direct-toplevel presentation is intentionally excluded from this s
 9681b586f96e  17-region swapchain retarget chain (VkFullScreenExclusiveEXT + output
                retargeting)
 6a00c43c71fe  needs wayland_fullscreen_request tracking list
-093181906443  needs client_surface attachment_generation/invalidate-once presentation
-               tracking
 3c332ec38747  output_info_array primary-selection rewrite; this base predates it
 9d4bdad83377  fix gates have_relative, a variable shape this base does not have (pre-
                split pointer path)
