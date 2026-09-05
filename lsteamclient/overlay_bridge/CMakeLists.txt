@@ -24,6 +24,12 @@ set(RELATIVE_POINTER_PROTOCOL_HEADER
     "${PROTOCOL_GENERATED_DIR}/relative-pointer-unstable-v1-client-protocol.h")
 set(RELATIVE_POINTER_PROTOCOL_CODE
     "${PROTOCOL_GENERATED_DIR}/relative-pointer-unstable-v1-protocol.c")
+set(FRACTIONAL_SCALE_PROTOCOL_XML
+    "${CMAKE_CURRENT_SOURCE_DIR}/protocols/fractional-scale-v1.xml")
+set(FRACTIONAL_SCALE_PROTOCOL_HEADER
+    "${PROTOCOL_GENERATED_DIR}/fractional-scale-v1-client-protocol.h")
+set(FRACTIONAL_SCALE_PROTOCOL_CODE
+    "${PROTOCOL_GENERATED_DIR}/fractional-scale-v1-protocol.c")
 
 file(MAKE_DIRECTORY "${PROTOCOL_GENERATED_DIR}")
 add_custom_command(
@@ -42,8 +48,26 @@ add_custom_command(
     DEPENDS "${RELATIVE_POINTER_PROTOCOL_XML}"
     VERBATIM
 )
+add_custom_command(
+    OUTPUT "${FRACTIONAL_SCALE_PROTOCOL_HEADER}"
+    COMMAND "${WAYLAND_SCANNER_EXECUTABLE}" client-header
+            "${FRACTIONAL_SCALE_PROTOCOL_XML}"
+            "${FRACTIONAL_SCALE_PROTOCOL_HEADER}"
+    DEPENDS "${FRACTIONAL_SCALE_PROTOCOL_XML}"
+    VERBATIM
+)
+add_custom_command(
+    OUTPUT "${FRACTIONAL_SCALE_PROTOCOL_CODE}"
+    COMMAND "${WAYLAND_SCANNER_EXECUTABLE}" private-code
+            "${FRACTIONAL_SCALE_PROTOCOL_XML}"
+            "${FRACTIONAL_SCALE_PROTOCOL_CODE}"
+    DEPENDS "${FRACTIONAL_SCALE_PROTOCOL_XML}"
+    VERBATIM
+)
 
 add_library(lsteamclient_overlay_bridge SHARED
+    ${FRACTIONAL_SCALE_PROTOCOL_CODE}
+    ${FRACTIONAL_SCALE_PROTOCOL_HEADER}
     ${RELATIVE_POINTER_PROTOCOL_CODE}
     ${RELATIVE_POINTER_PROTOCOL_HEADER}
     src/focus_proxy.c

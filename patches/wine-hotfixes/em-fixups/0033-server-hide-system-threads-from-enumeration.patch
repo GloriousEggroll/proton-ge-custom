@@ -1,0 +1,154 @@
+From f9eb4752139dfddfd572554da6f92a1c6eaff96f Mon Sep 17 00:00:00 2001
+From: M0n7y5 <17201053+M0n7y5@users.noreply.github.com>
+Date: Fri, 12 Jun 2026 18:37:56 +0200
+Subject: [PATCH] server: Don't return system threads in enumerations.
+
+Adapted for 11.0: renamed the initial-thread local to main_thread to avoid shadowing the SO_PEERCRED variable.
+
+(partially picked from commit 8a2788328c65e518d94f8b30632db98934be37dd)
+---
+ server/process.c | 18 ++++++++++++------
+ server/process.h |  1 +
+ server/request.c |  3 ++-
+ server/thread.c  |  6 +++---
+ 4 files changed, 18 insertions(+), 10 deletions(-)
+
+diff --git a/server/process.c b/server/process.c
+index 287718adc66..5bd62c651b1 100644
+--- a/server/process.c
++++ b/server/process.c
+@@ -556,9 +556,11 @@ void *get_ptid_entry( unsigned int id )
+ /* return the main thread of the process */
+ struct thread *get_process_first_thread( struct process *process )
+ {
+-    struct list *ptr = list_head( &process->thread_list );
+-    if (!ptr) return NULL;
+-    return LIST_ENTRY( ptr, struct thread, proc_entry );
++    struct thread *thread;
++
++    LIST_FOR_EACH_ENTRY( thread, &process->thread_list, struct thread, proc_entry )
++        if (!thread->is_system) return thread;
++    return NULL;
+ }
+ 
+ /* set the state of the process startup info */
+@@ -679,6 +681,7 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
+     process->unix_pid        = -1;
+     process->exit_code       = STILL_ACTIVE;
+     process->running_threads = 0;
++    process->user_threads    = 0;
+     process->priority        = PROCESS_PRIOCLASS_NORMAL;
+     process->base_priority   = 8;
+     process->disable_boost   = 0;
+@@ -1032,6 +1035,7 @@ static void process_killed( struct process *process )
+ void add_process_thread( struct process *process, struct thread *thread )
+ {
+     list_add_tail( &process->thread_list, &thread->proc_entry );
++    if (!thread->is_system) process->user_threads++;
+     if (!process->running_threads++)
+     {
+         list_add_tail( &process_list, &process->entry );
+@@ -1055,6 +1059,7 @@ void remove_process_thread( struct process *process, struct thread *thread )
+     assert( !list_empty( &process->thread_list ));
+ 
+     list_remove( &thread->proc_entry );
++    if (!thread->is_system) process->user_threads--;
+ 
+     if (!--process->running_threads)
+     {
+@@ -2078,9 +2083,9 @@ DECL_HANDLER(list_processes)
+         reply->info_size = (reply->info_size + 7) & ~7;
+         reply->info_size += sizeof(struct process_info) + process->imagelen;
+         reply->info_size = (reply->info_size + 7) & ~7;
+-        reply->info_size += process->running_threads * sizeof(struct thread_info);
++        reply->info_size += process->user_threads * sizeof(struct thread_info);
+         reply->process_count++;
+-        reply->total_thread_count += process->running_threads;
++        reply->total_thread_count += process->user_threads;
+         reply->total_name_len += process->imagelen;
+     }
+ 
+@@ -2101,7 +2106,7 @@ DECL_HANDLER(list_processes)
+         process_info = (struct process_info *)(buffer + pos);
+         process_info->start_time = process->start_time;
+         process_info->name_len = process->imagelen;
+-        process_info->thread_count = process->running_threads;
++        process_info->thread_count = process->user_threads;
+         process_info->priority = process->priority;
+         process_info->pid = process->id;
+         process_info->parent_pid = process->parent_id;
+@@ -2116,6 +2121,7 @@ DECL_HANDLER(list_processes)
+         {
+             struct thread_info *thread_info = (struct thread_info *)(buffer + pos);
+ 
++            if (thread->is_system) continue;
+             thread_info->start_time = thread->creation_time;
+             thread_info->tid = thread->id;
+             thread_info->base_priority = thread->base_priority;
+diff --git a/server/process.h b/server/process.h
+index 5d157d66979..2244f4d4a23 100644
+--- a/server/process.h
++++ b/server/process.h
+@@ -53,6 +53,7 @@ struct process
+     int                  unix_pid;        /* Unix pid for final SIGKILL */
+     int                  exit_code;       /* process exit code */
+     int                  running_threads; /* number of threads running in this process */
++    int                  user_threads;    /* number of user threads running in this process */
+     timeout_t            start_time;      /* absolute time at process start */
+     timeout_t            end_time;        /* absolute time at process end */
+     affinity_t           affinity;        /* process affinity mask */
+diff --git a/server/request.c b/server/request.c
+index 7e22a059b6c..b42a16fff14 100644
+--- a/server/request.c
++++ b/server/request.c
+@@ -591,7 +591,8 @@ static void master_socket_poll_event( struct fd *fd, int event )
+         if (thread) clear_error();
+         if ((process = create_process( client, thread ? thread->process : NULL, 0, NULL, NULL, NULL, 0, NULL )))
+         {
+-            create_thread( -1, process, NULL );
++            struct thread *main_thread = create_thread( -1, process, NULL );
++            if (main_thread) add_process_thread( process, main_thread );
+             release_object( process );
+         }
+     }
+diff --git a/server/thread.c b/server/thread.c
+index 8f1722f9b41..a3eaf221359 100644
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -583,7 +583,6 @@ struct thread *create_thread( int fd, struct process *process, const struct secu
+     }
+ 
+     set_fd_events( thread->request_fd, POLLIN );  /* start listening to events */
+-    add_process_thread( thread->process, thread );
+     return thread;
+ 
+ error:
+@@ -1739,6 +1738,7 @@ DECL_HANDLER(new_thread)
+         thread->is_system = req->is_system;
+         thread->dbg_hidden = !!(req->flags & THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER);
+         thread->bypass_proc_suspend = !!(req->flags & THREAD_CREATE_FLAGS_BYPASS_PROCESS_FREEZE);
++        add_process_thread( process, thread );
+         reply->tid = get_thread_id( thread );
+         if ((reply->handle = alloc_handle_no_access_check( current->process, thread,
+                                                            req->access, objattr->attributes )))
+@@ -1922,7 +1922,7 @@ DECL_HANDLER(get_thread_info)
+             reply->flags |= GET_THREAD_INFO_FLAG_DBG_HIDDEN;
+         if (thread->state == TERMINATED)
+             reply->flags |= GET_THREAD_INFO_FLAG_TERMINATED;
+-        if (thread->process->running_threads == 1)
++        if (thread->process->user_threads == 1)
+             reply->flags |= GET_THREAD_INFO_FLAG_LAST;
+         if (thread->disable_boost)
+             reply->flags |= GET_THREAD_INFO_FLAG_DISABLE_BOOST;
+@@ -2461,7 +2461,7 @@ DECL_HANDLER(get_next_thread)
+     while (ptr)
+     {
+         thread = LIST_ENTRY( ptr, struct thread, entry );
+-        if (thread->process == process &&
++        if (thread->process == process && !thread->is_system &&
+             (reply->handle = alloc_handle( current->process, thread, req->access, req->attributes )))
+         {
+             release_object( process );
+-- 
+2.55.0
+

@@ -1,0 +1,117 @@
+From 96e31d8dcb41a3c966b6c7f8d940f0bb0276c735 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Thu, 3 Sep 2026 16:41:45 -0600
+Subject: [PATCH] winewayland: Run the event dispatcher as a system thread
+
+Create the process-global Wayland dispatcher through PsCreateSystemThread so protected launchers cannot enumerate or terminate it through Win32 thread APIs. Include the ARM64 signal handling required by Unix-only system threads.
+---
+ dlls/ntdll/unix/signal_arm64.c         |  9 +++++++--
+ dlls/winewayland.drv/dllmain.c         | 13 -------------
+ dlls/winewayland.drv/waylanddrv_main.c | 24 ++++++++++++++++++++++++
+ 3 files changed, 31 insertions(+), 15 deletions(-)
+
+diff --git a/dlls/ntdll/unix/signal_arm64.c b/dlls/ntdll/unix/signal_arm64.c
+index c18e6507f6c..52ea43a1122 100644
+--- a/dlls/ntdll/unix/signal_arm64.c
++++ b/dlls/ntdll/unix/signal_arm64.c
+@@ -1324,7 +1324,8 @@ static void quit_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+ {
+     ucontext_t *context = sigcontext;
+ 
+-    if (!is_inside_syscall( SP_sig(context) )) user_mode_abort_thread( 0, get_syscall_frame() );
++    if (!ntdll_get_thread_data()->system_thread && !is_inside_syscall( SP_sig(context) ))
++        user_mode_abort_thread( 0, get_syscall_frame() );
+     abort_thread(0);
+ }
+ 
+@@ -1340,7 +1341,11 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+     CHPE_V2_CPU_AREA_INFO *chpe;
+     CONTEXT context;
+ 
+-    if ((chpe = NtCurrentTeb()->ChpeV2CpuAreaInfo) && chpe->SuspendDoorbell &&
++    if (ntdll_get_thread_data()->system_thread)
++    {
++        server_select( NULL, 0, SELECT_INTERRUPTIBLE, 0, NULL, NULL );
++    }
++    else if ((chpe = NtCurrentTeb()->ChpeV2CpuAreaInfo) && chpe->SuspendDoorbell &&
+              (chpe->InSimulation || chpe->InSyscallCallback))
+     {
+         NTSTATUS status = server_select( NULL, 0, SELECT_INTERRUPTIBLE | SELECT_COOPERATIVE_SUSPEND,
+diff --git a/dlls/winewayland.drv/dllmain.c b/dlls/winewayland.drv/dllmain.c
+index 8055d883ee0..1f85fce0060 100644
+--- a/dlls/winewayland.drv/dllmain.c
++++ b/dlls/winewayland.drv/dllmain.c
+@@ -27,17 +27,6 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
+ 
+-static DWORD WINAPI wayland_read_events_thread(void *arg)
+-{
+-    WAYLANDDRV_UNIX_CALL(read_events, NULL);
+-    /* This thread terminates only if an unrecoverable error occurred
+-     * during event reading (e.g., the connection to the Wayland
+-     * compositor is broken). */
+-    ERR("Failed to read events from the compositor, terminating process\n");
+-    TerminateProcess(GetCurrentProcess(), 1);
+-    return 0;
+-}
+-
+ static LRESULT CALLBACK clipboard_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+ {
+     switch (msg)
+@@ -105,8 +94,6 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
+     if (WAYLANDDRV_UNIX_CALL(init, NULL))
+         return FALSE;
+ 
+-    /* Read wayland events from a dedicated thread. */
+-    CloseHandle(CreateThread(NULL, 0, wayland_read_events_thread, NULL, 0, &tid));
+     /* Handle clipboard events in a dedicated thread, if needed. */
+     if (!WAYLANDDRV_UNIX_CALL(init_clipboard, NULL))
+         CloseHandle(CreateThread(NULL, 0, clipboard_thread, NULL, 0, &tid));
+diff --git a/dlls/winewayland.drv/waylanddrv_main.c b/dlls/winewayland.drv/waylanddrv_main.c
+index cdb5dd8a956..99e185ba4e7 100644
+--- a/dlls/winewayland.drv/waylanddrv_main.c
++++ b/dlls/winewayland.drv/waylanddrv_main.c
+@@ -86,8 +86,22 @@ static void wayland_init_process_name(void)
+     }
+ }
+ 
++static NTSTATUS waylanddrv_unix_read_events(void *arg);
++
++static void WINAPI wayland_event_dispatcher(void *arg)
++{
++    NTSTATUS status = waylanddrv_unix_read_events(NULL);
++
++    /* The Wayland connection is process-global. No window can recover after
++     * its event queue fails, so terminate without returning through PE code. */
++    NtTerminateProcess(NtCurrentProcess(), status);
++}
++
+ static NTSTATUS waylanddrv_unix_init(void *arg)
+ {
++    HANDLE thread;
++    NTSTATUS status;
++
+     /* Set the user driver functions now so that they are available during
+      * our initialization. We clear them on error. */
+     __wine_set_user_driver(&waylanddrv_funcs, WINE_GDI_DRIVER_VERSION);
+@@ -96,6 +110,16 @@ static NTSTATUS waylanddrv_unix_init(void *arg)
+ 
+     if (!wayland_process_init()) goto err;
+ 
++    status = PsCreateSystemThread(&thread, SYNCHRONIZE, NULL, NtCurrentProcess(),
++                                  NULL, wayland_event_dispatcher, NULL);
++    if (status)
++    {
++        ERR("Failed to create Wayland event dispatcher, status %#lx\n",
++            (unsigned long)status);
++        goto err;
++    }
++    NtClose(thread);
++
+     return 0;
+ 
+ err:
+-- 
+2.55.0
+

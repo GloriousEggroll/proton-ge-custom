@@ -11,6 +11,74 @@ input through the same event.
 Injected input remains available so lsteamclient can release activation keys
 without leaving game-side keyboard state stuck.
 
+The bridge temporarily hides Wine's hardware cursor while rendering Steam's
+cursor as a movable subsurface. Cache the exact cursor last applied by Wine's
+driver and export a generic replay helper so the bridge can restore custom and
+hidden game cursors when overlay ownership ends. Reapply the current cursor
+clip at the same time so relative-pointer locking does not depend on a real
+compositor focus cycle.
+
+--- a/dlls/win32u/cursoricon.c
++++ b/dlls/win32u/cursoricon.c
+@@ -60,6 +60,9 @@ struct cursoricon_object
+ };
+ 
+ static struct list icon_cache = LIST_INIT( icon_cache );
++static pthread_mutex_t driver_cursor_mutex = PTHREAD_MUTEX_INITIALIZER;
++static HWND driver_cursor_window;
++static HCURSOR driver_cursor_handle;
+ 
+ static struct cursoricon_object *get_icon_ptr( HICON handle )
+ {
+@@ -74,9 +77,36 @@ static struct cursoricon_object *get_icon_ptr( HICON handle )
+     return obj;
+ }
+ 
++W32KAPI void __wine_reapply_driver_cursor(void)
++{
++    RECT clip;
++    HWND window;
++    HCURSOR handle;
++    UINT context;
++
++    pthread_mutex_lock( &driver_cursor_mutex );
++    window = driver_cursor_window;
++    handle = driver_cursor_handle;
++    pthread_mutex_unlock( &driver_cursor_mutex );
++
++    if (window)
++    {
++        TRACE( "reapplying window %p, hcursor %p\n", window, handle );
++        user_driver->pSetCursor( window, handle );
++    }
++
++    context = NtUserSetThreadDpiAwarenessContext( NTUSER_DPI_PER_MONITOR_AWARE );
++    if (NtUserGetClipCursor( &clip )) NtUserClipCursor( &clip );
++    NtUserSetThreadDpiAwarenessContext( context );
++}
++
+ BOOL process_wine_setcursor( HWND hwnd, HWND window, HCURSOR handle )
+ {
+     TRACE( "hwnd %p, window %p, hcursor %p\n", hwnd, window, handle );
++    pthread_mutex_lock( &driver_cursor_mutex );
++    driver_cursor_window = window;
++    driver_cursor_handle = handle;
++    pthread_mutex_unlock( &driver_cursor_mutex );
+     user_driver->pSetCursor( window, handle );
+     return TRUE;
+ }
+
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -37,6 +37,7 @@ extern void release_clipboard_owner( HWND hwnd );
+ 
+ /* cursoricon.c */
+ extern BOOL process_wine_setcursor( HWND hwnd, HWND window, HCURSOR handle );
++extern W32KAPI void __wine_reapply_driver_cursor(void);
+ extern HICON alloc_cursoricon_handle( BOOL is_icon );
+ extern ULONG_PTR get_icon_param( HICON handle );
+ extern ULONG_PTR set_icon_param( HICON handle, const struct free_icon_params *params );
+
 --- a/dlls/win32u/message.c
 +++ b/dlls/win32u/message.c
 @@ -43,6 +43,49 @@ WINE_DECLARE_DEBUG_CHANNEL(relay);

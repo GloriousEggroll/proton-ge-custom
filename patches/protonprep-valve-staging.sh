@@ -93,7 +93,7 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/em-fixups/0001-winewayland-add-SNI-tray-icons-and-native-context-me.patch"
 
     # Original work by Erhan Bilgili:
-    # https://github.com/nanomatters/wine-wineland/commits/wineland_20260713-reorg/
+    # https://github.com/nanomatters/wine-salkim/tree/wineland_20260713-reorg
     echo "WINE: -CUSTOM- WINELAND CROSS-PROCESS CHILD RENDERING"
     apply_all_in_dir "../patches/wine-hotfixes/wineland-child-rendering/"
 
@@ -264,6 +264,18 @@ apply_all_in_dir() {
     echo "WINE: -HOTFIX- Fix Smart Tee negotiation and V4L WoW64 media type marshaling"
     apply_all_in_dir "../patches/wine-hotfixes/qcap-dshow-fixes/"
 
+    echo "WINE: -HOTFIX- Pump thread user messages during synchronous URLMon binds"
+    apply_patch "../patches/wine-hotfixes/pending/urlmon-pump-thread-user-messages-during-synchronous-bind.patch"
+
+    echo "WINE: -HOTFIX- Preserve PFX machine-keyset provider metadata"
+    apply_patch "../patches/wine-hotfixes/pending/crypt32-pfx-record-machine-keyset-in-prov-info.patch"
+
+    echo "WINE: -HOTFIX- Record the PFX container's actual key spec"
+    apply_patch "../patches/wine-hotfixes/pending/crypt32-pfx-use-the-container-key-spec.patch"
+
+    echo "WINE: -HOTFIX- Reject unsupported NCrypt-only private-key requests"
+    apply_patch "../patches/wine-hotfixes/pending/crypt32-reject-ncrypt-only-private-keys.patch"
+
     echo "WINE: -HOTFIX- Add GetFileVersionInfoByHandle version export stub"
     apply_patch "../patches/wine-hotfixes/pending/version-GetFileVersionInfoByHandle-stub.patch"
 
@@ -292,6 +304,9 @@ apply_all_in_dir() {
     # https://gitlab.winehq.org/wine/wine/-/commit/a31ec8da9572672e04ae46792a398da942649875
     echo "WINE: -HOTFIX- Prefer native non-Microsoft DLLs using version resources"
     apply_patch "../patches/wine-hotfixes/pending/ntdll-prefer-native-version-resource-heuristics.patch"
+
+    echo "WINE: -HOTFIX- Keep builtin AMD AGS ahead of the native-version heuristic"
+    apply_patch "../patches/wine-hotfixes/pending/ntdll-keep-builtin-amd-ags-ahead-of-version-heuristic.patch"
 
 ### END WINE HOTFIX/BACKPORT SECTION ###
 

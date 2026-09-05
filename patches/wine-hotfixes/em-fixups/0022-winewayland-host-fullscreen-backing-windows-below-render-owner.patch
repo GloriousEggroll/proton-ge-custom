@@ -1,0 +1,214 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Mon, 31 Aug 2026 10:00:00 -0600
+Subject: [PATCH] winewayland: Host fullscreen backing windows below render owner
+
+Some games create an inert disabled tool popup as a fullscreen backing window
+and explicitly place it immediately behind the actual render window.  Mapping
+the backing window as an independent xdg_toplevel cannot preserve that
+cross-toplevel ordering.  Once owner inference sees the overlapping render
+window, mapping it as an xdg_popup is worse: the protocol guarantees that the
+black backing surface remains above its parent.
+
+Recognize this narrow Win32 pattern and host the backing window as a
+subsurface of the same-process window immediately above it in Win32 Z order.
+Persist a below-parent stacking mode across role and parent recreation so
+later position-only updates cannot promote the backing surface over the game.
+
+This fixes fullscreen helper windows covering Forza Horizon 6 under
+Wine-Wayland while leaving interactive popups and menus on the xdg_popup path.
+---
+ dlls/winewayland.drv/wayland_surface.c | 14 +++++++--
+ dlls/winewayland.drv/waylanddrv.h      |  4 ++-
+ dlls/winewayland.drv/window.c          | 50 +++++++++++++++++++++++++++++----
+ 3 files changed, 59 insertions(+), 9 deletions(-)
+
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 55ff69813a1..7c5a86d872c 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -1652,11 +1652,13 @@ err:
+  * Gives the subsurface role to a plain Wayland surface.
+  */
+ void wayland_surface_make_subsurface(struct wayland_surface *surface,
+-                                     struct wayland_surface *parent)
++                                     struct wayland_surface *parent,
++                                     BOOL stack_below_parent)
+ {
+     assert(!surface->role || surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE);
+     if (surface->wl_subsurface && surface->toplevel_hwnd == parent->hwnd)
+     {
++        surface->stack_below_parent = stack_below_parent;
+         if (surface->parent_serial == parent->serial) return;
+ 
+         TRACE("hwnd=%p parent_hwnd=%p serial changed %u -> %u; recreating subsurface\n",
+@@ -1677,6 +1679,7 @@ void wayland_surface_make_subsurface(struct wayland_surface *surface,
+     wayland_surface_sync_alpha(surface);
+     surface->toplevel_hwnd = parent->hwnd;
+     surface->parent_serial = parent->serial;
++    surface->stack_below_parent = stack_below_parent;
+ 
+     /* Present contents independently of the parent surface. */
+     wl_subsurface_set_desync(surface->wl_subsurface);
+@@ -2103,6 +2106,7 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
+ 
+         surface->toplevel_hwnd = 0;
+         surface->parent_serial = 0;
++        surface->stack_below_parent = FALSE;
+         break;
+     }
+ 
+@@ -2238,7 +2242,8 @@ static void wayland_surface_reconfigure_subsurface(struct wayland_surface *surfa
+         TRACE("hwnd=%p parent_hwnd=%p serial changed %u -> %u; recreating subsurface\n",
+               surface->hwnd, toplevel_surface->hwnd, surface->parent_serial,
+               toplevel_surface->serial);
+-        wayland_surface_make_subsurface(surface, toplevel_surface);
++        wayland_surface_make_subsurface(surface, toplevel_surface,
++                                        surface->stack_below_parent);
+         return;
+     }
+ 
+@@ -2248,7 +2253,10 @@ static void wayland_surface_reconfigure_subsurface(struct wayland_surface *surfa
+ 
+     TRACE("hwnd=%p pos=%d,%d\n", surface->hwnd, point.x, point.y);
+     wl_subsurface_set_position(surface->wl_subsurface, point.x, point.y);
+-    if (toplevel_data->client_surface && toplevel_data->client_surface->wl_subsurface)
++    if (surface->stack_below_parent)
++        wl_subsurface_place_below(surface->wl_subsurface,
++                                  toplevel_surface->wl_surface);
++    else if (toplevel_data->client_surface && toplevel_data->client_surface->wl_subsurface)
+         wl_subsurface_place_above(surface->wl_subsurface,
+                                   toplevel_data->client_surface->wl_surface);
+     else
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index 336a23a4c24..ff3ec37203e 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -511,6 +511,7 @@ struct wayland_surface
+             struct wl_subsurface *wl_subsurface;
+             HWND toplevel_hwnd;
+             unsigned int parent_serial;
++            BOOL stack_below_parent;
+         };
+         struct
+         {
+@@ -574,7 +575,8 @@ struct wayland_surface *wayland_surface_create(HWND hwnd);
+ void wayland_surface_destroy(struct wayland_surface *surface);
+ void wayland_surface_make_toplevel(struct wayland_surface *surface, BOOL server_decor);
+ void wayland_surface_make_subsurface(struct wayland_surface *surface,
+-                                     struct wayland_surface *parent);
++                                     struct wayland_surface *parent,
++                                     BOOL stack_below_parent);
+ void wayland_surface_make_popup(struct wayland_surface *surface,
+                                 struct wayland_surface *owner);
+ void wayland_surface_make_layer(struct wayland_surface *surface, const RECT *rect, BOOL menu);
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index 7ec87a44a96..38daa5acc0d 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -310,6 +310,34 @@ static BOOL should_defer_unanchored_menu_popup(DWORD style, DWORD exstyle,
+     return is_menu_popup_candidate_style(style, exstyle);
+ }
+ 
++/* Some games create an inert fullscreen backing window and place it directly
++ * behind their render window. It must share the render window's surface tree:
++ * an independent toplevel has no controllable cross-toplevel z-order, while an
++ * xdg_popup is required by the protocol to remain above its parent. */
++static HWND get_fullscreen_backing_parent(HWND hwnd, HWND insert_after, BOOL fullscreen)
++{
++    DWORD style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
++    DWORD exstyle = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
++    HWND parent = insert_after;
++
++    if (!fullscreen || !(style & WS_POPUP) || !(style & WS_DISABLED) ||
++        !(exstyle & WS_EX_TOOLWINDOW) || (exstyle & WS_EX_APPWINDOW))
++        return NULL;
++
++    if (!parent || !NtUserIsWindow(parent))
++        parent = NtUserGetWindowRelative(hwnd, GW_HWNDPREV);
++    if (!parent || parent == hwnd || parent == NtUserGetDesktopWindow() ||
++        !NtUserIsWindow(parent))
++        return NULL;
++
++    parent = NtUserGetAncestor(parent, GA_ROOT);
++    if (!parent || parent == hwnd || parent == NtUserGetDesktopWindow() ||
++        (DWORD)(ULONG_PTR)NtUserQueryWindow(parent, WindowProcess) != GetCurrentProcessId())
++        return NULL;
++
++    return parent;
++}
++
+ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data,
+                                                     struct wayland_surface *toplevel_surface,
+                                                     struct wayland_surface *owner_surface,
+@@ -317,7 +345,8 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
+                                                     BOOL layer_menu,
+                                                     struct window_surface *window_surface,
+                                                     UINT swp_flags,
+-                                                    BOOL has_menu_popup_owner)
++                                                    BOOL has_menu_popup_owner,
++                                                    BOOL stack_below_parent)
+ {
+     struct wayland_client_surface *client = data->client_surface;
+     struct wayland_surface *surface;
+@@ -350,7 +379,7 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
+         !should_keep_minimized_toplevel_mapped(surface, style))
+         visible = FALSE;
+ 
+-    if (!visible) role = WAYLAND_SURFACE_ROLE_NONE;
++    if (!visible || (stack_below_parent && !toplevel_surface)) role = WAYLAND_SURFACE_ROLE_NONE;
+     else if (owner_surface) role = WAYLAND_SURFACE_ROLE_POPUP;
+     else if (use_layer_shell && !IsRectEmpty(&data->rects.window)) role = WAYLAND_SURFACE_ROLE_LAYER;
+     else if (toplevel_surface) role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
+@@ -411,7 +440,8 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
+         wayland_surface_make_layer(surface, &data->rects.window, layer_menu);
+         break;
+     case WAYLAND_SURFACE_ROLE_SUBSURFACE:
+-        wayland_surface_make_subsurface(surface, toplevel_surface);
++        wayland_surface_make_subsurface(surface, toplevel_surface,
++                                        stack_below_parent);
+         break;
+     case WAYLAND_SURFACE_ROLE_TOPLEVEL:
+         wayland_surface_make_toplevel(surface, server_decor);
+@@ -888,6 +918,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+                               const struct window_rects *new_rects, struct window_surface *surface)
+ {
+     HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT), owner = NULL, menu_popup_owner = NULL;
++    HWND backing_parent;
+     struct wayland_surface *toplevel_surface = NULL, *owner_surface = NULL;
+     struct wayland_client_surface *client;
+     struct wayland_win_data *data, *toplevel_data, *owner_data;
+@@ -896,6 +927,8 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+     BOOL notification = FALSE;
+     BOOL use_layer_shell = FALSE;
+ 
++    backing_parent = get_fullscreen_backing_parent(hwnd, insert_after, fullscreen);
++
+     /* Get the managed state with win_data unlocked, as is_window_managed
+      * may need to query win_data information about other HWNDs and thus
+      * acquire the lock itself internally. */
+@@ -903,7 +936,13 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+     managed = is_window_managed(hwnd, menu_popup_owner, swp_flags, fullscreen);
+     if (!tray_menu && surface && process_wayland.zwlr_layer_shell_v1)
+         notification = is_notification_window(hwnd, swp_flags, new_rects);
+-    if ((tray_menu || notification) && surface && process_wayland.zwlr_layer_shell_v1)
++    if (backing_parent)
++    {
++        managed = FALSE;
++        toplevel = backing_parent;
++        owner = NULL;
++    }
++    else if ((tray_menu || notification) && surface && process_wayland.zwlr_layer_shell_v1)
+     {
+         managed = FALSE;
+         toplevel = NULL;
+@@ -972,7 +1011,8 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+     }
+     else if (wayland_win_data_create_wayland_surface(data, toplevel_surface, owner_surface,
+                                                      use_layer_shell, tray_menu, surface, swp_flags,
+-                                                     menu_popup_owner != NULL))
++                                                     menu_popup_owner != NULL,
++                                                     backing_parent != NULL))
+     {
+         wayland_win_data_update_wayland_state(data);
+     }

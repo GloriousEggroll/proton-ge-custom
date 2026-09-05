@@ -1,0 +1,122 @@
+From 903a1cf2753b725f1f6e587e579e7df12bc80b75 Mon Sep 17 00:00:00 2001
+From: M0n7y5 <17201053+M0n7y5@users.noreply.github.com>
+Date: Fri, 12 Jun 2026 18:37:56 +0200
+Subject: [PATCH] server: Add support for system threads.
+
+Adapted for 11.0: kept int flags (no stdbool), set req->is_system directly in the fork's PsCreateSystemThread.
+
+(partially picked from commit 5155018f6f8579b4e0d89eedf45da52cc2478e95)
+---
+ dlls/ntdll/unix/thread.c       | 1 +
+ include/wine/server_protocol.h | 4 ++--
+ server/protocol.def            | 1 +
+ server/request_handlers.h      | 1 +
+ server/request_trace.h         | 1 +
+ server/thread.c                | 2 ++
+ server/thread.h                | 1 +
+ 7 files changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
+index b4950d015e3..907ad6c2fa9 100644
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -1526,6 +1526,7 @@ NTSTATUS WINAPI PsCreateSystemThread( HANDLE *handle, ACCESS_MASK access, OBJECT
+         req->access     = access;
+         req->flags      = THREAD_CREATE_FLAGS_BYPASS_PROCESS_FREEZE;
+         req->request_fd = request_pipe[0];
++        req->is_system  = 1;
+         wine_server_add_data( req, objattr, len );
+         if (!(status = wine_server_call( req )))
+         {
+diff --git a/include/wine/server_protocol.h b/include/wine/server_protocol.h
+index c2f24e71dea..274c5abce20 100644
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -1218,8 +1218,8 @@ struct new_thread_request
+     unsigned int access;
+     unsigned int flags;
+     int          request_fd;
++    int          is_system;
+     /* VARARG(objattr,object_attributes); */
+-    char __pad_28[4];
+ };
+ struct new_thread_reply
+ {
+@@ -7464,6 +7464,6 @@ union generic_reply
+     struct hwnd_dmabuf_release_channel_reply hwnd_dmabuf_release_channel_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 936
++#define SERVER_PROTOCOL_VERSION 937
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+diff --git a/server/protocol.def b/server/protocol.def
+index 06974f9d880..870f4b02e22 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -1219,6 +1219,7 @@ typedef volatile struct
+     unsigned int access;       /* wanted access rights */
+     unsigned int flags;        /* thread creation flags */
+     int          request_fd;   /* fd for request pipe */
++    int          is_system;    /* system thread (kernel mode only) */
+     VARARG(objattr,object_attributes); /* object attributes */
+ @REPLY
+     thread_id_t  tid;          /* thread id */
+diff --git a/server/request_handlers.h b/server/request_handlers.h
+index aacb9dc1860..0481306bee5 100644
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -732,6 +732,7 @@ C_ASSERT( offsetof(struct new_thread_request, process) == 12 );
+ C_ASSERT( offsetof(struct new_thread_request, access) == 16 );
+ C_ASSERT( offsetof(struct new_thread_request, flags) == 20 );
+ C_ASSERT( offsetof(struct new_thread_request, request_fd) == 24 );
++C_ASSERT( offsetof(struct new_thread_request, is_system) == 28 );
+ C_ASSERT( sizeof(struct new_thread_request) == 32 );
+ C_ASSERT( offsetof(struct new_thread_reply, tid) == 8 );
+ C_ASSERT( offsetof(struct new_thread_reply, handle) == 12 );
+diff --git a/server/request_trace.h b/server/request_trace.h
+index 9713566a779..2cf20fba59c 100644
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -103,6 +103,7 @@ static void dump_new_thread_request( const struct new_thread_request *req )
+     fprintf( stderr, ", access=%08x", req->access );
+     fprintf( stderr, ", flags=%08x", req->flags );
+     fprintf( stderr, ", request_fd=%d", req->request_fd );
++    fprintf( stderr, ", is_system=%d", req->is_system );
+     dump_varargs_object_attributes( ", objattr=", cur_size );
+ }
+ 
+diff --git a/server/thread.c b/server/thread.c
+index a81848fbab4..8f1722f9b41 100644
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -408,6 +408,7 @@ static inline void init_thread_structure( struct thread *thread )
+     thread->teb             = 0;
+     thread->entry_point     = 0;
+     thread->system_regs     = 0;
++    thread->is_system       = 0;
+     thread->queue           = NULL;
+     thread->wait            = NULL;
+     thread->error           = 0;
+@@ -1735,6 +1736,7 @@ DECL_HANDLER(new_thread)
+     {
+         thread->system_regs = current->system_regs;
+         if (req->flags & THREAD_CREATE_FLAGS_CREATE_SUSPENDED) thread->suspend++;
++        thread->is_system = req->is_system;
+         thread->dbg_hidden = !!(req->flags & THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER);
+         thread->bypass_proc_suspend = !!(req->flags & THREAD_CREATE_FLAGS_BYPASS_PROCESS_FREEZE);
+         reply->tid = get_thread_id( thread );
+diff --git a/server/thread.h b/server/thread.h
+index fd6947dbc1e..54613b0b22b 100644
+--- a/server/thread.h
++++ b/server/thread.h
+@@ -88,6 +88,7 @@ struct thread
+     int                    base_priority; /* base priority level (relative to process base priority class) */
+     int                    disable_boost; /* disable thread priority boost */
+     int                    suspend;       /* suspend count */
++    int                    is_system;     /* system thread (kernel mode only) */
+     int                    dbg_hidden;    /* hidden from debugger */
+     int                    bypass_proc_suspend; /* will still run if the process is suspended */
+     obj_handle_t           desktop;       /* desktop handle */
+-- 
+2.55.0

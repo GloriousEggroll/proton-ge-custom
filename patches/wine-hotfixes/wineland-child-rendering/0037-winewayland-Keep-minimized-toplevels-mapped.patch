@@ -1,0 +1,198 @@
+From 7d3c16911a81d263c5f7a4769a8d57d17b3f1151 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Sun, 12 Jul 2026 02:16:54 +0200
+Subject: [PATCH] winewayland: Keep minimized toplevels mapped.
+
+(cherry picked from commit 7d3c16911a81d263c5f7a4769a8d57d17b3f1151)
+
+Source: https://github.com/nanomatters/wine-salkim/commit/7d3c16911a81d263c5f7a4769a8d57d17b3f1151
+---
+ dlls/winewayland.drv/wayland_keyboard.c | 23 ++++++++++++--
+ dlls/winewayland.drv/wayland_surface.c  | 19 ++++++++++++
+ dlls/winewayland.drv/window.c           | 40 +++++++++++++++++++++----
+ 3 files changed, 75 insertions(+), 7 deletions(-)
+
+diff --git a/dlls/winewayland.drv/wayland_keyboard.c b/dlls/winewayland.drv/wayland_keyboard.c
+index b6d3072e386..d81a919c787 100644
+--- a/dlls/winewayland.drv/wayland_keyboard.c
++++ b/dlls/winewayland.drv/wayland_keyboard.c
+@@ -912,6 +912,8 @@ static void keyboard_handle_enter(void *private, struct wl_keyboard *wl_keyboard
+                                   struct wl_array *keys)
+ {
+     struct wayland_keyboard *keyboard = &process_wayland.keyboard;
++    struct wayland_surface *surface;
++    struct wayland_win_data *data;
+     HWND hwnd;
+ 
+     InterlockedExchange(&process_wayland.input_serial, serial);
+@@ -929,8 +931,25 @@ static void keyboard_handle_enter(void *private, struct wl_keyboard *wl_keyboard
+ 
+     NtUserPostMessage(hwnd, WM_INPUTLANGCHANGEREQUEST, 0 /*FIXME*/, (LPARAM)keyboard_hkl);
+     NtUserPostMessage(hwnd, WM_WINE_WINDOW_STATE_CHANGED, 0, 0);
+-    if (wayland_is_layer_menu_hwnd(hwnd))
+-        NtUserPostMessage(hwnd, WM_WAYLAND_SET_FOREGROUND, 0, 0);
++
++    if (!(data = wayland_win_data_get(hwnd))) return;
++
++    if ((surface = data->wayland_surface))
++    {
++        /* TODO: Drop the internal message and call NtUserSetForegroundWindow
++         * directly once it's updated to not explicitly deactivate the old
++         * foreground window when both the old and new foreground windows
++         * are in the same non-current thread. */
++        if (surface->window.minimized)
++        {
++            NtUserPostMessage(hwnd, WM_SYSCOMMAND, SC_RESTORE, 0);
++            NtUserPostMessage(hwnd, WM_WAYLAND_SET_FOREGROUND, 0, 0);
++        }
++        else if (surface->window.managed || wayland_is_layer_menu_hwnd(hwnd))
++            NtUserPostMessage(hwnd, WM_WAYLAND_SET_FOREGROUND, 0, 0);
++    }
++
++    wayland_win_data_release(data);
+ }
+ 
+ static BOOL wayland_disable_focus_loss(void)
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 094249d1796..86e3279584a 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -3214,6 +3214,13 @@ static BOOL wayland_surface_try_direct_dmabuf(HWND hwnd)
+     {
+         struct wayland_surface *surface = data->wayland_surface;
+ 
++        if (surface && surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL &&
++            surface->window.minimized)
++        {
++            wayland_win_data_release(data);
++            return FALSE;
++        }
++
+         had_direct = surface && surface->direct_dmabuf_surface;
+         may_try = surface && (had_direct ||
+                               (wayland_surface_is_toplevel(surface) &&
+@@ -3276,6 +3283,8 @@ void wayland_surface_update_hwnd_dmabufs(struct wayland_surface *surface)
+     if (!wayland_surface_is_toplevel(surface) && !wayland_surface_is_popup(surface) &&
+         !wayland_surface_is_layer(surface))
+         return;
++    if (surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL && surface->window.minimized)
++        return;
+ 
+     /* Import is driven by producer wakes (WM_WAYLAND_DMABUF_FRAME) at the producer's
+      * self-paced rate, regardless of whether our toplevel is presented. We do not pace
+@@ -3924,7 +3933,12 @@ static void wayland_client_surface_detach(struct client_surface *client)
+ 
+ static BOOL is_client_visible(HWND hwnd)
+ {
++    HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
+     RECT dummy;
++
++    if (NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_MINIMIZE) return FALSE;
++    if (root && root != hwnd && (NtUserGetWindowLongW(root, GWL_STYLE) & WS_MINIMIZE))
++        return FALSE;
+     return NtUserIsWindowVisible(hwnd) || NtUserGetPresentRect(hwnd, &dummy, -1);
+ }
+ 
+@@ -4191,6 +4205,11 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
+         if (toplevel_data) wayland_win_data_release(toplevel_data);
+         return wayland_client_surface_attach(client, NULL);
+     }
++    if (surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL && surface->window.minimized)
++    {
++        wayland_client_surface_attach(client, NULL);
++        return;
++    }
+ 
+     if (client->toplevel != toplevel ||
+         client->toplevel_wl_surface != surface->wl_surface)
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index c7363eb68ff..568026aaa31 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -255,15 +255,35 @@ static BOOL rect_intersects_virtual_screen(const RECT *rect)
+     return intersect_rect(&intersect, rect, &virtual_rect);
+ }
+ 
+-static BOOL should_keep_minimized_toplevel_mapped(struct wayland_surface *surface)
++static BOOL should_keep_minimized_toplevel_mapped(struct wayland_surface *surface,
++                                                  DWORD style)
+ {
+     if (!surface || surface->role != WAYLAND_SURFACE_ROLE_TOPLEVEL) return FALSE;
+-    if (!surface->window.minimized) return FALSE;
++    if (!(style & WS_MINIMIZE)) return FALSE;
+ 
+     return !surface->current.caps ||
+            (surface->current.caps & WAYLAND_SURFACE_WM_CAPS_MINIMIZE);
+ }
+ 
++static BOOL window_or_root_minimized(HWND hwnd)
++{
++    HWND root = NtUserGetAncestor(hwnd, GA_ROOT);
++
++    if (NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_MINIMIZE) return TRUE;
++    return root && root != hwnd && (NtUserGetWindowLongW(root, GWL_STYLE) & WS_MINIMIZE);
++}
++
++static void detach_client_surfaces_for_toplevel(HWND toplevel)
++{
++    struct wayland_win_data *data;
++
++    RB_FOR_EACH_ENTRY(data, &win_data_rb, struct wayland_win_data, entry)
++    {
++        if (data->client_surface && data->client_surface->toplevel == toplevel)
++            wayland_client_surface_attach(data->client_surface, NULL);
++    }
++}
++
+ static BOOL is_menu_popup_candidate_style(DWORD style, DWORD exstyle)
+ {
+     if (!(style & WS_POPUP)) return FALSE;
+@@ -305,7 +325,7 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
+ 
+     if (visible && !owner_surface && !use_layer_shell && !toplevel_surface &&
+         !rect_intersects_virtual_screen(&data->rects.window) &&
+-        !should_keep_minimized_toplevel_mapped(surface))
++        !should_keep_minimized_toplevel_mapped(surface, style))
+         visible = FALSE;
+ 
+     if (!visible) role = WAYLAND_SURFACE_ROLE_NONE;
+@@ -374,9 +394,12 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
+ 
+     if (client)
+     {
+-        if (role != WAYLAND_SURFACE_ROLE_NONE) wayland_client_surface_attach(client, data->hwnd);
++        if (role != WAYLAND_SURFACE_ROLE_NONE && !window_or_root_minimized(data->hwnd))
++            wayland_client_surface_attach(client, data->hwnd);
+         else wayland_client_surface_attach(client, NULL);
+     }
++    if (surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL && surface->window.minimized)
++        detach_client_surfaces_for_toplevel(data->hwnd);
+     wayland_surface_sync_window_regions(surface, window_surface);
+ 
+     /* Size/position changes affect the effective pointer constraint, so update
+@@ -852,7 +875,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+     {
+         if ((client = data->client_surface))
+         {
+-            if (toplevel && NtUserIsWindowVisible(hwnd))
++            if (toplevel && NtUserIsWindowVisible(hwnd) && !window_or_root_minimized(hwnd))
+                 wayland_client_surface_attach(client, toplevel);
+             else
+                 wayland_client_surface_attach(client, NULL);
+@@ -1546,6 +1569,13 @@ BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffe
+ 
+     if ((wayland_surface = data->wayland_surface))
+     {
++        if (wayland_surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL &&
++            wayland_surface->window.minimized)
++        {
++            wayland_win_data_release(data);
++            return TRUE;
++        }
++
+         if (wayland_surface_reconfigure(wayland_surface))
+         {
+             /* sync the alpha multiplier if it has changed due to SLWA/ULW */
+-- 
+2.55.0
+

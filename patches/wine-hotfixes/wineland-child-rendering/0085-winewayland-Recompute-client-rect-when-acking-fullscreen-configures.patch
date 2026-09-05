@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Wed, 2 Sep 2026 21:30:00 -0600
+Subject: [PATCH] winewayland: Recompute client rect when acking fullscreen
+ configures from requested state
+
+Complements the child-rendering fast paths from Erhan Bilgili's Wine-Wineland
+rebase (patches 0021 and 0071 in this series,
+https://github.com/nanomatters/wine-salkim/tree/wineland_20260713-reorg).
+
+Acking a fullscreen configure from the requested state finalizes the toplevel
+without running wayland_configure_window(), so the Win32 window is never
+issued a SWP_FRAMECHANGED for the transition. Applications that strip their
+frame styles before entering the state keep the stale frame insets in the
+Win32 client rect. Black Desert Online then builds its exclusive-fullscreen
+swapchain from GetClientRect() at the framed size and its display-mode
+validation fails, looping on retries (GE issue 721).
+
+Ask the window thread to refresh the client rect with a geometry-neutral
+frame-changed SetWindowPos. Restrict this to borderless windows in the true
+fullscreen Wayland state. Ordinary maximized application windows must not
+receive a synthetic non-client transition. The handler compares live Win32
+window and client dimensions, keeps the existing private message values stable,
+and rechecks its Wayland state before acting on the asynchronous request.
+
+---
+ dlls/winewayland.drv/wayland_surface.c | 13 +++++++++++++
+ dlls/winewayland.drv/waylanddrv.h      |  1 +
+ dlls/winewayland.drv/window.c          | 53 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 67 insertions(+)
+
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 13329aa331c..160cda3e4d7 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -3868,6 +3868,19 @@
+         memset(&surface->processing, 0, sizeof(surface->processing));
+         memset(&surface->requested, 0, sizeof(surface->requested));
+         xdg_surface_ack_configure(surface->xdg_surface, surface->current.serial);
++
++        /* Acking a fullscreen configure from the requested state bypasses
++         * wayland_configure_window(), so the Win32 client
++         * rect is not recomputed for the transition. Applications that
++         * removed their frame styles before entering the state keep the
++         * stale frame insets in the client rect, and exclusive-fullscreen
++         * apps size their swapchain against a framed client (Black Desert
++         * Online, GE issue 721). Ask the window thread to refresh it with
++         * a geometry-neutral frame-changed update; it stays quiet when the
++         * client rect already matches.
++         */
++        if (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN)
++            NtUserPostMessage(surface->hwnd, WM_WAYLAND_RECALC_CLIENT_RECT, 0, 0);
+     }
+     else if (!surface->current.serial ||
+              !wayland_surface_config_is_compatible(&surface->current, rect,
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index a02a8f6fcdc..e5940007f52 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -87,4 +87,5 @@
+     WM_WAYLAND_SET_FOREGROUND,
+     WM_WAYLAND_DMABUF_FRAME,
+     WM_WAYLAND_EXPOSE,
++    WM_WAYLAND_RECALC_CLIENT_RECT,
+ };
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index b6f0d8de411..b17ed47b040 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -1099,6 +1099,59 @@
+     case WM_WAYLAND_CONFIGURE:
+         wayland_configure_window(hwnd);
+         return 0;
++    case WM_WAYLAND_RECALC_CLIENT_RECT:
++    {
++        struct wayland_win_data *data;
++        struct wayland_surface *surface;
++        RECT window, expected, client;
++        static const RECT empty_rect;
++        DWORD style;
++        UINT dpi;
++        BOOL fullscreen = FALSE;
++
++        if ((data = wayland_win_data_get(hwnd)))
++        {
++            surface = data->wayland_surface;
++            fullscreen = surface && wayland_surface_is_toplevel(surface) &&
++                         (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN);
++            wayland_win_data_release(data);
++        }
++        if (!fullscreen) return 0;
++
++        /* This repair is for borderless fullscreen windows. In particular,
++         * do not send a synthetic non-client transition to ordinary
++         * maximized launchers. */
++        style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
++        if (style & (WS_MINIMIZE | WS_CAPTION | WS_THICKFRAME)) return 0;
++
++        /* Use live Win32 geometry rather than the cached Wayland window rect:
++         * the latter is populated from the same transition whose stale
++         * non-client metrics this message is repairing. */
++        dpi = NtUserGetDpiForWindow(hwnd);
++        if (!NtUserGetWindowRect(hwnd, &window, dpi) ||
++            !NtUserGetClientRect(hwnd, &client, dpi))
++            return 0;
++        SetRect(&expected, 0, 0, window.right - window.left,
++                window.bottom - window.top);
++        if (IsRectEmpty(&expected)) return 0;
++        if (EqualRect(&client, &expected)) return 0;
++
++        /* The posted message may outlive the configure that queued it. Do not
++         * repair a window that left fullscreen while it was pending. */
++        if (!(data = wayland_win_data_get(hwnd))) return 0;
++        surface = data->wayland_surface;
++        fullscreen = surface && wayland_surface_is_toplevel(surface) &&
++                     (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN);
++        wayland_win_data_release(data);
++        if (!fullscreen) return 0;
++
++        TRACE("hwnd=%p client %s -> %s\n", hwnd, wine_dbgstr_rect(&client),
++              wine_dbgstr_rect(&expected));
++        NtUserSetRawWindowPos(hwnd, empty_rect, SWP_NOSIZE | SWP_NOMOVE |
++                              SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER |
++                              SWP_FRAMECHANGED | SWP_NOSENDCHANGING, FALSE);
++        return 0;
++    }
+     case WM_WAYLAND_SET_FOREGROUND:
+     {
+         HWND focused, restore;
