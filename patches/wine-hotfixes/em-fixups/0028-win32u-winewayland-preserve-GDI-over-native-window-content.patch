@@ -1,0 +1,331 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Sat, 5 Sep 2026 12:00:00 -0600
+Subject: [PATCH] win32u, winewayland: Preserve GDI over a window's native content
+
+Purple alternates between full-window Vulkan presents and DXVK D3D9's
+partial-present GDI fallback. Once native presentation clips the client
+out of the backing SHM surface, GDI updates to that same HWND are still
+copied, but the Wayland flush clears them outside the surface clip. The
+last native frame remains visible until resizing forces another present.
+
+The existing GDI-over-producer tracking handles transparent children, not
+drawing to the producer window itself. Track these writes separately and
+include their region in the SHM clip. Keep the corresponding native client
+below the updated GDI pixels.
+
+Retire same-window GDI when the native presentation owner presents again,
+without clearing GDI from children. Exclude background erase and CopyBits
+from the new tracking so retained backing content cannot hide a native
+frame. Propagate the region through DPI-scaled window surfaces and flush
+retirement outside the client-surface lock.
+
+This extends the selective child-rendering implementation by Erhan Bilgili
+(nanomatters, https://github.com/nanomatters/wine-wineland). It is a local
+fix, not an imported upstream commit. Drivers with a direct PutImage path
+retain their existing behavior.
+
+Replaces the unsuccessful local SHM-source classification adaptation:
+classifying an empty clip does not preserve the pixels cleared by that
+clip, and its window queries reintroduced user-lock acquisition in flush.
+---
+diff --git a/dlls/win32u/clipping.c b/dlls/win32u/clipping.c
+index eece404..7eada11 100644
+--- a/dlls/win32u/clipping.c
++++ b/dlls/win32u/clipping.c
+@@ -215,7 +215,7 @@ INT WINAPI NtGdiExtSelectClipRgn( HDC hdc, HRGN rgn, INT mode )
+  *           set_visible_region
+  */
+ void set_visible_region( HDC hdc, HRGN hrgn, const RECT *vis_rect, const RECT *device_rect,
+-                         struct window_surface *surface, BOOL gdi_over_source,
++                         struct window_surface *surface, enum surface_gdi_source source,
+                          UINT dpi_from, UINT dpi_to )
+ {
+     DC * dc;
+@@ -236,7 +236,7 @@ void set_visible_region( HDC hdc, HRGN hrgn, const RECT *vis_rect, const RECT *d
+     dc->dpi_from = dpi_from;
+     dc->dpi_to = dpi_to;
+ 
+-    dibdrv_set_window_surface( dc, surface, gdi_over_source );
++    dibdrv_set_window_surface( dc, surface, source );
+     DC_UpdateXforms( dc );
+     update_dc_clipping( dc );
+     release_dc_ptr( dc );
+diff --git a/dlls/win32u/dce.c b/dlls/win32u/dce.c
+index 677b63d..f53a301 100644
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -693,6 +693,7 @@ static BOOL scaled_surface_flush( struct window_surface *window_surface, const R
+     struct scaled_surface *surface = get_scaled_surface( window_surface );
+     RECT src = *dirty, dst;
+     HDC hdc_dst, hdc_src;
++    HRGN self_painted;
+ 
+     src.left &= ~7;
+     src.top &= ~7;
+@@ -718,6 +719,17 @@ static BOOL scaled_surface_flush( struct window_surface *window_surface, const R
+     NtGdiDeleteObjectApp( hdc_src );
+ 
+     window_surface_lock( surface->target_surface );
++    self_painted = map_dpi_region( window_surface->self_painted_region, surface->dpi_from, surface->dpi_to );
++    if ((self_painted || surface->target_surface->self_painted_region) &&
++        !NtGdiEqualRgn( self_painted, surface->target_surface->self_painted_region ))
++    {
++        if (surface->target_surface->self_painted_region)
++            NtGdiDeleteObjectApp( surface->target_surface->self_painted_region );
++        surface->target_surface->self_painted_region = self_painted;
++        self_painted = 0;
++        surface->target_surface->bounds = surface->target_surface->rect;
++    }
++    if (self_painted) NtGdiDeleteObjectApp( self_painted );
+     window_surface_add_app_paint_rect( surface->target_surface, &dst );
+     add_bounds_rect( &surface->target_surface->bounds, &dst );
+     window_surface_unlock( surface->target_surface );
+@@ -1097,6 +1109,7 @@ W32KAPI void window_surface_release( struct window_surface *surface )
+         if (surface->app_painted_region) NtGdiDeleteObjectApp( surface->app_painted_region );
+         if (surface->gdi_over_producer_region) NtGdiDeleteObjectApp( surface->gdi_over_producer_region );
+         if (surface->gdi_over_paint_region) NtGdiDeleteObjectApp( surface->gdi_over_paint_region );
++        if (surface->self_painted_region) NtGdiDeleteObjectApp( surface->self_painted_region );
+         if (surface->color_bitmap) NtGdiDeleteObjectApp( surface->color_bitmap );
+         if (surface->shape_bitmap) NtGdiDeleteObjectApp( surface->shape_bitmap );
+         surface->funcs->destroy( surface );
+@@ -1233,6 +1246,37 @@ W32KAPI void window_surface_add_app_paint_rect( struct window_surface *surface,
+     NtGdiDeleteObjectApp( rect_region );
+ }
+ 
++void window_surface_add_self_paint_rect( struct window_surface *surface, const RECT *rect )
++{
++    HRGN region;
++
++    if (IsRectEmpty( rect ) || get_background_erase_depth() || get_copy_bits_depth()) return;
++    if (!(region = NtGdiCreateRectRgn( rect->left, rect->top, rect->right, rect->bottom ))) return;
++    if (!surface->self_painted_region) surface->self_painted_region = region;
++    else
++    {
++        NtGdiCombineRgn( surface->self_painted_region, surface->self_painted_region, region, RGN_OR );
++        NtGdiDeleteObjectApp( region );
++    }
++}
++
++void window_surface_clear_self_paint( struct window_surface *surface )
++{
++    BOOL changed = FALSE;
++
++    window_surface_lock( surface );
++    if (surface->self_painted_region)
++    {
++        NtGdiDeleteObjectApp( surface->self_painted_region );
++        surface->self_painted_region = 0;
++        surface->bounds = surface->rect;
++        changed = TRUE;
++    }
++    window_surface_unlock( surface );
++
++    if (changed) window_surface_flush( surface );
++}
++
+ W32KAPI void window_surface_add_gdi_over_paint_rect( struct window_surface *surface, const RECT *rect )
+ {
+     HRGN rect_region, clipped_region, producer_region = 0, synthetic_region = 0, combined_region = 0;
+@@ -1614,13 +1658,21 @@ static void update_visible_region( struct dce *dce )
+ 
+     if (surface)
+     {
+-        BOOL gdi_over_source = !foreign &&
+-            (dce->hwnd != top_win) &&
+-            (get_window_long( dce->hwnd, GWL_EXSTYLE ) & WS_EX_TRANSPARENT) &&
+-            !(paint_flags & (SET_WINPOS_PIXEL_FORMAT | SET_WINPOS_CLIP_CLIENT));
++        enum surface_gdi_source source = SURFACE_GDI_DEFAULT;
++
++        if (!foreign)
++        {
++            if (dce->hwnd == top_win && !user_driver->dc_funcs.pPutImage &&
++                (paint_flags & (SET_WINPOS_PIXEL_FORMAT | SET_WINPOS_CLIP_CLIENT)))
++                source = SURFACE_GDI_OVER_SELF;
++            else if (dce->hwnd != top_win &&
++                     (get_window_long( dce->hwnd, GWL_EXSTYLE ) & WS_EX_TRANSPARENT) &&
++                     !(paint_flags & (SET_WINPOS_PIXEL_FORMAT | SET_WINPOS_CLIP_CLIENT)))
++                source = SURFACE_GDI_OVER_CHILD;
++        }
+ 
+         user_driver->pGetDC( dce->hdc, dce->hwnd, top_win, &win_rect, &top_rect, flags );
+-        set_visible_region( dce->hdc, vis_rgn, &win_rect, &top_rect, surface, gdi_over_source, 0, 0 );
++        set_visible_region( dce->hdc, vis_rgn, &win_rect, &top_rect, surface, source, 0, 0 );
+         window_surface_release( surface );
+     }
+     else
+diff --git a/dlls/win32u/dibdrv/dc.c b/dlls/win32u/dibdrv/dc.c
+index 8f6bedc..9021e7e 100644
+--- a/dlls/win32u/dibdrv/dc.c
++++ b/dlls/win32u/dibdrv/dc.c
+@@ -321,6 +321,7 @@ void add_clipped_bounds( dibdrv_physdev *dev, const RECT *rect, HRGN clip )
+     if (dev->window_surface) window_surface_add_app_paint_rect( dev->window_surface, &rc );
+     add_bounds_rect( dev->bounds, &rc );
+     if (dev->gdi_over_surface) window_surface_add_gdi_over_paint_rect( dev->gdi_over_surface, &rc );
++    if (dev->self_paint_surface) window_surface_add_self_paint_rect( dev->self_paint_surface, &rc );
+ }
+ 
+ /**********************************************************************
+@@ -561,7 +562,7 @@ static void unlock_windrv_bits( struct gdi_image_bits *bits )
+     unlock_surface( bits->param );
+ }
+ 
+-void dibdrv_set_window_surface( DC *dc, struct window_surface *surface, BOOL gdi_over_source )
++void dibdrv_set_window_surface( DC *dc, struct window_surface *surface, enum surface_gdi_source source )
+ {
+     PHYSDEV windev;
+     struct windrv_physdev *physdev;
+@@ -605,7 +606,8 @@ void dibdrv_set_window_surface( DC *dc, struct window_surface *surface, BOOL gdi
+         OffsetRect( &dibdrv->dib.rect, -dc->device_rect.left, -dc->device_rect.top );
+         dibdrv->bounds = &surface->bounds;
+         dibdrv->window_surface = surface != &dummy_surface ? surface : NULL;
+-        dibdrv->gdi_over_surface = (gdi_over_source && surface != &dummy_surface) ? surface : NULL;
++        dibdrv->gdi_over_surface = source == SURFACE_GDI_OVER_CHILD ? dibdrv->window_surface : NULL;
++        dibdrv->self_paint_surface = source == SURFACE_GDI_OVER_SELF ? dibdrv->window_surface : NULL;
+         DC_InitDC( dc );
+     }
+     else if (windev)
+diff --git a/dlls/win32u/dibdrv/dibdrv.h b/dlls/win32u/dibdrv/dibdrv.h
+index 0a68bd3..3323149 100644
+--- a/dlls/win32u/dibdrv/dibdrv.h
++++ b/dlls/win32u/dibdrv/dibdrv.h
+@@ -101,6 +101,7 @@ typedef struct dibdrv_physdev
+     RECT *bounds;
+     struct window_surface *window_surface;
+     struct window_surface *gdi_over_surface;
++    struct window_surface *self_paint_surface;
+     struct cached_font *font;
+ 
+     /* pen */
+diff --git a/dlls/win32u/ntgdi_private.h b/dlls/win32u/ntgdi_private.h
+index 56022d3..caf0895 100644
+--- a/dlls/win32u/ntgdi_private.h
++++ b/dlls/win32u/ntgdi_private.h
+@@ -164,10 +164,17 @@ extern BOOL store_brush_pattern( LOGBRUSH *brush, struct brush_pattern *pattern
+ extern void free_brush_pattern( struct brush_pattern *pattern );
+ 
+ /* clipping.c */
++enum surface_gdi_source
++{
++    SURFACE_GDI_DEFAULT,
++    SURFACE_GDI_OVER_CHILD,
++    SURFACE_GDI_OVER_SELF,
++};
++
+ extern BOOL clip_device_rect( DC *dc, RECT *dst, const RECT *src );
+ extern BOOL clip_visrect( DC *dc, RECT *dst, const RECT *src );
+ extern void set_visible_region( HDC hdc, HRGN hrgn, const RECT *vis_rect, const RECT *device_rect,
+-                                struct window_surface *surface, BOOL gdi_over_source,
++                                struct window_surface *surface, enum surface_gdi_source source,
+                                 UINT dpi_from, UINT dpi_to );
+ extern void update_dc_clipping( DC * dc );
+ 
+@@ -226,7 +233,9 @@ extern UINT get_dib_dc_color_table( HDC hdc, UINT startpos, UINT entries,
+                                     RGBQUAD *colors );
+ extern UINT set_dib_dc_color_table( HDC hdc, UINT startpos, UINT entries,
+                                     const RGBQUAD *colors );
+-extern void dibdrv_set_window_surface( DC *dc, struct window_surface *surface, BOOL gdi_over_source );
++extern void dibdrv_set_window_surface( DC *dc, struct window_surface *surface, enum surface_gdi_source source );
++extern void window_surface_add_self_paint_rect( struct window_surface *surface, const RECT *rect );
++extern void window_surface_clear_self_paint( struct window_surface *surface );
+ 
+ /* driver.c */
+ extern const struct gdi_dc_funcs null_driver;
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index 1fbe279..e6da80a 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -364,6 +364,7 @@ void client_surface_invalidate_presentation( struct client_surface *surface )
+ 
+ void client_surface_present( struct client_surface *surface )
+ {
++    struct window_surface *window_surface = NULL;
+     HDC hdc = 0;
+     HWND hwnd;
+ 
+@@ -373,8 +374,19 @@ void client_surface_present( struct client_surface *surface )
+         if (surface->offscreen) hdc = NtUserGetDCEx( hwnd, 0, DCX_CACHE | DCX_USESTYLE );
+         surface->funcs->present( surface, hdc );
+         if (hdc) NtUserReleaseDC( hwnd, hdc );
++        if (!surface->offscreen && ReadAcquire( &surface->presentation_owner ) &&
++            !user_driver->dc_funcs.pPutImage)
++            window_surface = window_surface_get( hwnd );
+     }
+     pthread_mutex_unlock( &surfaces_lock );
++
++    /* A native frame supersedes GDI drawn over the same window, but not GDI
++     * from its children. Flush only after dropping the client-surface lock. */
++    if (window_surface)
++    {
++        window_surface_clear_self_paint( window_surface );
++        window_surface_release( window_surface );
++    }
+ }
+ 
+ void client_surface_update( struct client_surface *surface )
+diff --git a/dlls/winewayland.drv/window_surface.c b/dlls/winewayland.drv/window_surface.c
+index 35e573e..6286647 100644
+--- a/dlls/winewayland.drv/window_surface.c
++++ b/dlls/winewayland.drv/window_surface.c
+@@ -1173,6 +1173,7 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface,
+     HRGN merged_gdi_over_region = NULL;
+     HRGN gdi_over_region, gdi_over_paint_region;
+     HRGN copy_from_window_region = NULL;
++    HRGN self_paint_clip = NULL, clip_region = window_surface->clip_region;
+     uint32_t buffer_format;
+ 
+     if (!window_surface->app_painted_full && !window_surface->app_painted_region)
+@@ -1202,6 +1203,16 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface,
+                         window_surface->app_painted_region, RGN_AND) == ERROR)
+         goto done;
+ 
++    /* Same-window GDI presents are newer than the retained native image.
++     * Preserve their pixels even when the native client punched out SHM. */
++    if (clip_region && window_surface->self_painted_region)
++    {
++        if (!(self_paint_clip = NtGdiCreateRectRgn(0, 0, 0, 0))) goto done;
++        if (NtGdiCombineRgn(self_paint_clip, clip_region,
++                           window_surface->self_painted_region, RGN_OR) == ERROR) goto done;
++        clip_region = self_paint_clip;
++    }
++
+     buffer_format = (shape_bits || wws->occlusion_clipped || wws->layered) ?
+                     WL_SHM_FORMAT_ARGB8888 : WL_SHM_FORMAT_XRGB8888;
+     if (wws->wayland_buffer_queue->format != buffer_format)
+@@ -1272,10 +1283,10 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface,
+ 
+     overlay_flushed = wayland_gdi_overlay_update(window_surface->hwnd, &wws->gdi_overlay, shm_buffer, dirty,
+                                                  gdi_over_region, gdi_over_paint_region);
+-    /* Slots exist only while GDI pixels need their own above-producer surface. */
+-    content_over_producer = wws->gdi_overlay.slots_created;
++    /* Child overlays and same-window GDI both take precedence over native pixels. */
++    content_over_producer = wws->gdi_overlay.slots_created || window_surface->self_painted_region;
+     if (wws->occlusion_clipped)
+-        wayland_shm_buffer_clear_outside_clip(shm_buffer, dirty, window_surface->clip_region);
++        wayland_shm_buffer_clear_outside_clip(shm_buffer, dirty, clip_region);
+ 
+     NtGdiSetRectRgn(shm_buffer->damage_region, 0, 0, 0, 0);
+ 
+@@ -1290,6 +1301,7 @@ static BOOL wayland_window_surface_flush(struct window_surface *window_surface,
+     wl_display_flush(process_wayland.wl_display);
+ 
+ done:
++    if (self_paint_clip) NtGdiDeleteObjectApp(self_paint_clip);
+     if (merged_gdi_over_region && merged_gdi_over_region != window_surface->gdi_over_producer_region &&
+         merged_gdi_over_region != occluded_region)
+         NtGdiDeleteObjectApp(merged_gdi_over_region);
+diff --git a/include/wine/gdi_driver.h b/include/wine/gdi_driver.h
+index 8139a3e..b67795a 100644
+--- a/include/wine/gdi_driver.h
++++ b/include/wine/gdi_driver.h
+@@ -332,6 +332,7 @@ struct window_surface
+     HRGN                               shape_region; /* shape of the window surface, unshaped if 0 */
+     HRGN                               gdi_over_producer_region; /* GDI pixels that must appear over child producers */
+     HRGN                               gdi_over_paint_region; /* actual GDI paints to carry over child producers */
++    HRGN                               self_painted_region; /* GDI pixels newer than this window's native frame */
+     HBITMAP                            shape_bitmap; /* bitmap for the surface shape (1bpp) */
+     HBITMAP                            color_bitmap; /* bitmap for the surface colors */
+     /* driver-specific fields here */
+-- 
+2.51.0
+

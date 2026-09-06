@@ -1,0 +1,126 @@
+From 8c5e785aca15fb67c4a62a2dfeba1290f9b43350 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Sun, 30 Aug 2026 22:05:00 -0600
+Subject: [PATCH] gamefixes-umu: run the NCSOFT Purple launcher on Microsoft's
+ CLR
+
+Purple.exe is a protected WPF assembly whose metadata declares fields with
+FieldAttributes.HasFieldRVA without a matching FieldRVA row for each of them.
+Microsoft's CLR tolerates the dangling flag, Wine Mono 11.2.0 rejects it with
+System.BadImageFormatException while running the type initializer of the
+obfuscated type 741512A7, so the launcher dies inside the managed module
+constructor before any window or renderer is created.
+
+Install .NET Framework 4.8 so mscoree binds to Microsoft's CLR instead.
+
+Purple also writes Purple.logx through an appender that RSA-encrypts each
+message with a key only NCSoft can reverse, which hides every launcher side
+error, including the ones from a failed sign in. PROTON_L2_DEBUG=1 swaps that
+appender for stock log4net RollingFileAppender and restores the original
+config on the next run without the variable.
+---
+ gamefixes-umu/l2.py | 95 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 95 insertions(+)
+ create mode 100644 gamefixes-umu/l2.py
+
+diff --git a/gamefixes-umu/l2.py b/gamefixes-umu/l2.py
+new file mode 100644
+index 0000000..7281258
+--- /dev/null
++++ b/gamefixes-umu/l2.py
+@@ -0,0 +1,95 @@
++"""Game fix for the NCSOFT Purple launcher (Lineage 2)
++
++Purple.exe is a protected WPF application. Its metadata declares static
++readonly fields with FieldAttributes.HasFieldRVA without shipping a matching
++FieldRVA row for every one of them. Microsoft's CLR tolerates the dangling
++flag, Wine Mono does not:
++
++    field 182D01B2 in 741512A7 should have RVA data, but hasn't
++    System.BadImageFormatException
++    System.TypeInitializationException: The type initializer for '741512A7'
++    Failed to run module constructor
++
++The abort happens inside the managed module initializer, before any window or
++renderer exists, so nothing on the graphics side can reach it. Install the real
++.NET Framework so mscoree binds to Microsoft's CLR instead of Wine Mono.
++
++Purple logs through log4net with an appender that RSA-encrypts every message
++with a public key only NCSoft can reverse, so launcher side errors such as a
++failed sign in cannot be read. Set PROTON_L2_DEBUG=1 in the launch options to
++replace that appender with stock log4net RollingFileAppender and read
++Purple.logx as plain text. The original config is kept beside it as
++log4net.config.enc and is put back on the first run without the variable.
++"""
++
++import os
++import re
++import shutil
++from pathlib import Path
++
++from protonfixes import util
++
++_DEBUG_ENV = 'PROTON_L2_DEBUG'
++_BACKUP_SUFFIX = '.enc'
++_INSTALL_DIRS = ('Program Files (x86)/NC/Purple', 'Program Files/NC/Purple')
++_ENCRYPTING_APPENDER = ('Formula.Infrastructure.Logging.'
++                        'EncryptRollingFileAppender, '
++                        'Formula.Infrastructure.Logging')
++_PLAINTEXT_APPENDER = 'log4net.Appender.RollingFileAppender, log4net'
++_EXTRA_PROPERTIES = re.compile(r'\s*<(?:serviceNetwork|logFileExtension)[^>]*>')
++_MESSAGE_CONVERTER = re.compile(r'\s*<converter>.*?</converter>', re.DOTALL)
++
++
++def _purple_prefix() -> bool:
++    """Whether this prefix already holds an NCSOFT Purple installation"""
++    drive_c = util.protonprefix() / 'drive_c'
++    return any((drive_c / path).is_dir() for path in _INSTALL_DIRS)
++
++
++def _purple_configs() -> list[Path]:
++    """Every log4net.config shipped by an installed Purple version"""
++    drive_c = util.protonprefix() / 'drive_c'
++    configs = []
++    for path in _INSTALL_DIRS:
++        root = drive_c / path
++        configs.append(root / 'log4net.config')
++        configs.extend(sorted(root.glob('*/log4net.config')))
++    return [config for config in configs if config.is_file()]
++
++
++def _plaintext_config(text: str) -> str:
++    """Swap the encrypting appender for one that writes plain text"""
++    text = text.replace(_ENCRYPTING_APPENDER, _PLAINTEXT_APPENDER)
++    text = _MESSAGE_CONVERTER.sub('', text)
++    text = _EXTRA_PROPERTIES.sub('', text)
++    return text.replace('%Message', '%message')
++
++
++def _debug_logging() -> None:
++    """Make Purple.logx readable while PROTON_L2_DEBUG is set"""
++    debug = bool(os.environ.get(_DEBUG_ENV))
++    for config in _purple_configs():
++        backup = config.with_name(config.name + _BACKUP_SUFFIX)
++        if not debug:
++            if backup.is_file():
++                shutil.move(str(backup), str(config))
++            continue
++        text = config.read_text(encoding='utf-8-sig')
++        if _ENCRYPTING_APPENDER not in text:
++            continue
++        if not backup.is_file():
++            shutil.copy2(str(config), str(backup))
++        config.write_text(_plaintext_config(text), encoding='utf-8')
++
++
++def early() -> None:
++    """Copy builtin DLLs instead of symlinking, the installer patches them"""
++    os.environ['PROTON_DLL_COPY'] = '*'
++    _debug_logging()
++
++
++def main() -> None:
++    """Run the launcher on Microsoft's CLR, Wine Mono cannot load it"""
++    if not _purple_prefix():
++        return
++    util.protontricks('dotnet48')

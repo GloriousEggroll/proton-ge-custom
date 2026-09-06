@@ -4,7 +4,7 @@ This directory contains a selective rebase of Wine-Wineland's cross-process
 DMA-BUF rendering work onto the Wine base used by GE-Proton.
 
 Upstream branch:
-https://github.com/nanomatters/wine-salkim/tree/wineland_20260713-reorg
+https://github.com/nanomatters/wine-wineland/tree/wineland_20260713-reorg
 
 Original author: Erhan Bilgili <erhan.bilgili@gmail.com>
 
@@ -20,7 +20,7 @@ are not imported. References to child "overlays" inside this series mean GDI
 child-window composition, not the Steam overlay. Direct-toplevel presentation
 and other unrelated Wine-Wineland work are also intentionally excluded.
 
-The 84 patches selectively cover the source commits below. Most
+The 85 numbered patches selectively cover the source commits below. Most
 pending-producer changes from `64f5e7717f44` are folded into the following
 expose-order patch after rebasing; patch 0067 restores its managed Vulkan
 producer lifecycle, which must bracket image allocation and channel teardown.
@@ -87,8 +87,7 @@ commits, in patch order:
 Patch 0045 replaces the older local adaptation (previously 0038) with the
 upstream commit `f70d57bb55d3`. Patch 0069 (`cd4699994c7a`, "winewayland: Unmap
 hidden toplevels") prevents an explicitly hidden launcher window from
-remaining mapped and taking focus away from the game window. It does not fix
-Purple's separate CEF navigation repaint stall.
+remaining mapped and taking focus away from the game window.
 
 Adaptations made while importing:
 
@@ -144,12 +143,50 @@ frame-changed `SetWindowPos`. It only acts on a live, non-minimized,
 borderless window that remains in the true Wayland fullscreen state and whose
 live Win32 client dimensions do not match its live window dimensions.
 
-`../em-fixups/0024` handles a separate shaped-window repaint failure found in
-the NCSOFT Purple launcher. A near-full GDI navigation update can leave its
-attached accelerated client idle until a native move exposes the child
-hierarchy. The fix recognizes that narrow surface state and requests one
-Win32 hierarchy repaint, with a latch reset by smaller damage rather than a
-timer or executable-specific workaround.
+`../em-fixups/0024` is a focused backport of Erhan Bilgili's presentation
+lifecycle work from `8878f044c1b0`, `88b19ffdd44b`, `a9ce7e02fe50`, and
+`48bf29c49f2b`. It tracks a minimal presentation generation, invalidates it
+when a Wayland client subsurface is detached, polls host present waits in
+bounded slices, and returns `VK_ERROR_OUT_OF_DATE_KHR` after a three-second
+visible-surface feedback stall. It also avoids no-op parent commits after
+desynchronized client presents. This supplies bounded recovery for a stalled
+presenter without a repaint request or executable-specific behavior. The
+direct-toplevel and host-surface retirement portions remain excluded.
+
+`../em-fixups/0026` is a focused adaptation of Erhan Bilgili's
+`13bb88cb72c8` presenter-coordination work. It records every native graphics
+client targeting an HWND and supplies the per-window bookkeeping used by later
+fixups. Keeping every native presenter attached proved insufficient for Purple:
+its DXVK D3D9Ex path uses immediate presentation and can block indefinitely in
+`vkAcquireNextImageKHR` on an obsolete host WSI stream.
+
+`../em-fixups/0027` completes the relevant ownership behavior from
+`13bb88cb72c8`. It selects the newest active graphics-surface generation,
+invalidates prior generations on ownership changes, and backs non-owning
+Vulkan presenters with locally retired images instead of another host Wayland
+WSI surface. Host image acquisition is polled in bounded slices so an already
+blocked presenter observes ownership invalidation. A separate pending-native
+reference keeps only the replacement surface attached while host Wayland WSI
+creates its swapchain, then hands attachment ownership to the active native
+reference. This avoids the circular create-before-attach stall without
+reattaching locally retired or cross-process managed swapchains. The fix has no
+synthetic repaints, resize nudges, or executable-specific path. The full
+virtual presentation-timing and direct-toplevel portions remain excluded.
+
+`../em-fixups/0030` through `0035` import the Unix-only system-thread support
+by Alexandre Julliard and M0n7y5. `../em-fixups/0036` is the GE-Proton
+integration that creates Wine-Wayland's process-global event dispatcher as a
+system thread. Such a thread is omitted from Win32 process/thread enumeration,
+cannot receive a user thread context or APC, and does not emit debug events.
+This prevents protected child processes such as Lineage II from identifying
+and terminating the dispatcher, which otherwise leaves their xdg surfaces
+waiting forever for an initial configure. The dispatcher still has a normal
+Wine TEB and architecture-specific signal handling on x86, x86-64, and ARM64.
+`../em-fixups/0037` completes process teardown for that integration: when the
+last user thread exits, the server terminates the remaining process-local
+system threads before running normal last-thread cleanup. Without it, games
+that exit without explicitly calling `RtlExitUserProcess` can leave their
+`.bin` process and audio alive behind the hidden dispatcher.
 
 Adaptations made while importing:
 
@@ -186,17 +223,17 @@ fixup loop instead of in the middle of this series.
 
 ## Skipped upstream commits
 
-The 43 commits below were probed and deliberately not imported; the six
-fixes above came out of this list once they were ported. Almost all of the
-remainder are built on subsystems this Wine base predates: cached `win_data`
+The commits below were probed and deliberately not imported; the fixes above
+came out of this list once they were ported. Almost all of the remainder are
+built on subsystems this Wine base predates: cached `win_data`
 window state
 (`data->style`, `exstyle`, `visible`, `toplevel`, `owner`, `restore_rect`,
 `configure_state_serial`), direct-toplevel presentation (`direct_client`,
-`evict_direct_client`, `presentation_scaling`), presentation generation and
-present-wait tracking, fullscreen-request tracking, the `output_info_array`
-rework, and client-presentation timing feedback. Getting those fixes means
-re-syncing the whole series onto a newer upstream snapshot, not cherry-picking
-onto this one.
+`evict_direct_client`, `presentation_scaling`), full active-wait and host
+surface retirement tracking, fullscreen-request tracking, the
+`output_info_array` rework, and client-presentation timing feedback. Getting
+those fixes means re-syncing the whole series onto a newer upstream snapshot,
+not cherry-picking onto this one.
 
 ```
 c60d65ba48fb  needs excluded direct-toplevel/external-commit-owner machinery
@@ -204,15 +241,6 @@ c60d65ba48fb  needs excluded direct-toplevel/external-commit-owner machinery
                0010/0012/0020
 75930c29daf5  invasive state-request refactor (new struct/fields + reconcile helper);
                prerequisite cluster 81/102/103/104/106 probed independently
-8878f044c1b0  needs client_surface begin/end_present_wait + presentation_generation
-               tracking (absent from GE base)
-88b19ffdd44b  depends on swapchain_wait_for_present from 8878f044 (absent)
-a9ce7e02fe50  needs absent subsystems: direct_client, direct_host_surface,
-               evict_direct_client, presentation_scaling,
-               wayland_toplevel_has_other_client_surface
-48bf29c49f2b  needs absent subsystems: commit_pending_state, direct_client,
-               direct_host_surface, evict_direct_client, external_commit_owner,
-               presentation_scaling, wayland_toplevel_has_other_client_surface
 c3f8032ff16a  needs configure_state_serial/restore_rect state cluster absent from base
 a56ff94277e4  needs absent subsystems: configure_state_serial, data->style,
                restore_rect_valid, update_restore_rect
@@ -270,7 +298,8 @@ a4eb16883cc3  needs application_fullscreen_rect/present_rect fields
 1a91dda5c8f9  presentation_rects decoupling chain (prerequisite of 8e19ff7)
 82dd594113e2  presentation timing feedback: needs host present_results/managed host
                semaphore
-13bb88cb72c8  89-region presenter-coordination rewrite across win32u+winewayland
+13bb88cb72c8  focused native-presenter portion is ../em-fixups/0026; managed
+               virtual-swapchain/direct-toplevel portions remain omitted
 a89aaf2ef60b  41-region presentation-feedback propagation across the managed present
                path
 e4a20d77c8e1  adds a compositor-GPU helper with no consumer in this base
