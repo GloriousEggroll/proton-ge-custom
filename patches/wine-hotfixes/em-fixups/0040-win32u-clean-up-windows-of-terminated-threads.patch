@@ -1,0 +1,434 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Sun, 6 Sep 2026 14:00:00 -0600
+Subject: [PATCH] win32u: Release windows abandoned by terminated threads
+
+Lineage II's NSplash.dll terminates its splash thread and unloads without
+successfully destroying the thread's window. The server removes the HWND,
+but TerminateThread does not run USER32's thread detach callback. The native
+window and local rendering resources consequently survive.
+
+Notify surviving GUI queues when server teardown removes a terminated
+thread's window. Retain a list of local window objects independently of
+the shared server handle table so an invalidated or reused slot does not
+make the old WND unreachable. Claim the exact full HWND once under the
+USER lock, then release driver and surface resources outside that lock,
+using the same resource cleanup as normal thread detach.
+
+Do not call application window procedures or DLL_THREAD_DETACH on behalf
+of the terminated thread, and do not clean up from its signal handler.
+The surviving queues receive an internal notification, not an application
+message. Handle-slot reuse must not clear a replacement client object.
+
+Allow X11 window destruction from a surviving thread which has not yet
+initialized its own display data. This is shared USER cleanup, not a
+Wayland-only or executable-specific rule.
+
+This does not change DLL_PROCESS_DETACH or bypass C++ mutexes. The separate
+ncplatformsdk-cpp.dll shutdown wait observed in Lineage II still needs
+investigation/comparison with the native C++ runtime.
+
+---
+diff --git a/dlls/win32u/message.c b/dlls/win32u/message.c
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -2241,6 +2241,9 @@
+     {
+     case WM_WINE_DESTROYWINDOW:
+         return destroy_window( hwnd );
++    case WM_WINE_DESTROY_ABANDONED_WINDOW:
++        destroy_abandoned_window( UlongToHandle(wparam) );
++        return 0;
+     case WM_WINE_SETWINDOWPOS:
+         if (is_desktop_window( hwnd )) return 0;
+         return set_window_pos( (WINDOWPOS *)lparam, 0, 0 );
+diff --git a/dlls/win32u/ntuser_private.h b/dlls/win32u/ntuser_private.h
+--- a/dlls/win32u/ntuser_private.h
++++ b/dlls/win32u/ntuser_private.h
+@@ -77,6 +77,7 @@
+     int                clip_from_parent; /* Client area is clipped out of parent surfaces */
+     int                cbWndExtra;    /* class cbWndExtra at window creation */
+     DWORD_PTR          userdata;      /* User private data */
++    struct list        entry;         /* process window objects, including dead server handles */
+     DWORD              wExtra[1];     /* Window extra bytes */
+ } WND;
+ 
+diff --git a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -301,6 +301,7 @@
+ struct tagWND;
+ extern BOOL client_to_screen( HWND hwnd, POINT *pt );
+ extern void destroy_thread_windows(void);
++extern void destroy_abandoned_window( HWND hwnd );
+ extern LRESULT destroy_window( HWND hwnd );
+ extern BOOL get_client_rect( HWND hwnd, RECT *rect, UINT dpi );
+ extern BOOL get_present_rect( HWND hwnd, RECT *rect, UINT dpi );
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -39,6 +39,7 @@
+ #define USER_HANDLE_FROM_INDEX(index, generation) UlongToHandle( (index << 1) + FIRST_USER_HANDLE + (generation << 16) )
+ 
+ static void *client_objects[MAX_USER_HANDLES];
++static struct list window_objects = LIST_INIT(window_objects);
+ 
+ #define SWP_AGG_NOGEOMETRYCHANGE \
+     (SWP_NOSIZE | SWP_NOCLIENTSIZE | SWP_NOZORDER)
+@@ -5654,6 +5655,7 @@
+             set_user_handle_ptr( hwnd, NULL );
+         }
+         SERVER_END_REQ;
++        list_remove( &win->entry );
+         user_unlock();
+         free( win->pScroll );
+         free( win->text );
+@@ -5825,55 +5827,61 @@
+     return user_destroy_window( hwnd, TRUE );
+ }
+ 
++/* Detach the local object before releasing resources outside the USER lock. */
++static void detach_window_object( WND *win, struct list *windows, struct list *drawables )
++{
++    WORD index = USER_HANDLE_TO_INDEX( win->handle );
++
++    free_dce( win->dce, win->handle, drawables );
++    InterlockedCompareExchangePointer( &client_objects[index], NULL, win );
++    list_remove( &win->entry );
++    list_add_head( windows, &win->entry );
++}
++
++static void destroy_window_objects( struct list *windows, struct list *drawables )
++{
++    WND *win, *next;
++
++    release_opengl_drawables( drawables );
++    LIST_FOR_EACH_ENTRY_SAFE( win, next, windows, WND, entry )
++    {
++        TRACE( "destroying %p\n", win->handle );
++
++        list_remove( &win->entry );
++        detach_client_surfaces( win->handle );
++        user_driver->pDestroyWindow( win->handle );
++        if (win->current_drawable) opengl_drawable_release( win->current_drawable );
++        if (win->unused_drawable) opengl_drawable_release( win->unused_drawable );
++
++        if ((win->dwStyle & (WS_CHILD | WS_POPUP)) != WS_CHILD)
++            NtUserDestroyMenu( (HMENU)win->wIDmenu );
++        NtUserDestroyMenu( win->hSysMenu );
++        if (win->surface)
++        {
++            register_window_surface( win->surface, NULL );
++            window_surface_release( win->surface );
++        }
++        free( win->pScroll );
++        free( win->text );
++        free( win );
++    }
++}
++
+ /*****************************************************************************
+  *           destroy_thread_windows
+  *
+- * Destroy all window owned by the current thread.
++ * Destroy all windows owned by the current thread.
+  */
+ void destroy_thread_windows(void)
+ {
+-    struct destroy_entry
+-    {
+-        HWND handle;
+-        HMENU menu;
+-        HMENU sys_menu;
+-        struct opengl_drawable *current_drawable;
+-        struct opengl_drawable *unused_drawable;
+-        struct window_surface *surface;
+-        struct destroy_entry *next;
+-    } *entry, *free_list = NULL;
+-    struct list drawables = LIST_INIT(drawables);
++    struct list windows = LIST_INIT(windows), drawables = LIST_INIT(drawables);
+     HANDLE handle = 0;
+     WND *win;
+ 
+-    /* recycle WND structs as destroy_entry structs */
+-    C_ASSERT( sizeof(struct destroy_entry) <= sizeof(WND) );
+-
+     user_lock();
+     while ((win = next_thread_user_object( GetCurrentThreadId(), &handle, NTUSER_OBJ_WINDOW )))
+-    {
+-        BOOL is_child = (win->dwStyle & (WS_CHILD | WS_POPUP)) == WS_CHILD;
+-        struct destroy_entry tmp = {0};
+-
+-        free_dce( win->dce, win->handle, &drawables );
+-        set_user_handle_ptr( handle, NULL );
+-        free( win->pScroll );
+-        free( win->text );
+-
+-        /* recycle the WND struct as a destroy_entry struct */
+-        entry = (struct destroy_entry *)win;
+-        tmp.handle = win->handle;
+-        if (!is_child) tmp.menu = (HMENU)win->wIDmenu;
+-        tmp.sys_menu = win->hSysMenu;
+-        tmp.current_drawable = win->current_drawable;
+-        tmp.unused_drawable = win->unused_drawable;
+-        tmp.surface = win->surface;
+-        *entry = tmp;
+-
+-        entry->next = free_list;
+-        free_list = entry;
+-    }
+-    if (free_list)
++        detach_window_object( win, &windows, &drawables );
++    if (!list_empty( &windows ))
+     {
+         SERVER_START_REQ( destroy_window )
+         {
+@@ -5884,27 +5892,31 @@
+     }
+     user_unlock();
+ 
+-    release_opengl_drawables( &drawables );
+-
+-    while ((entry = free_list))
+-    {
+-        free_list = entry->next;
+-        TRACE( "destroying %p\n", entry );
++    destroy_window_objects( &windows, &drawables );
++}
+ 
+-        detach_client_surfaces( entry->handle );
+-        user_driver->pDestroyWindow( entry->handle );
+-        if (entry->current_drawable) opengl_drawable_release( entry->current_drawable );
+-        if (entry->unused_drawable) opengl_drawable_release( entry->unused_drawable );
++void destroy_abandoned_window( HWND hwnd )
++{
++    struct list windows = LIST_INIT(windows), drawables = LIST_INIT(drawables);
++    WND *win;
+ 
+-        NtUserDestroyMenu( entry->menu );
+-        NtUserDestroyMenu( entry->sys_menu );
+-        if (entry->surface)
++    user_lock();
++    /* Server handles may already be reused; only take the exact old local
++     * object. Multiple GUI threads can receive the same notification. */
++    if (!is_window( hwnd ))
++    {
++        LIST_FOR_EACH_ENTRY( win, &window_objects, WND, entry )
+         {
+-            register_window_surface( entry->surface, NULL );
+-            window_surface_release( entry->surface );
++            if (win->handle != hwnd) continue;
++            detach_window_object( win, &windows, &drawables );
++            break;
+         }
+-        free( entry );
+     }
++    user_unlock();
++
++    /* The thread's DLLs may already have been unloaded. No window procedure
++     * or DLL_THREAD_DETACH callback may be invoked here. */
++    destroy_window_objects( &windows, &drawables );
+ }
+ 
+ /***********************************************************************
+@@ -5988,6 +6000,7 @@
+     win->winproc    = get_class_winproc( class );
+     win->hInstance  = instance;
+     win->cbWndExtra = extra_bytes;
++    list_add_tail( &window_objects, &win->entry );
+     set_user_handle_ptr( handle, win );
+     if (is_winproc_unicode( win->winproc, !ansi )) win->flags |= WIN_ISUNICODE;
+     return win;
+diff --git a/dlls/winex11.drv/window.c b/dlls/winex11.drv/window.c
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -3038,14 +3038,17 @@
+  */
+ void X11DRV_DestroyWindow( HWND hwnd )
+ {
+-    struct x11drv_thread_data *thread_data = x11drv_thread_data();
++    struct x11drv_thread_data *thread_data;
+     struct x11drv_win_data *data;
+ 
+     if (!(data = get_win_data( hwnd ))) return;
+ 
+     destroy_whole_window( data, FALSE );
+-    if (thread_data->last_focus == hwnd) thread_data->last_focus = 0;
+-    if (thread_data->last_xic_hwnd == hwnd) thread_data->last_xic_hwnd = 0;
++    if ((thread_data = x11drv_thread_data()))
++    {
++        if (thread_data->last_focus == hwnd) thread_data->last_focus = 0;
++        if (thread_data->last_xic_hwnd == hwnd) thread_data->last_xic_hwnd = 0;
++    }
+     if (data->icon_pixmap) XFreePixmap( gdi_display, data->icon_pixmap );
+     if (data->icon_mask) XFreePixmap( gdi_display, data->icon_mask );
+     if (data->parent) host_window_release( data->parent );
+diff --git a/dlls/user32/tests/win.c b/dlls/user32/tests/win.c
+--- a/dlls/user32/tests/win.c
++++ b/dlls/user32/tests/win.c
+@@ -12822,6 +12822,87 @@
+     CloseHandle( thread1 );
+ }
+ 
++static struct
++{
++    HANDLE ready, stop;
++    HWND window;
++    HMENU menu;
++    LONG destroyed;
++} terminated_window;
++
++static LRESULT WINAPI terminated_window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
++{
++    if (msg == WM_DESTROY || msg == WM_NCDESTROY)
++        InterlockedIncrement( &terminated_window.destroyed );
++    return DefWindowProcW( hwnd, msg, wparam, lparam );
++}
++
++static DWORD WINAPI terminated_window_thread( void *arg )
++{
++    terminated_window.menu = CreateMenu();
++    terminated_window.window = CreateWindowW( L"terminated_window", L"terminated window",
++                                              WS_OVERLAPPEDWINDOW | WS_VISIBLE,
++                                              100, 100, 200, 100, NULL,
++                                              terminated_window.menu, NULL, NULL );
++    SetEvent( terminated_window.ready );
++    WaitForSingleObject( terminated_window.stop, INFINITE );
++    return 0;
++}
++
++static void test_terminated_thread_window(void)
++{
++    WNDCLASSW cls = {0};
++    HANDLE thread;
++    HWND survivor;
++    DWORD ret;
++    BOOL result;
++
++    cls.lpfnWndProc = terminated_window_proc;
++    cls.lpszClassName = L"terminated_window";
++    cls.hInstance = GetModuleHandleW( NULL );
++    ok( RegisterClassW( &cls ), "RegisterClass failed: %lu\n", GetLastError() );
++    terminated_window.ready = CreateEventW( NULL, FALSE, FALSE, NULL );
++    terminated_window.stop = CreateEventW( NULL, FALSE, FALSE, NULL );
++    terminated_window.destroyed = 0;
++    survivor = CreateWindowW( L"static", L"survivor", WS_OVERLAPPEDWINDOW,
++                              400, 100, 200, 100, NULL, NULL, NULL, NULL );
++    ok( !!survivor, "CreateWindow failed: %lu\n", GetLastError() );
++
++    thread = CreateThread( NULL, 0, terminated_window_thread, NULL, 0, NULL );
++    ok( !!thread, "CreateThread failed: %lu\n", GetLastError() );
++    if (!thread) goto cleanup;
++    ret = WaitForSingleObject( terminated_window.ready, 10000 );
++    ok( ret == WAIT_OBJECT_0, "Window creation wait returned %#lx\n", ret );
++    if (ret != WAIT_OBJECT_0)
++    {
++        SetEvent( terminated_window.stop );
++        WaitForSingleObject( thread, 10000 );
++        CloseHandle( thread );
++        goto cleanup;
++    }
++    ok( IsWindow( terminated_window.window ), "Thread window was not created\n" );
++    ok( IsMenu( terminated_window.menu ), "Thread menu was not created\n" );
++    result = TerminateThread( thread, 12 );
++    ok( result, "TerminateThread failed: %lu\n", GetLastError() );
++    if (!result) SetEvent( terminated_window.stop );
++    ret = WaitForSingleObject( thread, 10000 );
++    ok( ret == WAIT_OBJECT_0, "Thread termination wait returned %#lx\n", ret );
++    CloseHandle( thread );
++    flush_events( TRUE );
++
++    ok( !IsWindow( terminated_window.window ), "Terminated thread window remains valid\n" );
++    ok( !IsMenu( terminated_window.menu ), "Terminated thread window menu remains valid\n" );
++    ok( !terminated_window.destroyed, "Window procedure received destruction messages: %ld\n",
++        terminated_window.destroyed );
++    ok( IsWindow( survivor ), "Surviving thread window was destroyed\n" );
++
++cleanup:
++    DestroyWindow( survivor );
++    CloseHandle( terminated_window.ready );
++    CloseHandle( terminated_window.stop );
++    UnregisterClassW( cls.lpszClassName, cls.hInstance );
++}
++
+ static void test_IsWindowEnabled(void)
+ {
+     BOOL ret;
+@@ -14902,6 +14983,7 @@
+     test_hide_window();
+     test_minimize_window(hwndMain);
+     test_destroy_quit();
++    test_terminated_thread_window();
+     test_IsWindowEnabled();
+     test_window_placement();
+     test_arrange_iconic_windows();
+diff --git a/include/ntuser.h b/include/ntuser.h
+--- a/include/ntuser.h
++++ b/include/ntuser.h
+@@ -656,6 +656,7 @@
+     WM_WINE_SETSCROLLINFO,
+     WM_WINE_MAP_NOTIFY_ICON_POINT,
+     WM_WINE_SETWINDOWSURFACECLIP,
++    WM_WINE_DESTROY_ABANDONED_WINDOW,
+     WM_WINE_FIRST_DRIVER_MSG = 0x80001000,  /* range of messages reserved for the USER driver */
+     WM_WINE_CLIPCURSOR = 0x80001ff0, /* internal driver notification messages */
+     WM_WINE_SETCURSOR,
+diff --git a/server/queue.c b/server/queue.c
+--- a/server/queue.c
++++ b/server/queue.c
+@@ -3067,6 +3067,32 @@
+     release_object( thread );
+ }
+ 
++/* Let a surviving GUI thread release the client resources of a dead thread's window. */
++void notify_abandoned_window( struct thread *owner, user_handle_t win )
++{
++    struct thread *thread;
++    struct message *msg;
++
++    LIST_FOR_EACH_ENTRY( thread, &owner->process->thread_list, struct thread, proc_entry )
++    {
++        if (thread->state == TERMINATED || thread->is_system || !thread->queue) continue;
++        if (!(msg = mem_alloc( sizeof(*msg) ))) continue;
++
++        msg->type      = MSG_NOTIFY;
++        msg->win       = 0; /* not tied to the window's dead message queue */
++        msg->msg       = WM_WINE_DESTROY_ABANDONED_WINDOW;
++        msg->wparam    = win;
++        msg->lparam    = 0;
++        msg->result    = NULL;
++        msg->data      = NULL;
++        msg->data_size = 0;
++        get_message_defaults( thread->queue, &msg->x, &msg->y, &msg->time );
++
++        list_add_tail( &thread->queue->msg_list[SEND_MESSAGE], &msg->entry );
++        set_queue_bits( thread->queue, QS_SENDMESSAGE );
++    }
++}
++
+ /* post a win event */
+ void post_win_event( struct thread *thread, unsigned int event,
+                      user_handle_t win, unsigned int object_id,
+diff --git a/server/user.h b/server/user.h
+--- a/server/user.h
++++ b/server/user.h
+@@ -130,6 +130,7 @@
+                           lparam_t wparam, lparam_t lparam );
+ extern void send_notify_message( user_handle_t win, unsigned int message,
+                                  lparam_t wparam, lparam_t lparam );
++extern void notify_abandoned_window( struct thread *owner, user_handle_t win );
+ extern void post_win_event( struct thread *thread, unsigned int event,
+                             user_handle_t win, unsigned int object_id,
+                             unsigned int child_id, client_ptr_t proc,
+diff --git a/server/window.c b/server/window.c
+--- a/server/window.c
++++ b/server/window.c
+@@ -2466,6 +2466,8 @@
+         post_message( win->parent->handle, WM_PARENTNOTIFY, WM_DESTROY, win->handle );
+     }
+ 
++    if (win->thread && win->thread->state == TERMINATED)
++        notify_abandoned_window( win->thread, win->handle );
+     detach_window_thread( win );
+ 
+     if (win->parent) set_parent_window( win, NULL );
