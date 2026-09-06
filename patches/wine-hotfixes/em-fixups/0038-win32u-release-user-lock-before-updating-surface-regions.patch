@@ -1,0 +1,111 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Sun, 6 Sep 2026 12:45:00 -0600
+Subject: [PATCH] win32u: Release the USER lock before updating surface regions
+
+Lineage II can deadlock on a fullscreen transition while a helper thread
+destroys its temporary OpenGL window. apply_window_pos() retains a WND,
+then update_surface_region() retains another WND and calls region setters
+which can synchronously flush through the graphics driver.
+
+The resize thread holds the recursive USER mutex while waiting for
+winewayland's win_data_mutex in set_window_surface_contents(). The helper
+holds win_data_mutex in wayland_client_surface_detach() and waits for USER
+when updating presentation ownership. Live thread stacks and both mutex
+ownership records confirm this cycle.
+
+Move update_surface_region() outside apply_window_pos()'s WND lifetime.
+Inside the region update, retain the window surface and copy the needed
+style before releasing the WND as well. Releasing only one of these nested
+USER lock acquisitions would leave the deadlock intact.
+
+Keep the synchronous shape, clipping and GDI-over-producer updates. This
+does not defer repainting, remove Purple's GDI preservation, or change
+fullscreen policy.
+---
+ dlls/win32u/window.c | 26 +++++++++++++++++---------
+ 1 file changed, 17 insertions(+), 9 deletions(-)
+
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -2091,29 +2091,37 @@
+ static void update_surface_region( HWND hwnd )
+ {
+     WND *win = get_win_ptr( hwnd );
++    struct window_surface *surface;
+     HRGN region, shape = 0;
++    DWORD ex_style;
+     RECT visible;
+ 
+     if (!win || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return;
+-    if (!win->surface) goto done;
++    surface = win->surface;
++    ex_style = win->dwExStyle;
++    if (surface) window_surface_add_ref( surface );
++    release_win_ptr( win );
++    if (!surface) return;
+ 
++    /* Region setters may flush through the driver. Keep the surface alive,
++     * but do not hold the USER lock while acquiring driver locks. */
+     if (get_window_region( hwnd, WINDOW_REGION_SHAPE, &shape, &visible )) goto done;
+     if (shape)
+     {
+         region = NtGdiCreateRectRgn( 0, 0, visible.right - visible.left, visible.bottom - visible.top );
+         NtGdiCombineRgn( shape, shape, region, RGN_AND );
+-        if (win->dwExStyle & WS_EX_LAYOUTRTL) NtUserMirrorRgn( hwnd, shape );
++        if (ex_style & WS_EX_LAYOUTRTL) NtUserMirrorRgn( hwnd, shape );
+         NtGdiDeleteObjectApp( region );
+     }
+-    window_surface_set_shape( win->surface, shape );
++    window_surface_set_shape( surface, shape );
+ 
+     if (get_window_region( hwnd, WINDOW_REGION_SURFACE, &region, &visible )) goto done;
+-    if (!region) window_surface_set_clip( win->surface, shape );
++    if (!region) window_surface_set_clip( surface, shape );
+     else
+     {
+         NtGdiOffsetRgn( region, -visible.left, -visible.top );
+         if (shape) NtGdiCombineRgn( region, region, shape, RGN_AND );
+-        window_surface_set_clip( win->surface, region );
++        window_surface_set_clip( surface, region );
+         NtGdiDeleteObjectApp( region );
+     }
+ 
+@@ -2122,14 +2130,14 @@
+     {
+         NtGdiOffsetRgn( region, -visible.left, -visible.top );
+         if (shape) NtGdiCombineRgn( region, region, shape, RGN_AND );
+-        window_surface_set_gdi_over_producer_region( win->surface, region );
++        window_surface_set_gdi_over_producer_region( surface, region );
+         NtGdiDeleteObjectApp( region );
+     }
+-    else window_surface_set_gdi_over_producer_region( win->surface, 0 );
++    else window_surface_set_gdi_over_producer_region( surface, 0 );
+ 
+ done:
+     if (shape) NtGdiDeleteObjectApp( shape );
+-    release_win_ptr( win );
++    window_surface_release( surface );
+ }
+ 
+ 
+@@ -2486,7 +2494,6 @@
+ 
+     if (ret)
+     {
+-        update_surface_region( surface_win );
+         if (((swp_flags & SWP_AGG_NOPOSCHANGE) != SWP_AGG_NOPOSCHANGE) ||
+             (swp_flags & (SWP_HIDEWINDOW | SWP_SHOWWINDOW | SWP_STATECHANGED | SWP_FRAMECHANGED)))
+             invalidate_dce( win, &old_rects.window );
+@@ -2525,6 +2532,7 @@
+ 
+     if (ret)
+     {
++        update_surface_region( surface_win );
+         TRACE( "win %p surface %p -> %p\n", hwnd, old_surface, new_surface );
+         register_window_surface( old_surface, new_surface );
+         if (old_surface)
+-- 
+2.53.0
+

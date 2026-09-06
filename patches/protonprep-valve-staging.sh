@@ -19,6 +19,7 @@ apply_all_in_dir() {
     git reset --hard HEAD
     git clean -xdf
     patch -Np1 < ../patches/dxvk/layered-overlay-dxvk.patch
+    apply_patch "../patches/dxvk/dxgi-defer-initial-fullscreen-for-probe-swapchains.patch"
     popd
 
     pushd vkd3d-proton
@@ -93,7 +94,7 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/em-fixups/0001-winewayland-add-SNI-tray-icons-and-native-context-me.patch"
 
     # Original work by Erhan Bilgili:
-    # https://github.com/nanomatters/wine-salkim/tree/wineland_20260713-reorg
+    # https://github.com/nanomatters/wine-wineland/tree/wineland_20260713-reorg
     echo "WINE: -CUSTOM- WINELAND CROSS-PROCESS CHILD RENDERING"
     apply_all_in_dir "../patches/wine-hotfixes/wineland-child-rendering/"
 

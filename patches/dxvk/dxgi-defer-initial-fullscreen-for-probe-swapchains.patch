@@ -1,0 +1,146 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] dxgi: Defer initial fullscreen for temporary probe swapchains.
+
+Purple On's purpleony32.dll probes IDXGISwapChain::Present by creating a
+temporary D3D11 swapchain against Lineage II's D3D9 game window. The probe
+requests fullscreen with zero buffer dimensions, then releases the chain
+without presenting or leaving fullscreen. In the captured X11 run DXGI
+selects 320x200@120 from the 111x27 startup client and subsequently stalls
+changing the window style from the probe thread.
+
+Add an opt-in deferral of creation-time fullscreen until the first
+non-test Present. Until then report the actual windowed state; explicit
+SetFullscreenState requests replace the pending request. A probe released
+without presenting has no fullscreen state to restore or leave behind.
+
+Enable this and the existing deferred VkSurface creation option for L2.bin
+only. D3D9 mode changes and other applications keep their existing behavior.
+This is a compatibility adjustment for the probe, not a global change to
+DXGI creation semantics. The separately observed NSplash thread teardown
+problem is not addressed by this patch.
+
+---
+diff --git a/dxvk.conf b/dxvk.conf
+index 40de82f8..732005b4 100644
+--- a/dxvk.conf
++++ b/dxvk.conf
+@@ -62,6 +62,17 @@
+ # d3d9.deferSurfaceCreation = False
+ 
+ 
++# Delay a fullscreen request made at DXGI swapchain creation until the first
++# non-test Present. Temporary swapchains released without presenting will not
++# change the window or display mode. Explicit SetFullscreenState calls still
++# take effect immediately. The reported state stays windowed until the switch.
++# This does not affect D3D9 fullscreen requests.
++#
++# Supported values: True, False
++
++# dxgi.deferInitialFullscreen = False
++
++
+ # Enforce a stricter maximum frame latency. Overrides the application
+ # setting specified by calling IDXGIDevice::SetMaximumFrameLatency.
+ # Setting this to 0 will have no effect.
+diff --git a/src/dxgi/dxgi_options.cpp b/src/dxgi/dxgi_options.cpp
+index d83342e2..b5bae6a4 100644
+--- a/src/dxgi/dxgi_options.cpp
++++ b/src/dxgi/dxgi_options.cpp
+@@ -176,6 +176,7 @@ namespace dxvk {
+ 
+     // We don't support dcomp swapchains and some games may rely on them failing on creation
+     this->enableDummyCompositionSwapchain = config.getOption<bool>("dxgi.enableDummyCompositionSwapchain", false);
++    this->deferInitialFullscreen = config.getOption<bool>("dxgi.deferInitialFullscreen", false);
+ 
+     // Expose Nvidia GPUs properly if NvAPI is enabled in environment
+     this->hideNvidiaGpu = !isNvapiEnabled();
+diff --git a/src/dxgi/dxgi_options.h b/src/dxgi/dxgi_options.h
+index c61c574a..69a79f7e 100644
+--- a/src/dxgi/dxgi_options.h
++++ b/src/dxgi/dxgi_options.h
+@@ -58,6 +58,9 @@ namespace dxvk {
+     /// Enable support for dummy composition swapchains
+     bool enableDummyCompositionSwapchain;
+ 
++    /// Delay an initial fullscreen request until the first real present.
++    bool deferInitialFullscreen;
++
+     /// Limit frame rate
+     int32_t maxFrameRate;
+ 
+diff --git a/src/dxgi/dxgi_swapchain.cpp b/src/dxgi/dxgi_swapchain.cpp
+index 767a7837..bb8a0a50 100644
+--- a/src/dxgi/dxgi_swapchain.cpp
++++ b/src/dxgi/dxgi_swapchain.cpp
+@@ -39,6 +39,12 @@ namespace dxvk {
+     m_factory->QueryInterface(__uuidof(IDXGIVkMonitorInfo), reinterpret_cast<void**>(&m_monitorInfo));
+     
+     // Apply initial window mode and fullscreen state
++    if (!m_descFs.Windowed && m_factory->GetOptions()->deferInitialFullscreen) {
++      // Temporary API probes must not change another renderer's window or display mode.
++      m_deferredFullscreen = true;
++      m_descFs.Windowed = TRUE;
++    }
++
+     if (!m_descFs.Windowed && FAILED(EnterFullscreenMode(nullptr)))
+     {
+       Logger::warn("DXGI: EnterFullscreenMode failed. Creating a windowed swapchain instead.");
+@@ -350,6 +356,18 @@ namespace dxvk {
+ 
+     if ((m_desc.SwapEffect == DXGI_SWAP_EFFECT_DISCARD || m_desc.SwapEffect == DXGI_SWAP_EFFECT_SEQUENTIAL) && wsi::isMinimized(m_window))
+       return DXGI_STATUS_OCCLUDED;
++
++    if (m_factory->GetOptions()->deferInitialFullscreen && !(PresentFlags & DXGI_PRESENT_TEST)) {
++      std::lock_guard<dxvk::recursive_mutex> lock(m_lockWindow);
++      if (m_deferredFullscreen) {
++        m_deferredFullscreen = false;
++        if (FAILED(EnterFullscreenMode(nullptr))) {
++          Logger::warn("DXGI: Deferred fullscreen transition failed. Keeping a windowed swapchain.");
++          m_descFs.Windowed = TRUE;
++        }
++      }
++    }
++
+     bool occluded = !m_descFs.Windowed && wsi::isOccluded(m_window) && !wsi::isMinimized(m_window);
+ 
+     auto options = m_factory->GetOptions();
+@@ -525,6 +543,9 @@ namespace dxvk {
+     if (!Fullscreen && pTarget)
+       return DXGI_ERROR_INVALID_CALL;
+ 
++    // Explicit application requests replace the deferred startup request.
++    m_deferredFullscreen = false;
++
+     Com<IDXGIOutput1> target;
+ 
+     if (pTarget) {
+diff --git a/src/dxgi/dxgi_swapchain.h b/src/dxgi/dxgi_swapchain.h
+index 400532cf..48b115c2 100644
+--- a/src/dxgi/dxgi_swapchain.h
++++ b/src/dxgi/dxgi_swapchain.h
+@@ -191,6 +191,7 @@ namespace dxvk {
+     DXGI_SWAP_CHAIN_FULLSCREEN_DESC m_descFs;
+     UINT                            m_presentId;
+     bool                            m_ModeChangeInProgress = false;
++    bool                            m_deferredFullscreen = false;
+ 
+     Com<IDXGIVkSwapChain>           m_presenter;
+     Com<IDXGIVkSwapChain1>          m_presenter1;
+diff --git a/src/util/config/config.cpp b/src/util/config/config.cpp
+index 693636a9..6c66cbc1 100644
+--- a/src/util/config/config.cpp
++++ b/src/util/config/config.cpp
+@@ -508,6 +508,13 @@ namespace dxvk {
+     /* D3D9 GAMES                                 */
+     /**********************************************/
+ 
++    /* Lineage II: Purple On probes D3D11 with a temporary fullscreen
++     * swapchain on the game's D3D9 window, without ever presenting. */
++    { R"(\\L2\.bin$)", {{
++      { "dxgi.deferSurfaceCreation",        "True" },
++      { "dxgi.deferInitialFullscreen",      "True" },
++    }} },
++
+     /* A Hat in Time                              */
+     { R"(\\HatinTimeGame\.exe$)", {{
+       { "d3d9.lenientClear",                "True" },
