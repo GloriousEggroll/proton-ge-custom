@@ -1,0 +1,271 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Sun, 6 Sep 2026 16:00:00 -0600
+Subject: [PATCH] ntdll: Finish process exit instead of waiting on orphaned SRW locks
+
+Lineage II reaches ExitProcess, but ncplatformsdk-cpp.dll's process-detach
+destructor takes an MSVCP140 mutex whose owning thread has already been
+terminated. The remaining thread waits indefinitely in
+RtlAcquireSRWLockExclusive, leaving Purple's game process running after its
+windows have gone away.
+
+Windows terminates an exiting process rather than entering an orphaned
+critical section. SRW acquisition during shutdown is also reported to use
+this safeguard, preserving the original exit status:
+https://devblogs.microsoft.com/oldnewthing/20100122-00/?p=15193
+https://github.com/microsoft/mimalloc/issues/1377
+
+Retain the status requested by RtlExitUserProcess and finish termination
+when an SRW acquisition would block during its detach callbacks. Do not
+pretend to acquire the lock and continue potentially inconsistent cleanup.
+The fast paths, normal contention, DLL unload and standalone
+LdrShutdownProcess calls without RtlExitUserProcess remain unchanged.
+
+Add subprocess coverage for exclusive/shared orphaned owners, compatible
+shared acquisition, unlocked acquisition and preservation of zero/nonzero
+exit status. An inherited event verifies that the shutdown callback was
+actually reached, and another distinguishes termination from incorrectly
+returning ownership. Each child has a bounded wait.
+
+The native SRW behavior above is reported upstream; these new tests have
+not yet been run on Windows locally.
+
+---
+diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -95,6 +95,8 @@
+ static BOOL is_prefix_bootstrap;  /* are we bootstrapping the prefix? */
+ static BOOL imports_fixup_done = FALSE;  /* set once the imports have been fixed up, before attaching them */
+ static BOOL process_detaching = FALSE;  /* set on process detach to avoid deadlocks with thread detach */
++static BOOL process_exiting;           /* RtlExitUserProcess has terminated the other threads */
++static DWORD process_exit_status;
+ static int free_lib_count;   /* recursion depth of LdrUnloadDll calls */
+ static LONG path_safe_mode;  /* path mode set by RtlSetSearchPathMode */
+ static LONG dll_safe_mode = 1;  /* dll search mode */
+@@ -4275,10 +4277,20 @@
+     RtlEnterCriticalSection( &loader_section );
+     RtlAcquirePebLock();
+     NtTerminateProcess( 0, status );
++    process_exit_status = status;
++    process_exiting = TRUE;
+     LdrShutdownProcess();
+     for (;;) NtTerminateProcess( GetCurrentProcess(), status );
+ }
+ 
++/* Called only when acquiring a lock would block. Never run cleanup with
++ * fabricated ownership of a lock left behind by a terminated thread. */
++void terminate_process_on_shutdown(void)
++{
++    if (process_exiting && process_detaching)
++        for (;;) NtTerminateProcess( GetCurrentProcess(), process_exit_status );
++}
++
+ /******************************************************************
+  *		LdrShutdownThread (NTDLL.@)
+  *
+diff --git a/dlls/ntdll/ntdll_misc.h b/dlls/ntdll/ntdll_misc.h
+--- a/dlls/ntdll/ntdll_misc.h
++++ b/dlls/ntdll/ntdll_misc.h
+@@ -88,6 +88,7 @@
+ 
+ /* init routines */
+ extern void loader_init( CONTEXT *context, void **entry );
++extern void terminate_process_on_shutdown(void);
+ extern void version_init(void);
+ extern void debug_init(void);
+ extern void actctx_init(void);
+diff --git a/dlls/ntdll/sync.c b/dlls/ntdll/sync.c
+--- a/dlls/ntdll/sync.c
++++ b/dlls/ntdll/sync.c
+@@ -543,6 +543,7 @@
+         } while (InterlockedCompareExchange( u.l, new.l, old.l ) != old.l);
+ 
+         if (!wait) return;
++        terminate_process_on_shutdown();
+         RtlWaitOnAddress( &u.s->owners, &new.s.owners, sizeof(short), NULL );
+     }
+ }
+@@ -582,6 +583,7 @@
+         } while (InterlockedCompareExchange( u.l, new.l, old.l ) != old.l);
+ 
+         if (!wait) return;
++        terminate_process_on_shutdown();
+         RtlWaitOnAddress( u.s, &new.s, sizeof(struct srw_lock), NULL );
+     }
+ }
+diff --git a/dlls/kernel32/tests/sync.c b/dlls/kernel32/tests/sync.c
+--- a/dlls/kernel32/tests/sync.c
++++ b/dlls/kernel32/tests/sync.c
+@@ -55,6 +55,8 @@
+ static VOID   (WINAPI *pReleaseSRWLockShared)(PSRWLOCK);
+ static BOOLEAN (WINAPI *pTryAcquireSRWLockExclusive)(PSRWLOCK);
+ static BOOLEAN (WINAPI *pTryAcquireSRWLockShared)(PSRWLOCK);
++static DWORD (WINAPI *pFlsAlloc)(PFLS_CALLBACK_FUNCTION);
++static BOOL (WINAPI *pFlsSetValue)(DWORD, void *);
+ 
+ static DWORD (WINAPI *pQueueUserAPC2)(PAPCFUNC,HANDLE,ULONG_PTR,QUEUE_USER_APC_FLAGS);
+ 
+@@ -2618,6 +2620,136 @@
+ 
+ }
+ 
++struct srwlock_shutdown_info
++{
++    SRWLOCK lock;
++    HANDLE ready, entered, acquired;
++    unsigned int owner;
++    BOOL shared;
++};
++
++static DWORD WINAPI srwlock_shutdown_thread(void *arg)
++{
++    struct srwlock_shutdown_info *info = arg;
++
++    if (info->owner == 2) pAcquireSRWLockShared(&info->lock);
++    else pAcquireSRWLockExclusive(&info->lock);
++    SetEvent(info->ready);
++    Sleep(INFINITE); /* ExitProcess must terminate the owner while it holds the lock. */
++    return 0;
++}
++
++static void WINAPI srwlock_shutdown_callback(void *arg)
++{
++    struct srwlock_shutdown_info *info = arg;
++
++    SetEvent(info->entered);
++    if (info->shared)
++    {
++        pAcquireSRWLockShared(&info->lock);
++        SetEvent(info->acquired);
++        pReleaseSRWLockShared(&info->lock);
++    }
++    else
++    {
++        pAcquireSRWLockExclusive(&info->lock);
++        SetEvent(info->acquired);
++        pReleaseSRWLockExclusive(&info->lock);
++    }
++}
++
++static void srwlock_shutdown_child(char **argv)
++{
++    struct srwlock_shutdown_info info = {0};
++    DWORD index, ret, exit_code = strtoul(argv[5], NULL, 10);
++    HANDLE thread;
++
++    info.owner = atoi(argv[3]);
++    info.shared = atoi(argv[4]);
++    info.entered = ULongToHandle(strtoul(argv[6], NULL, 16));
++    info.acquired = ULongToHandle(strtoul(argv[7], NULL, 16));
++    pInitializeSRWLock(&info.lock);
++    if (info.owner)
++    {
++        info.ready = CreateEventW(NULL, TRUE, FALSE, NULL);
++        if (!info.ready) ExitProcess(200);
++        thread = CreateThread(NULL, 0, srwlock_shutdown_thread, &info, 0, NULL);
++        if (!thread) ExitProcess(201);
++        ret = WaitForSingleObject(info.ready, 5000);
++        if (ret != WAIT_OBJECT_0) ExitProcess(202);
++        CloseHandle(thread);
++        CloseHandle(info.ready);
++    }
++    index = pFlsAlloc(srwlock_shutdown_callback);
++    if (index == FLS_OUT_OF_INDEXES) ExitProcess(203);
++    if (!pFlsSetValue(index, &info)) ExitProcess(204);
++    ExitProcess(exit_code);
++}
++
++static void test_srwlock_shutdown(void)
++{
++    SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
++    STARTUPINFOA si = {sizeof(si)};
++    PROCESS_INFORMATION pi;
++    HANDLE entered, acquired;
++    char cmdline[MAX_PATH + 128], **argv;
++    unsigned int owner, shared, i;
++    static const DWORD exit_codes[] = {0, 7};
++    DWORD ret, exit_code;
++    BOOL success, can_acquire;
++
++    if (!pInitializeSRWLock || !pFlsAlloc || !pFlsSetValue)
++    {
++        win_skip("SRW locks or FLS callbacks are not supported.\n");
++        return;
++    }
++
++    winetest_get_mainargs(&argv);
++    entered = CreateEventW(&sa, TRUE, FALSE, NULL);
++    acquired = CreateEventW(&sa, TRUE, FALSE, NULL);
++    ok(entered && acquired, "CreateEvent failed, error %lu.\n", GetLastError());
++    if (!entered || !acquired) goto done;
++
++    for (owner = 0; owner < 3; ++owner)
++    for (shared = 0; shared < 2; ++shared)
++    for (i = 0; i < ARRAY_SIZE(exit_codes); ++i)
++    {
++        winetest_push_context("owner %u, shared %u, exit %lu", owner, shared, exit_codes[i]);
++        ResetEvent(entered);
++        ResetEvent(acquired);
++        sprintf(cmdline, "\"%s\" sync srwlock_shutdown %u %u %lu %lx %lx", argv[0],
++                owner, shared, exit_codes[i], HandleToULong(entered), HandleToULong(acquired));
++        success = CreateProcessA(argv[0], cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
++        ok(success, "CreateProcess failed, error %lu.\n", GetLastError());
++        if (success)
++        {
++            ret = WaitForSingleObject(pi.hProcess, 10000);
++            ok(ret == WAIT_OBJECT_0, "Child did not exit, wait returned %#lx.\n", ret);
++            if (ret != WAIT_OBJECT_0)
++            {
++                TerminateProcess(pi.hProcess, 205);
++                WaitForSingleObject(pi.hProcess, 5000);
++            }
++            success = GetExitCodeProcess(pi.hProcess, &exit_code);
++            ok(success, "GetExitCodeProcess failed, error %lu.\n", GetLastError());
++            if (success) ok(exit_code == exit_codes[i], "Unexpected exit code %lu.\n", exit_code);
++            ret = WaitForSingleObject(entered, 0);
++            ok(ret == WAIT_OBJECT_0, "Shutdown callback did not run, wait returned %#lx.\n", ret);
++            can_acquire = !owner || (owner == 2 && shared);
++            ret = WaitForSingleObject(acquired, 0);
++            ok(ret == (can_acquire ? WAIT_OBJECT_0 : WAIT_TIMEOUT),
++                    "Unexpected lock acquisition, wait returned %#lx.\n", ret);
++            CloseHandle(pi.hThread);
++            CloseHandle(pi.hProcess);
++        }
++        winetest_pop_context();
++    }
++
++done:
++    if (entered) CloseHandle(entered);
++    if (acquired) CloseHandle(acquired);
++}
++
+ static SRWLOCK srwlock_example;
+ static LONG srwlock_protected_value = 0;
+ static LONG srwlock_example_errors = 0, srwlock_inside = 0, srwlock_cnt = 0;
+@@ -3385,6 +3517,8 @@
+     pReleaseSRWLockShared = (void *)GetProcAddress(hdll, "ReleaseSRWLockShared");
+     pTryAcquireSRWLockExclusive = (void *)GetProcAddress(hdll, "TryAcquireSRWLockExclusive");
+     pTryAcquireSRWLockShared = (void *)GetProcAddress(hdll, "TryAcquireSRWLockShared");
++    pFlsAlloc = (void *)GetProcAddress(hdll, "FlsAlloc");
++    pFlsSetValue = (void *)GetProcAddress(hdll, "FlsSetValue");
+     pQueueUserAPC2 = (void *)GetProcAddress(hdll, "QueueUserAPC2");
+     pInitializeSynchronizationBarrier = (void *)GetProcAddress(hdll, "InitializeSynchronizationBarrier");
+     pDeleteSynchronizationBarrier = (void *)GetProcAddress(hdll, "DeleteSynchronizationBarrier");
+@@ -3405,6 +3539,8 @@
+         {
+             for (;;) SleepEx(INFINITE, TRUE);
+         }
++        if (argc == 8 && !strcmp(argv[2], "srwlock_shutdown"))
++            srwlock_shutdown_child(argv);
+         return;
+     }
+ 
+@@ -3433,6 +3569,7 @@
+     test_srwlock_base(&unaligned_srwlock.lock);
+ #endif
+     test_srwlock_example();
++    test_srwlock_shutdown();
+     test_alertable_wait();
+     test_apc_deadlock();
+     test_crit_section();
