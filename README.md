@@ -565,6 +565,7 @@ Disable Steam Input for the game before using the Sony controller compatibility 
 |                      | `WAYLANDDRV_PRIMARY_MONITOR`   | Specify primary monitor where the value is something like `eDP-1`. Requires the Wayland driver. |
 |                      | `PROTON_ENABLE_MEDIACONV`      | Enable media converter for winegstreamer. This is not needed for winedmo, since the mediaconverter implementation of the codecs doesn't override the underlying implementation. |
 |                      | `WAYLANDDRV_RAWINPUT`          | A value of 0 disables unaccelerated input and uses accelerated input. Any positive real number (like 0.5) adjusts the sensitivity of rawinput. Requires the Wayland driver. |
+| `lowlatencylayer`    | `LOW_LATENCY_LAYER`            | Enables [low_latency_layer](https://github.com/Korthos-Software/low_latency_layer). |
 
 ## Credits
 
