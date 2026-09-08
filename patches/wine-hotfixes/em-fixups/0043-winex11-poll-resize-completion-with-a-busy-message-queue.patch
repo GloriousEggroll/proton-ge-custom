@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Mon, 7 Sep 2026 09:00:00 -0600
+Subject: [PATCH] winex11: Poll resize completion with a busy message queue
+
+move_resize_window polls XQueryPointer for button release, but first drains
+the entire Win32 message queue between polls. If an application renders in
+a WM_TIMER callback that takes longer than its timer interval, that queue
+never empties. Wine stays inside SC_SIZE and never sends WM_EXITSIZEMOVE,
+even though the window manager has finished resizing the window.
+
+This occurs with Aion and Wine-drawn borders: WM_ENTERSIZEMOVE starts a
+20 ms timer, callbacks take about 32 ms, and the resize command remains
+on the stack until the window is destroyed roughly 100 seconds later.
+The client grows from 800x600 to 1363x961 without a D3D9 backbuffer reset.
+
+Bound message dispatch by the existing 100 ms pointer polling interval,
+and wait only for the remainder of that interval. This preserves message
+filtering and synthetic button release while allowing resize completion
+to be checked even if the application continually generates messages.
+
+This only fixes starvation in the X11 driver-initiated move/resize loop.
+It does not change server-decoration-initiated sizing, Wayland sizing,
+mouse coordinate mapping, or D3D9 reset behavior.
+
+---
+diff --git a/dlls/winex11.drv/mouse.c b/dlls/winex11.drv/mouse.c
+--- a/dlls/winex11.drv/mouse.c
++++ b/dlls/winex11.drv/mouse.c
+@@ -1552,6 +1552,7 @@ void move_resize_window( HWND hwnd, int dir, POINT pos )
+         MSG msg;
+         INPUT input;
+         int x, y, rootX, rootY;
++        DWORD start = NtGetTickCount(), elapsed;
+ 
+         if (!XQueryPointer( display, root_window, &root, &child, &rootX, &rootY, &x, &y, &xstate )) break;
+ 
+@@ -1576,10 +1577,13 @@ void move_resize_window( HWND hwnd, int dir, POINT pos )
+                 NtUserTranslateMessage( &msg, 0 );
+                 NtUserDispatchMessage( &msg );
+             }
++            /* A rendering timer can keep the queue busy indefinitely. */
++            if (NtGetTickCount() - start >= 100) break;
+         }
+ 
+         if (!(xstate & (Button1Mask << (button - 1)))) break;
+-        NtUserMsgWaitForMultipleObjectsEx( 0, NULL, 100, QS_ALLINPUT, 0 );
++        if ((elapsed = NtGetTickCount() - start) < 100)
++            NtUserMsgWaitForMultipleObjectsEx( 0, NULL, 100 - elapsed, QS_ALLINPUT, 0 );
+     }
+ 
+     TRACE( "hwnd %p/%lx done\n", hwnd, win );

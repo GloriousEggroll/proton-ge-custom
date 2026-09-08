@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Sun, 6 Sep 2026 22:00:00 -0600
+Subject: [PATCH] winewayland: Account for hidden frames in compositor size limits
+
+The configure-bounds support imported from Erhan Bilgili's wine-wineland
+returns visible geometry as the Win32 maximum tracking size. With server
+decorations, the hidden Win32 frame still contributes to the outer window
+size. Applying the visible limit to that outer rectangle makes the client
+smaller than the compositor requested.
+
+In Aion, a 2880x1852 maximize configure is clamped to an outer rectangle of
+that size, leaving a 2872x1818 client. The maximized configure is then
+incompatible, and presentation remains on the old configure until another
+resize arrives.
+
+Convert the visible limit to an outer-window limit using the same frame
+offsets as configure handling. While a maximize configure is pending, use
+its explicit size instead of the last committed floating bounds. Do not
+apply floating limits to pending fullscreen or tiled states.
+
+Retain the existing live WS_THICKFRAME check and committed-bounds policy
+for ordinary floating windows. This does not change X11, mouse coordinate
+mapping, or the application's ownership of its D3D9 backbuffer size.
+
+This fixes the sizing defect observed in the maximize trace. The separate
+lack of D3D9 resets during interactive drag resizing is not established
+as a consequence of this defect and still needs runtime verification.
+
+---
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -2335,12 +2335,30 @@
+     if (!surface->window.resizeable || !wayland_surface_is_toplevel(surface) ||
+         !surface->xdg_toplevel)
+         return FALSE;
+-    if (!config->serial || wayland_surface_config_is_managed(config) ||
+-        !wayland_surface_config_has_bounds(config))
++
++    /* A maximize/restore command runs before the new configure is committed.
++     * Do not constrain it with the previous floating window's bounds. */
++    if (surface->processing.serial) config = &surface->processing;
++    else if (surface->requested.serial) config = &surface->requested;
++    if (config->state & (WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN |
++                         WAYLAND_SURFACE_CONFIG_STATE_TILED))
+         return FALSE;
++    if (config->serial && (config->state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED))
++    {
++        /* Configure rects are already in window coordinates. */
++        width = config->rect.right - config->rect.left;
++        height = config->rect.bottom - config->rect.top;
++    }
++    else
++    {
++        config = &surface->current;
++        if (!config->serial || wayland_surface_config_is_managed(config) ||
++            !wayland_surface_config_has_bounds(config))
++            return FALSE;
+ 
+-    wayland_surface_coords_to_window(surface, config->bounds_width,
+-                                     config->bounds_height, &width, &height);
++        wayland_surface_coords_to_window(surface, config->bounds_width,
++                                         config->bounds_height, &width, &height);
++    }
+     if (width <= 0 || height <= 0) return FALSE;
+ 
+     size->cx = width;
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -1675,16 +1675,26 @@
+ BOOL WAYLAND_GetWindowMaxTrackSize(HWND hwnd, SIZE *size)
+ {
+     struct wayland_win_data *data;
++    RECT rect;
+     BOOL ret = FALSE;
+ 
+     if (!(data = wayland_win_data_get(hwnd))) return FALSE;
+ 
+     /* The cached Wayland config is refreshed from WindowPosChanged, but this
+      * query runs during calc_winpos. Recheck the live style so a borderless
+      * fullscreen transition cannot be clamped by stale configure bounds. */
+     if ((NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_THICKFRAME) && data->wayland_surface)
+         ret = wayland_surface_get_max_track_size(data->wayland_surface, size);
+ 
++    if (ret)
++    {
++        /* xdg-shell constrains visible geometry, not the hidden Win32 frame. */
++        SetRect(&rect, 0, 0, size->cx, size->cy);
++        rect = window_rect_from_visible(&data->rects, rect);
++        size->cx = rect.right - rect.left;
++        size->cy = rect.bottom - rect.top;
++    }
++
+     wayland_win_data_release(data);
+     return ret;
+ }
