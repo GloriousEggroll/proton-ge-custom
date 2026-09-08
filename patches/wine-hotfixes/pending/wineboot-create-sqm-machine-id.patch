@@ -1,0 +1,89 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Tue, 8 Sep 2026 02:00:00 -0400
+Subject: [PATCH] wineboot: Initialize the SQM client machine identifier.
+
+Purple's RegistryHelper.GetMachineId reads MachineId from the native view
+of HKLM\Software\Microsoft\SQMClient. Without that value its logging
+service throws ArgumentNullException, including when completing sign-in.
+Installing native .NET happens to supply the value, but it is Windows
+registry data rather than a CLR implementation detail.
+
+Microsoft documents the location and one-time UuidCreate initialization:
+https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-sqmcs2/0442f736-8670-4ae4-8651-5732f3ba18dd
+
+Create the missing identifier at boot so existing prefixes are covered as
+well as new ones. Preserve existing values and use the native registry
+view, including for 32-bit clients on 64-bit Wine. This does not opt into
+SQM or implement telemetry collection or transmission.
+---
+diff --git a/programs/wineboot/Makefile.in b/programs/wineboot/Makefile.in
+--- a/programs/wineboot/Makefile.in
++++ b/programs/wineboot/Makefile.in
+@@ -1,5 +1,5 @@
+ MODULE    = wineboot.exe
+-IMPORTS   = uuid advapi32 ws2_32 kernelbase
++IMPORTS   = uuid advapi32 ws2_32 kernelbase rpcrt4
+ DELAYIMPORTS = shell32 shlwapi version user32 gdi32 setupapi newdev wininet crypt32
+ 
+ EXTRADLLFLAGS = -mconsole
+diff --git a/programs/wineboot/wineboot.c b/programs/wineboot/wineboot.c
+--- a/programs/wineboot/wineboot.c
++++ b/programs/wineboot/wineboot.c
+@@ -82,6 +82,7 @@
+ #include <wininet.h>
+ #include <newdev.h>
+ #include <wincrypt.h>
++#include <rpc.h>
+ #include "resource.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(wineboot);
+@@ -1856,6 +1857,41 @@ done:
+     RegCloseKey( key );
+ }
+ 
++static void create_sqm_machine_id(void)
++{
++    WCHAR buffer[39];
++    RPC_STATUS status;
++    DWORD size = 0;
++    UUID uuid;
++    HKEY key;
++    LSTATUS ret;
++
++    if ((ret = RegCreateKeyExW( HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\SQMClient", 0, NULL, 0,
++                               KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_WOW64_64KEY, NULL, &key, NULL )))
++    {
++        WINE_WARN( "Failed to open SQMClient key, error %ld.\n", ret );
++        return;
++    }
++
++    /* Do not change an existing identity, including one installed by native .NET. */
++    if (RegQueryValueExW( key, L"MachineId", NULL, NULL, NULL, &size ) != ERROR_FILE_NOT_FOUND)
++        goto done;
++
++    status = UuidCreate( &uuid );
++    if (status != RPC_S_OK && status != RPC_S_UUID_LOCAL_ONLY)
++    {
++        WINE_WARN( "Failed to generate SQM machine id, error %ld.\n", status );
++        goto done;
++    }
++    swprintf( buffer, ARRAY_SIZE(buffer), L"{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
++              (unsigned int)uuid.Data1, uuid.Data2, uuid.Data3, uuid.Data4[0], uuid.Data4[1], uuid.Data4[2],
++              uuid.Data4[3], uuid.Data4[4], uuid.Data4[5], uuid.Data4[6], uuid.Data4[7] );
++    if ((ret = RegSetValueExW( key, L"MachineId", 0, REG_SZ, (const BYTE *)buffer, sizeof(buffer) )))
++        WINE_WARN( "Failed to store SQM machine id, error %ld.\n", ret );
++done:
++    RegCloseKey( key );
++}
++
+ int __cdecl main( int argc, char *argv[] )
+ {
+     /* First, set the current directory to SystemRoot */
+@@ -1970,6 +2006,7 @@ int __cdecl main( int argc, char *argv[] )
+     if (init || update) update_wineprefix( update );
+ 
+     create_digitalproductid();
++    create_sqm_machine_id();
+     create_volatile_environment_registry_key();
+     create_known_dlls();
+     initialize_internet();

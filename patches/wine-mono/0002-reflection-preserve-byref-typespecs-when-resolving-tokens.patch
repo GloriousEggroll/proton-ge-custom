@@ -1,0 +1,51 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] reflection: preserve byref TypeSpecs when resolving tokens.
+
+Module.ResolveType and ResolveMember resolve TypeSpecs through MonoClass
+and return its byval_arg. This loses the byref bit: a TypeSpec signature
+ELEMENT_TYPE_BYREF ELEMENT_TYPE_U1 resolves to System.Byte, not Byte&.
+
+Purple's startup code uses such a token to read bytes through a reference.
+With the byref bit lost, it converts the address to a byte instead of
+dereferencing it. Its module name decoding then fails, eventually passing
+IntPtr.Zero to Marshal.GetDelegateForFunctionPointer. The null-pointer
+exception is correct; the earlier type resolution is not.
+
+Use Mono's existing type resolver for non-dynamic TypeSpecs, as ldtoken
+already does. Preserve the byref bit when that resolver canonicalizes an
+inflated generic type as well. Keep the existing token validation,
+TypeDef/TypeRef handling, and dynamic-image handling unchanged.
+
+Based on wine-mono/mono 775a29a0d864061a40438e38830c0afaadf9ae79
+(Wine-Mono 11.2.0). No application-specific checks or exceptions are changed.
+---
+diff --git a/mono/metadata/class.c b/mono/metadata/class.c
+--- a/mono/metadata/class.c
++++ b/mono/metadata/class.c
+@@ -2938,7 +2938,9 @@ mono_type_get_checked (MonoImage *image, guint32 type_token, MonoGenericContext *co
+ 
+ 	if (inflated) {
+ 		MonoType *tmp = type;
++		MonoClass *klass = mono_class_from_mono_type_internal (type);
++
+-		type = m_class_get_byval_arg (mono_class_from_mono_type_internal (type));
++		type = tmp->byref ? m_class_get_this_arg (klass) : m_class_get_byval_arg (klass);
+ 		/* FIXME: This is a workaround fo the fact that a typespec token sometimes reference to the generic type definition.
+ 		 * A MonoClass::_byval_arg of a generic type definion has type CLASS.
+ 		 * Some parts of mono create a GENERICINST to reference a generic type definition and this generates confict with _byval_arg.
+diff --git a/mono/metadata/icall.c b/mono/metadata/icall.c
+--- a/mono/metadata/icall.c
++++ b/mono/metadata/icall.c
+@@ -6338,6 +6338,12 @@ module_resolve_type_token (MonoImage *image, guint32 token, MonoArrayHandle type_ar
+ 	}
+ 
+ 	init_generic_context_from_args_handles (&context, type_args, method_args);
++	if (table == MONO_TABLE_TYPESPEC) {
++		/* A MonoClass cannot distinguish T from T&. */
++		result = mono_type_get_checked (image, token, &context, error);
++		goto leave;
++	}
++
+ 	klass = mono_class_get_checked (image, token, error);
+ 	if (klass)
+ 		klass = mono_class_inflate_generic_class_checked (klass, &context, error);

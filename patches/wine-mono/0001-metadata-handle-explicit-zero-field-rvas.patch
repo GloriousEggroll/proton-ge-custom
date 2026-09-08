@@ -1,0 +1,120 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] metadata: preserve explicit zero RVAs for mapped static fields.
+
+Purple 2.26.907.19 takes the address of a static byte with an explicit
+FieldRVA row whose RVA is zero. Its module initializer needs the mapped
+image base, not a separately allocated zero-initialized static. Mono
+currently conflates a zero RVA with a missing FieldRVA row and falls back
+to ordinary static storage. Purple later throws BadImageFormatException.
+
+Distinguish a missing row from an explicit zero RVA, and return the image
+base for the latter when the image is a Win32 module. Leave the generic
+RVA mapper unchanged: zero still means absent data for its other callers,
+including method bodies. Missing FieldRVA rows retain the existing static
+storage fallback, and nonzero RVAs retain the existing bounds checks.
+
+Microsoft's implementation likewise uses GetRvaData(field, NULL_OK) for
+mapped fields, allowing an explicit RVA of zero to address the image base:
+https://github.com/dotnet/coreclr/blob/master/src/vm/pefile.inl
+https://github.com/dotnet/runtime/blob/main/src/coreclr/utilcode/pedecoder.cpp
+
+Based on wine-mono/mono 775a29a0d864061a40438e38830c0afaadf9ae79
+(Wine Mono 11.2.0). This is a compatibility fix, not an exception bypass.
+---
+diff --git a/mono/metadata/class.c b/mono/metadata/class.c
+index 96c76df..fc0c1a5 100644
+--- a/mono/metadata/class.c
++++ b/mono/metadata/class.c
+@@ -5451,10 +5451,18 @@ mono_field_get_rva (MonoClassField *field)
+ 		
+ 	if (!def_values [field_index].data && !image_is_dynamic (m_class_get_image (klass))) {
+ 		int first_field_idx = mono_class_get_first_field_idx (klass);
+-		mono_metadata_field_info (m_class_get_image (field->parent), first_field_idx + field_index, NULL, &rva, NULL);
+-		if (!rva)
++		MonoImage *image = m_class_get_image (klass);
++		if (!mono_metadata_field_get_rva (image, first_field_idx + field_index, &rva)) {
+ 			g_warning ("field %s in %s should have RVA data, but hasn't", mono_field_get_name (field), m_class_get_name (field->parent));
+-		def_values [field_index].data = mono_image_rva_map (m_class_get_image (field->parent), rva);
++			return NULL;
++		}
++#ifdef HOST_WIN32
++		/* An explicit zero RVA addresses the PE headers of a mapped module. */
++		if (!rva && m_image_is_module_handle (image) && image->raw_data_len)
++			def_values [field_index].data = image->raw_data;
++		else
++#endif
++			def_values [field_index].data = mono_image_rva_map (image, rva);
+ 	}
+ 
+ 	return def_values [field_index].data;
+diff --git a/mono/metadata/metadata-internals.h b/mono/metadata/metadata-internals.h
+index 24b81a2..f6d2e08 100644
+--- a/mono/metadata/metadata-internals.h
++++ b/mono/metadata/metadata-internals.h
+@@ -1167,6 +1167,9 @@ mono_metadata_field_info_with_mempool (
+ 				      guint32      *rva,
+ 				      MonoMarshalSpec **marshal_spec);
+ 
++gboolean
++mono_metadata_field_get_rva (MonoImage *meta, guint32 index, guint32 *rva);
++
+ MonoClassField*
+ mono_metadata_get_corresponding_field_from_generic_type_definition (MonoClassField *field);
+ 
+diff --git a/mono/metadata/metadata.c b/mono/metadata/metadata.c
+index 0ce118d..8d3aba0 100644
+--- a/mono/metadata/metadata.c
++++ b/mono/metadata/metadata.c
+@@ -6539,6 +6539,27 @@ mono_metadata_field_info_with_mempool (MonoImage *meta, guint32 index, guint32 *
+ 	mono_metadata_field_info_full (meta, index, offset, rva, marshal_spec, TRUE);
+ }
+ 
++/* Unlike mono_metadata_field_info(), distinguish an explicit RVA of zero from a missing row. */
++gboolean
++mono_metadata_field_get_rva (MonoImage *meta, guint32 index, guint32 *rva)
++{
++	MonoTableInfo *tdef = &meta->tables [MONO_TABLE_FIELDRVA];
++	locator_t loc;
++
++	loc.idx = index + 1;
++	if (meta->uncompressed_metadata)
++		loc.idx = search_ptr_table (meta, MONO_TABLE_FIELD_POINTER, loc.idx);
++	loc.col_idx = MONO_FIELD_RVA_FIELD;
++	loc.t = tdef;
++
++	*rva = 0;
++	if (!tdef->base || !mono_binary_search (&loc, tdef->base, tdef->rows, tdef->row_size, table_locator))
++		return FALSE;
++
++	*rva = mono_metadata_decode_row_col (tdef, loc.result, MONO_FIELD_RVA_RVA);
++	return TRUE;
++}
++
+ static void
+ mono_metadata_field_info_full (MonoImage *meta, guint32 index, guint32 *offset, guint32 *rva, 
+ 				       MonoMarshalSpec **marshal_spec, gboolean alloc_from_image)
+@@ -6562,21 +6583,8 @@ mono_metadata_field_info_full (MonoImage *meta, guint32 index, guint32 *offset,
+ 			*offset = (guint32)-1;
+ 		}
+ 	}
+-	if (rva) {
+-		tdef = &meta->tables [MONO_TABLE_FIELDRVA];
+-
+-		loc.col_idx = MONO_FIELD_RVA_FIELD;
+-		loc.t = tdef;
+-		
+-		if (tdef->base && mono_binary_search (&loc, tdef->base, tdef->rows, tdef->row_size, table_locator)) {
+-			/*
+-			 * LAMESPEC: There is no signature, no nothing, just the raw data.
+-			 */
+-			*rva = mono_metadata_decode_row_col (tdef, loc.result, MONO_FIELD_RVA_RVA);
+-		} else {
+-			*rva = 0;
+-		}
+-	}
++	if (rva)
++		mono_metadata_field_get_rva (meta, index, rva);
+ 	if (marshal_spec) {
+ 		const char *p;
+ 		
+

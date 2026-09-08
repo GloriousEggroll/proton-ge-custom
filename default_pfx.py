@@ -79,7 +79,8 @@ def filter_registry(filename):
     """Remove registry values that contain a fully qualified path
     inside some well-known registry keys. These paths are devised on
     the build machine and it makes no sense to distribute them. Plus,
-    they are known to cause bugs."""
+    they are known to cause bugs. Also remove the template's SQM machine
+    identifier so wineboot generates a separate one in each new prefix."""
 
     FILTER_KEYS = [
         r'Software\\Microsoft\\Windows\\CurrentVersion\\Fonts',
@@ -88,6 +89,7 @@ def filter_registry(filename):
     ]
 
     filtering = False
+    filtering_sqm = False
     with open(filename) as fin:
         with open(filename + '.tmp', 'w') as fout:
             for line in fin:
@@ -97,10 +99,13 @@ def filter_registry(filename):
                 if match is not None:
                     fout.write(line + '\n')
                     filtering = match.group(1) in FILTER_KEYS
+                    filtering_sqm = match.group(1) == r'Software\\Microsoft\\SQMClient'
                     continue
 
                 match = VALUE_RE.match(line)
                 if match is not None:
+                    if filtering_sqm and match.group(1) == 'MachineId':
+                        continue
                     if not filtering or match.group(2)[1:2] != ':':
                         fout.write(line + '\n')
                     continue
