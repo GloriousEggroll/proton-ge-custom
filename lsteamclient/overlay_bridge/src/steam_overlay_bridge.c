@@ -6,6 +6,7 @@
  */
 
 #include "steam_overlay_bridge.h"
+#include "x11_focus.h"
 
 #include <dlfcn.h>
 #include <linux/input.h>
@@ -205,6 +206,7 @@ static int overlay_initialized;
 static int overlay_active;
 static int overlay_input_active;
 static int overlay_focus_owner;
+static Window overlay_focus_window;
 static int overlay_requested_focus;
 static int overlay_advertised_focus = -1;
 static int overlay_bridge_suspended;
@@ -1429,6 +1431,19 @@ static int init_overlay_bridge(int force_retry)
     net_wm_pid = XInternAtom(overlay_display, "_NET_WM_PID", False);
     XChangeProperty(overlay_display, overlay_window, net_wm_pid, XA_CARDINAL, 32,
                     PropModeReplace, (unsigned char *)&pid, 1);
+
+    overlay_focus_window = ge_overlay_create_x11_focus_window(overlay_display,
+                                                              window_class);
+    if (!overlay_focus_window)
+    {
+        XDestroyWindow(overlay_display, overlay_window);
+        overlay_window = None;
+        destroy_opengl_presenter_resources();
+        XCloseDisplay(overlay_display);
+        overlay_display = NULL;
+        goto retry;
+    }
+
     previous_after_function =
         XSetAfterFunction(overlay_display, overlay_x11_after_request);
     XMapWindow(overlay_display, overlay_window);
@@ -1442,6 +1457,8 @@ static int init_overlay_bridge(int force_retry)
         previous_after_function = NULL;
         XDestroyWindow(overlay_display, overlay_window);
         overlay_window = None;
+        ge_overlay_destroy_x11_focus_window(overlay_display, overlay_focus_window);
+        overlay_focus_window = None;
         destroy_opengl_presenter_resources();
         XCloseDisplay(overlay_display);
         overlay_display = NULL;
@@ -1455,6 +1472,7 @@ static int init_overlay_bridge(int force_retry)
     overlay_trace("created X11 %s window %#lx\n",
                   overlay_opengl_requested ? "GLX overlay" : "input proxy",
                   overlay_window);
+    overlay_trace("created InputOnly Steam focus window %#lx\n", overlay_focus_window);
     return 1;
 
 retry:
@@ -1516,7 +1534,7 @@ static void sync_overlay_focus(void)
 
         if (overlay_focus_owner)
         {
-            XSetInputFocus(overlay_display, overlay_window,
+            XSetInputFocus(overlay_display, overlay_focus_window,
                            RevertToParent, CurrentTime);
             advertise_focus = 1;
         }
@@ -1524,7 +1542,7 @@ static void sync_overlay_focus(void)
     else if (overlay_focus_owner)
     {
         XGetInputFocus(overlay_display, &current_focus, &revert_to);
-        if (current_focus == overlay_window)
+        if (current_focus == overlay_focus_window)
             XSetInputFocus(overlay_display, PointerRoot,
                            RevertToPointerRoot, CurrentTime);
 
@@ -1548,13 +1566,13 @@ static void sync_overlay_focus(void)
 
     overlay_trace("X11 focus proxy is now %s\n",
                   focused ? "focused" : "unfocused");
-    if (!overlay_opengl_requested)
-    {
-        event.type = focused ? FocusIn : FocusOut;
-        event.xfocus.mode = NotifyNormal;
-        event.xfocus.detail = NotifyNonlinear;
-        forward_overlay_x11_event(&event);
-    }
+    /* The drawable no longer receives server focus events. Notify Steam's
+     * renderer locally for both Vulkan and GLX, without activating a native
+     * XWayland surface over the game. */
+    event.type = focused ? FocusIn : FocusOut;
+    event.xfocus.mode = NotifyNormal;
+    event.xfocus.detail = NotifyNonlinear;
+    forward_overlay_x11_event(&event);
     update_overlay_active();
 }
 
@@ -1903,11 +1921,13 @@ static void destroy_overlay_bridge(void)
         XSetSelectionOwner(overlay_display, overlay_owner_atom, None, CurrentTime);
 
     XGetInputFocus(overlay_display, &current_focus, &revert_to);
-    if (current_focus == overlay_window)
+    if (current_focus == overlay_focus_window)
         XSetInputFocus(overlay_display, PointerRoot,
                        RevertToPointerRoot, CurrentTime);
 
     XSetAfterFunction(overlay_display, previous_after_function);
+    ge_overlay_destroy_x11_focus_window(overlay_display, overlay_focus_window);
+    overlay_focus_window = None;
     XDestroyWindow(overlay_display, overlay_window);
     XSync(overlay_display, False);
     XUnlockDisplay(overlay_display);

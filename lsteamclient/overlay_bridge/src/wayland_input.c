@@ -92,7 +92,9 @@ static void overlay_trace(const char *message)
 
 static void update_bridge_focus(struct ge_overlay_wayland_surface *surface)
 {
-    int focused = surface->keyboard_focus || surface->pointer_focus;
+    /* Pointer hover can remain on an inactive game during alt-tab or the
+     * compositor overview. Only fall back to it for seats without a keyboard. */
+    int focused = surface->keyboard ? surface->keyboard_focus : surface->pointer_focus;
 
     if (focused == surface->bridge_focus) return;
     surface->bridge_focus = focused;
@@ -802,10 +804,10 @@ static void destroy_relative_pointer(struct ge_overlay_wayland_surface *surface)
 
 static void destroy_seat_devices(struct ge_overlay_wayland_surface *surface)
 {
+    surface->keyboard_focus = 0;
+    surface->pointer_focus = 0;
     if (surface->bridge_focus)
     {
-        surface->keyboard_focus = 0;
-        surface->pointer_focus = 0;
         surface->bridge_focus = 0;
         ge_overlay_bridge_focus(0);
     }
@@ -855,7 +857,6 @@ static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps)
         wl_keyboard_release(surface->keyboard);
         surface->keyboard = NULL;
         destroy_keyboard_state(surface);
-        update_bridge_focus(surface);
     }
 
     if ((caps & WL_SEAT_CAPABILITY_POINTER) && !surface->pointer)
@@ -875,8 +876,8 @@ static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps)
         destroy_relative_pointer(surface);
         wl_pointer_release(surface->pointer);
         surface->pointer = NULL;
-        update_bridge_focus(surface);
     }
+    update_bridge_focus(surface);
 }
 
 static void seat_name(void *data, struct wl_seat *seat, const char *name)

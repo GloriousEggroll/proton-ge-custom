@@ -8,6 +8,7 @@
  */
 
 #include "steam_overlay_bridge.h"
+#include "x11_focus.h"
 
 #include <dlfcn.h>
 #include <pthread.h>
@@ -74,6 +75,47 @@ static int load_direct_xlib(struct direct_xlib *xlib)
            xlib->destroy_window && xlib->close_display;
 }
 
+Window ge_overlay_create_x11_focus_window(Display *display, const char *window_class)
+{
+    struct direct_xlib xlib;
+    XSetWindowAttributes attributes = {0};
+    XClassHint class_hint;
+    unsigned long pid = (unsigned long)getpid();
+    Atom net_wm_pid;
+    Window window;
+
+    if (!load_direct_xlib(&xlib)) return None;
+
+    /* Steam Input needs an X11 focus identity, not a drawable. Mutter tracks
+     * InputOutput windows even with override_redirect and focusing one takes
+     * keyboard focus away from the native Wayland game. InputOnly windows
+     * are excluded from that window-management path. Keep this root child
+     * separate from the overlay drawable, and out of Steam's render hooks.
+     * https://github.com/GloriousEggroll/proton-ge-custom/issues/754 */
+    attributes.override_redirect = True;
+    window = xlib.create_window(display, DefaultRootWindow(display), -1, -1,
+                                1, 1, 0, 0, InputOnly, CopyFromParent,
+                                CWOverrideRedirect, &attributes);
+    if (!window) return None;
+
+    class_hint.res_name = (char *)window_class;
+    class_hint.res_class = (char *)window_class;
+    XSetClassHint(display, window, &class_hint);
+    XStoreName(display, window, window_class);
+    net_wm_pid = XInternAtom(display, "_NET_WM_PID", False);
+    XChangeProperty(display, window, net_wm_pid, XA_CARDINAL, 32,
+                    PropModeReplace, (unsigned char *)&pid, 1);
+    xlib.map_window(display, window);
+    return window;
+}
+
+void ge_overlay_destroy_x11_focus_window(Display *display, Window window)
+{
+    struct direct_xlib xlib;
+
+    if (window && load_direct_xlib(&xlib)) xlib.destroy_window(display, window);
+}
+
 static int env_enabled(const char *name, int default_value)
 {
     const char *value = getenv(name);
@@ -114,20 +156,15 @@ static int proxy_should_stop(void)
 static void *run_focus_proxy(void *arg)
 {
     struct direct_xlib xlib;
-    XSetWindowAttributes attributes = {0};
     struct timespec sleep_time = {0, 50 * 1000 * 1000};
-    XClassHint class_hint;
     const char *display_name = getenv("DISPLAY");
     const char *appid = getenv("SteamAppId");
     char owner_selection[160];
     char window_class[128];
     Display *display;
     Window current_focus;
-    Window root;
     Window window;
     Atom owner_atom;
-    Atom net_wm_pid;
-    unsigned long pid = (unsigned long)getpid();
     int revert_to;
     int owns_selection = 0;
 
@@ -143,30 +180,17 @@ static void *run_focus_proxy(void *arg)
     if (!(display = xlib.open_display(display_name)))
         return NULL;
 
-    root = DefaultRootWindow(display);
-    attributes.override_redirect = True;
-    window = xlib.create_window(display, root, -1, -1, 1, 1, 0, 0,
-                                InputOnly, CopyFromParent, CWOverrideRedirect,
-                                &attributes);
+    snprintf(window_class, sizeof(window_class), "steam_app_%s", appid);
+    window = ge_overlay_create_x11_focus_window(display, window_class);
     if (!window)
     {
         xlib.close_display(display);
         return NULL;
     }
 
-    snprintf(window_class, sizeof(window_class), "steam_app_%s", appid);
     snprintf(owner_selection, sizeof(owner_selection),
              "_WINE_WAYLAND_STEAM_FOCUS_%s", appid);
     owner_atom = XInternAtom(display, owner_selection, False);
-    class_hint.res_name = window_class;
-    class_hint.res_class = window_class;
-    XSetClassHint(display, window, &class_hint);
-    XStoreName(display, window, window_class);
-
-    net_wm_pid = XInternAtom(display, "_NET_WM_PID", False);
-    XChangeProperty(display, window, net_wm_pid, XA_CARDINAL, 32,
-                    PropModeReplace, (unsigned char *)&pid, 1);
-    xlib.map_window(display, window);
 
     /* Every Wine process creates an instance. Only bootstrap focus when no
      * process in this app already owns the per-game target. A focused Wayland
@@ -204,7 +228,7 @@ static void *run_focus_proxy(void *arg)
     XGetInputFocus(display, &current_focus, &revert_to);
     if (current_focus == window)
         XSetInputFocus(display, PointerRoot, RevertToPointerRoot, CurrentTime);
-    xlib.destroy_window(display, window);
+    ge_overlay_destroy_x11_focus_window(display, window);
     XSync(display, False);
     xlib.close_display(display);
 
