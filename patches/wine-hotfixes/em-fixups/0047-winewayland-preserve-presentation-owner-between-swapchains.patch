@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Tue, 8 Sep 2026 23:30:00 -0400
+Subject: [PATCH] winewayland: Preserve presentation owner between swapchains
+
+THE FINALS repeatedly destroys and recreates its Vulkan swapchain on the
+same VkSurface. When its last swapchain is destroyed, deactivate excludes
+the current client from both owner searches. With no other client this
+clears the owner and detaches the subsurface. Detaching replaces the opaque
+carrier with a transparent SHM buffer, exposing the desktop until the next
+swapchain attaches the same client again.
+
+Use the existing update_owner policy on deactivation: prefer the newest
+active client, otherwise retain the current registered owner. A zero active
+count between swapchains does not mean that the graphics surface or window
+has been destroyed. Keeping the subsurface also avoids invalidating its
+attachment and presentation generations during an ordinary swapchain gap.
+
+Actual client destruction/detachment still unregisters the surface and
+selects a replacement. Visibility and role changes still detach clients
+through the existing attach checks. Active replacement presenters retain
+priority; inactive probe surfaces cannot displace a displayed frame merely
+because its swapchain is being recreated.
+
+The new #754 log contains 129 activations of the same 0x100c2 client, with
+128 intervening deactivate/recreate cycles and no client-size warnings.
+This fixes the unnecessary detach during those cycles, without suppressing
+WSI out-of-date results or changing the working overlay focus fix.
+
+This corrects GE's activation/deactivation extension of the native-presenter
+coordination originally implemented by Erhan Bilgili (nanomatters).
+Link: https://github.com/GloriousEggroll/proton-ge-custom/issues/754#issuecomment-5594967486
+---
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -4919,18 +4919,12 @@ static BOOL wayland_client_surface_is_candidate(struct client_surface *client)
+ static void wayland_client_surface_deactivate(struct client_surface *client)
+ {
+-    struct wayland_client_surface *surface = impl_from_client_surface(client);
+-    struct wayland_client_surface *owner;
+     struct wayland_win_data *data;
+ 
+     if (!(data = wayland_win_data_get(client->hwnd))) return;
+ 
+-    if (!ReadAcquire(&client->active_ref) && data->client_surface == surface)
+-    {
+-        owner = wayland_client_surface_find_owner(data, surface, TRUE);
+-        if (!owner) owner = wayland_client_surface_find_owner(data, surface, FALSE);
+-        wayland_client_surface_set_owner(data, owner);
+-    }
+-    wayland_client_surfaces_attach(data, NtUserGetAncestor(client->hwnd, GA_ROOT));
++    /* Keep the last frame attached across swapchain recreation. Only another
++     * active presenter, or actual surface detachment/destruction, replaces it. */
++    wayland_client_surface_update_owner(data);
+     TRACE("deactivated %s\n", debugstr_client_surface(client));
+     wayland_win_data_release(data);
+ }
