@@ -15,12 +15,15 @@ returned over subsequent ReadSample calls instead of being discarded behind
 EOS. Continue servicing selected streams after MEEndOfPresentation until each
 stream has completed its transform drain. Return drain failures as Source
 Reader errors with the original HRESULT.
+---
+ dlls/mfreadwrite/reader.c | 305 +++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 247 insertions(+), 58 deletions(-)
 
 diff --git a/dlls/mfreadwrite/reader.c b/dlls/mfreadwrite/reader.c
-index 3b9e89174..8fa723698 100644
+index a83c32aec9b121ef62ea24ad94c79bf4ae6e421a..16f5736cd13293bf33a50581911bf0d40e8838c6 100644
 --- a/dlls/mfreadwrite/reader.c
 +++ b/dlls/mfreadwrite/reader.c
-@@ -56,6 +56,7 @@
+@@ -56,6 +56,7 @@ struct stream_response
  enum media_stream_state
  {
      STREAM_STATE_READY = 0,
@@ -28,7 +31,7 @@ index 3b9e89174..8fa723698 100644
      STREAM_STATE_EOS,
  };
  
-@@ -113,6 +114,9 @@
+@@ -113,6 +114,9 @@ struct media_stream
      BOOL have_sample_ts;
      BOOL is_new_stream;
      BOOL unthrottled_audio_output;
@@ -38,7 +41,7 @@ index 3b9e89174..8fa723698 100644
      struct list retained_audio_samples;
      struct source_reader *reader;
  };
-@@ -230,10 +234,11 @@
+@@ -230,10 +234,11 @@ static struct source_reader_async_command *impl_from_async_command_IUnknown(IUnk
  
  static void source_reader_release_responses(struct source_reader *reader, struct media_stream *stream);
  static HRESULT source_reader_get_stream_selection(const struct source_reader *reader, DWORD index, BOOL *selected);
@@ -52,7 +55,7 @@ index 3b9e89174..8fa723698 100644
  
  static ULONG source_reader_addref(struct source_reader *reader)
  {
-@@ -266,6 +271,8 @@
+@@ -266,6 +271,8 @@ static void media_stream_destroy(struct media_stream *stream)
  {
      struct transform_entry *entry, *next;
  
@@ -61,7 +64,7 @@ index 3b9e89174..8fa723698 100644
      media_stream_release_retained_audio_samples(stream);
  
      LIST_FOR_EACH_ENTRY_SAFE(entry, next, &stream->transforms, struct transform_entry, entry)
-@@ -676,21 +683,28 @@
+@@ -676,21 +683,28 @@ static BOOL source_reader_request_sample_eos(HRESULT hr)
      return hr == MF_E_END_OF_STREAM;
  }
  
@@ -95,7 +98,7 @@ index 3b9e89174..8fa723698 100644
              }
              else
                  WARN("Sample request failed, hr %#lx.\n", hr);
-@@ -740,6 +754,8 @@
+@@ -740,6 +754,8 @@ static HRESULT source_reader_new_stream_handler(struct source_reader *reader, IM
                  source_reader_release_responses(reader, &reader->streams[i]);
                  reader->next_stream_eos_index = 0;
  
@@ -104,7 +107,7 @@ index 3b9e89174..8fa723698 100644
                  if ((ptr = list_head(&reader->streams[i].transforms)))
                  {
                      struct transform_entry *entry = LIST_ENTRY(ptr, struct transform_entry, entry);
-@@ -1097,7 +1113,7 @@
+@@ -1097,7 +1113,7 @@ static HRESULT update_media_type_from_upstream(IMFMediaType *media_type, IMFMedi
  }
  
  static HRESULT source_reader_pull_transform_samples(struct source_reader *reader, struct media_stream *stream,
@@ -113,7 +116,7 @@ index 3b9e89174..8fa723698 100644
  static inline BOOL source_reader_is_nonfatal_transform_status(HRESULT hr)
  {
      return hr == MF_E_TRANSFORM_NEED_MORE_INPUT || hr == MF_E_END_OF_STREAM;
-@@ -1156,20 +1172,50 @@
+@@ -1156,12 +1172,12 @@ static HRESULT source_reader_push_transform_samples(struct source_reader *reader
  
      do
      {
@@ -128,8 +131,7 @@ index 3b9e89174..8fa723698 100644
              return hr == MF_E_TRANSFORM_NEED_MORE_INPUT ? S_OK : hr;
          }
      }
-     while (hr == MF_E_NOTACCEPTING);
- 
+@@ -1170,6 +1186,36 @@ static HRESULT source_reader_push_transform_samples(struct source_reader *reader
      return hr;
  }
  
@@ -166,7 +168,7 @@ index 3b9e89174..8fa723698 100644
  /* update the transform output type while keeping subtype which matches the desired type */
  static HRESULT set_matching_transform_output_type(IMFTransform *transform, IMFMediaType *old_output_type)
  {
-@@ -1277,7 +1323,7 @@
+@@ -1277,7 +1323,7 @@ static void transform_entry_initialize_attributes(struct source_reader *reader,
  }
  
  static HRESULT source_reader_pull_transform_samples(struct source_reader *reader, struct media_stream *stream,
@@ -175,17 +177,17 @@ index 3b9e89174..8fa723698 100644
  {
      MFT_OUTPUT_STREAM_INFO stream_info = {0};
      struct transform_entry *next = NULL;
-@@ -1298,6 +1344,9 @@
+@@ -1298,6 +1344,9 @@ static HRESULT source_reader_pull_transform_samples(struct source_reader *reader
          return hr;
      stream_info.cbSize = max(stream_info.cbSize, entry->min_buffer_size);
  
 +    if (draining && !stream->requests)
 +        return S_OK;
 +
-     while (SUCCEEDED(hr))
+     do
      {
          MFT_OUTPUT_DATA_BUFFER out_buffer = {0};
-@@ -1322,6 +1371,25 @@
+@@ -1322,6 +1371,25 @@ static HRESULT source_reader_pull_transform_samples(struct source_reader *reader
  
              if (FAILED(hr))
                  source_reader_queue_response(reader, stream, hr, MF_SOURCE_READERF_ERROR, 0, NULL);
@@ -211,7 +213,7 @@ index 3b9e89174..8fa723698 100644
              else if (next)
                  hr = source_reader_push_transform_samples(reader, stream, next, out_buffer.pSample);
              else
-@@ -1347,7 +1415,9 @@
+@@ -1347,7 +1415,9 @@ static HRESULT source_reader_pull_transform_samples(struct source_reader *reader
          if (out_buffer.pEvents)
              IMFCollection_Release(out_buffer.pEvents);
  
@@ -222,7 +224,7 @@ index 3b9e89174..8fa723698 100644
                  && (!source_reader_stream_is_audio(stream) || !stream->unthrottled_audio_output))
              break;
      }
-@@ -1355,23 +1425,154 @@
+@@ -1356,25 +1426,154 @@ static HRESULT source_reader_pull_transform_samples(struct source_reader *reader
      return hr;
  }
  
@@ -306,6 +308,8 @@ index 3b9e89174..8fa723698 100644
  
 -    if (FAILED(hr = IMFTransform_ProcessMessage(entry->transform, MFT_MESSAGE_COMMAND_DRAIN, 0)))
 -        WARN("Failed to drain transform %p, hr %#lx\n", entry->transform, hr);
+-    /* MF_E_SAMPLEALLOCATOR_EMPTY can occur here if many samples are drained
+-     * from a transform, but it's not an issue if a later call succeeds. */
 -    if (FAILED(hr = source_reader_pull_transform_samples(reader, stream, entry))
 -            && !source_reader_is_nonfatal_transform_status(hr))
 -        WARN("Failed to pull pending samples, hr %#lx.\n", hr);
@@ -388,7 +392,7 @@ index 3b9e89174..8fa723698 100644
  }
  
  static HRESULT source_reader_flush_transform_samples(struct source_reader *reader, struct media_stream *stream,
-@@ -1507,22 +1708,10 @@
+@@ -1510,22 +1709,10 @@ static HRESULT source_reader_media_stream_state_handler(struct source_reader *re
              switch (event_type)
              {
                  case MEEndOfStream:
@@ -413,7 +417,7 @@ index 3b9e89174..8fa723698 100644
                      stream->flags &= ~(STREAM_FLAG_SAMPLE_REQUESTED | STREAM_FLAG_EOS_REPORTED | STREAM_FLAG_STOPPED);
                      source_reader_reset_stream_timing(stream);
  
-@@ -1536,7 +1725,7 @@
+@@ -1539,7 +1726,7 @@ static HRESULT source_reader_media_stream_state_handler(struct source_reader *re
                      }
                      break;
                  case MEStreamStarted:
@@ -422,7 +426,7 @@ index 3b9e89174..8fa723698 100644
                      stream->flags &= ~(STREAM_FLAG_SAMPLE_REQUESTED | STREAM_FLAG_EOS_REPORTED | STREAM_FLAG_STOPPED);
                      source_reader_reset_stream_timing(stream);
  
-@@ -1837,7 +2026,7 @@
+@@ -1840,7 +2027,7 @@ static void source_reader_request_audio_for_video_sync(struct source_reader *rea
      if (!(response = source_reader_peek_response_for_stream(reader, stream)) || !response->sample)
          return;
  
@@ -431,7 +435,7 @@ index 3b9e89174..8fa723698 100644
              && audio->unthrottled_audio_output)
      {
          audio_lead = response->timestamp - audio->delivered_sample_ts;
-@@ -1858,7 +2047,7 @@
+@@ -1861,7 +2048,7 @@ static void source_reader_prefetch_stream_sample(struct source_reader *reader, s
  
      if (!reader->flag_eos_for_all_streams || reader->async_callback)
          return;
@@ -440,7 +444,7 @@ index 3b9e89174..8fa723698 100644
          return;
      if (source_reader_stream_is_audio(stream))
          max_responses = 8;
-@@ -1902,10 +2091,9 @@
+@@ -1905,10 +2092,9 @@ static BOOL source_reader_selected_streams_eos(struct source_reader *reader)
  
      for (i = 0; i < reader->stream_count; ++i)
      {
@@ -453,7 +457,7 @@ index 3b9e89174..8fa723698 100644
              return FALSE;
      }
  
-@@ -1946,7 +2134,7 @@
+@@ -1949,7 +2135,7 @@ static HRESULT source_reader_get_next_unreported_selected_eos_stream(struct sour
  
          if (FAILED(source_reader_get_stream_selection(reader, index, &selected)) || !selected)
              continue;
@@ -462,7 +466,29 @@ index 3b9e89174..8fa723698 100644
              continue;
          if (stream->flags & STREAM_FLAG_EOS_REPORTED)
              continue;
-@@ -2211,9 +2399,6 @@
+@@ -2072,7 +2258,6 @@ static BOOL source_reader_get_read_result(struct source_reader *reader, struct m
+ {
+     struct stream_response *response = NULL;
+     BOOL request_sample = FALSE;
+-    struct list *ptr;
+ 
+     while ((response = media_stream_pop_response(reader, stream)))
+     {
+@@ -2084,13 +2269,6 @@ static BOOL source_reader_get_read_result(struct source_reader *reader, struct m
+         if (*sample)
+         {
+             IMFSample_AddRef(*sample);
+-            if (stream->state == STREAM_STATE_EOS && (ptr = list_head(&stream->transforms)))
+-            {
+-                struct transform_entry *entry = LIST_ENTRY(ptr, struct transform_entry, entry);
+-                /* Try to drain another sample in case the decoder emits many while draining.
+-                 * Draining one at a time prevents exhaustion of the allocator in some cases. */
+-                source_reader_drain_transform_samples(reader, stream, entry);
+-            }
+         }
+         if (*sample)
+         {
+@@ -2224,9 +2402,6 @@ static HRESULT source_reader_get_next_selected_stream(struct source_reader *read
  
  static HRESULT source_reader_request_selected_stream_samples(struct source_reader *reader)
  {
@@ -472,7 +498,7 @@ index 3b9e89174..8fa723698 100644
      if (reader->flag_eos_for_all_streams)
          return source_reader_request_windows_media_stream_sample(reader);
  
-@@ -2272,6 +2457,14 @@
+@@ -2285,6 +2460,14 @@ static void source_reader_flush_stream(struct source_reader *reader, DWORD strea
  
      source_reader_release_responses(reader, stream);
  
@@ -487,7 +513,7 @@ index 3b9e89174..8fa723698 100644
      if ((ptr = list_head(&stream->transforms)))
      {
          struct transform_entry *entry = LIST_ENTRY(ptr, struct transform_entry, entry);
-@@ -2591,6 +2784,8 @@
+@@ -2604,6 +2787,8 @@ static HRESULT WINAPI src_reader_SetStreamSelection(IMFSourceReaderEx *iface, DW
      {
          for (i = 0; i < reader->stream_count; ++i)
          {
@@ -496,7 +522,7 @@ index 3b9e89174..8fa723698 100644
              source_reader_reset_stream_timing(&reader->streams[i]);
          }
      }
-@@ -2785,6 +2980,9 @@
+@@ -2798,6 +2983,9 @@ static HRESULT source_reader_set_compatible_media_type(struct source_reader *rea
      if (flags & MF_MEDIATYPE_EQUAL_FORMAT_DATA)
          return S_OK;
  
@@ -506,7 +532,7 @@ index 3b9e89174..8fa723698 100644
      if (stream->transform_service)
      {
          IMFTransform_Release(stream->transform_service);
-@@ -3186,7 +3384,8 @@
+@@ -3199,7 +3387,8 @@ static HRESULT WINAPI src_reader_SetCurrentPosition(IMFSourceReaderEx *iface, RE
      {
          for (i = 0; i < reader->stream_count; ++i)
          {

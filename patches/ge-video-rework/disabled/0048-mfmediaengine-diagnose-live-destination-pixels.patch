@@ -1,0 +1,115 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@proton.me>
+Date: Wed, 26 Aug 2026 13:05:00 -0600
+Subject: [PATCH] mfmediaengine: Diagnose live destination pixels
+
+Read back a sparse set of pixels from the application's destination texture
+after TransferVideoFrame renders into it.  Comparing this with the decoded
+frame probe distinguishes a failed render from a shared-resource visibility
+or ownership problem.  Limit the synchronous readback to four live frames.
+---
+ dlls/mfmediaengine/main.c | 80 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 80 insertions(+)
+
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -3279,9 +3279,82 @@ static HRESULT media_engine_transfer_d3d11(struct media_engine *engine, ID3D11Te
+     return hr;
+ }
+ 
++static void media_engine_diagnose_live_destination_pixels(ID3D11Device *device,
++        ID3D11DeviceContext *context, ID3D11Texture2D *texture,
++        const D3D11_TEXTURE2D_DESC *desc, LONG diagnostic_id)
++{
++    D3D11_TEXTURE2D_DESC staging_desc = *desc;
++    D3D11_MAPPED_SUBRESOURCE mapped;
++    ID3D11Texture2D *staging = NULL;
++    DWORD rgb_sum = 0, nonblack = 0, pixel_count = 0;
++    BOOL mapped_texture = FALSE;
++    unsigned int x, y;
++    HRESULT hr;
++
++    switch (desc->Format)
++    {
++    case DXGI_FORMAT_B8G8R8A8_UNORM:
++    case DXGI_FORMAT_B8G8R8X8_UNORM:
++    case DXGI_FORMAT_R8G8B8A8_UNORM:
++        break;
++    default:
++        hr = MF_E_INVALIDMEDIATYPE;
++        goto done;
++    }
++
++    staging_desc.Usage = D3D11_USAGE_STAGING;
++    staging_desc.BindFlags = 0;
++    staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++    staging_desc.MiscFlags = 0;
++
++    if (FAILED(hr = ID3D11Device_CreateTexture2D(device, &staging_desc, NULL, &staging)))
++        goto done;
++
++    ID3D11DeviceContext_CopyResource(context, (ID3D11Resource *)staging,
++            (ID3D11Resource *)texture);
++    if (FAILED(hr = ID3D11DeviceContext_Map(context, (ID3D11Resource *)staging,
++            0, D3D11_MAP_READ, 0, &mapped)))
++        goto done;
++    mapped_texture = TRUE;
++
++    if (mapped.RowPitch < desc->Width * 4)
++    {
++        hr = MF_E_UNEXPECTED;
++        goto done;
++    }
++
++    for (y = 0; y < desc->Height; y += 16)
++    {
++        const BYTE *row = (const BYTE *)mapped.pData + y * mapped.RowPitch;
++
++        for (x = 0; x < desc->Width; x += 16)
++        {
++            const BYTE *pixel = row + x * 4;
++            DWORD value = pixel[0] + pixel[1] + pixel[2];
++
++            rgb_sum += value;
++            nonblack += !!value;
++            ++pixel_count;
++        }
++    }
++
++done:
++    if (SUCCEEDED(hr))
++        WARN("live-destination diagnostic %ld: RGB sum %lu, nonblack %lu/%lu, row pitch %u.\n",
++                diagnostic_id, rgb_sum, nonblack, pixel_count, mapped.RowPitch);
++    else
++        WARN("live-destination diagnostic %ld failed, hr %#lx.\n", diagnostic_id, hr);
++
++    if (mapped_texture)
++        ID3D11DeviceContext_Unmap(context, (ID3D11Resource *)staging, 0);
++    if (staging)
++        ID3D11Texture2D_Release(staging);
++}
++
+ static HRESULT media_engine_transfer_to_d3d11_texture(struct media_engine *engine, ID3D11Texture2D *texture,
+         const MFVideoNormalizedRect *src_rect, const RECT *dst_rect, const MFARGB *color)
+ {
++    static LONG live_destination_pixel_diagnostic_count;
+     static const float black[] = {0.0f, 0.0f, 0.0f, 0.0f};
+     ID3D11Device *device, *dst_device;
+     ID3D11DeviceContext *context;
+@@ -3398,6 +3471,13 @@ static HRESULT media_engine_transfer_to_d3d11_texture(struct media_engine *engin
+             | D3D11_RESOURCE_MISC_SHARED_NTHANDLE)))
+         ID3D11DeviceContext_Flush(context);
+ 
++    if (isinf(engine->duration))
++    {
++        LONG diagnostic_id = InterlockedIncrement(&live_destination_pixel_diagnostic_count);
++        if (diagnostic_id <= 4)
++            media_engine_diagnose_live_destination_pixels(device, context, texture, &desc, diagnostic_id);
++    }
++
+     ID3D11RenderTargetView_Release(rtv);
+     ID3D11DeviceContext_Release(context);
+ 
+-- 
+2.51.0

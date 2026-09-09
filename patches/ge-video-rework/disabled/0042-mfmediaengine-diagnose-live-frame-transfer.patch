@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@proton.me>
+Date: Wed, 26 Aug 2026 09:00:00 -0600
+Subject: [PATCH] mfmediaengine: Diagnose live video frame transfer
+
+Emit bounded warnings for live Media Engine video ticks and destination
+texture transfers.  This distinguishes a client that never requests decoded
+frames from a transfer path that reports success without making those frames
+visible to the client.  Keep the diagnostics limited to the first calls of
+each kind so warn-level VRChat logs remain usable.
+---
+ dlls/mfmediaengine/main.c | 30 ++++++++++++++++++++++++++++--
+ 1 file changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -3433,8 +3433,12 @@ static HRESULT WINAPI media_engine_TransferVideoFrame(IMFMediaEngineEx *iface, I
+         const MFVideoNormalizedRect *src_rect, const RECT *dst_rect, const MFARGB *color)
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
++    static LONG live_transfer_diagnostic_count;
++    HRESULT render_hr = E_NOTIMPL, direct_hr = E_NOTIMPL;
++    D3D11_TEXTURE2D_DESC desc;
+     ID3D11Texture2D *texture;
+     HRESULT hr = E_NOINTERFACE;
++    LONG diagnostic_id;
+     IWICBitmap *bitmap;
+ 
+     TRACE("%p, %p, %s, %s, %p.\n", iface, surface, src_rect ? wine_dbg_sprintf("(%f,%f)-(%f,%f)",
+@@ -3447,10 +3451,22 @@ static HRESULT WINAPI media_engine_TransferVideoFrame(IMFMediaEngineEx *iface, I
+     {
+         if (isinf(engine->duration))
+         {
++            diagnostic_id = InterlockedIncrement(&live_transfer_diagnostic_count);
++            ID3D11Texture2D_GetDesc(texture, &desc);
+             TRACE("Using the render-target transfer path for a live video frame.\n");
+-            hr = media_engine_transfer_to_d3d11_texture(engine, texture, src_rect, dst_rect, color);
++            render_hr = media_engine_transfer_to_d3d11_texture(engine, texture, src_rect, dst_rect, color);
++            hr = render_hr;
+             if (FAILED(hr))
+-                hr = media_engine_transfer_d3d11(engine, texture, src_rect, dst_rect, color);
++            {
++                direct_hr = media_engine_transfer_d3d11(engine, texture, src_rect, dst_rect, color);
++                hr = direct_hr;
++            }
++            if (diagnostic_id <= 16)
++                WARN("live-frame diagnostic %ld: texture %ux%u format %u usage %u bind %#x cpu %#x misc %#x "
++                        "samples %u/%u, render hr %#lx, direct hr %#lx, final hr %#lx.\n",
++                        diagnostic_id, desc.Width, desc.Height, desc.Format, desc.Usage, desc.BindFlags,
++                        desc.CPUAccessFlags, desc.MiscFlags, desc.SampleDesc.Count, desc.SampleDesc.Quality,
++                        render_hr, direct_hr, hr);
+         }
+         else if (!engine->device_manager
+                 || engine->video_frame.format_mismatch
+@@ -3477,5 +3493,7 @@ static HRESULT WINAPI media_engine_OnVideoStreamTick(IMFMediaEngineEx *iface, LO
+ {
+     struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
++    static LONG live_tick_diagnostic_count;
++    LONG diagnostic_id;
+     HRESULT hr;
+ 
+     TRACE("%p, %p.\n", iface, pts);
+@@ -3542,6 +3560,14 @@ static HRESULT WINAPI media_engine_OnVideoStreamTick(IMFMediaEngineEx *iface, LO
+             hr = S_FALSE;
+     }
+ 
++    if (isinf(engine->duration))
++    {
++        diagnostic_id = InterlockedIncrement(&live_tick_diagnostic_count);
++        if (diagnostic_id <= 24)
++            WARN("live-tick diagnostic %ld: hr %#lx, pts %I64d, flags %#x.\n", diagnostic_id, hr,
++                    pts ? *pts : MINLONGLONG, engine->flags);
++    }
++
+     LeaveCriticalSection(&engine->cs);
+ 
+     return hr;
+-- 
+2.51.0

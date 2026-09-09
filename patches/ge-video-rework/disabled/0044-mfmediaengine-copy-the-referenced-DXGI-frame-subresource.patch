@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@proton.me>
+Date: Wed, 26 Aug 2026 10:15:00 -0600
+Subject: [PATCH] mfmediaengine: Copy the referenced DXGI frame subresource
+
+IMFDXGIBuffer returns both a texture and the subresource containing the
+sample.  Media Engine ignored that subresource and used CopyResource to copy
+the complete source allocation into its single-frame intermediate texture.
+Allocator-backed samples can use one slice of a texture array, making the two
+complete resources incompatible.  D3D11 copy commands have no return value,
+so the copy was silently discarded while TransferVideoFrame still returned
+success and rendered an unchanged texture.
+
+Copy only the referenced source subresource and the dimensions shared by the
+source and destination.  Preserve the pixel width separately from the CPU row
+pitch, and fall back to the CPU path if the texture formats are incompatible.
+Keep a bounded descriptor warning while validating live HLS playback.
+---
+ dlls/mfmediaengine/main.c | 45 ++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 38 insertions(+), 7 deletions(-)
+
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -2935,13 +2935,16 @@ static HRESULT get_d3d11_resource_from_sample(IMFSample *sample, ID3D11Texture2D
+ 
+ static void media_engine_update_d3d11_frame_surface(ID3D11DeviceContext *context, struct media_engine *engine)
+ {
++    static LONG live_dxgi_upload_diagnostic_count;
+     static LONG live_upload_diagnostic_count;
+     D3D11_TEXTURE2D_DESC surface_desc;
+     D3D11_TEXTURE2D_DESC src_desc;
++    D3D11_BOX src_box = {0};
+     IMFMediaBuffer *media_buffer;
+     ID3D11Texture2D *src_texture;
+     ID3D11Device *device;
+     IMFSample *sample;
++    UINT surface_pitch;
+     UINT subresource;
+     HRESULT hr;
+ 
+@@ -2954,11 +2957,11 @@ static void media_engine_update_d3d11_frame_surface(ID3D11DeviceContext *context
+     {
+     case DXGI_FORMAT_B8G8R8A8_UNORM:
+     case DXGI_FORMAT_B8G8R8X8_UNORM:
+-        surface_desc.Width *= 4;
++        surface_pitch = surface_desc.Width * 4;
+         break;
+     default:
+         FIXME("Unsupported format %#x.\n", surface_desc.Format);
+-        surface_desc.Width = 0;
++        surface_pitch = 0;
+     }
+ 
+     if (SUCCEEDED(hr = get_d3d11_resource_from_sample(sample, &src_texture, &subresource)))
+@@ -2966,10 +2969,38 @@ static void media_engine_update_d3d11_frame_surface(ID3D11DeviceContext *context
+ 
+         ID3D11Texture2D_GetDesc(src_texture, &src_desc);
+ 
+-        if (SUCCEEDED(hr = media_engine_lock_d3d_device(engine, &device)))
++        if (isinf(engine->duration))
++        {
++            LONG diagnostic_id = InterlockedIncrement(&live_dxgi_upload_diagnostic_count);
++
++            if (diagnostic_id <= 16)
++                WARN("live-DXGI upload diagnostic %ld: source %ux%u format %u mips %u array %u subresource %u; "
++                        "destination %ux%u format %u.\n", diagnostic_id, src_desc.Width, src_desc.Height,
++                        src_desc.Format, src_desc.MipLevels, src_desc.ArraySize, subresource,
++                        surface_desc.Width, surface_desc.Height, surface_desc.Format);
++        }
++
++        if (src_desc.Format != surface_desc.Format)
++        {
++            WARN("Cannot copy video frame format %#x to %#x; trying the CPU path.\n",
++                    src_desc.Format, surface_desc.Format);
++            hr = MF_E_INVALIDMEDIATYPE;
++        }
++        else if (subresource >= src_desc.MipLevels * src_desc.ArraySize)
++        {
++            WARN("Invalid video frame subresource %u for %u mips and %u array slices.\n",
++                    subresource, src_desc.MipLevels, src_desc.ArraySize);
++            hr = MF_E_UNEXPECTED;
++        }
++        else if (SUCCEEDED(hr = media_engine_lock_d3d_device(engine, &device)))
+         {
+             ID3D11Device_GetImmediateContext(device, &context);
+-            ID3D11DeviceContext_CopyResource(context, (ID3D11Resource *)engine->video_frame.d3d11.source, (ID3D11Resource *)src_texture);
++            src_box.right = min(src_desc.Width, surface_desc.Width);
++            src_box.bottom = min(src_desc.Height, surface_desc.Height);
++            src_box.back = 1;
++            ID3D11DeviceContext_CopySubresourceRegion(context,
++                    (ID3D11Resource *)engine->video_frame.d3d11.source, 0, 0, 0, 0,
++                    (ID3D11Resource *)src_texture, subresource, &src_box);
+             ID3D11DeviceContext_Release(context);
+             media_engine_unlock_d3d_device(engine, device);
+         }
+@@ -2986,16 +3017,16 @@ static void media_engine_update_d3d11_frame_surface(ID3D11DeviceContext *context
+         {
+             LONG diagnostic_id = 0;
+ 
+-            expected_size = surface_desc.Width * surface_desc.Height;
++            expected_size = surface_pitch * surface_desc.Height;
+             if (isinf(engine->duration))
+                 diagnostic_id = InterlockedIncrement(&live_upload_diagnostic_count);
+             if (diagnostic_id && diagnostic_id <= 16)
+                 WARN("live-upload diagnostic %ld: buffer %lu bytes, visible %lu bytes, pitch %u, height %u.\n",
+-                        diagnostic_id, buffer_size, expected_size, surface_desc.Width, surface_desc.Height);
++                        diagnostic_id, buffer_size, expected_size, surface_pitch, surface_desc.Height);
+             if (buffer_size >= expected_size)
+             {
+                 ID3D11DeviceContext_UpdateSubresource(context, (ID3D11Resource *)engine->video_frame.d3d11.source,
+-                        0, NULL, buffer, surface_desc.Width, 0);
++                        0, NULL, buffer, surface_pitch, 0);
+             }
+ 
+             IMFMediaBuffer_Unlock(media_buffer);
+-- 
+2.51.0

@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@proton.me>
+Date: Wed, 26 Aug 2026 12:35:00 -0600
+Subject: [PATCH] mfmediaengine: Bridge cross-device decoded frames
+
+FFmpeg-backed transforms can return an IMFDXGIBuffer whose texture belongs to
+a different D3D11 device than the Media Engine frame resources.  D3D11 copy
+operations do not support resources from different devices, and
+CopySubresourceRegion() cannot report that failure to its caller.  The frame
+surface was therefore left unchanged while TransferVideoFrame() still
+reported success.
+
+Detect this case and use the existing CPU-visible media-buffer path to bridge
+the decoded frame.  Also include the device identities in the bounded live
+frame diagnostics.
+---
+ dlls/mfmediaengine/main.c | 20 +++++++++++++++++---
+ 1 file changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -2943,10 +2943,11 @@ static void media_engine_update_d3d11_frame_surface(ID3D11DeviceContext *context
+     D3D11_BOX src_box = {0};
+     IMFMediaBuffer *media_buffer;
+     ID3D11Texture2D *src_texture;
+-    ID3D11Device *device;
++    ID3D11Device *device, *src_device, *surface_device;
+     IMFSample *sample;
+     UINT surface_pitch;
+     UINT subresource;
++    BOOL device_mismatch;
+     HRESULT hr;
+ 
+     if (!video_frame_sink_get_sample(engine->presentation.frame_sink, &sample))
+@@ -2970,6 +2971,10 @@ static void media_engine_update_d3d11_frame_surface(ID3D11DeviceContext *context
+ 
+         ID3D11Texture2D_GetDesc(src_texture, &src_desc);
+ 
++        ID3D11Texture2D_GetDevice(src_texture, &src_device);
++        ID3D11Texture2D_GetDevice(engine->video_frame.d3d11.source, &surface_device);
++        device_mismatch = src_device != surface_device;
++
+         if (isinf(engine->duration))
+         {
+             LONG diagnostic_id = InterlockedIncrement(&live_dxgi_upload_diagnostic_count);
+@@ -2977,9 +2981,13 @@ static void media_engine_update_d3d11_frame_surface(ID3D11DeviceContext *context
+             if (diagnostic_id <= 16)
+                 WARN("live-DXGI upload diagnostic %ld: source %ux%u format %u mips %u array %u subresource %u; "
+-                        "destination %ux%u format %u.\n", diagnostic_id, src_desc.Width, src_desc.Height,
++                        "destination %ux%u format %u; devices %p -> %p%s.\n",
++                        diagnostic_id, src_desc.Width, src_desc.Height,
+                         src_desc.Format, src_desc.MipLevels, src_desc.ArraySize, subresource,
+-                        surface_desc.Width, surface_desc.Height, surface_desc.Format);
++                        surface_desc.Width, surface_desc.Height, surface_desc.Format,
++                        src_device, surface_device, device_mismatch ? " (cross-device)" : "");
+         }
++        ID3D11Device_Release(surface_device);
++        ID3D11Device_Release(src_device);
+ 
+         if (src_desc.Format != surface_desc.Format)
+         {
+@@ -2994,6 +3002,10 @@ static void media_engine_update_d3d11_frame_surface(ID3D11DeviceContext *context
+                     subresource, src_desc.MipLevels, src_desc.ArraySize);
+             hr = MF_E_UNEXPECTED;
+         }
++        else if (device_mismatch)
++        {
++            hr = MF_E_INVALIDREQUEST;
++        }
+         else if (SUCCEEDED(hr = media_engine_lock_d3d_device(engine, &device)))
+         {
+             ID3D11Device_GetImmediateContext(device, &context);
+-- 
+2.51.0

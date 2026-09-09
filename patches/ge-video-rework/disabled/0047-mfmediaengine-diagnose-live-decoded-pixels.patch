@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@proton.me>
+Date: Wed, 26 Aug 2026 12:40:00 -0600
+Subject: [PATCH] mfmediaengine: Diagnose live decoded pixels
+
+Read back a sparse set of RGB pixels from the first four decoded live frames.
+This distinguishes a decoder producing black surfaces from a failure while
+transferring valid pixels into the application's shared texture.  Keep the
+diagnostic bounded to avoid ongoing GPU readback overhead.
+---
+ dlls/mfmediaengine/main.c | 60 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 60 insertions(+)
+
+diff --git a/dlls/mfmediaengine/main.c b/dlls/mfmediaengine/main.c
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -2933,6 +2933,63 @@ static HRESULT get_d3d11_resource_from_sample(IMFSample *sample, ID3D11Texture2D
+     return hr;
+ }
+ 
++static void media_engine_diagnose_live_frame_pixels(IMFSample *sample,
++        const D3D11_TEXTURE2D_DESC *desc, LONG diagnostic_id)
++{
++    IMF2DBuffer2 *buffer_2d = NULL;
++    IMFMediaBuffer *buffer = NULL;
++    BYTE *scanline, *buffer_start;
++    DWORD buffer_length, rgb_sum = 0, nonblack = 0, pixel_count = 0;
++    BOOL locked = FALSE;
++    unsigned int x, y;
++    LONG pitch;
++    HRESULT hr;
++
++    if (FAILED(hr = IMFSample_GetBufferByIndex(sample, 0, &buffer)))
++        goto done;
++    if (FAILED(hr = IMFMediaBuffer_QueryInterface(buffer, &IID_IMF2DBuffer2, (void **)&buffer_2d)))
++        goto done;
++    if (FAILED(hr = IMF2DBuffer2_Lock2DSize(buffer_2d, MF2DBuffer_LockFlags_Read,
++            &scanline, &pitch, &buffer_start, &buffer_length)))
++        goto done;
++    locked = TRUE;
++
++    if ((pitch < 0 ? -pitch : pitch) < desc->Width * 4)
++    {
++        hr = MF_E_UNEXPECTED;
++        goto done;
++    }
++
++    for (y = 0; y < desc->Height; y += 16)
++    {
++        const BYTE *row = scanline + (LONG)y * pitch;
++
++        for (x = 0; x < desc->Width; x += 16)
++        {
++            const BYTE *pixel = row + x * 4;
++            DWORD value = pixel[0] + pixel[1] + pixel[2];
++
++            rgb_sum += value;
++            nonblack += !!value;
++            ++pixel_count;
++        }
++    }
++
++done:
++    if (SUCCEEDED(hr))
++        WARN("live-pixel diagnostic %ld: RGB sum %lu, nonblack %lu/%lu, pitch %ld, buffer %lu bytes.\n",
++                diagnostic_id, rgb_sum, nonblack, pixel_count, pitch, buffer_length);
++    else
++        WARN("live-pixel diagnostic %ld failed, hr %#lx.\n", diagnostic_id, hr);
++
++    if (locked)
++        IMF2DBuffer2_Unlock2D(buffer_2d);
++    if (buffer_2d)
++        IMF2DBuffer2_Release(buffer_2d);
++    if (buffer)
++        IMFMediaBuffer_Release(buffer);
++}
++
+ static void media_engine_update_d3d11_frame_surface(ID3D11DeviceContext *context, struct media_engine *engine)
+ {
+     static LONG live_dxgi_upload_diagnostic_count;
+@@ -2985,6 +3042,9 @@ static void media_engine_update_d3d11_frame_surface(ID3D11DeviceContext *context
+                         src_desc.Format, src_desc.MipLevels, src_desc.ArraySize, subresource,
+                         surface_desc.Width, surface_desc.Height, surface_desc.Format,
+                         src_device, surface_device, device_mismatch ? " (cross-device)" : "");
++
++            if (diagnostic_id <= 4)
++                media_engine_diagnose_live_frame_pixels(sample, &src_desc, diagnostic_id);
+         }
+         ID3D11Device_Release(surface_device);
+         ID3D11Device_Release(src_device);
+-- 
+2.51.0
