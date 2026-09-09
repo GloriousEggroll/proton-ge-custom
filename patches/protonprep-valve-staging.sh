@@ -91,7 +91,10 @@ apply_all_in_dir() {
 
 ### END PROBLEMATIC COMMIT REVERT SECTION ###
 
-### (2-2) EM-10/WINE-WAYLAND PATCH SECTION ###
+### (2-2) EM-11/WINE-WAYLAND PATCH SECTION ###
+
+    # EM-11 5a1ae24b090b on Wine bleeding-edge 542ca26b64ed.
+    # Import and exclusion details: wine-hotfixes/wine-wayland/README.md
 
     echo "WINE: -WINEOPENXR- copy files into wine"
     mkdir -p dlls/wineopenxr
@@ -116,7 +119,7 @@ apply_all_in_dir() {
         esac
     done
 
-### END EM-10/WINE-WAYLAND PATCH SECTION ###
+### END EM-11/WINE-WAYLAND PATCH SECTION ###
 
 ### (2-3) WINE STAGING APPLY SECTION ###
 
@@ -153,7 +156,7 @@ apply_all_in_dir() {
     -W winex11-Fixed-scancodes \
     -W Staging
 
-    # NOTE: Some patches are applied manually because they -do- apply, just not cleanly, ie with patch fuzz.
+    # Manual sets use GE-rebased copies where their context overlaps our earlier patches.
     # A detailed list of why the above patches are disabled is listed below:
 
     # server-Signal_Thread - breaks steamclient for some games -- notably DBFZ
@@ -198,16 +201,16 @@ apply_all_in_dir() {
     # wined3d-Indexed_Vertex_Blending -- interferes with proton's wined3d -- currently also disabled in upstream staging
 
     echo "WINE: -STAGING- ntdll-Hide_Wine_Exports manually applied"
-    apply_all_in_dir "../wine-staging/patches/ntdll-Hide_Wine_Exports/"
+    apply_all_in_dir "../patches/wine-hotfixes/wine-staging/ntdll-Hide_Wine_Exports/"
 
     echo "WINE: -STAGING- kernel32-Debugger manually applied"
-    apply_all_in_dir "../wine-staging/patches/kernel32-Debugger/"
+    apply_all_in_dir "../patches/wine-hotfixes/wine-staging/kernel32-Debugger/"
 
     echo "WINE: -STAGING- ntdll-ext4-case-folder manually applied"
-    apply_all_in_dir "../wine-staging/patches/ntdll-ext4-case-folder/"
+    apply_all_in_dir "../patches/wine-hotfixes/wine-staging/ntdll-ext4-case-folder/"
 
     echo "WINE: -STAGING- winex11-Window_Style manually applied"
-    apply_all_in_dir "../wine-staging/patches/winex11-Window_Style/"
+    apply_all_in_dir "../patches/wine-hotfixes/wine-staging/winex11-Window_Style/"
 
     echo "WINE: -STAGING- wininet-Cleanup manually applied"
     apply_all_in_dir "../wine-staging/patches/wininet-Cleanup/"
@@ -246,9 +249,6 @@ apply_all_in_dir() {
 
     echo "WINE: -GAME FIXES- add set current directory workaround for Vanguard Saga of Heroes"
     apply_patch "../patches/game-patches/vgsoh.patch"
-
-    echo "WINE: -GAME FIXES- add xinput support to Dragon Age Inquisition"
-    apply_patch "../patches/game-patches/dai_xinput.patch"
 
     echo "WINE: -GAME FIXES- add fixes for star citizen"
     apply_patch "../patches/game-patches/silence-starcitizen-unsupported-os.patch"
