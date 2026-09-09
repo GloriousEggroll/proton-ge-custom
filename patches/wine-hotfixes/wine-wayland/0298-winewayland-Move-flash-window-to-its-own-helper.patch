@@ -1,0 +1,146 @@
+From cc0e38f991251866bd742fb2d371c87cfaaeb5e3 Mon Sep 17 00:00:00 2001
+From: Etaash Mathamsetty
+ <45927311+Etaash-mathamsetty@users.noreply.github.com>
+Date: Mon, 7 Sep 2026 14:15:34 -0500
+Subject: [PATCH] winewayland: Move flash window to its own helper.
+
+---
+ dlls/winewayland.drv/wayland_surface.c | 44 ++++++++++++++++++--------
+ dlls/winewayland.drv/waylanddrv.h      |  3 +-
+ dlls/winewayland.drv/window.c          | 22 ++++++-------
+ 3 files changed, 42 insertions(+), 27 deletions(-)
+
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 7bf47fb12b4..afb646f18de 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -2023,21 +2023,39 @@ static void xdg_activation_token_handle_done(void *user_data,
+     struct wayland_win_data *data;
+     struct wayland_surface *surface;
+ 
+-    if ((data = wayland_win_data_get(hwnd)))
+-    {
+-        if ((surface = data->wayland_surface))
+-            xdg_activation_v1_activate(process_wayland.xdg_activation_v1, token, surface->wl_surface);
+-        wayland_win_data_release(data);
+-    }
++    if (!(data = wayland_win_data_get(hwnd))) goto done;
+ 
+-    if (xdg_activation_token_v1) xdg_activation_token_v1_destroy(xdg_activation_token_v1);
++    if ((surface = data->wayland_surface))
++        xdg_activation_v1_activate(process_wayland.xdg_activation_v1, token, surface->wl_surface);
++    wayland_win_data_release(data);
++
++done:
++    xdg_activation_token_v1_destroy(xdg_activation_token_v1);
+ }
+ 
+ const static struct xdg_activation_token_v1_listener xdg_activation_listener = {
+     xdg_activation_token_handle_done
+ };
+ 
+-void wayland_surface_activate(struct wayland_surface *surface, BOOL activate)
++void wayland_surface_flash_window(struct wayland_surface *surface)
++{
++    struct xdg_activation_token_v1 *token;
++
++    if (!process_wayland.xdg_activation_v1) return;
++    if (!wayland_surface_is_toplevel(surface)) return;
++
++    if (!(token = xdg_activation_v1_get_activation_token(process_wayland.xdg_activation_v1)))
++    {
++        ERR("Failed to create activation token!\n");
++        return;
++    }
++
++    xdg_activation_token_v1_add_listener(token, &xdg_activation_listener, surface->hwnd);
++    xdg_activation_token_v1_set_surface(token, surface->wl_surface);
++    xdg_activation_token_v1_commit(token);
++}
++
++void wayland_surface_activate(struct wayland_surface *surface)
+ {
+     struct wayland_seat *seat = &process_wayland.seat;
+     struct xdg_activation_token_v1 *token;
+@@ -2048,9 +2066,9 @@ void wayland_surface_activate(struct wayland_surface *surface, BOOL activate)
+     if (!wayland_surface_is_toplevel(surface)) return;
+ 
+     /* fall back to the per process activation token */
+-    if (!serial && activate && process_activate_token)
++    if (!serial && process_activate_token)
+     {
+-        xdg_activation_token_handle_done(surface->hwnd, NULL, process_activate_token);
++        xdg_activation_v1_activate(process_wayland.xdg_activation_v1, process_activate_token, surface->wl_surface);
+         free(process_activate_token);
+         process_activate_token = NULL;
+         return;
+@@ -2063,13 +2081,11 @@ void wayland_surface_activate(struct wayland_surface *surface, BOOL activate)
+     }
+ 
+     pthread_mutex_lock(&seat->mutex);
+-
+     xdg_activation_token_v1_add_listener(token, &xdg_activation_listener, surface->hwnd);
+     xdg_activation_token_v1_set_surface(token, surface->wl_surface);
+-    if (process_name && activate) xdg_activation_token_v1_set_app_id(token, process_name);
+-    if (activate) xdg_activation_token_v1_set_serial(token, serial, seat->wl_seat);
++    if (process_name) xdg_activation_token_v1_set_app_id(token, process_name);
++    xdg_activation_token_v1_set_serial(token, serial, seat->wl_seat);
+     xdg_activation_token_v1_commit(token);
+-
+     pthread_mutex_unlock(&seat->mutex);
+ }
+ 
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index 71f7679c5eb..67519a71dea 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -478,7 +478,8 @@ void wayland_surface_set_title(struct wayland_surface *surface, LPCWSTR title);
+ void wayland_surface_assign_icon(struct wayland_surface *surface);
+ void wayland_surface_set_icon_buffer(struct wayland_surface *surface, UINT type, const ICONINFO *ii);
+ void wayland_surface_set_opacity(struct wayland_surface *surface, BYTE alpha, UINT flags);
+-void wayland_surface_activate(struct wayland_surface *surface, BOOL serial);
++void wayland_surface_flash_window(struct wayland_surface *surface);
++void wayland_surface_activate(struct wayland_surface *surface);
+ void wayland_surface_shortcut_control(struct wayland_surface *surface, BOOL inhibit);
+ 
+ static inline BOOL wayland_surface_is_toplevel(struct wayland_surface *surface)
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index 7cad44c3882..9ea93852983 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -870,12 +870,11 @@ void WAYLAND_FlashWindowEx(FLASHWINFO *info)
+ 
+     TRACE("hwnd %p flags %u\n", info->hwnd, info->dwFlags);
+ 
+-    if ((data = wayland_win_data_get(info->hwnd)))
+-    {
+-        if (data->wayland_surface && info->dwFlags)
+-            wayland_surface_activate(data->wayland_surface, FALSE);
+-        wayland_win_data_release(data);
+-    }
++    if (!info->dwFlags || !(data = wayland_win_data_get(info->hwnd))) return;
++    if (data->wayland_surface) wayland_surface_flash_window(data->wayland_surface);
++    wayland_win_data_release(data);
++
++    wl_display_flush(process_wayland.wl_display);
+ }
+ 
+ /***********************************************************************
+@@ -889,12 +888,11 @@ void WAYLAND_ActivateWindow(HWND hwnd, HWND previous)
+ 
+     if (hwnd == previous) return;
+ 
+-    if ((data = wayland_win_data_get(hwnd)))
+-    {
+-        if (data->wayland_surface)
+-            wayland_surface_activate(data->wayland_surface, TRUE);
+-        wayland_win_data_release(data);
+-    }
++    if (!(data = wayland_win_data_get(hwnd))) return;
++    if (data->wayland_surface) wayland_surface_activate(data->wayland_surface);
++    wayland_win_data_release(data);
++
++    wl_display_flush(process_wayland.wl_display);
+ }
+ 
+ /***********************************************************************

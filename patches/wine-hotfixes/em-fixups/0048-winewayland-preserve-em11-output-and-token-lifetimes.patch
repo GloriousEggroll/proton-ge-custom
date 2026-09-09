@@ -1,0 +1,98 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Wed, 9 Sep 2026 15:00:00 -0400
+Subject: [PATCH] winewayland: preserve EM-11 output and activation token lifetimes
+
+Integrate the output-enter tracking and activation token changes from
+Etaash Mathamsetty's EM-11 commits dd7dfbd95ae2 and ce0fa7a14ec0 with GE's
+cross-process surface lifecycle. Ignore events for a replaced wl_surface,
+avoid duplicate output references, and release references on leave even if
+the surface changed role. Destroying a surface need not generate leave events.
+
+Keep the startup activation token until a valid toplevel can consume it, and
+handle activation-token allocation failure before registering its listener.
+Declare the new refresh helper without changing when activation is requested.
+
+---
+ dlls/winewayland.drv/wayland_surface.c | 20 +++++++++++++++++---
+ dlls/winewayland.drv/waylanddrv.h      |  1 +
+ 2 files changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 36f2a897fe2440e959b1e98a50cb898e86e1a1a3..a2b39f66342d0202dfed6f667b0695b4b19a171a 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -895,7 +895,10 @@ static void wayland_surface_handle_enter(void *private, struct wl_surface *wl_su
+ 
+     if (!(data = wayland_win_data_get(hwnd))) return;
+     if (!(surface = data->wayland_surface)) goto err;
++    if (surface->wl_surface != wl_surface) goto err;
+     if (!wayland_surface_is_toplevel(surface)) goto err;
++    wl_list_for_each(output_entry, &surface->output_list, entry)
++        if (output_entry->output == output) goto err;
+     if (!(output_entry = calloc(1, sizeof(*output_entry)))) goto err;
+ 
+     wl_list_init(&output_entry->entry);
+@@ -923,7 +926,7 @@ static void wayland_surface_handle_leave(void *private, struct wl_surface *wl_su
+ 
+     if (!(data = wayland_win_data_get(hwnd))) return;
+     if (!(surface = data->wayland_surface)) goto err;
+-    if (!wayland_surface_is_toplevel(surface)) goto err;
++    if (surface->wl_surface != wl_surface) goto err;
+ 
+     wl_list_for_each_safe(pos, tmp, &surface->output_list, entry)
+     {
+@@ -1502,9 +1505,19 @@ err:
+  */
+ void wayland_surface_destroy(struct wayland_surface *surface)
+ {
++    struct surface_output_entry *output, *next;
++
+     wayland_surface_clear_input_state(surface);
+     wayland_surface_clear_role(surface);
+ 
++    /* Destroying a wl_surface need not generate leave events. */
++    wl_list_for_each_safe(output, next, &surface->output_list, entry)
++    {
++        wl_list_remove(&output->entry);
++        wayland_output_release(output->output);
++        free(output);
++    }
++
+     if (surface->wp_alpha_modifier_surface_v1)
+     {
+         wp_alpha_modifier_surface_v1_destroy(surface->wp_alpha_modifier_surface_v1);
+@@ -5510,11 +5523,12 @@ void wayland_surface_refresh_token(struct wayland_surface *surface)
+ void wayland_surface_activate(struct wayland_surface *surface)
+ {
+     struct xdg_activation_token_v1 *token;
+-    char *token_str = InterlockedExchangePointer((void **)&process_activate_token, NULL);
++    char *token_str;
+ 
+     if (!process_wayland.xdg_activation_v1) return;
+     if (!wayland_surface_is_toplevel(surface)) return;
+ 
++    token_str = InterlockedExchangePointer((void **)&process_activate_token, NULL);
+     if (token_str)
+     {
+         xdg_activation_v1_activate(process_wayland.xdg_activation_v1, token_str, surface->wl_surface);
+@@ -5522,7 +5536,7 @@ void wayland_surface_activate(struct wayland_surface *surface)
+     }
+     else
+     {
+-        token = wayland_surface_create_token(surface, TRUE);
++        if (!(token = wayland_surface_create_token(surface, TRUE))) return;
+         xdg_activation_token_v1_add_listener(token, &activate_listener, surface->hwnd);
+         xdg_activation_token_v1_commit(token);
+     }
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index 7a41961eda40fe176ff7c5193935821ea1a520ad..aace6fd9db0f07b35985fed5a8bbfb0f239e2664 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -632,6 +632,7 @@ void wayland_surface_set_icon_buffer(struct wayland_surface *surface, UINT type,
+ void wayland_surface_set_opacity(struct wayland_surface *surface, BYTE alpha, UINT flags);
+ void wayland_surface_flash_window(struct wayland_surface *surface);
+ void wayland_surface_activate(struct wayland_surface *surface);
++void wayland_surface_refresh_token(struct wayland_surface *surface);
+ void wayland_surface_shortcut_control(struct wayland_surface *surface, BOOL inhibit);
+ void wayland_surface_sync_alpha(struct wayland_surface *surface);
+ BOOL wayland_is_popup_menu_class(HWND hwnd);

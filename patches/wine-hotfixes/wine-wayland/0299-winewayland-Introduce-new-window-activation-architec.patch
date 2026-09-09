@@ -1,0 +1,152 @@
+From ce0fa7a14ec0be744836337f0c40956755b6af55 Mon Sep 17 00:00:00 2001
+From: Etaash Mathamsetty
+ <45927311+Etaash-mathamsetty@users.noreply.github.com>
+Date: Mon, 7 Sep 2026 16:36:32 -0500
+Subject: [PATCH] winewayland: Introduce new window activation architecture.
+
+---
+ dlls/winewayland.drv/wayland_surface.c | 97 ++++++++++++++++++--------
+ 1 file changed, 67 insertions(+), 30 deletions(-)
+
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index afb646f18de..bc67d17fec4 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -2015,9 +2015,9 @@ void wayland_surface_set_opacity(struct wayland_surface *surface, BYTE alpha, UI
+     wl_display_flush(process_wayland.wl_display);
+ }
+ 
+-static void xdg_activation_token_handle_done(void *user_data,
+-                                             struct xdg_activation_token_v1 *xdg_activation_token_v1,
+-                                             const char *token)
++static void activate_token_handle_done(void *user_data,
++                                       struct xdg_activation_token_v1 *xdg_activation_token_v1,
++                                       const char *token)
+ {
+     HWND hwnd = user_data;
+     struct wayland_win_data *data;
+@@ -2033,60 +2033,97 @@ done:
+     xdg_activation_token_v1_destroy(xdg_activation_token_v1);
+ }
+ 
+-const static struct xdg_activation_token_v1_listener xdg_activation_listener = {
+-    xdg_activation_token_handle_done
++const static struct xdg_activation_token_v1_listener activate_listener = {
++    activate_token_handle_done,
+ };
+ 
+-void wayland_surface_flash_window(struct wayland_surface *surface)
++static void save_token_handle_done(void *user_data,
++                                   struct xdg_activation_token_v1 *xdg_activation_token_v1,
++                                   const char *token)
++{
++    /* TODO: move this token to wineserver (or a shared memory) */
++    char *temp = InterlockedExchangePointer((void **)&process_activate_token, strdup(token));
++    xdg_activation_token_v1_destroy(xdg_activation_token_v1);
++    if (temp) free(temp);
++}
++
++const static struct xdg_activation_token_v1_listener save_token_listener = {
++    save_token_handle_done,
++};
++
++static struct xdg_activation_token_v1 *wayland_surface_create_token(
++                                        struct wayland_surface *surface,
++                                        BOOL activate)
+ {
++    struct wayland_seat *seat = &process_wayland.seat;
+     struct xdg_activation_token_v1 *token;
++    uint32_t serial = ReadAcquire(&process_wayland.input_serial);
+ 
+-    if (!process_wayland.xdg_activation_v1) return;
+-    if (!wayland_surface_is_toplevel(surface)) return;
++    if (!process_wayland.xdg_activation_v1) return NULL;
++    if (!wayland_surface_is_toplevel(surface)) return NULL;
+ 
+     if (!(token = xdg_activation_v1_get_activation_token(process_wayland.xdg_activation_v1)))
+     {
+         ERR("Failed to create activation token!\n");
+-        return;
++        return NULL;
+     }
+ 
+-    xdg_activation_token_v1_add_listener(token, &xdg_activation_listener, surface->hwnd);
+     xdg_activation_token_v1_set_surface(token, surface->wl_surface);
++    if (process_name && activate) xdg_activation_token_v1_set_app_id(token, process_name);
++
++    pthread_mutex_lock(&seat->mutex);
++    if (activate && seat->wl_seat) xdg_activation_token_v1_set_serial(token, serial, seat->wl_seat);
++    pthread_mutex_unlock(&seat->mutex);
++
++    return token;
++}
++
++void wayland_surface_flash_window(struct wayland_surface *surface)
++{
++    struct xdg_activation_token_v1 *token;
++
++    if (!process_wayland.xdg_activation_v1) return;
++    if (!wayland_surface_is_toplevel(surface)) return;
++
++    if (!(token = wayland_surface_create_token(surface, FALSE))) return;
++    xdg_activation_token_v1_add_listener(token, &activate_listener, surface->hwnd);
++    xdg_activation_token_v1_commit(token);
++}
++
++void wayland_surface_refresh_token(struct wayland_surface *surface)
++{
++    struct xdg_activation_token_v1 *token;
++
++    if (!process_wayland.xdg_activation_v1) return;
++    if (!wayland_surface_is_toplevel(surface)) return;
++
++    if (!(token = wayland_surface_create_token(surface, TRUE))) return;
++    xdg_activation_token_v1_add_listener(token, &save_token_listener, NULL);
+     xdg_activation_token_v1_commit(token);
+ }
+ 
+ void wayland_surface_activate(struct wayland_surface *surface)
+ {
+-    struct wayland_seat *seat = &process_wayland.seat;
+     struct xdg_activation_token_v1 *token;
+-    uint32_t serial = ReadAcquire(&process_wayland.input_serial);
+-    assert(surface);
++    char *token_str = InterlockedExchangePointer((void **)&process_activate_token, NULL);
+ 
+     if (!process_wayland.xdg_activation_v1) return;
+     if (!wayland_surface_is_toplevel(surface)) return;
+ 
+-    /* fall back to the per process activation token */
+-    if (!serial && process_activate_token)
++    if (token_str)
+     {
+-        xdg_activation_v1_activate(process_wayland.xdg_activation_v1, process_activate_token, surface->wl_surface);
+-        free(process_activate_token);
+-        process_activate_token = NULL;
+-        return;
++        xdg_activation_v1_activate(process_wayland.xdg_activation_v1, token_str, surface->wl_surface);
++        free(token_str);
+     }
+-
+-    if (!(token = xdg_activation_v1_get_activation_token(process_wayland.xdg_activation_v1)))
++    else
+     {
+-        ERR("Failed to create activation token!\n");
+-        return;
++        token = wayland_surface_create_token(surface, TRUE);
++        xdg_activation_token_v1_add_listener(token, &activate_listener, surface->hwnd);
++        xdg_activation_token_v1_commit(token);
+     }
+ 
+-    pthread_mutex_lock(&seat->mutex);
+-    xdg_activation_token_v1_add_listener(token, &xdg_activation_listener, surface->hwnd);
+-    xdg_activation_token_v1_set_surface(token, surface->wl_surface);
+-    if (process_name) xdg_activation_token_v1_set_app_id(token, process_name);
+-    xdg_activation_token_v1_set_serial(token, serial, seat->wl_seat);
+-    xdg_activation_token_v1_commit(token);
+-    pthread_mutex_unlock(&seat->mutex);
++    /* The previous activation token is now consumed. The window that (hopefully) gets
++     * activated will create a new token for us to use in the future. */
+ }
+ 
+ static BOOL use_inhibit(void)
