@@ -33,7 +33,12 @@ stop, reset, release, render-buffer draining, and render-position accounting do
 not treat the haptic stream as a half-created Pulse stream.
 
 ---
+ dlls/winepulse.drv/Makefile.in |   4 +-
+ dlls/winepulse.drv/pulse.c     | 762 +++++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 736 insertions(+), 30 deletions(-)
+
 diff --git a/dlls/winepulse.drv/Makefile.in b/dlls/winepulse.drv/Makefile.in
+index ba26cae987538a4fcd7b560539d4a58d4dfc7cac..f7322d80b702a1f6c8ef8ec55a579db419cbf524 100644
 --- a/dlls/winepulse.drv/Makefile.in
 +++ b/dlls/winepulse.drv/Makefile.in
 @@ -1,8 +1,8 @@
@@ -48,9 +53,10 @@ diff --git a/dlls/winepulse.drv/Makefile.in b/dlls/winepulse.drv/Makefile.in
  SOURCES = \
  	pulse.c
 diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+index 5a908076f60741303ebaefbe9d413cb24a3def69..d8b26929f856ab21af8b907a80ba92a6c330dcd6 100644
 --- a/dlls/winepulse.drv/pulse.c
 +++ b/dlls/winepulse.drv/pulse.c
-@@ -31,6 +31,7 @@
+@@ -34,6 +34,7 @@
  #include <math.h>
  #include <poll.h>
  
@@ -58,7 +64,7 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
  #include <pulse/pulseaudio.h>
  
  #include "ntstatus.h"
-@@ -83,6 +84,8 @@
+@@ -90,6 +91,8 @@ struct pulse_stream
  
      char *device;
      pa_stream *stream;
@@ -67,7 +73,7 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
      pa_sample_spec ss;
      pa_channel_map map;
      pa_buffer_attr attr;
-@@ -101,6 +104,11 @@
+@@ -108,6 +111,11 @@ struct pulse_stream
      SIZE_T peek_ofs, read_offs_bytes, lcl_offs_bytes, pa_offs_bytes;
      SIZE_T tmp_buffer_bytes, held_bytes, peek_len, peek_buffer_len, pa_held_bytes, max_pa_held_bytes;
      BYTE *local_buffer, *tmp_buffer, *peek_buffer;
@@ -77,9 +83,9 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
 +    pa_usec_t haptic_path_check_time;
 +    unsigned int haptic_hotplug_generation;
      void *locked_ptr;
-     BOOL just_underran;
+     BOOL just_underran, pa_started, update_timing_info_pending, rebase_write_index;
      pa_usec_t mmdev_period_usec;
-@@ -146,6 +154,8 @@
+@@ -155,6 +163,8 @@ typedef struct _PhysDevice {
      REFERENCE_TIME min_period, def_period;
      WAVEFORMATEXTENSIBLE fmt;
      GUID container_id;
@@ -88,7 +94,7 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
      char pulse_name[0];
  } PhysDevice;
  
-@@ -154,6 +164,7 @@
+@@ -163,6 +173,7 @@ static pa_mainloop *pulse_ml;
  
  static pthread_mutex_t g_phys_mutex;
  static pthread_cond_t g_phys_cond = PTHREAD_COND_INITIALIZER;
@@ -96,7 +102,7 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
  static struct list g_phys_speakers = LIST_INIT(g_phys_speakers);
  static struct list g_phys_sources = LIST_INIT(g_phys_sources);
  static struct list g_phys_speakers_added = LIST_INIT(g_phys_speakers_added);
-@@ -177,6 +188,17 @@
+@@ -186,6 +197,17 @@ static NTSTATUS pulse_not_implemented(void *args)
      return STATUS_SUCCESS;
  }
  
@@ -114,7 +120,7 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
  static void g_phys_lock(void)
  {
      pthread_mutex_lock(&g_phys_mutex);
-@@ -212,6 +234,8 @@
+@@ -237,6 +259,8 @@ static void pulse_dev_free(PhysDevice *dev)
      pthread_mutex_destroy(&dev->ready_mutex);
      pthread_cond_destroy(&dev->ready_cond);
      free(dev->name);
@@ -123,7 +129,7 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
      free(dev);
  }
  
-@@ -642,9 +666,17 @@
+@@ -697,9 +721,17 @@ static void silence_buffer(pa_sample_format_t format, BYTE *buffer, UINT32 bytes
  
  static BOOL pulse_stream_valid(struct pulse_stream *stream)
  {
@@ -141,7 +147,7 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
  static void pulse_contextcallback(pa_context *c, void *userdata)
  {
      switch (pa_context_get_state(c))
-@@ -920,6 +952,24 @@
+@@ -975,6 +1007,24 @@ static void fill_device_info(PhysDevice *dev, pa_proplist *p)
          dev->container_id = get_container_id(buffer);
  }
  
@@ -166,7 +172,7 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
  static void pulse_add_device(struct list *list, pa_proplist *proplist, int index, EndpointFormFactor form,
                               UINT channel_mask, const char *pulse_name, const char *desc)
  {
-@@ -939,12 +989,34 @@
+@@ -994,12 +1044,34 @@ static void pulse_add_device(struct list *list, pa_proplist *proplist, int index
      dev->channel_mask = channel_mask;
      dev->def_period = 0;
      dev->min_period = 0;
@@ -201,7 +207,7 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
      memcpy(dev->pulse_name, pulse_name, len + 1);
  
      list_add_tail(list, &dev->entry);
-@@ -1398,9 +1470,11 @@
+@@ -1453,9 +1525,11 @@ static HRESULT pulse_spec_from_waveformat(struct pulse_stream *stream, const WAV
      return S_OK;
  }
  
@@ -214,7 +220,7 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
      int ret;
      char buffer[64];
      static LONG number;
-@@ -1409,7 +1483,24 @@
+@@ -1463,7 +1537,24 @@ static HRESULT pulse_stream_connect(struct pulse_stream *stream, const char *pul
  
      ret = InterlockedIncrement(&number);
      sprintf(buffer, "audio stream #%i", ret);
@@ -240,8 +246,8 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
  
      if (!stream->stream) {
          WARN("pa_stream_new returned error %i\n", pa_context_errno(pulse_ctx));
-@@ -1427,8 +1518,10 @@
-     attr.prebuf = 0;
+@@ -1482,8 +1573,10 @@ static HRESULT pulse_stream_connect(struct pulse_stream *stream, const char *pul
+     stream->attr = attr;
      dump_attr(&attr);
  
 -    /* If specific device was requested, use it exactly */
@@ -253,7 +259,8 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
          flags |= PA_STREAM_DONT_MOVE;
      else
          pulse_name = NULL;  /* use default */
-@@ -1442,9 +1535,26 @@
+@@ -1496,10 +1589,27 @@ static HRESULT pulse_stream_connect(struct pulse_stream *stream, const char *pul
+         WARN("Returns %i\n", ret);
          return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
      }
 -    while (pa_stream_get_state(stream->stream) == PA_STREAM_CREATING)
@@ -282,7 +289,7 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
  
      if (stream->dataflow == eRender) {
          pa_stream_set_underflow_callback(stream->stream, pulse_underflow_callback, stream);
-@@ -1480,13 +1589,513 @@
+@@ -1535,13 +1645,513 @@ static HRESULT get_device_period_helper(EDataFlow flow, const char *pulse_name,
      return E_FAIL;
  }
  
@@ -797,7 +804,7 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
  
      if (params->share == AUDCLNT_SHAREMODE_EXCLUSIVE) {
          params->result = AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED;
-@@ -1522,6 +2129,23 @@
+@@ -1577,6 +2187,23 @@ static NTSTATUS pulse_create_stream(void *args)
      if (FAILED(hr))
          goto exit;
  
@@ -821,7 +828,7 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
      stream->def_period = params->period;
      stream->duration = params->duration;
  
-@@ -1535,7 +2159,34 @@
+@@ -1590,7 +2217,34 @@ static NTSTATUS pulse_create_stream(void *args)
  
      stream->share = params->share;
      stream->flags = params->flags;
@@ -857,7 +864,7 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
      if (SUCCEEDED(hr)) {
          UINT32 unalign;
          const pa_buffer_attr *attr = pulse_stream_ready(stream) ? pa_stream_get_buffer_attr(stream->stream) : &stream->attr;
-@@ -1591,9 +2237,12 @@
+@@ -1646,9 +2300,12 @@ exit:
              pa_stream_unref(stream->stream);
          }
          free(stream->device);
@@ -870,7 +877,7 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
      pulse_unlock();
      return STATUS_SUCCESS;
  }
-@@ -1771,7 +2420,15 @@
+@@ -1898,7 +2555,15 @@ static void pulse_write(struct pulse_stream *stream)
      /* write as much data to PA as we can */
      UINT32 to_write;
      BYTE *buf = stream->local_buffer + stream->pa_offs_bytes;
@@ -885,9 +892,9 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
 +
 +    bytes = pa_stream_writable_size(stream->stream);
  
-     pulse_write_index_catchup(stream);
- 
-@@ -1989,11 +2646,14 @@
+     if (stream->just_underran)
+     {
+@@ -2171,11 +2836,14 @@ static void pa_streams_timer_cb(pa_mainloop_api *api, pa_time_event *e, const st
              {
                  pulse_write(stream);
  
@@ -905,9 +912,9 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
 +                    stream->held_bytes -= adv_bytes;
 +                }
              }
-             else if (stream->dataflow == eRender)
+             else if (stream->dataflow == eCapture)
              {
-@@ -2100,12 +2760,20 @@
+@@ -2288,12 +2956,20 @@ static NTSTATUS pulse_release_stream(void *args)
  
      pulse_lock();
      remove_stream_from_period(stream);
@@ -933,7 +940,7 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
      pulse_unlock();
  
      if (stream->tmp_buffer) {
-@@ -2119,7 +2787,9 @@
+@@ -2307,7 +2983,9 @@ static NTSTATUS pulse_release_stream(void *args)
                              &size, MEM_RELEASE);
      }
      free(stream->peek_buffer);
@@ -943,7 +950,7 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
      free(stream);
      return STATUS_SUCCESS;
  }
-@@ -2153,14 +2823,25 @@
+@@ -2341,14 +3019,25 @@ static NTSTATUS pulse_start(void *args)
          return STATUS_SUCCESS;
      }
  
@@ -976,7 +983,7 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
      }
  
      if (SUCCEEDED(params->result))
-@@ -2194,7 +2875,15 @@
+@@ -2382,7 +3071,15 @@ static NTSTATUS pulse_stop(void *args)
      }
  
      params->result = S_OK;
@@ -993,7 +1000,7 @@ diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
      {
          if (!wait_pa_operation_complete(pa_stream_cork(stream->stream, 1, pulse_op_cb, &success)))
              success = 0;
-@@ -2238,7 +2927,16 @@
+@@ -2431,7 +3128,16 @@ static NTSTATUS pulse_reset(void *args)
      {
          /* If there is still data in the render buffer it needs to be removed from the server */
          int success = 0;
