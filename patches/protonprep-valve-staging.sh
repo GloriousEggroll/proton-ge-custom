@@ -329,6 +329,12 @@ apply_all_in_dir() {
 
 ### (2-6) WINE PENDING UPSTREAM SECTION ###
 
+    # https://github.com/GloriousEggroll/proton-ge-custom/issues/531
+    # https://gitlab.winehq.org/wine/wine/-/merge_requests/10889 (Aaron Yourk)
+    echo "WINE: -BACKPORT- Recreate stale OLE clipboard windows after STA thread exit"
+    apply_patch "../patches/wine-hotfixes/pending/ole32-clipboard-stale-handle-1-tests.patch"
+    apply_patch "../patches/wine-hotfixes/pending/ole32-clipboard-stale-handle-2-fix.patch"
+
     # https://github.com/Frogging-Family/wine-tkg-git/commit/ca0daac62037be72ae5dd7bf87c705c989eba2cb
     echo "WINE: -PENDING- unity crash hotfix"
     apply_patch "../patches/wine-hotfixes/pending/unity_crash_hotfix.patch"

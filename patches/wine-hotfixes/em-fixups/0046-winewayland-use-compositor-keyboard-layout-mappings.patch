@@ -1,0 +1,180 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Tue, 8 Sep 2026 15:00:00 -0400
+Subject: [PATCH] winewayland: Use compositor keyboard layout mappings
+
+A layout language does not identify its letter arrangement. For example,
+de:qwerty currently gets QWERTZ virtual keys, although the key names and
+character tables are generated from the compositor's QWERTY keymap.
+
+Use the unmodified Latin alphabet of each XKB group to adjust the existing
+scan-to-VK table. Swap assignments rather than introducing duplicate virtual
+keys when a letter moves to an OEM key. Retain the existing language tables
+for non-Latin or ambiguous alphabets, and preserve keypad/modifier flags and
+the existing character, dead-key and physical-scancode handling.
+
+An application's initial HKL can also come from its locale rather than any
+configured compositor layout. Returning NULL for that HKL makes win32u use
+its US tables. When no configured layout matches, return the active XKB
+group instead. Explicit requests matching a configured layout are unchanged.
+Track modifier/group changes even without keyboard focus so this fallback
+does not retain the wrong group on entry.
+
+This extends the KBDTABLES implementation by Remi Bernon and the Wayland
+keyboard support by Alexandros Frantzis. No X11 or overlay changes.
+
+Link: https://github.com/GloriousEggroll/proton-ge-custom/issues/309
+---
+diff --git a/dlls/winewayland.drv/wayland_keyboard.c b/dlls/winewayland.drv/wayland_keyboard.c
+--- a/dlls/winewayland.drv/wayland_keyboard.c
++++ b/dlls/winewayland.drv/wayland_keyboard.c
+@@ -76,6 +76,7 @@ struct layout
+ 
+ static pthread_mutex_t xkb_layouts_mutex = PTHREAD_MUTEX_INITIALIZER;
+ static struct list xkb_layouts = LIST_INIT(xkb_layouts);
++static xkb_layout_index_t active_xkb_group; /* protected by xkb_layouts_mutex */
+ 
+ /* These are only used from the wayland event thread and don't need locking */
+ static struct rxkb_context *rxkb_context;
+@@ -413,6 +414,54 @@ static HKL get_layout_hkl(struct layout *layout, LCID locale)
+     else return (HKL)(UINT_PTR)MAKELONG(locale, 0xf000 | layout->layout_id);
+ }
+ 
++static void map_layout_letters(struct xkb_keymap *keymap, xkb_layout_index_t group, USHORT *scan2vk)
++{
++    WORD letter_scans[26] = {0};
++    xkb_keycode_t keyc, min_keycode = xkb_keymap_min_keycode(keymap);
++    xkb_keycode_t max_keycode = xkb_keymap_max_keycode(keymap);
++    unsigned int i, j, count = 0;
++
++    for (keyc = min_keycode; keyc <= max_keycode; keyc++)
++    {
++        const xkb_keysym_t *syms;
++        xkb_keysym_t sym;
++        WORD scan, vkey;
++
++        if (keyc < 8) continue;
++        scan = key2scan(keyc - 8);
++        if (!scan || scan >= 0x100) continue;
++        vkey = scan2vk[scan];
++        if (!((vkey >= '0' && vkey <= '9') || (vkey >= 'A' && vkey <= 'Z') ||
++              (vkey >= VK_OEM_1 && vkey <= VK_OEM_3) ||
++              (vkey >= VK_OEM_4 && vkey <= VK_OEM_8) || vkey == VK_OEM_102)) continue;
++        if (xkb_keymap_key_get_syms_by_level(keymap, keyc, group, 0, &syms) != 1) continue;
++        sym = xkb_keysym_to_upper(syms[0]);
++        if (sym < 'A' || sym > 'Z') continue;
++        if (letter_scans[sym - 'A']) return;
++        letter_scans[sym - 'A'] = scan;
++        count++;
++    }
++
++    /* Leave non-Latin and ambiguous layouts on the existing fallback tables. */
++    if (count != ARRAY_SIZE(letter_scans)) return;
++
++    for (i = 0; i < ARRAY_SIZE(letter_scans); i++)
++    {
++        WORD scan = letter_scans[i];
++        WORD vkey = 'A' + i;
++
++        /* Preserve a one-to-one VK mapping, including displaced OEM keys. */
++        if (scan2vk[scan] == vkey) continue;
++        for (j = 0; j < 0x100; j++)
++        {
++            if (scan2vk[j] != vkey) continue;
++            scan2vk[j] = scan2vk[scan];
++            scan2vk[scan] = vkey;
++            break;
++        }
++    }
++}
++
+ static void add_xkb_layout(const char *xkb_layout, struct xkb_keymap *xkb_keymap, struct xkb_compose_table *xkb_compose,
+                             xkb_layout_index_t xkb_group, LANGID lang)
+ {
+@@ -427,7 +476,8 @@ static void add_xkb_layout(const char *xkb_layout, struct xkb_keymap *xkb_keymap, str
+     WCHAR *names_str;
+     VK_TO_WCHARS8 *vk2wchars_entry;
+     struct layout *layout;
+-    const USHORT *scan2vk;
++    const USHORT *base_scan2vk;
++    USHORT scan2vk[ARRAY_SIZE(scan2vk_qwerty)];
+     WORD index = 0;
+     char *ptr;
+ 
+@@ -497,12 +547,14 @@ static void add_xkb_layout(const char *xkb_layout, struct xkb_keymap *xkb_keymap, str
+ 
+     switch (lang)
+     {
+-    case MAKELANGID(LANG_FRENCH, SUBLANG_DEFAULT): scan2vk = scan2vk_azerty; break;
+-    case MAKELANGID(LANG_GERMAN, SUBLANG_DEFAULT): scan2vk = scan2vk_qwertz; break;
+-    case MAKELANGID(LANG_GERMAN, SUBLANG_GERMAN_SWISS): scan2vk = scan2vk_qwertz; break;
+-    default: scan2vk = scan2vk_qwerty; break;
++    case MAKELANGID(LANG_FRENCH, SUBLANG_DEFAULT): base_scan2vk = scan2vk_azerty; break;
++    case MAKELANGID(LANG_GERMAN, SUBLANG_DEFAULT): base_scan2vk = scan2vk_qwertz; break;
++    case MAKELANGID(LANG_GERMAN, SUBLANG_GERMAN_SWISS): base_scan2vk = scan2vk_qwertz; break;
++    default: base_scan2vk = scan2vk_qwerty; break;
+     }
+-    if (strstr(xkb_layout, "dvorak")) scan2vk = scan2vk_dvorak;
++    if (strstr(xkb_layout, "dvorak")) base_scan2vk = scan2vk_dvorak;
++    memcpy(scan2vk, base_scan2vk, sizeof(scan2vk));
++    map_layout_letters(xkb_keymap, xkb_group, scan2vk);
+ 
+     layout->tables.pKeyNames = layout->key_names;
+     layout->tables.pKeyNamesExt = layout->key_names_ext;
+@@ -750,7 +802,10 @@ static void set_current_xkb_group(xkb_layout_index_t xkb_group)
+     LIST_FOR_EACH_ENTRY(layout, &xkb_layouts, struct layout, entry)
+         if (layout->xkb_group == xkb_group) break;
+     if (&layout->entry != &xkb_layouts)
++    {
++        active_xkb_group = xkb_group;
+         hkl = get_layout_hkl(layout, locale);
++    }
+     else
+     {
+         ERR("Failed to find Xkb Layout for group %d\n", xkb_group);
+@@ -767,8 +822,9 @@ static void set_current_xkb_group(xkb_layout_index_t xkb_group)
+     keyboard_hkl = hkl;
+ 
+     TRACE("Changing keyboard layout to %p\n", hkl);
+-    NtUserPostMessage(keyboard->focused_hwnd, WM_INPUTLANGCHANGEREQUEST, 0 /*FIXME*/,
+-                      (LPARAM)keyboard_hkl);
++    if (keyboard->focused_hwnd)
++        NtUserPostMessage(keyboard->focused_hwnd, WM_INPUTLANGCHANGEREQUEST, 0 /*FIXME*/,
++                          (LPARAM)keyboard_hkl);
+ }
+ 
+ static BOOL find_xkb_layout_variant(const char *name, const char **layout, const char **variant)
+@@ -1120,12 +1176,15 @@ static void keyboard_handle_modifiers(void *data, struct wl_keyboard *wl_keyboard,
+ 
+     InterlockedExchange(&process_wayland.input_serial, serial);
+ 
+-    if (!wayland_keyboard_get_focused_hwnd()) return;
+-
+     TRACE("serial=%u mods_depressed=%#x mods_latched=%#x mods_locked=%#x xkb_group=%d\n",
+           serial, mods_depressed, mods_latched, mods_locked, xkb_group);
+ 
+     pthread_mutex_lock(&keyboard->mutex);
++    if (!keyboard->xkb_state)
++    {
++        pthread_mutex_unlock(&keyboard->mutex);
++        return;
++    }
+     xkb_state_update_mask(keyboard->xkb_state, mods_depressed, mods_latched,
+                           mods_locked, 0, 0, xkb_group);
+     pthread_mutex_unlock(&keyboard->mutex);
+@@ -1235,6 +1294,15 @@ const KBDTABLES *WAYLAND_KbdLayerDescriptor(HKL hkl)
+ 
+     LIST_FOR_EACH_ENTRY(layout, &xkb_layouts, struct layout, entry)
+         if (hkl == get_layout_hkl(layout, LOWORD(hkl))) break;
++    if (&layout->entry == &xkb_layouts)
++    {
++        /* The application's locale need not be a configured keyboard layout.
++         * Do not silently turn that into US input on a non-US keyboard. */
++        TRACE("No Xkb layout for HKL %p, using active group %u\n", hkl, active_xkb_group);
++        LIST_FOR_EACH_ENTRY(layout, &xkb_layouts, struct layout, entry)
++            if (layout->xkb_group == active_xkb_group) break;
++    }
++
+     if (&layout->entry == &xkb_layouts) layout = NULL;
+     else xkb_layout_addref(layout);
+ 
