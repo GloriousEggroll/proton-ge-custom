@@ -52,6 +52,29 @@ GE-Proton's separately applied NVIDIA Reflex patch are restored by patch 0065,
 and patch 0066 imports the required present-wait dispatch follow-up by Etaash
 Mathamsetty.
 
+## Wine / EM-11 rebase (2026-09-09)
+
+Rebased onto Wine `542ca26b64ed` plus EM-11 `5a1ae24b090b`. Original
+Wine-Wineland author headers and `Source:` references remain intact.
+See `../wine-wayland/README.md` for the complete import and validation notes.
+
+The combined implementation preserves EM's output enter/leave listeners,
+output-reference list, and activation API while retaining cross-process
+composition. A queued Win32 geometry/state update takes precedence over a
+new output-placement hint. Patch 0055 invalidates cached limits only inside
+EM's new committed/window-state change conditional. Patch 0029 retains the
+exact-aligned popup fallback after EM's separate above/left owner probes.
+
+The clipping patches no longer carry context that would restore the old
+implicit `attach_thread_input` behavior removed from Wine's parent-change
+path. The optional window-move-hack removal remains owned by patch 0073;
+the equivalent new EM revert is kept in `../disabled/`.
+
+No Wine-Wineland Steam-overlay code was added in this rebase. GE's current
+overlay integration, presentation-ownership fixes, and Unix-only dispatcher
+remain in use. Patch application was validated in an isolated tree; this
+does not substitute for build or runtime validation.
+
 ## Re-sync onto `wineland_20260713-reorg` (2026-09-01)
 
 22 upstream commits newer than `129fa64fc449` were imported as real
