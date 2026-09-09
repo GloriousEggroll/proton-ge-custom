@@ -1,0 +1,128 @@
+From b04de9af23b31cbb8e6e49b2d362af06ab3b42f6 Mon Sep 17 00:00:00 2001
+From: Aaron Yourk <ayourk@gmail.com>
+Date: Sun, 17 May 2026 01:30:41 -0600
+Subject: [PATCH 1/2] ole32/tests: Add test for OLE clipboard reuse across STA
+ threads.
+
+Test that OleSetClipboard succeeds when called from a second STA
+thread after the first thread (which created the cached clipboard
+window) has exited. Currently this fails because the stale window
+handle is never invalidated. Based on the bug reproducer source.
+
+Wine-Bug: https://bugs.winehq.org/show_bug.cgi?id=59519
+---
+ dlls/ole32/tests/clipboard.c | 92 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 92 insertions(+)
+
+diff --git a/dlls/ole32/tests/clipboard.c b/dlls/ole32/tests/clipboard.c
+index 50e4e8c27a3..dedf23f629c 100644
+--- a/dlls/ole32/tests/clipboard.c
++++ b/dlls/ole32/tests/clipboard.c
+@@ -1925,6 +1925,97 @@ static void test_get_clipboard_locked(void)
+     OleUninitialize();
+ }
+ 
++struct sta_clipboard_thread_data
++{
++    const char *text;
++    HRESULT hr_set;
++};
++
++static DWORD CALLBACK sta_clipboard_set_thread(void *arg)
++{
++    struct sta_clipboard_thread_data *data = arg;
++    IDataObject *dataobj;
++    HRESULT hr;
++
++    hr = OleInitialize(NULL);
++    if (FAILED(hr))
++    {
++        data->hr_set = hr;
++        return 1;
++    }
++
++    hr = DataObjectImpl_CreateText(data->text, &dataobj);
++    ok(hr == S_OK, "DataObjectImpl_CreateText returned %#lx\n", hr);
++
++    hr = OleSetClipboard(dataobj);
++    data->hr_set = hr;
++    IDataObject_Release(dataobj);
++
++    if (SUCCEEDED(hr))
++        OleFlushClipboard();
++
++    OleUninitialize();
++    return 0;
++}
++
++static void test_sta_clipboard_reuse(void)
++{
++    struct sta_clipboard_thread_data data;
++    HANDLE thread, hdata;
++    HRESULT hr;
++    char *text;
++    DWORD ret;
++
++    hr = OleInitialize(NULL);
++    ok(hr == S_OK, "OleInitialize returned %#lx\n", hr);
++
++    /* First STA thread sets clipboard to "first". */
++    data.text = "first";
++    data.hr_set = E_FAIL;
++    thread = CreateThread(NULL, 0, sta_clipboard_set_thread, &data, 0, NULL);
++    ok(thread != NULL, "CreateThread failed (%ld)\n", GetLastError());
++    ret = WaitForSingleObject(thread, 5000);
++    ok(ret == WAIT_OBJECT_0, "WaitForSingleObject returned %#lx\n", ret);
++    CloseHandle(thread);
++    ok(data.hr_set == S_OK, "first OleSetClipboard returned %#lx\n", data.hr_set);
++
++    ok(OpenClipboard(NULL), "OpenClipboard failed\n");
++    hdata = GetClipboardData(CF_TEXT);
++    ok(hdata != NULL, "GetClipboardData returned NULL\n");
++    if (hdata)
++    {
++        text = GlobalLock(hdata);
++        ok(!strcmp(text, "first"), "expected \"first\", got \"%s\"\n", text);
++        GlobalUnlock(hdata);
++    }
++    CloseClipboard();
++
++    /* Second STA thread sets clipboard to "second". The first thread's
++       OLE clipboard window has been destroyed, but Wine caches the stale
++       HWND and the second OleSetClipboard fails with CLIPBRD_E_CANT_OPEN. */
++    data.text = "second";
++    data.hr_set = E_FAIL;
++    thread = CreateThread(NULL, 0, sta_clipboard_set_thread, &data, 0, NULL);
++    ok(thread != NULL, "CreateThread failed (%ld)\n", GetLastError());
++    ret = WaitForSingleObject(thread, 5000);
++    ok(ret == WAIT_OBJECT_0, "WaitForSingleObject returned %#lx\n", ret);
++    CloseHandle(thread);
++    todo_wine ok(data.hr_set == S_OK, "second OleSetClipboard returned %#lx\n", data.hr_set);
++
++    ok(OpenClipboard(NULL), "OpenClipboard failed\n");
++    hdata = GetClipboardData(CF_TEXT);
++    ok(hdata != NULL, "GetClipboardData returned NULL\n");
++    if (hdata)
++    {
++        text = GlobalLock(hdata);
++        todo_wine ok(!strcmp(text, "second"), "expected \"second\", got \"%s\"\n", text);
++        GlobalUnlock(hdata);
++    }
++    CloseClipboard();
++
++    OleUninitialize();
++}
++
+ START_TEST(clipboard)
+ {
+     test_get_clipboard_uninitialized();
+@@ -1935,5 +2026,6 @@ START_TEST(clipboard)
+     test_nonole_clipboard();
+     test_getdatahere();
+     test_multithreaded_clipboard();
++    test_sta_clipboard_reuse();
+     test_get_clipboard_locked();
+ }
+-- 
+GitLab
+
