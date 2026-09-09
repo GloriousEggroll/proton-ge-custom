@@ -1,0 +1,156 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] dxgi: Follow explicit D3D12 fullscreen client resolution changes.
+
+Civilization VI's DX12 renderer changes fullscreen resolution by resizing
+both the swapchain buffers and the HWND, without calling ResizeTarget.
+The captured transition goes from 1600x900 to 2560x1600, with
+ALLOW_MODE_SWITCH still set (ResizeBuffers flags 0x802). Wine's virtual
+display and DXGI present rectangle remain at 1600x900; the native X window
+also stays 1600x900 while the client and buffers become 2560x1600. The
+picture is scaled into the stale target, leaving mouse hit testing in a
+different coordinate space.
+
+Remember the buffer size before a successful D3D12 resize and check the
+client at the next real, visible Present. If the old buffers matched the
+current display mode, the new client matches the new buffers, and the
+requested mode is supported exactly, update the fullscreen display mode
+and Wine presentation rectangle together.
+
+This is a guarded compatibility path for an explicit client-and-buffer
+resize, not a change to ResizeBuffers' general display-mode semantics.
+Leave windowed chains, D3D11, chains without ALLOW_MODE_SWITCH, buffer-only
+render scaling, and already completed ResizeTarget transitions alone.
+Consume each candidate once. Do not hold the buffer mutex during Win32
+mode changes, which can re-enter ResizeBuffers through WM_SIZE.
+
+The dxgi DLL is shared by DXVK and VKD3D-Proton, so no Wine display-driver
+or VKD3D presentation changes are required.
+
+Manual validation after rebuilding (not yet performed):
+- Civ VI DX12: fullscreen 1600x900 -> 2560x1600 -> 1600x900; verify menu
+  hover/click alignment at the center and screen edges after each change.
+- Repeat in XWayland and Wine-Wayland, with and without Gamescope.
+- Check windowed resizing, fullscreen/windowed transitions, alt-tab,
+  DX11, and a DX12 game with independently adjustable render resolution.
+- With DXVK_LOG_LEVEL=debug, expect the matching display-mode change as
+  well as the buffer reallocation on the affected fullscreen path.
+
+---
+diff --git a/src/dxgi/dxgi_swapchain.cpp b/src/dxgi/dxgi_swapchain.cpp
+index fa2711d1..ce99ae9b 100644
+--- a/src/dxgi/dxgi_swapchain.cpp
++++ b/src/dxgi/dxgi_swapchain.cpp
+@@ -391,6 +391,9 @@ namespace dxvk {
+     std::lock_guard<dxvk::recursive_mutex> lockWin(m_lockWindow);
+     HRESULT hr = S_OK;
+ 
++    if (!(PresentFlags & DXGI_PRESENT_TEST) && !occluded && !wsi::isMinimized(m_window))
++      UpdateFullscreenResolution();
++
+     if (wsi::isWindow(m_window) || !m_window) {
+       std::lock_guard<dxvk::mutex> lockBuf(m_lockBuffer);
+       hr = m_presenter->Present(SyncInterval, PresentFlags, pPresentParameters);
+@@ -459,6 +462,7 @@ namespace dxvk {
+       return DXGI_ERROR_INVALID_CALL;
+     
+     std::lock_guard<dxvk::mutex> lock(m_lockBuffer);
++    VkExtent2D oldSize = { m_desc.Width, m_desc.Height };
+     m_desc.Width  = Width;
+     m_desc.Height = Height;
+     m_desc.Flags  = SwapChainFlags;
+@@ -480,6 +484,10 @@ namespace dxvk {
+     if (FAILED(hr))
+       return hr;
+ 
++    if (m_is_d3d12 && !m_fullscreenResizeFrom.width
++     && (oldSize.width != m_desc.Width || oldSize.height != m_desc.Height))
++      m_fullscreenResizeFrom = oldSize;
++
+     UpdateSourceSize(m_desc.Width, m_desc.Height);
+     UpdateColorSpace(m_desc.Format, m_colorSpace);
+     return hr;
+@@ -930,6 +938,63 @@ namespace dxvk {
+   }
+   
+   
++  void DxgiSwapChain::UpdateFullscreenResolution() {
++    if (!m_is_d3d12 || m_ModeChangeInProgress)
++      return;
++
++    DXGI_SWAP_CHAIN_DESC1 desc;
++    VkExtent2D oldSize;
++
++    {
++      std::lock_guard<dxvk::mutex> lock(m_lockBuffer);
++      oldSize = m_fullscreenResizeFrom;
++      m_fullscreenResizeFrom = {};
++      desc = m_desc;
++    }
++
++    if (!oldSize.width || !oldSize.height || m_descFs.Windowed
++     || !(desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH))
++      return;
++
++    // A buffer-only resize is not a display-mode change. Only follow an app
++    // that also resized its fullscreen client from the old mode to the new one.
++    uint32_t width = 0, height = 0;
++    RECT bounds = {};
++    wsi::getWindowSize(m_window, &width, &height);
++    if (!wsi::getDesktopCoordinates(m_monitor, &bounds)
++     || width != desc.Width || height != desc.Height
++     || oldSize.width != uint32_t(bounds.right - bounds.left)
++     || oldSize.height != uint32_t(bounds.bottom - bounds.top)
++     || (width == oldSize.width && height == oldSize.height))
++      return;
++
++    Com<IDXGIOutput1> output;
++    if (FAILED(GetOutputFromMonitor(m_monitor, &output)))
++      return;
++
++    DXGI_MODE_DESC1 mode = {};
++    mode.Width = width;
++    mode.Height = height;
++    mode.RefreshRate = m_descFs.RefreshRate;
++    mode.Format = desc.Format;
++
++    DXGI_MODE_DESC1 selected = {};
++    if (FAILED(output->FindClosestMatchingMode1(&mode, &selected, nullptr))
++     || selected.Width != width || selected.Height != height)
++      return;
++
++    // This can deliver WM_SIZE and re-enter ResizeBuffers. The caller holds
++    // m_lockWindow, but m_lockBuffer must not be held across the mode change.
++    scoped_bool in_progress(m_ModeChangeInProgress);
++    if (FAILED(ChangeDisplayMode(output.ptr(), &mode))) {
++      Logger::warn("DXGI: Failed to update fullscreen resolution after client resize");
++      return;
++    }
++
++    wsi::updateFullscreenWindow(m_monitor, m_window, false);
++  }
++
++
+   HRESULT DxgiSwapChain::RestoreDisplayMode(HMONITOR hMonitor) {
+     if (!hMonitor)
+       return DXGI_ERROR_INVALID_CALL;
+diff --git a/src/dxgi/dxgi_swapchain.h b/src/dxgi/dxgi_swapchain.h
+index 18afb115..c6d9a0cf 100644
+--- a/src/dxgi/dxgi_swapchain.h
++++ b/src/dxgi/dxgi_swapchain.h
+@@ -192,6 +192,7 @@ namespace dxvk {
+     UINT                            m_presentId;
+     bool                            m_ModeChangeInProgress = false;
+     bool                            m_deferredFullscreen = false;
++    VkExtent2D                      m_fullscreenResizeFrom = {};
+ 
+     Com<IDXGIVkSwapChain>           m_presenter;
+     Com<IDXGIVkSwapChain1>          m_presenter1;
+@@ -231,6 +232,8 @@ namespace dxvk {
+     
+     HRESULT RestoreDisplayMode(
+             HMONITOR                hMonitor);
++
++    void UpdateFullscreenResolution();
+     
+     HRESULT GetSampleCount(
+             UINT                    Count,

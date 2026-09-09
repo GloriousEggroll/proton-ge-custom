@@ -23,6 +23,7 @@ apply_all_in_dir() {
     git clean -xdf
     patch -Np1 < ../patches/dxvk/layered-overlay-dxvk.patch
     apply_patch "../patches/dxvk/dxgi-defer-initial-fullscreen-for-probe-swapchains.patch"
+    apply_patch "../patches/dxvk/dxgi-follow-d3d12-fullscreen-client-resizes.patch"
     popd
 
     pushd vkd3d-proton
