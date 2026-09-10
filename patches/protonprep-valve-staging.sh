@@ -403,6 +403,7 @@ apply_all_in_dir() {
     apply_all_in_dir "../patches/ge-video-rework/"
 
     # https://github.com/xzn/proton-ds5-haptic
+    # Includes default VitaPad-to-DS4 translation (issue #691).
     echo "WINE: -HOTFIX- Add proton DS5 patches"
     for patch in ../patches/proton-ds5-haptic/*.patch; do
         apply_patch "$patch"

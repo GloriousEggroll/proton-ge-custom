@@ -515,6 +515,16 @@ Environment variable options:
 
 Disable Steam Input for the game before using the Sony controller compatibility options below. This allows Wine to use the physical controller's HIDRAW interface instead of Steam's virtual controller.
 
+Wired [VitaPad v.2.0.0](https://github.com/carlelieser/vitapad/releases/tag/v.2.0.0) (`054c:1337`) is exposed as a DualShock 4 v2 by default through HIDRAW, without an opt-in variable or SDL mapping. This maps the face buttons, both sticks, D-pad, Select/Start to Share/Options, and rear-touch L2/R2 and L3/R3. L2/R2 remain digital; rumble, motion and DS4 touchpad input are not available. The existing `PROTON_SONY_DUALSHOCK4_V2_AS_V1=1` option also applies to VitaPad. Unreleased VitaPad builds with a different button layout are not supported by this mapping.
+
+VitaPad DS4 emulation requires read/write access to its `/dev/hidraw*` device. If your distribution's controller rules do not include VitaPad, a system administrator can add this udev rule to `/etc/udev/rules.d/70-vitapad.rules`, reload the rules, and reconnect the device:
+
+```udev
+KERNEL=="hidraw*", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="1337", MODE="0660", TAG+="uaccess"
+```
+
+Without HIDRAW access, Wine retains its normal SDL fallback, which does not provide this DS4 emulation. Explicit `PROTON_USE_SDL`/`PROTON_PREFER_SDL` or HIDRAW-disable options also bypass the emulation. Disable Steam Input when testing native DS4 detection and PlayStation button icons.
+
 | Compat config string  | Environment Variable           | Description  |
 | :-------------------- | :----------------------------- | :----------- |
 |                       | <tt>PROTON_LOG</tt>            | Convenience method for dumping a useful debug log to `$HOME/steam-$APPID.log`. For more thorough logging, use `user_settings.py`. |

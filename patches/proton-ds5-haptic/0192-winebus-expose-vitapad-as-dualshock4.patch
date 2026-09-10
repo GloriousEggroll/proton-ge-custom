@@ -1,0 +1,280 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Wed, 9 Sep 2026 22:25:04 -0400
+Subject: [PATCH] winebus: Expose wired VitaPad as a DualShock 4 by default.
+
+Prefer hidraw for VitaPad (054c:1337) and reuse the existing DS4 descriptor
+and identity support without requiring a compatibility option. Honor the
+existing DS4-v1 option when choosing the emulated generation.
+
+Translate VitaPad's seven-byte USB input report into a complete DS4 USB
+report, rather than only changing the PID. Preserve Square/Cross/Circle/
+Triangle, L1/R1, Select/Start as Share/Options, rear-touch L2/R2 and L3/R3,
+signed stick axes, and the eight D-pad directions. Opposite D-pad inputs
+cancel. Digital triggers are exposed as fully released or fully pressed.
+
+Initialize the cached input report to neutral and synthesize DS4
+calibration, firmware and pairing feature reports. Keep gyro and touch
+input inactive. Consume DS4 output and initialization requests locally:
+VitaPad does not implement DS4 rumble, lights, motion or touch reports.
+
+Keep the physical VID/PID internally for device matching. Use existing
+hidraw/SDL deduplication, retaining the SDL fallback if hidraw cannot be
+opened. Existing explicit backend selection and Steam Input filtering
+remain authoritative. DS4 emulation needs host hidraw access; Proton
+cannot grant device-node permissions.
+
+Protocol credit: carlelieser's VitaPad v.2.0.0 firmware, corroborated by
+deadbeef7's SDL mapping in issue #691:
+https://github.com/carlelieser/vitapad/blob/v.2.0.0/skprx/main.c
+https://github.com/carlelieser/vitapad/blob/v.2.0.0/skprx/usbDescriptors.h
+https://github.com/GloriousEggroll/proton-ge-custom/issues/691#issuecomment-5340902900
+
+Target the distributed v.2.0.0 layout. Unreleased upstream commit
+d365eb3f780365af69437c7725c6c40b26ce0b45 changes face-button and D-pad bit
+assignments without changing the USB identity, so that incompatible
+layout cannot be distinguished by VID/PID and is not handled here.
+---
+diff --git a/dlls/winebus.sys/bus_udev.c b/dlls/winebus.sys/bus_udev.c
+index c516d80..9ec7763 100644
+--- a/dlls/winebus.sys/bus_udev.c
++++ b/dlls/winebus.sys/bus_udev.c
+@@ -1541,7 +1541,14 @@ static NTSTATUS hidraw_device_create(struct udev_device *dev, int fd, const char
+         desc.is_gamepad = TRUE;
+         TRACE("mapping Sony hidraw controller %04x:%04x to XInput.\n", desc.vid, desc.pid);
+     }
+-    if (!desc.is_gamepad && spoof_dualsense_as_dualshock4() && is_dualsense_gamepad(desc.vid, desc.pid))
++    if (is_vitapad_gamepad(desc.vid, desc.pid))
++    {
++        desc.spoof_dualshock4 = TRUE;
++        desc.spoof_dualshock4_v1 = spoof_dualshock4_v2_as_v1();
++        TRACE("exposing VitaPad %04x:%04x as DualShock 4 %s.\n",
++                desc.vid, desc.pid, desc.spoof_dualshock4_v1 ? "v1" : "v2");
++    }
++    else if (!desc.is_gamepad && spoof_dualsense_as_dualshock4() && is_dualsense_gamepad(desc.vid, desc.pid))
+     {
+         desc.spoof_dualshock4 = TRUE;
+         desc.spoof_dualshock4_v1 = spoof_dualshock4_v2_as_v1();
+diff --git a/dlls/winebus.sys/main.c b/dlls/winebus.sys/main.c
+index 9ab4adf..e72306b 100644
+--- a/dlls/winebus.sys/main.c
++++ b/dlls/winebus.sys/main.c
+@@ -1160,6 +1160,7 @@ static BOOL is_hidraw_enabled(WORD vid, WORD pid, const USAGE_AND_PAGE *usages,
+     if (options.disable_sdl && options.disable_input) prefer_hidraw = TRUE;
+     if (is_dualshock4_gamepad(vid, pid)) prefer_hidraw = TRUE;
+     if (is_dualsense_gamepad(vid, pid)) prefer_hidraw = TRUE;
++    if (is_vitapad_gamepad(vid, pid)) prefer_hidraw = TRUE;
+ 
+     switch (vid)
+     {
+@@ -1259,7 +1260,42 @@ static BOOL deliver_next_report(struct device_extension *ext, IRP *irp)
+     return TRUE;
+ }
+ 
+-static BOOL hidraw_fixup_dualsense_input_as_dualshock4(struct device_extension *ext,
++/* VitaPad v.2.0.0 uses four signed stick axes and sixteen digital buttons.
++ * The unreleased upstream layout differs; keep the released firmware ordering. */
++static BOOL vitapad_to_dualshock4(const BYTE *input, ULONG length, BYTE sequence,
++        ULONGLONG ticks, BYTE *output)
++{
++    static const BYTE hats[3][3] = {{7, 0, 1}, {6, 8, 2}, {5, 4, 3}};
++    WORD buttons, timestamp;
++    int x, y;
++    unsigned int i;
++
++    if (length != 7 || input[0] != 1) return FALSE;
++
++    buttons = input[1] | ((WORD)input[2] << 8);
++    x = !!(buttons & 0x4000) - !!(buttons & 0x8000);
++    y = !!(buttons & 0x2000) - !!(buttons & 0x1000);
++    timestamp = ticks * 375 / 2; /* DS4 sensor clock: 16/3 microseconds. */
++
++    memset(output, 0, DUALSHOCK4_INPUT_REPORT_SIZE);
++    output[0] = 1;
++    for (i = 0; i < 4; ++i) output[1 + i] = input[3 + i] ^ 0x80;
++    output[5] = ((buttons & 0x000f) << 4) | hats[y + 1][x + 1];
++    output[6] = (buttons >> 4) & 0xff;
++    output[7] = (sequence & 0x3f) << 2;
++    output[8] = (buttons & 0x0040) ? 255 : 0;
++    output[9] = (buttons & 0x0080) ? 255 : 0;
++    output[10] = timestamp;
++    output[11] = timestamp >> 8;
++    output[24] = 0x20; /* Stationary accelerometer, +1g on Z; no gyro samples. */
++    output[30] = 0x1a; /* USB power; VitaPad has no battery report. */
++    output[33] = 1;
++    output[34] = sequence;
++    output[35] = output[39] = 0x80; /* Both DS4 touch contacts are inactive. */
++    return TRUE;
++}
++
++static BOOL hidraw_fixup_input_as_dualshock4(struct device_extension *ext,
+         struct hid_report *report)
+ {
+     BYTE translated[DUALSHOCK4_INPUT_REPORT_SIZE] = {0};
+@@ -1268,6 +1304,17 @@ static BOOL hidraw_fixup_dualsense_input_as_dualshock4(struct device_extension *
+ 
+     if (!ext->desc.spoof_dualshock4) return TRUE;
+ 
++    if (is_vitapad_gamepad(ext->desc.vid, ext->desc.pid))
++    {
++        if (!vitapad_to_dualshock4(report->buffer, report->length, ext->sony_input_seq++,
++                GetTickCount64(), translated))
++        {
++            WARN("Ignoring malformed VitaPad input report, length %lu.\n", report->length);
++            return FALSE;
++        }
++        goto done;
++    }
++
+     if (report->buffer[0] == DUALSENSE_INPUT_REPORT_USB &&
+             ext->desc.bus_type == BUS_TYPE_BLUETOOTH && report->length >= 10)
+     {
+@@ -1390,7 +1437,7 @@ static void process_hid_report(DEVICE_OBJECT *device, BYTE *report_buf, DWORD re
+ 
+     /* Preserve the complete DualSense state before the generic Bluetooth
+      * compatibility fixup reduces extended reports to their ten-byte form. */
+-    if (!hidraw_fixup_dualsense_input_as_dualshock4(ext, report))
++    if (!hidraw_fixup_input_as_dualshock4(ext, report))
+     {
+         RtlFreeHeap(GetProcessHeap(), 0, report);
+         return;
+@@ -2241,6 +2288,12 @@ static NTSTATUS pdo_pnp_dispatch(DEVICE_OBJECT *device, IRP *irp)
+                     {
+                         report->length = reports[i].InputLength;
+                         report->buffer[0] = reports[i].ReportID;
++                        if (ext->desc.spoof_dualshock4 && is_vitapad_gamepad(ext->desc.vid, ext->desc.pid) &&
++                                reports[i].ReportID == 1 && report->length == DUALSHOCK4_INPUT_REPORT_SIZE)
++                        {
++                            static const BYTE neutral[] = {1, 0, 0, 0, 0, 0, 0};
++                            vitapad_to_dualshock4(neutral, sizeof(neutral), 0, GetTickCount64(), report->buffer);
++                        }
+                         ext->last_reports[reports[i].ReportID] = report;
+                     }
+                 }
+@@ -2387,6 +2440,54 @@ static void sony_set_output_report_crc(BYTE *report, ULONG report_len)
+     report[report_len - 1] = crc >> 24;
+ }
+ 
++static void hidraw_get_vitapad_feature_report(struct device_extension *ext,
++        HID_XFER_PACKET *packet, IO_STATUS_BLOCK *io)
++{
++    /* Neutral DS4 USB calibration with nonzero gyro/accelerometer ranges. */
++    static const BYTE calibration[DUALSHOCK4_FEATURE_REPORT_CALIBRATION_SIZE] =
++    {
++        0x02, 0, 0, 0, 0, 0, 0,
++        0x00, 0x20, 0x00, 0xe0, 0x00, 0x20, 0x00, 0xe0, 0x00, 0x20, 0x00, 0xe0,
++        0x00, 0x02, 0x00, 0x02,
++        0x00, 0x20, 0x00, 0xe0, 0x00, 0x20, 0x00, 0xe0, 0x00, 0x20, 0x00, 0xe0, 0, 0,
++    };
++    ULONG size;
++    DWORD address;
++
++    io->Information = 0;
++    switch (packet->reportId)
++    {
++        case DUALSHOCK4_FEATURE_REPORT_CALIBRATION: size = sizeof(calibration); break;
++        case DUALSHOCK4_FEATURE_REPORT_PAIRING_INFO: size = DUALSHOCK4_FEATURE_REPORT_PAIRING_INFO_SIZE; break;
++        default:
++            io->Status = STATUS_NOT_IMPLEMENTED;
++            return;
++    }
++
++    if (packet->reportBufferLen < size)
++    {
++        io->Status = STATUS_BUFFER_TOO_SMALL;
++        return;
++    }
++
++    memset(packet->reportBuffer, 0, packet->reportBufferLen);
++    if (packet->reportId == DUALSHOCK4_FEATURE_REPORT_CALIBRATION)
++        memcpy(packet->reportBuffer, calibration, size);
++    else
++    {
++        /* A per-device, locally administered synthetic address, stored LSB first. */
++        address = RtlComputeCrc32(0, (BYTE *)&ext->container_id, sizeof(ext->container_id));
++        packet->reportBuffer[0] = packet->reportId;
++        packet->reportBuffer[1] = address;
++        packet->reportBuffer[2] = address >> 8;
++        packet->reportBuffer[3] = address >> 16;
++        packet->reportBuffer[4] = address >> 24;
++        packet->reportBuffer[6] = 0x02;
++    }
++    io->Information = size;
++    io->Status = STATUS_SUCCESS;
++}
++
+ static BOOL hidraw_get_spoofed_dualshock4_feature_report(DEVICE_OBJECT *device,
+         HID_XFER_PACKET *packet, IO_STATUS_BLOCK *io)
+ {
+@@ -2434,6 +2535,12 @@ static BOOL hidraw_get_spoofed_dualshock4_feature_report(DEVICE_OBJECT *device,
+         return TRUE;
+     }
+ 
++    if (is_vitapad_gamepad(ext->desc.vid, ext->desc.pid))
++    {
++        hidraw_get_vitapad_feature_report(ext, packet, io);
++        return TRUE;
++    }
++
+     if (!ext->desc.spoof_dualshock4)
+     {
+         /* DS4 v1 and v2 share their report layout. Bluetooth calibration is
+@@ -2521,10 +2628,17 @@ static BOOL hidraw_get_spoofed_dualshock4_feature_report(DEVICE_OBJECT *device,
+ static BOOL hidraw_set_spoofed_dualshock4_feature_report(struct device_extension *ext,
+         HID_XFER_PACKET *packet, IO_STATUS_BLOCK *io)
+ {
+-    if (!ext->desc.spoof_dualshock4 || !ext->desc.is_hidraw ||
+-            packet->reportId != DUALSHOCK4_FEATURE_REPORT_USB_INIT)
++    if (!ext->desc.spoof_dualshock4 || !ext->desc.is_hidraw)
+         return FALSE;
+ 
++    if (packet->reportId != DUALSHOCK4_FEATURE_REPORT_USB_INIT)
++    {
++        if (!is_vitapad_gamepad(ext->desc.vid, ext->desc.pid)) return FALSE;
++        io->Information = 0;
++        io->Status = STATUS_NOT_IMPLEMENTED;
++        return TRUE;
++    }
++
+     if (packet->reportBufferLen != DUALSHOCK4_FEATURE_REPORT_USB_INIT_SIZE ||
+             packet->reportBuffer[0] != DUALSHOCK4_FEATURE_REPORT_USB_INIT)
+     {
+@@ -2795,6 +2909,22 @@ static NTSTATUS WINAPI hid_internal_dispatch(DEVICE_OBJECT *device, IRP *irp)
+             HID_XFER_PACKET *packet = (HID_XFER_PACKET *)irp->UserBuffer;
+             HID_XFER_PACKET fixed_packet;
+             BYTE fixed_report[DUALSENSE_OUTPUT_REPORT_BT_SIZE];
++            if (ext->desc.spoof_dualshock4 && is_vitapad_gamepad(ext->desc.vid, ext->desc.pid))
++            {
++                /* VitaPad has no output endpoint: never send DS4 commands to it. */
++                irp->IoStatus.Information = 0;
++                if (packet->reportId != DUALSHOCK4_OUTPUT_REPORT_USB)
++                    irp->IoStatus.Status = STATUS_NOT_IMPLEMENTED;
++                else if (packet->reportBufferLen != DUALSHOCK4_OUTPUT_REPORT_USB_SIZE ||
++                        packet->reportBuffer[0] != DUALSHOCK4_OUTPUT_REPORT_USB)
++                    irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
++                else
++                {
++                    irp->IoStatus.Information = packet->reportBufferLen;
++                    irp->IoStatus.Status = STATUS_SUCCESS;
++                }
++                break;
++            }
+             if (TRACE_ON(hid))
+             {
+                 TRACE("write output report id %u length %lu:\n", packet->reportId, packet->reportBufferLen);
+diff --git a/dlls/winebus.sys/unixlib.h b/dlls/winebus.sys/unixlib.h
+index 6ac652e..3074967 100644
+--- a/dlls/winebus.sys/unixlib.h
++++ b/dlls/winebus.sys/unixlib.h
+@@ -191,6 +191,11 @@ static inline BOOL is_xbox_gamepad(WORD vid, WORD pid)
+     return FALSE;
+ }
+ 
++static inline BOOL is_vitapad_gamepad(WORD vid, WORD pid)
++{
++    return vid == 0x054c && pid == 0x1337;
++}
++
+ static inline BOOL is_dualshock4_gamepad(WORD vid, WORD pid)
+ {
+     if (vid != 0x054c) return FALSE;
