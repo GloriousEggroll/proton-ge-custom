@@ -1,0 +1,224 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] mf: Serialize replay requests with end-of-presentation draining.
+
+After patch 0058, GRANDIA II receives MESessionEnded correctly but still
+hangs after the resurrection movie. Its event callback handles
+MEEndOfPresentation, not MESessionEnded: it sets its player state to ended,
+and the main thread then calls Start(VT_EMPTY) to replay the clip.
+
+The session publishes MEEndOfPresentation while command_state is COMPLETE,
+before the sinks finish draining. Start consequently takes the already
+started / keep-position shortcut: it restarts only the clock and never
+starts the exhausted source again. The game's sample wait then has no
+producer. A live capture confirmed its player state remained playing while
+the media session was stopped and all MF worker threads were idle.
+
+Reserve the existing ENDING_STREAMS transition before publishing the source
+EOP event for a running presentation. A replay submitted by the application
+now waits for the old sinks and sources to stop, then runs the normal
+stopped-session Start path. The finite-file source can reset to the beginning
+instead of leaving a successful no-op Start stranded at EOF.
+
+Leave paused presentations interruptible: an EOF event racing with Pause
+must not prevent Resume from restarting the clock needed to drain the sink.
+Keep 0058, which preserves the natural-stop reason when replay is enqueued.
+
+Add a synthetic-source/sink test that holds the final sink marker, requests
+replay after EOP, checks that it does not complete before the old sink drains,
+and verifies a fresh source start and subsequent explicit Stop completion.
+No game files, timing heuristics, or title-specific hooks are involved.
+
+Issue: https://github.com/GloriousEggroll/proton-ge-custom/issues/739
+References:
+ https://learn.microsoft.com/en-us/windows/win32/medfound/meendofpresentation
+ https://learn.microsoft.com/en-us/windows/win32/api/mfidl/nf-mfidl-imfmediasession-start
+---
+
+diff --git a/dlls/mf/session.c b/dlls/mf/session.c
+--- a/dlls/mf/session.c
++++ b/dlls/mf/session.c
+@@ -4388,6 +4388,10 @@ static void session_raise_end_of_present
+         if (session_nodes_is_mask_set(session, MF_TOPOLOGY_MAX, SOURCE_FLAG_END_OF_PRESENTATION))
+         {
+             session->presentation.flags |= SESSION_FLAG_PRESENTATION_ENDING;
++            /* A replay requested from the event callback must wait for the old sinks to stop.
++             * Do not block Resume if EOF arrived while the presentation clock was paused. */
++            if (session->state == SESSION_STATE_STARTED)
++                session->command_state = COMMAND_STATE_ENDING_STREAMS;
+             IMFMediaEventQueue_QueueEventParamVar(session->event_queue, MEEndOfPresentation, &GUID_NULL, S_OK, NULL);
+         }
+     }
+
+diff --git a/dlls/mf/tests/mf.c b/dlls/mf/tests/mf.c
+--- a/dlls/mf/tests/mf.c
++++ b/dlls/mf/tests/mf.c
+@@ -994,6 +994,7 @@ struct test_stream_sink
+     IUnknown *device_manager;
+ 
+     IMFMediaEventQueue *event_queue;
++    BOOL hold_markers;
+ };
+ 
+ static struct test_stream_sink *impl_from_IMFStreamSink(IMFStreamSink *iface)
+@@ -1155,6 +1156,11 @@ static HRESULT WINAPI test_stream_sink_P
+ static HRESULT WINAPI test_stream_sink_PlaceMarker(IMFStreamSink *iface, MFSTREAMSINK_MARKER_TYPE marker_type,
+         const PROPVARIANT *marker_value, const PROPVARIANT *context)
+ {
++    struct test_stream_sink *sink = impl_from_IMFStreamSink(iface);
++
++    if (sink->hold_markers && marker_type == MFSTREAMSINK_MARKER_ENDOFSEGMENT)
++        return S_OK;
++
+     ok(0, "Unexpected call.\n");
+     return E_NOTIMPL;
+ }
+@@ -8736,6 +8742,141 @@ static void test_media_session_seek(void
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+ }
+ 
++static void test_media_session_replay_at_eop(void)
++{
++    struct test_media_sink *sink;
++    struct test_source *source_impl;
++    struct test_handler *handler;
++    IMFAsyncCallback *callback;
++    IMFMediaSession *session;
++    IMFMediaSource *source;
++    IMFTopology *topology;
++    IMFClock *clock;
++    MFCLOCK_STATE state;
++    PROPVARIANT value;
++    HRESULT hr;
++    unsigned int i;
++
++    hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++
++    hr = MFCreateMediaSession(NULL, &session);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    source = create_test_source(TRUE);
++    source_impl = impl_test_source_from_IMFMediaSource(source);
++    handler = create_test_handler();
++    sink = create_test_media_sink(&handler->IMFMediaTypeHandler_iface);
++    IMFMediaTypeHandler_Release(&handler->IMFMediaTypeHandler_iface);
++    impl_from_IMFStreamSink(sink->stream)->hold_markers = TRUE;
++
++    topology = create_test_topology_unk(source, (IUnknown *)sink->stream, NULL, NULL);
++    hr = IMFMediaSession_SetTopology(session, 0, topology);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    IMFTopology_Release(topology);
++    callback = create_test_callback(TRUE);
++    PropVariantInit(&value);
++    hr = wait_media_event_until_blocking(session, callback, MESessionTopologyStatus, 1000, &value);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    PropVariantClear(&value);
++
++    SET_EXPECT(test_media_sink_GetPresentationClock);
++    SET_EXPECT(test_media_sink_SetPresentationClock);
++    SET_EXPECT(test_media_sink_GetStreamSinkCount);
++    hr = IMFMediaSession_Start(session, NULL, &value);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = wait_media_event_until_blocking(session, callback, MESessionTopologyStatus, 1000, &value);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    PropVariantClear(&value);
++    hr = IMFStreamSink_QueueEvent(sink->stream, MEStreamSinkStarted, &GUID_NULL, S_OK, NULL);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = wait_media_event_until_blocking(session, callback, MESessionStarted, 1000, &value);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    if (hr != S_OK) goto done;
++    CLEAR_CALLED(test_media_sink_GetPresentationClock);
++    CLEAR_CALLED(test_media_sink_SetPresentationClock);
++    CLEAR_CALLED(test_media_sink_GetStreamSinkCount);
++
++    /* The source is exhausted, but the sink has not consumed its final marker. */
++    hr = IMFMediaStream_QueueEvent(&source_impl->streams[0]->IMFMediaStream_iface,
++            MEEndOfStream, &GUID_NULL, S_OK, NULL);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = IMFMediaSource_QueueEvent(source, MEEndOfPresentation, &GUID_NULL, S_OK, NULL);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = wait_media_event_until_blocking(session, callback, MEEndOfPresentation, 1000, &value);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    if (hr != S_OK) goto done;
++
++    SET_EXPECT(test_media_sink_GetPresentationClock);
++    SET_EXPECT(test_media_sink_GetStreamSinkCount);
++    hr = IMFMediaSession_Start(session, NULL, &value);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = wait_media_event_until_blocking(session, callback, MESessionStarted, 100, &value);
++    ok(hr == WAIT_TIMEOUT, "Replay completed before the sink drained, hr %#lx.\n", hr);
++
++    hr = IMFStreamSink_QueueEvent(sink->stream, MEStreamSinkMarker, &GUID_NULL, S_OK, NULL);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = wait_media_event_until_blocking(session, callback, MESessionTopologyStatus, 1000, &value);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    PropVariantClear(&value);
++    if (hr != S_OK) goto done;
++    SET_EXPECT(test_stream_sink_Flush);
++    hr = IMFStreamSink_QueueEvent(sink->stream, MEStreamSinkStopped, &GUID_NULL, S_OK, NULL);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = wait_media_event_until_blocking(session, callback, MESessionEnded, 1000, &value);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    if (hr != S_OK) goto done;
++    CHECK_CALLED(test_stream_sink_Flush);
++
++    /* Replay must start the source again, not merely restart the clock at EOF. */
++    hr = wait_media_event_until_blocking(session, callback, MESessionTopologyStatus, 1000, &value);
++    ok(hr == S_OK, "Source did not restart after EOF, hr %#lx.\n", hr);
++    PropVariantClear(&value);
++    if (hr != S_OK) goto done;
++    hr = IMFStreamSink_QueueEvent(sink->stream, MEStreamSinkStarted, &GUID_NULL, S_OK, NULL);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = wait_media_event_until_blocking(session, callback, MESessionStarted, 1000, &value);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    if (hr != S_OK) goto done;
++
++    /* An explicit stop after replay still completes with MESessionStopped. */
++    hr = IMFMediaSession_GetClock(session, &clock);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    SET_EXPECT(test_stream_sink_Flush);
++    hr = IMFMediaSession_Stop(session);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    for (i = 0; i < 100; ++i)
++    {
++        hr = IMFClock_GetState(clock, 0, &state);
++        ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++        if (state == MFCLOCK_STATE_STOPPED) break;
++        Sleep(10);
++    }
++    IMFClock_Release(clock);
++    ok(state == MFCLOCK_STATE_STOPPED, "Clock did not stop, state %u.\n", state);
++    hr = IMFStreamSink_QueueEvent(sink->stream, MEStreamSinkStopped, &GUID_NULL, S_OK, NULL);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = wait_media_event_until_blocking(session, callback, MESessionStopped, 1000, &value);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++
++done:
++    PropVariantClear(&value);
++    hr = IMFMediaSession_Shutdown(session);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = IMFMediaSource_Shutdown(source);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    IMFAsyncCallback_Release(callback);
++    IMFMediaSession_Release(session);
++    IMFMediaSource_Release(source);
++    IMFMediaSink_Release(&sink->IMFMediaSink_iface);
++    CLEAR_CALLED(test_media_sink_GetPresentationClock);
++    CLEAR_CALLED(test_media_sink_SetPresentationClock);
++    CLEAR_CALLED(test_media_sink_GetStreamSinkCount);
++    CLEAR_CALLED(test_stream_sink_Flush);
++
++    hr = MFShutdown();
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++}
++
+ static void test_media_session_invalid_topology(void)
+ {
+     IMFAsyncCallback *callback;
+@@ -9148,6 +9289,7 @@ START_TEST(mf)
+     test_media_session_source_shutdown();
+     test_media_session_thinning();
+     test_media_session_seek();
++    test_media_session_replay_at_eop();
+     test_media_session_sink_shutdown();
+     test_async_transform();
+ }

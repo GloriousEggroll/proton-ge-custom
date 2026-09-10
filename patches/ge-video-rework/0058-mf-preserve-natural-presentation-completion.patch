@@ -1,0 +1,60 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] mf: Preserve natural presentation completion across queued commands.
+
+GRANDIA II can call Start(VT_EMPTY) on an already started session between
+MEEndOfPresentation and the final stream-sink marker. Command submission
+clears SESSION_FLAG_PRESENTATION_ENDING, and the sink-driven EOF path does
+not restore it. The ensuing automatic stop emits MESessionStopped instead
+of MESessionEnded. This was observed after the resurrection movie
+movies/magic/m05.mp4, with the session stopped and its lock free. Correcting
+this event alone does not resolve the game's wait; 0059 also serializes the
+replay requested from its MEEndOfPresentation handler.
+
+Set the ending flag when the fully drained presentation begins its internal
+stop. This also covers the synthesized-EOP path where the media source did
+not send MEEndOfPresentation. Defer clearing the flag for an external command
+until that command actually executes, so queuing a command during the
+asynchronous sink/source stop cannot change its completion event. Explicit
+Stop commands still clear the flag before starting their own transition.
+
+Follow-up to the sink-driven EOF handling in 0003. Keep the sample-grabber
+callback lock fix in 0024; this is a separate completion-event failure.
+
+Issue: https://github.com/GloriousEggroll/proton-ge-custom/issues/739
+References:
+ https://learn.microsoft.com/en-us/windows/win32/medfound/mesessionended
+ https://learn.microsoft.com/en-us/windows/win32/medfound/mesessionstopped
+---
+ dlls/mf/session.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/mf/session.c b/dlls/mf/session.c
+--- a/dlls/mf/session.c
++++ b/dlls/mf/session.c
+@@ -495,7 +495,6 @@ static HRESULT session_submit_command(struct media_session *session, struct session_op *op)
+     EnterCriticalSection(&session->cs);
+     if (SUCCEEDED(hr = session_is_shut_down(session)))
+     {
+-        session->presentation.flags &= ~SESSION_FLAG_PRESENTATION_ENDING;
+         if (list_empty(&session->commands) && session->command_state == COMMAND_STATE_COMPLETE)
+         {
+             hr = MFPutWorkItem(MFASYNC_CALLBACK_QUEUE_STANDARD, &session->commands_callback, &op->IUnknown_iface);
+@@ -2875,6 +2874,9 @@ static HRESULT WINAPI session_commands_callback_Invoke(IMFAsyncCallback *iface, IMFAsyncResult *result)
+     assert( session->command_state == COMMAND_STATE_SUBMITTED );
+     list_remove(&op->entry);
+ 
++    /* Queuing a command must not change the reason for an in-progress stop. */
++    session->presentation.flags &= ~SESSION_FLAG_PRESENTATION_ENDING;
++
+     switch (op->command)
+     {
+         case SESSION_CMD_CLEAR_TOPOLOGIES:
+@@ -4442,6 +4444,8 @@ static void session_synthesize_end_of_presentation_from_sinks(struct media_session *session)
+     LIST_FOR_EACH_ENTRY(source, &session->presentation.sources, struct media_source, entry)
+         source->flags |= SOURCE_FLAG_END_OF_PRESENTATION;
+ 
++    /* A command may have cleared the ending flag while the sinks were draining. */
++    session->presentation.flags |= SESSION_FLAG_PRESENTATION_ENDING;
+     session->command_state = COMMAND_STATE_ENDING_STREAMS;
+     if (!source_eop)
+         IMFMediaEventQueue_QueueEventParamVar(session->event_queue, MEEndOfPresentation, &GUID_NULL, S_OK, NULL);
