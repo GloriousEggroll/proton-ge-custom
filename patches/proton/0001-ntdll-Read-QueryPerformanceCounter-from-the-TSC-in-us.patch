@@ -1,0 +1,173 @@
+From 6416d5f57dcfbf333051483c2b1939c93b12382f Mon Sep 17 00:00:00 2001
+From: Haeris31 <279492726+Haeris31@users.noreply.github.com>
+Date: Fri, 11 Sep 2026 00:13:32 +0200
+Subject: [PATCH] ntdll: Read QueryPerformanceCounter from the TSC in user
+ mode.
+
+Windows has served QueryPerformanceCounter from the time-stamp counter in
+user mode since Windows 8 (~15 ns). Wine routes RtlQueryPerformanceCounter
+through NtQueryPerformanceCounter and the syscall dispatcher (~50 ns plus a
+full xsave), which is invisible for most programs but dominates games that
+instrument themselves with it.
+
+DCS World calls it ~200,000 times per frame from its main thread (its
+profiler, ED_get_ticks, and its Lua bindings). Measured on a Ryzen 7 9700X
+with GE-Proton11-3, Grayflag multiplayer, graphics at minimum:
+
+  - 28 % of the main thread and 55 % of the render thread sampled inside
+    __wine_syscall_dispatcher, all reached from RtlQueryPerformanceCounter;
+  - 39 FPS with the stock ntdll, 62 FPS with this patch, nothing else changed;
+  - cost per call 51 ns -> 15 ns, unchanged with three threads calling
+    concurrently; Sleep(500) reads 500.0 ms through the new path.
+
+The first call records the real counter and the TSC; until 250 ms of real
+time have elapsed callers keep getting the real counter, then a second
+sample fixes the TSC rate as a 32.32 fixed-point multiplier and the base is
+rebased on that sample so the switch is continuous. The hot path is rdtscp,
+one 64x64->128-bit multiply and an add: no locked instruction and no shared
+write, because an earlier version with an interlocked monotonic clamp
+bounced a cache line between the calling threads and gave no gain at all.
+
+The TSC path is used only when CPUID reports an invariant TSC and rdtscp,
+and can be disabled with WINE_DISABLE_QPC_TSC=1 in the environment; both
+fall back to the unchanged syscall path. No cross-thread clamp is applied:
+an invariant TSC is synchronized across cores on the CPUs that report it,
+which is what Windows relies on too. Nothing on the unix side changes.
+---
+ dlls/ntdll/time.c | 108 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 108 insertions(+)
+
+diff --git a/dlls/ntdll/time.c b/dlls/ntdll/time.c
+index 105a6cf..c87475f 100644
+--- a/dlls/ntdll/time.c
++++ b/dlls/ntdll/time.c
+@@ -29,6 +29,10 @@
+ #include <string.h>
+ #include <limits.h>
+ #include <time.h>
++#ifdef __x86_64__
++#include <x86intrin.h>
++#include <cpuid.h>
++#endif
+ 
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+@@ -377,11 +381,115 @@ LONGLONG WINAPI RtlGetSystemTimePrecise( void )
+     return ret;
+ }
+ 
++#ifdef __x86_64__
++/* User-mode performance counter based on the invariant TSC (dcs-linux, 2026-09-10).
++ * Calibration: the first call records (qpc0, tsc0) from the real counter; once at least
++ * QPC_TSC_CALIBRATION_TICKS of real time have elapsed, a second sample fixes the TSC rate as a
++ * 32.32 fixed-point multiplier. The hot path is then rdtscp + one 64x64->128 multiply, with
++ * plain loads only: no locked instruction, so concurrent callers never share a cache line
++ * write. No cross-thread clamp: the invariant TSC is synchronized across cores on the CPUs
++ * that report it (Windows does not clamp either). */
++#define QPC_TSC_CALIBRATION_TICKS (TICKSPERSEC / 4)   /* 250 ms */
++
++static volatile LONG qpc_tsc_state;          /* 0 = unknown, 1 = calibrating, 2 = ready, -1 = disabled */
++static LONGLONG qpc_tsc_base_qpc;
++static ULONGLONG qpc_tsc_base_tsc;
++static ULONGLONG qpc_tsc_mult;               /* TICKSPERSEC * 2^32 / tsc_hz */
++
++static BOOL qpc_tsc_supported(void)
++{
++    unsigned int eax, ebx, ecx, edx;
++    UNICODE_STRING name, value;
++    WCHAR buffer[8];
++
++    /* escape hatch: WINE_DISABLE_QPC_TSC=1 in the environment */
++    RtlInitUnicodeString( &name, L"WINE_DISABLE_QPC_TSC" );
++    value.Buffer = buffer;
++    value.MaximumLength = sizeof(buffer);
++    value.Length = 0;
++    if (!RtlQueryEnvironmentVariable_U( NULL, &name, &value ) && value.Length && buffer[0] != '0')
++        return FALSE;
++
++    /* invariant TSC: CPUID 0x80000007 EDX bit 8 ; rdtscp: CPUID 0x80000001 EDX bit 27 */
++    __cpuid( 0x80000000, eax, ebx, ecx, edx );
++    if (eax < 0x80000007) return FALSE;
++    __cpuid( 0x80000007, eax, ebx, ecx, edx );
++    if (!(edx & (1u << 8))) return FALSE;
++    __cpuid( 0x80000001, eax, ebx, ecx, edx );
++    if (!(edx & (1u << 27))) return FALSE;
++    return TRUE;
++}
++
++static inline ULONGLONG qpc_read_tsc(void)
++{
++    unsigned int aux;
++    return __rdtscp( &aux );
++}
++
++static BOOL qpc_tsc_counter( LARGE_INTEGER *counter )
++{
++    LONG state = qpc_tsc_state;   /* plain load: the publish below is a release via InterlockedExchange */
++
++    if (state == 2)
++    {
++        ULONGLONG delta = qpc_read_tsc() - qpc_tsc_base_tsc;
++        counter->QuadPart = qpc_tsc_base_qpc + (LONGLONG)(((unsigned __int128)delta * qpc_tsc_mult) >> 32);
++        return TRUE;
++    }
++    if (state < 0) return FALSE;
++
++    if (state == 0)
++    {
++        if (!qpc_tsc_supported())
++        {
++            InterlockedExchange( (LONG *)&qpc_tsc_state, -1 );
++            return FALSE;
++        }
++        if (InterlockedCompareExchange( (LONG *)&qpc_tsc_state, 1, 0 ) == 0)
++        {
++            LARGE_INTEGER now;
++            ULONGLONG tsc = qpc_read_tsc();
++            NtQueryPerformanceCounter( &now, NULL );
++            qpc_tsc_base_qpc = now.QuadPart;
++            qpc_tsc_base_tsc = tsc;
++        }
++        return FALSE;
++    }
++
++    /* state == 1: still calibrating, use the real counter and try to finish */
++    {
++        LARGE_INTEGER now;
++        ULONGLONG tsc = qpc_read_tsc();
++        NtQueryPerformanceCounter( &now, NULL );
++        if (now.QuadPart - qpc_tsc_base_qpc >= QPC_TSC_CALIBRATION_TICKS)
++        {
++            ULONGLONG dtsc = tsc - qpc_tsc_base_tsc;
++            LONGLONG dqpc = now.QuadPart - qpc_tsc_base_qpc;
++            unsigned __int128 hz = (unsigned __int128)dtsc * TICKSPERSEC / (ULONGLONG)dqpc;
++            if (hz > 100000000ull && hz < 20000000000ull &&   /* 100 MHz .. 20 GHz : sane */
++                InterlockedCompareExchange( (LONG *)&qpc_tsc_state, 3, 1 ) == 1)   /* single publisher */
++            {
++                /* rebase on this sample so the switch is continuous, then publish (release) */
++                qpc_tsc_mult = (ULONGLONG)(((unsigned __int128)TICKSPERSEC << 32) / (ULONGLONG)hz);
++                qpc_tsc_base_qpc = now.QuadPart;
++                qpc_tsc_base_tsc = tsc;
++                InterlockedExchange( (LONG *)&qpc_tsc_state, 2 );
++            }
++        }
++        counter->QuadPart = now.QuadPart;
++        return TRUE;
++    }
++}
++#endif
++
+ /******************************************************************************
+  *  RtlQueryPerformanceCounter   [NTDLL.@]
+  */
+ BOOL WINAPI DECLSPEC_HOTPATCH RtlQueryPerformanceCounter( LARGE_INTEGER *counter )
+ {
++#ifdef __x86_64__
++    if (qpc_tsc_counter( counter )) return TRUE;
++#endif
+     NtQueryPerformanceCounter( counter, NULL );
+     return TRUE;
+ }
+-- 
+2.55.0
+

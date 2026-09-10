@@ -403,6 +403,10 @@ apply_all_in_dir() {
     apply_patch "../patches/proton/0001-HACK-kernelbase-allow-overriding-dlls-for-DLSS-XeSS-.patch"
     apply_patch "../patches/proton/0002-HACK-ntdll-add-optiscaler-inection-hack.patch"
 
+    # https://github.com/GloriousEggroll/proton-ge-custom/pull/759
+    echo "WINE: -PERF- read QueryPerformanceCounter from the TSC in user mode (DCS World: 39 -> 62 FPS)"
+    apply_patch "../patches/proton/0001-ntdll-Read-QueryPerformanceCounter-from-the-TSC-in-us.patch"
+
     echo "WINE: -HOTFIX- Implement GE-Proton ffmpeg + winedmo only video playback rework patches"
     apply_all_in_dir "../patches/ge-video-rework/"
 
