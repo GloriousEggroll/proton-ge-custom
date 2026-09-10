@@ -1,14 +1,15 @@
-# Wine-Mono Runtime Fixes
+# Wine-Mono Fixes
 
 These patches apply to Wine-Mono's Mono submodule, not Wine.
 `patches/protonprep-valve-staging.sh` prepares the official Wine-Mono 11.2.0
 source release and applies them. The Proton `Makefile.in` then builds
 `libmono-2.0-x86.dll` and `libmono-2.0-x86_64.dll` using the SDK's
 MinGW toolchains. Both runtime DLLs replace their prebuilt counterparts in
-the distribution. Managed libraries, WPF, WinForms, support MSI and other
-native helpers remain from the matching official binary release.
+the distribution. It also rebuilds the Windows `System.Drawing.dll` class
+library. All other managed libraries, WPF, WinForms, support MSI and native
+helpers remain from the matching official binary release.
 
-The runtime patches do not change winewayland, mscoree, executable metadata,
+The Mono patches do not change winewayland, mscoree, executable metadata,
 or game prefixes. The separate Wine SQM registry initialization described
 below addresses a later failure. The layer/graphics work is unrelated.
 
@@ -33,13 +34,22 @@ is rejected rather than deleted.
 
 Only successful prep publishes `wine-mono/.proton-prepared`. The build
 copies that prepared tree into `build/src-wine-mono-11.2.0/` and builds the
-native runtimes there; it does not apply patches a second time. Re-running
-prep invalidates those native build outputs. Builds without another prep
+native runtimes and class libraries there; it does not apply patches a second
+time. Re-running prep invalidates those build outputs. Builds without another prep
 reuse them. Re-run prep whenever changing the patch stack. Missing or stale
 prep stops the build with an explicit instruction to run protonprep.
 
-No extra LLVM toolchain download or full managed framework rebuild is
-requested. The generated source tree is ignored by the main Git repository.
+The class-library stage uses the release's `mono.make` host-runtime/compiler
+bootstrap and `net_4_x` Windows profile. This builds the framework dependencies
+needed by `System.Drawing`, but only `System.Drawing.dll` and its PDB (when
+present) replace files in the distribution. The GAC copy is also the target of
+the release's `lib/mono/4.5/System.Drawing.dll` symlink, so both lookup paths
+use the replacement. No application-local DLLs or prefix overrides are used.
+The initial class-library build adds work beyond the previous native-only
+build; the drawing stamp caches it until the prepared source changes.
+
+No extra LLVM toolchain download or WPF/WinForms rebuild is requested.
+The generated source tree is ignored by the main Git repository.
 The native runtime link explicitly uses `-static-libgcc`: the SDK's x86
 GCC otherwise imports its integer-division helpers from
 `libgcc_s_dw2-1.dll`, which is not included in the distribution. Pass this
@@ -69,6 +79,43 @@ before Purple starts, followed by repeated exception handling failures.
 Its cause has not been established; do not attribute it to Mono, which
 had not loaded. That earlier exception loop was not present in the new
 capture.
+
+## Settings.exe Icon Failure
+
+`0003-drawing-resolve-default-icon-dimensions.patch` fixes the immediate
+startup failure of SP Football Life 2026's `Settings.exe`, without an
+executable-name check. The September 10 capture at `~/steam-spfl26.log`
+shows `System.Drawing.Icon.BuildBitmapOnWin32()` throwing
+`Unexpected number of bits: 0` from `Form.UpdateWindowIcon()`, followed by
+`CorExitProcess(1)`. A later native fault in `Settings_b.dll` occurs during
+termination; it is not the first failure.
+
+Read-only inspection of the executable's serialized icon resource confirmed:
+
+- `IconSize` contains width and height zero (unspecified).
+- `IconData` contains seven frames in a 52,968-byte array.
+- Mono's old unspecified-size fallback chooses the largest non-ignored
+  frame by byte count: a 48x48, nominally 24-bpp entry with an all-zero DIB
+  header. Valid 32x32 entries exist in the same icon.
+
+Zero dimensions should first resolve to the system icon metrics, as in
+[Microsoft's Icon implementation](https://github.com/dotnet/winforms/blob/main/src/System.Drawing.Common/src/System/Drawing/Icon.cs).
+The patch reuses Mono's existing User32 binding on Windows and its 32-pixel
+default on Unix, for stream loading (including deserialization) and cloning.
+It does not suppress bitmap-decoding exceptions, repair malformed image data,
+or change selection for explicitly specified nonzero dimensions.
+
+The upstream `System.Drawing` NUnit tests now include generated multi-frame
+fixtures covering zero dimensions, cloning, missing/empty serialized sizes,
+a damaged unselected frame, explicit larger sizes, and bitmap/handle creation.
+The new tests require the Windows backend (Wine or native Windows); no game
+assets are included. Patch application was checked without fuzz. No build or
+runtime tests have been run by the agent for this change.
+
+After normal protonprep and rebuild, retest the original `Settings.exe`
+command without installing native .NET or altering the executable. The log
+must no longer contain the fatal `Unexpected number of bits: 0` stack.
+Successful end-to-end application startup still needs user verification.
 
 ## Purple Failure
 

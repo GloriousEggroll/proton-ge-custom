@@ -1,0 +1,200 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] System.Drawing: resolve unspecified icon dimensions before selecting a frame.
+
+Serialized Icon resources can contain IconSize = Size.Empty. Windows .NET
+resolves each zero dimension to SM_CXICON / SM_CYICON before choosing an
+image. Mono instead falls back to the largest non-ignored image by byte
+count. SP Football Life 2026's Settings.exe consequently selects a damaged
+48x48 image rather than one of its valid default-sized images and throws
+"Unexpected number of bits: 0" while creating the form's window icon.
+
+Resolve zero dimensions for stream loading (including deserialization)
+and icon cloning. Reuse the existing User32 metrics binding on Windows;
+retain the 32-pixel default on Unix. Leave explicit nonzero sizes, format
+validation, and the frame selection algorithm otherwise unchanged.
+
+Add generated multi-frame regression fixtures for zero dimensions,
+empty/missing serialized sizes, a damaged unused frame, cloning, and
+explicit larger sizes. No game assets or application-specific checks.
+
+Reference for zero-size semantics:
+https://github.com/dotnet/winforms/blob/main/src/System.Drawing.Common/src/System/Drawing/Icon.cs
+
+Based on wine-mono/mono 775a29a0d864061a40438e38830c0afaadf9ae79
+(Wine-Mono 11.2.0).
+---
+diff --git a/mcs/class/System.Drawing/System.Drawing/Icon.cs b/mcs/class/System.Drawing/System.Drawing/Icon.cs
+--- a/mcs/class/System.Drawing/System.Drawing/Icon.cs
++++ b/mcs/class/System.Drawing/System.Drawing/Icon.cs
+@@ -151,6 +151,7 @@
+ 			if (original == null)
+ 				throw new ArgumentException ("original");
+ 
++			size = ResolveIconSize (size.Width, size.Height);
+ 			iconSize = size;
+ 			iconDir = original.iconDir;
+ 			
+@@ -736,12 +737,26 @@
+ 			Dispose ();
+ 		}
+ 			
++		private static Size ResolveIconSize (int width, int height)
++		{
++			// A zero dimension requests the system icon size, including in serialized resources.
++			if (width == 0)
++				width = GDIPlus.RunningOnWindows () ? UnsafeNativeMethods.GetSystemMetrics (SafeNativeMethods.SM_CXICON) : 32;
++			if (height == 0)
++				height = GDIPlus.RunningOnWindows () ? UnsafeNativeMethods.GetSystemMetrics (SafeNativeMethods.SM_CYICON) : 32;
++			return new Size (width, height);
++		}
++
+ 		private void InitFromStreamWithSize (Stream stream, int width, int height)
+ 		{
+ 			//read the icon header
+ 			if (stream == null || stream.Length == 0)
+ 				throw new System.ArgumentException ("The argument 'stream' must be a picture that can be used as a Icon", "stream");
+-			
++
++			Size size = ResolveIconSize (width, height);
++			width = size.Width;
++			height = size.Height;
++
+ 			BinaryReader reader = new BinaryReader (stream);
+ 
+ 			//iconDir = new IconDir ();
+diff --git a/mcs/class/System.Drawing/Test/System.Drawing/TestIcon.cs b/mcs/class/System.Drawing/Test/System.Drawing/TestIcon.cs
+--- a/mcs/class/System.Drawing/Test/System.Drawing/TestIcon.cs
++++ b/mcs/class/System.Drawing/Test/System.Drawing/TestIcon.cs
+@@ -34,6 +34,8 @@
+ using System.Drawing.Imaging;
+ using System.IO;
+ using System.Reflection;
++using System.Runtime.InteropServices;
++using System.Runtime.Serialization;
+ using System.Security.Permissions;
+ using NUnit.Framework;
+ 
+@@ -182,6 +184,122 @@
+ 			Assert.Throws<ArgumentException> (() => new Icon ((Stream) null));
+ 		}
+ 
++		[DllImport ("user32.dll")]
++		private static extern int GetSystemMetrics (int index);
++
++		private static Size DefaultIconSize ()
++		{
++			Size size = new Size (GetSystemMetrics (11), GetSystemMetrics (12));
++			if (size.Width <= 0 || size.Height <= 0 || size.Width >= 240 || size.Height >= 240)
++				Assert.Ignore ("The icon fixture requires dimensions below 240 pixels.");
++			return size;
++		}
++
++		private static byte [] MultiSizeIcon (Size size, bool invalidLargeImage)
++		{
++			Size [] sizes = { size, new Size (size.Width + 16, size.Height + 16) };
++			using (MemoryStream stream = new MemoryStream ()) {
++				using (BinaryWriter writer = new BinaryWriter (stream)) {
++					writer.Write ((ushort) 0);
++					writer.Write ((ushort) 1);
++					writer.Write ((ushort) sizes.Length);
++					int offset = 6 + 16 * sizes.Length;
++					foreach (Size frame in sizes) {
++						int maskSize = ((frame.Width + 31) / 32) * 4 * frame.Height;
++						int length = 40 + frame.Width * frame.Height * 4 + maskSize;
++						writer.Write ((byte) frame.Width);
++						writer.Write ((byte) frame.Height);
++						writer.Write ((byte) 0);
++						writer.Write ((byte) 0);
++						writer.Write ((ushort) 1);
++						writer.Write ((ushort) 32);
++						writer.Write (length);
++						writer.Write (offset);
++						offset += length;
++					}
++					for (int i = 0; i < sizes.Length; i++) {
++						Size frame = sizes [i];
++						if (i == 1 && invalidLargeImage) {
++							writer.Write (new byte [40]);
++						} else {
++							writer.Write (40);
++							writer.Write (frame.Width);
++							writer.Write (frame.Height * 2);
++							writer.Write ((ushort) 1);
++							writer.Write ((ushort) 32);
++							writer.Write (new byte [24]);
++						}
++						for (int pixel = 0; pixel < frame.Width * frame.Height; pixel++)
++							writer.Write (Color.Red.ToArgb ());
++						writer.Write (new byte [((frame.Width + 31) / 32) * 4 * frame.Height]);
++					}
++					return stream.ToArray ();
++				}
++			}
++		}
++
++		private static void CheckDefaultIcon (Icon result, Size expected)
++		{
++			Assert.AreEqual (expected, result.Size, "Size");
++			Assert.AreNotEqual (IntPtr.Zero, result.Handle, "Handle");
++			using (Bitmap bitmap = result.ToBitmap ()) {
++				Assert.AreEqual (expected, bitmap.Size, "Bitmap size");
++				Assert.AreEqual (Color.Red.ToArgb (), bitmap.GetPixel (0, 0).ToArgb (), "Pixel");
++			}
++		}
++
++		[TestCase (true, true)]
++		[TestCase (true, false)]
++		[TestCase (false, true)]
++		[Platform ("Win")]
++		public void Constructor_Stream_ZeroDimensions (bool zeroWidth, bool zeroHeight)
++		{
++			Size size = DefaultIconSize ();
++			using (MemoryStream stream = new MemoryStream (MultiSizeIcon (size, false)))
++			using (Icon result = new Icon (stream, zeroWidth ? 0 : size.Width, zeroHeight ? 0 : size.Height))
++				CheckDefaultIcon (result, size);
++		}
++
++		[Test]
++		[Platform ("Win")]
++		public void Constructor_Icon_ZeroDimensions ()
++		{
++			Size size = DefaultIconSize ();
++			using (MemoryStream stream = new MemoryStream (MultiSizeIcon (size, false)))
++			using (Icon original = new Icon (stream, size))
++			using (Icon result = new Icon (original, Size.Empty))
++				CheckDefaultIcon (result, size);
++		}
++
++		[TestCase (true, false)]
++		[TestCase (false, false)]
++		[TestCase (true, true)]
++		[TestCase (false, true)]
++		[Platform ("Win")]
++		public void Deserialize_DefaultSize (bool includeSize, bool invalidLargeImage)
++		{
++			Size size = DefaultIconSize ();
++			SerializationInfo info = new SerializationInfo (typeof (Icon), new FormatterConverter ());
++			info.AddValue ("IconData", MultiSizeIcon (size, invalidLargeImage), typeof (byte []));
++			if (includeSize)
++				info.AddValue ("IconSize", Size.Empty, typeof (Size));
++			ConstructorInfo constructor = typeof (Icon).GetConstructor (BindingFlags.Instance | BindingFlags.NonPublic,
++				null, new Type [] { typeof (SerializationInfo), typeof (StreamingContext) }, null);
++			using (Icon result = (Icon) constructor.Invoke (new object [] { info, new StreamingContext () }))
++				CheckDefaultIcon (result, size);
++		}
++
++		[Test]
++		[Platform ("Win")]
++		public void Constructor_Stream_ExplicitLargeSize ()
++		{
++			Size size = DefaultIconSize ();
++			Size large = new Size (size.Width + 16, size.Height + 16);
++			using (MemoryStream stream = new MemoryStream (MultiSizeIcon (size, false)))
++			using (Icon result = new Icon (stream, large))
++				CheckDefaultIcon (result, large);
++		}
++
+ 		[Test]
+ 		public void Constructor_StreamNull_Int_Int ()
+ 		{
+

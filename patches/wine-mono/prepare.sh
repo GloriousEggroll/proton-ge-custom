@@ -30,7 +30,7 @@ rm -rf -- wine-mono
 mkdir wine-mono
 tar --no-same-owner -xf "$archive" --strip-components=1 -C wine-mono
 
-echo "WINE-MONO: apply native runtime patches"
+echo "WINE-MONO: apply runtime and class-library patches"
 (
     cd wine-mono/mono
     for patch_file in "$patch_dir"/*.patch; do
