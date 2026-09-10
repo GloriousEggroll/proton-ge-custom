@@ -270,6 +270,10 @@ apply_all_in_dir() {
     echo "WINE: -GAME FIXES- make MapleStory launch: accept SPI_SETSTICKYKEYS/SPI_SETFILTERKEYS"
     apply_patch "../patches/game-patches/maplestory-spi-stickykeys-filterkeys.patch"
 
+    # https://github.com/GloriousEggroll/proton-ge-custom/issues/736
+    echo "WINE: -GAME FIXES- allow AI LIMIT DX12 to reuse its packaged compute shaders"
+    apply_patch "../patches/game-patches/ai-limit-dx12-compute-shader-fallback.patch"
+
     echo "WINE: -GAME FIXES- repair NASCAR 25 protected loader state"
     apply_patch "../patches/game-patches/nascar25-protector.patch"
 

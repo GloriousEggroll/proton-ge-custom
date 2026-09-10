@@ -1,0 +1,196 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Thu, 10 Sep 2026 17:00:00 -0400
+Subject: [PATCH] ntdll: Allow AI LIMIT to reuse DXBC compute shaders in DX12.
+
+AI LIMIT ships Unity 2022.3.39f1 compute shader variants for renderer 2
+(DX11) only. With -force-d3d12, Unity instead selects renderer 18, creates
+an empty variant, and fails to find KDepthDownsample8DualUav. HDRP never
+initializes, although game audio and input continue to work.
+
+Duplicating the existing DXBC cs_5_0 entries as DX12 asset entries restored
+rendering in a local experiment. Hook the selector at module initialization
+to use the existing DX11 entry only when no native DX12 entry exists. Keep
+the actual DX12 device and do not write to the installed game files.
+
+Restrict this to AI-LIMIT.exe and the inspected x86-64 UnityPlayer.dll,
+checking image metadata and the complete selector/device-getter code before
+installing the hook. Preserve the original selector for all other cases,
+restore page protections, and release the thunk when the DLL unloads.
+The runtime hook still needs in-game validation with the original assets.
+
+Issue: https://github.com/GloriousEggroll/proton-ge-custom/issues/736
+---
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -149,6 +149,7 @@
+     struct file_id        id;
+     ULONG                 CheckSum;
+     BOOL                  system;
++    void                 *ai_limit_compute_thunk;
+ } WINE_MODREF;
+ 
+ static UINT tls_module_count = 32;     /* number of modules with TLS directory */
+@@ -1766,6 +1767,143 @@
+     }
+ }
+ 
++#if defined(__x86_64__) && !defined(__arm64ec__)
++typedef BYTE *(WINAPI *unity_get_gfx_device_func)(void);
++typedef void *(WINAPI *unity_select_compute_variant_func)(BYTE *shader);
++
++static void *WINAPI ai_limit_select_compute_variant( BYTE *shader, unity_get_gfx_device_func get_device,
++                                                     unity_select_compute_variant_func select_variant )
++{
++    BYTE *device = get_device(), *variants, *dx11 = NULL;
++    SIZE_T count, i;
++
++    if (!device || *(UINT *)(device + 0x1e84) != 18) return select_variant( shader );
++
++    variants = *(BYTE **)(shader + 0x38);
++    count = *(SIZE_T *)(shader + 0x48);
++    for (i = 0; i < count; ++i)
++    {
++        BYTE *variant = variants + i * 0x50;
++
++        /* Never replace a native DX12 entry, even if its kernel list is empty. */
++        if (*(UINT *)variant == 18) return select_variant( shader );
++        if (*(UINT *)variant == 2 && !*(UINT *)(variant + 4) && *(SIZE_T *)(variant + 0x18))
++            dx11 = variant;
++    }
++
++    /* The inspected DX11 entries contain DXBC cs_5_0 programs usable by DX12.
++     * Return the owned entry without copying its vectors or changing the device. */
++    return dx11 ? dx11 : select_variant( shader );
++}
++
++#include "pshpack1.h"
++struct ai_limit_compute_thunk
++{
++    BYTE mov_rdx[2];
++    unity_get_gfx_device_func get_device;
++    BYTE mov_r8[2];
++    unity_select_compute_variant_func select_variant;
++    BYTE jump[6];
++    void *hook;
++    BYTE original[20];
++    BYTE return_jump[6];
++    void *return_address;
++};
++#include "poppack.h"
++
++C_ASSERT(offsetof(struct ai_limit_compute_thunk, original) == 34);
++C_ASSERT(sizeof(struct ai_limit_compute_thunk) == 68);
++
++static void patch_ai_limit_compute_shaders( WINE_MODREF *wm )
++{
++    static const BYTE jump[] = {0xff, 0x25, 0, 0, 0, 0};
++    struct ai_limit_compute_thunk *thunk;
++    BYTE *base = wm->ldr.DllBase, *target = base + 0x6049a0;
++    const WCHAR *app, *p;
++    void *allocation = NULL, *address;
++    SIZE_T size;
++    ULONG old_protect, unused;
++    NTSTATUS status;
++
++    if (wm->ai_limit_compute_thunk || (wm->ldr.Flags & LDR_WINE_INTERNAL) ||
++        wcsicmp( wm->ldr.BaseDllName.Buffer, L"UnityPlayer.dll" )) return;
++    app = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
++    if ((p = wcsrchr( app, '\\' ))) app = p + 1;
++    if ((p = wcsrchr( app, '/' ))) app = p + 1;
++    if (wcsicmp( app, L"AI-LIMIT.exe" )) return;
++
++    /* AI LIMIT's Unity 2022.3.39f1. Check the complete selector and device
++     * getter before relying on their private layout or relocating the prologue.
++     * These code ranges have no base relocations. Unknown builds stay untouched. */
++    if (wm->ldr.TimeDateStamp != 0x6696cce1 || wm->ldr.SizeOfImage != 0x1e57000 ||
++        RtlImageNtHeader( wm->ldr.DllBase )->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
++        RtlComputeCrc32( 0, target, 0x259 ) != 0xcf04ef1f ||
++        RtlComputeCrc32( 0, base + 0x705e80, 0xe5 ) != 0xeb25b6f4)
++    {
++        WARN_(loaddll)("AI LIMIT: skipping DX12 compute fallback for an unrecognized UnityPlayer.dll.\n");
++        return;
++    }
++
++    size = sizeof(*thunk);
++    status = NtAllocateVirtualMemory( NtCurrentProcess(), &allocation, 0, &size,
++                                      MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE );
++    if (status) goto failed;
++    thunk = allocation;
++    thunk->mov_rdx[0] = 0x48;
++    thunk->mov_rdx[1] = 0xba;
++    thunk->get_device = (unity_get_gfx_device_func)(base + 0x705e80);
++    thunk->mov_r8[0] = 0x49;
++    thunk->mov_r8[1] = 0xb8;
++    thunk->select_variant = (unity_select_compute_variant_func)thunk->original;
++    memcpy( thunk->jump, jump, sizeof(jump) );
++    thunk->hook = ai_limit_select_compute_variant;
++    /* Four complete MOVs save nonvolatile registers in the caller's home area.
++     * They are position independent and leave RSP unchanged. The rest of Unity's
++     * prologue and its original unwind information remain at their original RVAs. */
++    memcpy( thunk->original, target, sizeof(thunk->original) );
++    memcpy( thunk->return_jump, jump, sizeof(jump) );
++    thunk->return_address = target + sizeof(thunk->original);
++
++    address = allocation;
++    size = sizeof(*thunk);
++    status = NtProtectVirtualMemory( NtCurrentProcess(), &address, &size, PAGE_EXECUTE_READ, &unused );
++    if (status) goto failed;
++    status = NtFlushInstructionCache( NtCurrentProcess(), allocation, sizeof(*thunk) );
++    if (status) goto failed;
++
++    address = target;
++    size = sizeof(jump) + sizeof(allocation);
++    status = NtProtectVirtualMemory( NtCurrentProcess(), &address, &size, PAGE_EXECUTE_READWRITE, &old_protect );
++    if (status) goto failed;
++    /* Install under the loader lock, before this module's TLS callbacks/DllMain. */
++    memcpy( target, jump, sizeof(jump) );
++    memcpy( target + sizeof(jump), &allocation, sizeof(allocation) );
++    status = NtFlushInstructionCache( NtCurrentProcess(), target, sizeof(thunk->original) );
++    if (!status)
++        status = NtProtectVirtualMemory( NtCurrentProcess(), &address, &size, old_protect, &unused );
++    if (status)
++    {
++        memcpy( target, thunk->original, sizeof(thunk->original) );
++        NtFlushInstructionCache( NtCurrentProcess(), target, sizeof(thunk->original) );
++        NtProtectVirtualMemory( NtCurrentProcess(), &address, &size, old_protect, &unused );
++        goto failed;
++    }
++    wm->ai_limit_compute_thunk = allocation;
++    TRACE_(loaddll)("AI LIMIT: enabled DX12 compute-shader fallback for Unity 2022.3.39f1.\n");
++    return;
++
++failed:
++    if (allocation)
++    {
++        size = 0;
++        NtFreeVirtualMemory( NtCurrentProcess(), &allocation, &size, MEM_RELEASE );
++    }
++    WARN_(loaddll)("AI LIMIT: could not install DX12 compute-shader fallback, status %#lx.\n", status);
++}
++#else
++static void patch_ai_limit_compute_shaders( WINE_MODREF *wm ) {}
++#endif
++
+ /*************************************************************************
+  *              MODULE_InitDLL
+  */
+@@ -1780,6 +1918,7 @@
+     /* Skip calls for modules loaded with special load flags */
+ 
+     if (wm->ldr.Flags & (LDR_DONT_RESOLVE_REFS | LDR_DONT_CALL_DLLMAIN)) return STATUS_SUCCESS;
++    if (reason == DLL_PROCESS_ATTACH) patch_ai_limit_compute_shaders( wm );
+     if (wm->ldr.TlsIndex == -1) call_tls_callbacks( wm->ldr.DllBase, reason );
+     if (!entry) return STATUS_SUCCESS;
+ 
+@@ -4399,6 +4538,11 @@
+     free_tls_slot( &wm->ldr );
+     RtlReleaseActivationContext( wm->ldr.ActivationContext );
+     NtUnmapViewOfSection( NtCurrentProcess(), wm->ldr.DllBase );
++    if (wm->ai_limit_compute_thunk)
++    {
++        SIZE_T size = 0;
++        NtFreeVirtualMemory( NtCurrentProcess(), &wm->ai_limit_compute_thunk, &size, MEM_RELEASE );
++    }
+     if (cached_modref == wm) cached_modref = NULL;
+     RtlFreeUnicodeString( &wm->ldr.FullDllName );
+     RtlFreeHeap( GetProcessHeap(), 0, wm );
