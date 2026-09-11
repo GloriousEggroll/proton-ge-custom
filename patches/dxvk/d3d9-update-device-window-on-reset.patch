@@ -1,0 +1,88 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Fri, 11 Sep 2026 01:30:00 -0400
+Subject: [PATCH] d3d9: Update the device window before applying Reset's fullscreen state.
+
+Painkiller creates a windowed device against the desktop, then resets it
+with hDeviceWindow pointing at its initially 640x480 game window. Reset
+keeps using m_window from creation until Present updates it. Consequently,
+the fullscreen mode, window procedure hook and resize are applied to the
+desktop, while presentation switches to the still-small game window.
+
+Select the normalized device window before processing the fullscreen
+transition. When an existing fullscreen swapchain changes device window,
+leave fullscreen on its old device window first, releasing the old hook,
+present rectangle and saved window state. Mark that transition windowed
+so the normal path enters fullscreen on the replacement window, including
+when both the old and new presentation parameters request fullscreen.
+
+This also resets a temporary Present destination override back to the
+device window and invalidates its cached windowed refresh rate. Ordinary
+same-window fullscreen resets retain the existing update path.
+
+The issue was reported by DarkSwan86 and Deus-nsf. Blisto91 and BinqAdams
+provided the upstream size diagnostics; WinterSnowfall identified the WSI
+path and rrPKrr confirmed that resizing the actual game window fixes it.
+
+References:
+https://github.com/GloriousEggroll/proton-ge-custom/issues/579
+https://github.com/doitsujin/dxvk/issues/3762
+---
+ src/d3d9/d3d9_swapchain.cpp | 25 +++++++++++++++++++++----
+ 1 file changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/src/d3d9/d3d9_swapchain.cpp b/src/d3d9/d3d9_swapchain.cpp
+--- a/src/d3d9/d3d9_swapchain.cpp
++++ b/src/d3d9/d3d9_swapchain.cpp
+@@ -627,15 +627,32 @@ namespace dxvk {
+     this->NormalizePresentParameters(pPresentParams);
+ 
+     bool changeFullscreen = m_presentParams.Windowed != pPresentParams->Windowed;
++    bool changeWindow = m_presentParams.hDeviceWindow != pPresentParams->hDeviceWindow;
++
++    // Reset can replace the device window before the first Present (Painkiller).
++    // Release fullscreen ownership on the old window before switching targets.
++    if (changeWindow && !m_presentParams.Windowed) {
++      m_window = m_presentParams.hDeviceWindow;
++      hr = this->LeaveFullscreenMode();
++      if (FAILED(hr))
++        return hr;
++
++      m_presentParams.Windowed = TRUE;
++    }
++
++    if (m_window != pPresentParams->hDeviceWindow) {
++      m_window = pPresentParams->hDeviceWindow;
++      m_displayRefreshRateDirty = true;
++    }
+ 
+     if (pPresentParams->Windowed) {
+-      if (changeFullscreen)
++      if (!m_presentParams.Windowed)
+         this->LeaveFullscreenMode();
+     }
+     else {
+       m_parent->NotifyFullscreen(m_window, true);
+ 
+-      if (changeFullscreen) {
++      if (m_presentParams.Windowed) {
+         hr = this->EnterFullscreenMode(pPresentParams, pFullscreenDisplayMode);
+         if (FAILED(hr))
+           return hr;
+@@ -643,7 +660,7 @@ namespace dxvk {
+ 
+       D3D9WindowMessageFilter filter(m_window);
+ 
+-      if (!changeFullscreen) {
++      if (!m_presentParams.Windowed) {
+         hr = ChangeDisplayMode(pPresentParams, pFullscreenDisplayMode);
+         if (FAILED(hr))
+           return hr;
+@@ -654,7 +671,7 @@ namespace dxvk {
+ 
+     m_presentParams = *pPresentParams;
+ 
+-    if (changeFullscreen)
++    if (changeFullscreen || changeWindow)
+       SetGammaRamp(0, &m_ramp);
+ 
+     UpdatePresentParameters();
