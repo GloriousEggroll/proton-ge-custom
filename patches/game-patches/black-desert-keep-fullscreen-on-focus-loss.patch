@@ -1,0 +1,127 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] win32u: Keep Black Desert fullscreen across application deactivation.
+
+Black Desert changes its HWND from undecorated fullscreen to a hidden,
+then decorated window when focus leaves the game. The mode restoration
+follows those application-side style changes. This occurs with GE's
+Wine-Wayland build and with Proton Experimental on XWayland, even though
+the same visual symptom in FFXIV is addressed entirely in DXGI.
+
+Add an executable-scoped compatibility policy for blackdesert64.exe:
+when its visible, enabled, non-minimized, undecorated DXGI fullscreen
+window loses foreground to another process, omit WA_INACTIVE and
+WM_ACTIVATEAPP(FALSE) for that window. Keep WM_NCACTIVATE, WM_KILLFOCUS,
+the Wine server's active/foreground/focus changes, cursor unclipping and
+normal reactivation. Do not intercept input events or spoof focus queries.
+
+Gate on Wine's non-empty DXGI present rect rather than monitor-sized
+geometry, so ordinary borderless windows are not included. Application
+hide/minimize, transitions within the game process, windowed mode,
+SetFullscreenState and window destruction remain untouched.
+
+Pair this with DXVK's Black Desert keepFullscreenOnFocusLoss profile;
+otherwise DXGI independently exits fullscreen after foreground loss.
+The FFXIV behavior and all non-Black Desert processes are unchanged.
+
+This is an intentional game-specific behavior override, not a change to
+general Win32 activation semantics. The logs establish the focus-driven
+window transition, but do not identify which activation message the game
+uses; the compatibility policy still requires runtime confirmation.
+
+Set WINE_BLACK_DESERT_KEEP_FULLSCREEN=0 to disable the Wine part. For a
+full baseline comparison also set DXVK_CONFIG="dxgi.keepFullscreenOnFocusLoss = False".
+
+Issue: https://github.com/GloriousEggroll/proton-ge-custom/issues/721
+
+Manual validation (pending; no game launched while preparing this patch):
+- Fullscreen below desktop resolution: Alt+Tab and click another monitor.
+- Return focus, repeat, and confirm fullscreen remains without game input
+  reaching the background game.
+- Explicit windowed, fullscreen-windowed and fullscreen transitions.
+- Minimize/restore, settings dialogs, Alt+F4 and normal exit.
+- Steam overlay open/close and input isolation.
+- Repeat on XWayland and Wine-Wayland; check the launcher is unaffected.
+
+---
+diff --git a/dlls/win32u/input.c b/dlls/win32u/input.c
+--- a/dlls/win32u/input.c
++++ b/dlls/win32u/input.c
+@@ -2049,6 +2049,40 @@
+     return previous;
+ }
+ 
++static BOOL black_desert_keep_fullscreen_on_focus_loss( HWND hwnd )
++{
++    static const WCHAR black_desertW[] =
++        {'b','l','a','c','k','d','e','s','e','r','t','6','4','.','e','x','e',0};
++    static LONG enabled = -1;
++    LONG value = InterlockedCompareExchange( &enabled, -1, -1 );
++    HWND foreground;
++    DWORD style, pid;
++    RECT rect;
++
++    if (value == -1)
++    {
++        const WCHAR *p, *name = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
++        const char *env = getenv( "WINE_BLACK_DESERT_KEEP_FULLSCREEN" );
++
++        if ((p = wcsrchr( name, '/' ))) name = p + 1;
++        if ((p = wcsrchr( name, '\\' ))) name = p + 1;
++        value = !wcsicmp( name, black_desertW ) && (!env || strcmp( env, "0" ));
++        InterlockedCompareExchange( &enabled, value, -1 );
++    }
++    if (!value || !hwnd) return FALSE;
++
++    style = get_window_long( hwnd, GWL_STYLE );
++    if ((style & (WS_VISIBLE | WS_MINIMIZE | WS_CHILD | WS_DISABLED | WS_CAPTION | WS_THICKFRAME))
++        != WS_VISIBLE) return FALSE;
++
++    foreground = NtUserGetForegroundWindow();
++    if (foreground == hwnd) return FALSE;
++    if (foreground && get_window_thread( foreground, &pid ) && pid == GetCurrentProcessId()) return FALSE;
++
++    /* Only cover DXGI exclusive fullscreen, not borderless windows or dialogs. */
++    return get_present_rect( hwnd, &rect, get_thread_dpi() );
++}
++
+ static DWORD get_activateapp_thread_id( HWND hwnd, HWND previous, DWORD old_thread, DWORD new_thread )
+ {
+     if (old_thread || !new_thread || previous)
+@@ -2075,7 +2109,7 @@
+  */
+ BOOL set_active_window( HWND hwnd, HWND *prev, BOOL mouse, BOOL focus, DWORD new_active_thread_id )
+ {
+-    HWND previous = get_active_window();
++    HWND previous = get_active_window(), fullscreen_window;
+     BOOL ret;
+     DWORD old_thread, new_thread;
+     CBTACTIVATESTRUCT cbt;
+@@ -2094,11 +2128,17 @@
+     cbt.hWndActive = previous;
+     if (call_hooks( WH_CBT, HCBT_ACTIVATE, (WPARAM)hwnd, (LPARAM)&cbt, sizeof(cbt) )) return FALSE;
+ 
++    fullscreen_window = !hwnd && black_desert_keep_fullscreen_on_focus_loss( previous ) ? previous : 0;
++    if (fullscreen_window) TRACE( "Keeping Black Desert fullscreen on deactivation of %p\n", previous );
++
+     if (is_window( previous ))
+     {
+         send_message( previous, WM_NCACTIVATE, FALSE, (LPARAM)hwnd );
+-        send_message( previous, WM_ACTIVATE,
+-                      MAKEWPARAM( WA_INACTIVE, is_iconic(previous) ? 0x20 : 0 ), (LPARAM)hwnd );
++        /* Avoid the game's windowed-mode reaction, but still update the real
++         * active/focus state below and deliver WM_KILLFOCUS for input cleanup. */
++        if (previous != fullscreen_window)
++            send_message( previous, WM_ACTIVATE,
++                          MAKEWPARAM( WA_INACTIVE, is_iconic(previous) ? 0x20 : 0 ), (LPARAM)hwnd );
+     }
+ 
+     SERVER_START_REQ( set_active_window )
+@@ -2137,7 +2177,7 @@
+                 if (!new_active_thread_id) new_active_thread_id = new_thread;
+                 for (phwnd = list; *phwnd; phwnd++)
+                 {
+-                    if (get_window_thread( *phwnd, NULL ) == old_thread)
++                    if (get_window_thread( *phwnd, NULL ) == old_thread && *phwnd != fullscreen_window)
+                         send_message( *phwnd, WM_ACTIVATEAPP, 0, new_active_thread_id );
+                 }
+             }

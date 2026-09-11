@@ -1,0 +1,147 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] dxgi: Allow keeping fullscreen presentation on focus loss.
+
+FFXIV shrinks from emulated fullscreen to its saved 1280x720 window when
+focus moves to another monitor. Captures from both XWayland and Wine-Wayland
+show the same sequence: foreground loss, a roughly 100 ms delay, then the
+desktop-mode restore and decorated-window restore. Wine-Wayland keeps the
+3840x2160 fullscreen surface until that restore; it does not initially
+shrink the surface on keyboard leave.
+
+This matches DXGI's foreground-loss occlusion handling, which calls
+SetFullscreenState(FALSE) from Present or GetFullscreenState. With Wine's
+fullscreen emulation that tears down scaling even though the game could
+remain fullscreen in the background.
+
+Add dxgi.keepFullscreenOnFocusLoss, disabled by default, and enable it for
+ffxiv_dx11.exe. Suppress both the implicit fullscreen exit and the
+focus-only DXGI_STATUS_OCCLUDED result, including DXGI_PRESENT_TEST, so an
+application polling presentation does not get an inconsistent state.
+Keep the existing minimized-window handling and do not change explicit
+SetFullscreenState calls, input focus, or D3D9. Continue to defer D3D12
+fullscreen resolution updates while unfocused.
+
+This is a scoped compatibility behavior, not a global change to DXGI's
+fullscreen semantics. Other games can opt in through DXVK_CONFIG for
+comparison without changing Wine or either overlay bridge. Black Desert
+has not yet been validated with this option.
+
+Issue: https://github.com/GloriousEggroll/proton-ge-custom/issues/639
+
+Runtime validation pending:
+- FFXIV: fullscreen 1920x1080 on a 3840x2160 desktop; click another monitor
+  and Alt+Tab out/back. Confirm full-size presentation without game input.
+- Switch to windowed mode explicitly; verify the saved window is restored.
+- Minimize/restore, change fullscreen resolution, and exit normally.
+- Repeat with XWayland and Wine-Wayland, with and without the overlay.
+- Set dxgi.keepFullscreenOnFocusLoss = False to compare the old behavior.
+- Check an unrelated game retains its existing fullscreen-loss behavior.
+
+---
+diff --git a/dxvk.conf b/dxvk.conf
+index 33002dd..254d3fc 100644
+--- a/dxvk.conf
++++ b/dxvk.conf
+@@ -73,6 +73,18 @@
+ # dxgi.deferInitialFullscreen = False
+ 
+ 
++# Keep a non-minimized DXGI fullscreen swapchain when keyboard focus moves
++# to another window. Prevents the automatic desktop-mode and window-size
++# restore from dropping Wine's fullscreen upscaling. Focus and input still
++# belong to the newly activated window.
++# Explicit fullscreen/windowed requests and minimized-window handling remain
++# unchanged. This does not affect D3D9 and is enabled by default for FFXIV.
++#
++# Supported values: True, False
++
++# dxgi.keepFullscreenOnFocusLoss = False
++
++
+ # Enforce a stricter maximum frame latency. Overrides the application
+ # setting specified by calling IDXGIDevice::SetMaximumFrameLatency.
+ # Setting this to 0 will have no effect.
+diff --git a/src/dxgi/dxgi_options.cpp b/src/dxgi/dxgi_options.cpp
+index b5bae6a..d539111 100644
+--- a/src/dxgi/dxgi_options.cpp
++++ b/src/dxgi/dxgi_options.cpp
+@@ -177,6 +177,7 @@ namespace dxvk {
+     // We don't support dcomp swapchains and some games may rely on them failing on creation
+     this->enableDummyCompositionSwapchain = config.getOption<bool>("dxgi.enableDummyCompositionSwapchain", false);
+     this->deferInitialFullscreen = config.getOption<bool>("dxgi.deferInitialFullscreen", false);
++    this->keepFullscreenOnFocusLoss = config.getOption<bool>("dxgi.keepFullscreenOnFocusLoss", false);
+ 
+     // Expose Nvidia GPUs properly if NvAPI is enabled in environment
+     this->hideNvidiaGpu = !isNvapiEnabled();
+diff --git a/src/dxgi/dxgi_options.h b/src/dxgi/dxgi_options.h
+index 69a79f7..17d49fc 100644
+--- a/src/dxgi/dxgi_options.h
++++ b/src/dxgi/dxgi_options.h
+@@ -61,6 +61,9 @@ namespace dxvk {
+     /// Delay an initial fullscreen request until the first real present.
+     bool deferInitialFullscreen;
+ 
++    /// Keep a non-minimized fullscreen swapchain on foreground focus loss.
++    bool keepFullscreenOnFocusLoss;
++
+     /// Limit frame rate
+     int32_t maxFrameRate;
+ 
+diff --git a/src/dxgi/dxgi_swapchain.cpp b/src/dxgi/dxgi_swapchain.cpp
+index ce99ae9..6b2309f 100644
+--- a/src/dxgi/dxgi_swapchain.cpp
++++ b/src/dxgi/dxgi_swapchain.cpp
+@@ -280,7 +280,8 @@ namespace dxvk {
+           IDXGIOutput** ppTarget) {
+     HRESULT hr = S_OK;
+ 
+-    if (!m_is_d3d12 && !m_descFs.Windowed && wsi::isOccluded(m_window))
++    if (!m_is_d3d12 && !m_descFs.Windowed && wsi::isOccluded(m_window)
++     && (!m_factory->GetOptions()->keepFullscreenOnFocusLoss || wsi::isMinimized(m_window)))
+       SetFullscreenState(FALSE, nullptr);
+     if (pFullscreen != nullptr)
+       *pFullscreen = !m_descFs.Windowed;
+@@ -376,10 +377,13 @@ namespace dxvk {
+       }
+     }
+ 
+-    bool occluded = !m_descFs.Windowed && wsi::isOccluded(m_window) && !wsi::isMinimized(m_window);
+-
+     auto options = m_factory->GetOptions();
+ 
++    // Wine can keep presenting fullscreen without owning keyboard focus.
++    // Do not report focus-only occlusion when preserving that presentation.
++    bool focusLost = !m_descFs.Windowed && wsi::isOccluded(m_window) && !wsi::isMinimized(m_window);
++    bool occluded = focusLost && !options->keepFullscreenOnFocusLoss;
++
+     if (options->syncInterval >= 0)
+       SyncInterval = options->syncInterval;
+ 
+@@ -391,7 +395,7 @@ namespace dxvk {
+     std::lock_guard<dxvk::recursive_mutex> lockWin(m_lockWindow);
+     HRESULT hr = S_OK;
+ 
+-    if (!(PresentFlags & DXGI_PRESENT_TEST) && !occluded && !wsi::isMinimized(m_window))
++    if (!(PresentFlags & DXGI_PRESENT_TEST) && !focusLost && !wsi::isMinimized(m_window))
+       UpdateFullscreenResolution();
+ 
+     if (wsi::isWindow(m_window) || !m_window) {
+diff --git a/src/util/config/config.cpp b/src/util/config/config.cpp
+index f45c102..e907567 100644
+--- a/src/util/config/config.cpp
++++ b/src/util/config/config.cpp
+@@ -293,10 +293,12 @@ namespace dxvk {
+     { R"(\\MarySkelter2\.exe$)", {{
+       { "d3d11.disableMsaa",                "True" },
+     }} },
+-    /* Final Fantasy XIV: Uses lots of HVV and    *
+-     * also reads some uncached memory.           */
++    /* Final Fantasy XIV: Uses lots of HVV and reads uncached memory.
++     * Keep fullscreen on focus loss instead of restoring the saved small
++     * window, which drops Wine's fullscreen upscaling when using another monitor. */
+     { R"(\\ffxiv_dx11\.exe$)", {{
+       { "d3d11.cachedDynamicResources",       "vi" },
++      { "dxgi.keepFullscreenOnFocusLoss",   "True" },
+     }} },
+     /* Final Fantasy XV: VXAO does thousands of   *
+      * draw calls with the same UAV bound         */

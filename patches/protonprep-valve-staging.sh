@@ -24,6 +24,10 @@ apply_all_in_dir() {
     patch -Np1 < ../patches/dxvk/layered-overlay-dxvk.patch
     apply_patch "../patches/dxvk/dxgi-defer-initial-fullscreen-for-probe-swapchains.patch"
     apply_patch "../patches/dxvk/dxgi-follow-d3d12-fullscreen-client-resizes.patch"
+    # FFXIV: keep emulated fullscreen when focus moves to another window (#639).
+    apply_patch "../patches/dxvk/dxgi-keep-fullscreen-on-focus-loss.patch"
+    # Black Desert also needs the matching Wine activation compatibility patch below.
+    apply_patch "../patches/dxvk/black-desert-keep-fullscreen-on-focus-loss.patch"
     popd
 
     pushd vkd3d-proton
@@ -263,6 +267,10 @@ apply_all_in_dir() {
 
     echo "WINE: -GAME FIXES- add fixes Guilty Gear Accent Core Plus R intro video (win32u related)"
     apply_patch "../patches/game-patches/0001-win32u-Avoid-zero-WM_ACTIVATEAPP-lparam-on-first-for.patch"
+
+    # https://github.com/GloriousEggroll/proton-ge-custom/issues/721
+    echo "WINE: -GAME FIXES- keep Black Desert fullscreen on focus loss"
+    apply_patch "../patches/game-patches/black-desert-keep-fullscreen-on-focus-loss.patch"
 
     echo "WINE: -GAME FIXES- make MapleStory launch: avoid NULL deref in CharPrevA/CharPrevExA"
     apply_patch "../patches/game-patches/maplestory-kernelbase-charprev-null.patch"
