@@ -282,6 +282,11 @@ apply_all_in_dir() {
     echo "WINE: -GAME FIXES- allow AI LIMIT DX12 to reuse its packaged compute shaders"
     apply_patch "../patches/game-patches/ai-limit-dx12-compute-shader-fallback.patch"
 
+    # Original CPU detection diagnosis and fix by LuigoAlma:
+    # https://www.reddit.com/r/Amd/comments/dr5f0b/comment/f6q2krp/
+    echo "WINE: -GAME FIXES- fix Max Payne JPEG loading on modern CPUs"
+    apply_patch "../patches/game-patches/max-payne-cpu-detection.patch"
+
     echo "WINE: -GAME FIXES- repair NASCAR 25 protected loader state"
     apply_patch "../patches/game-patches/nascar25-protector.patch"
 

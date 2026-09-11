@@ -1,0 +1,107 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] ntdll: Fix Max Payne's truncated CPUID leaf count.
+
+Max Payne's rlmfc.dll masks CPUID(0).EAX with 0x0f. On CPUs reporting
+a maximum basic leaf of 0x10, including the local Ryzen 7 9800X3D,
+this skips feature detection and selects a broken scalar path. Loading
+a new game then produces repeated JPEG corruption dialogs.
+
+Original diagnosis and instruction-level fix by LuigoAlma:
+https://www.reddit.com/r/Amd/comments/dr5f0b/comment/f6q2krp/
+https://github.com/luigoalma/maxpayne-grphmfc-jpg-patcher
+
+Apply the correction only to the loaded image, before its initialization,
+without modifying installed game files or replacing the JPEG decoder.
+Use TEST EAX,EAX; NOP instead of AND EAX,0x0f to preserve the full leaf
+count and explicitly set the zero flag for the following branch.
+
+Restrict this to maxpayne.exe and the inspected 32-bit rlmfc.dll using
+image metadata and the complete relocation-free CPUID(0) sequence.
+Unknown and already patched DLL versions remain untouched. Restore
+page protection and flush the instruction cache after the change.
+---
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -1904,6 +1904,74 @@
+ static void patch_ai_limit_compute_shaders( WINE_MODREF *wm ) {}
+ #endif
+ 
++#ifdef __i386__
++static void patch_max_payne_cpu_detection( WINE_MODREF *wm )
++{
++    static const BYTE expected[] =
++    {
++        0x66, 0x60, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x0f, 0xa2,
++        0x89, 0x45, 0xdc, 0x88, 0x5d, 0xc0, 0x88, 0x7d, 0xc1,
++        0xc1, 0xeb, 0x10, 0x88, 0x5d, 0xc2, 0x88, 0x7d, 0xc3,
++        0x88, 0x55, 0xc4, 0x88, 0x75, 0xc5, 0xc1, 0xea, 0x10,
++        0x88, 0x55, 0xc6, 0x88, 0x75, 0xc7, 0x88, 0x4d, 0xc8,
++        0x88, 0x6d, 0xc9, 0xc1, 0xe9, 0x10, 0x88, 0x4d, 0xca,
++        0x88, 0x6d, 0xcb, 0xc6, 0x45, 0xcc, 0x00, 0x85, 0xc0,
++        0x66, 0x61, 0x8b, 0x45, 0xdc, 0x83, 0xe0, 0x0f,
++        0x89, 0x45, 0xdc, 0x0f, 0x84, 0x92, 0x12, 0x00, 0x00,
++        0x83, 0xf8, 0x01, 0x72, 0x38, 0x66, 0x60,
++    };
++    static const BYTE replacement[] = {0x85, 0xc0, 0x90}; /* test eax,eax; nop */
++    BYTE *base = wm->ldr.DllBase, *target;
++    const WCHAR *app, *p;
++    void *address;
++    SIZE_T size;
++    ULONG old_protect, unused;
++    NTSTATUS status;
++
++    if ((wm->ldr.Flags & LDR_WINE_INTERNAL) || wcsicmp( wm->ldr.BaseDllName.Buffer, L"rlmfc.dll" )) return;
++    app = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
++    if ((p = wcsrchr( app, '\\' ))) app = p + 1;
++    if ((p = wcsrchr( app, '/' ))) app = p + 1;
++    if (wcsicmp( app, L"maxpayne.exe" )) return;
++
++    /* LuigoAlma identified the erroneous CPUID(0).EAX & 0xf test in rlmfc.
++     * Keep the full leaf count so 0x10 does not select the broken scalar path.
++     * Verify the relocation-free instruction sequence before changing it. */
++    if (wm->ldr.TimeDateStamp != 0x3c03ab3e || wm->ldr.SizeOfImage != 0x67000 ||
++        RtlImageNtHeader( wm->ldr.DllBase )->FileHeader.Machine != IMAGE_FILE_MACHINE_I386 ||
++        memcmp( base + 0x256a9, expected, sizeof(expected) ))
++    {
++        TRACE_(loaddll)("Max Payne: skipping CPU detection fix for an unrecognized rlmfc.dll.\n");
++        return;
++    }
++
++    target = base + 0x256ed;
++    address = target;
++    size = sizeof(replacement);
++    status = NtProtectVirtualMemory( NtCurrentProcess(), &address, &size, PAGE_EXECUTE_READWRITE, &old_protect );
++    if (status) goto failed;
++    /* Called under the loader lock, before rlmfc's TLS callbacks or DllMain. */
++    memcpy( target, replacement, sizeof(replacement) );
++    status = NtFlushInstructionCache( NtCurrentProcess(), target, sizeof(replacement) );
++    if (!status)
++        status = NtProtectVirtualMemory( NtCurrentProcess(), &address, &size, old_protect, &unused );
++    if (status)
++    {
++        memcpy( target, expected + 0x256ed - 0x256a9, sizeof(replacement) );
++        NtFlushInstructionCache( NtCurrentProcess(), target, sizeof(replacement) );
++        NtProtectVirtualMemory( NtCurrentProcess(), &address, &size, old_protect, &unused );
++        goto failed;
++    }
++    TRACE_(loaddll)("Max Payne: fixed rlmfc.dll CPU detection for JPEG loading.\n");
++    return;
++
++failed:
++    WARN_(loaddll)("Max Payne: could not fix rlmfc.dll CPU detection, status %#lx.\n", status);
++}
++#else
++static void patch_max_payne_cpu_detection( WINE_MODREF *wm ) {}
++#endif
++
+ /*************************************************************************
+  *              MODULE_InitDLL
+  */
+@@ -1919,6 +1987,7 @@
+ 
+     if (wm->ldr.Flags & (LDR_DONT_RESOLVE_REFS | LDR_DONT_CALL_DLLMAIN)) return STATUS_SUCCESS;
+     if (reason == DLL_PROCESS_ATTACH) patch_ai_limit_compute_shaders( wm );
++    if (reason == DLL_PROCESS_ATTACH) patch_max_payne_cpu_detection( wm );
+     if (wm->ldr.TlsIndex == -1) call_tls_callbacks( wm->ldr.DllBase, reason );
+     if (!entry) return STATUS_SUCCESS;
+ 
