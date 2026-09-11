@@ -427,6 +427,9 @@ apply_all_in_dir() {
     echo "WINE: -PERF- read QueryPerformanceCounter from the TSC in user mode (DCS World: 39 -> 62 FPS)"
     apply_patch "../patches/proton/0001-ntdll-Read-QueryPerformanceCounter-from-the-TSC-in-us.patch"
 
+    echo "WINE: implement IOCTL_SERIAL_GET_DTRRTS (Qt serial device tools, e.g. MOZA Cockpit)"
+    apply_patch "../patches/proton/0001-ntdll-Implement-IOCTL_SERIAL_GET_DTRRTS-for-serial-dev.patch"
+
     echo "WINE: -HOTFIX- Implement GE-Proton ffmpeg + winedmo only video playback rework patches"
     apply_all_in_dir "../patches/ge-video-rework/"
 
