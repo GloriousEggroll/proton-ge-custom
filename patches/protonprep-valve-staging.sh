@@ -28,6 +28,8 @@ apply_all_in_dir() {
     apply_patch "../patches/dxvk/dxgi-keep-fullscreen-on-focus-loss.patch"
     # Black Desert also needs the matching Wine activation compatibility patch below.
     apply_patch "../patches/dxvk/black-desert-keep-fullscreen-on-focus-loss.patch"
+    # Painkiller: Reset must apply fullscreen to the new device window (#579).
+    apply_patch "../patches/dxvk/d3d9-update-device-window-on-reset.patch"
     popd
 
     pushd vkd3d-proton
@@ -286,6 +288,11 @@ apply_all_in_dir() {
     # https://www.reddit.com/r/Amd/comments/dr5f0b/comment/f6q2krp/
     echo "WINE: -GAME FIXES- fix Max Payne JPEG loading on modern CPUs"
     apply_patch "../patches/game-patches/max-payne-cpu-detection.patch"
+
+    # https://github.com/GloriousEggroll/proton-ge-custom/issues/587
+    # https://bugs.winehq.org/show_bug.cgi?id=60296
+    echo "WINE: -GAME FIXES- restore Return to Krondor text bitmap readback"
+    apply_patch "../patches/game-patches/return-to-krondor-text-bitmap-readback.patch"
 
     echo "WINE: -GAME FIXES- repair NASCAR 25 protected loader state"
     apply_patch "../patches/game-patches/nascar25-protector.patch"
