@@ -1,0 +1,103 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Fri, 11 Sep 2026 00:45:00 -0400
+Subject: [PATCH] winewayland: Hide thin frames around fullscreen clients.
+
+Dragon Age: Inquisition retains WS_POPUP | WS_BORDER in windowed fullscreen
+and positions its 3842x2162 window at (-1,-1), leaving a 3840x2160 client
+at the monitor origin. WS_CAPTION includes WS_BORDER, so rejecting any
+caption bit prevents this window from entering the Wayland fullscreen
+state. The compositor then places the outer frame on screen and exposes
+its top and left edges.
+
+Recognize a thin-bordered popup only when win32u already classifies its
+rectangle as fullscreen and its client size matches the monitor. Continue
+to reject captioned, resizable and child windows on this path.
+
+For a fullscreen client matching the compositor's configured size, use
+the client subregion as xdg window geometry, including its surface-local
+origin. Keep the Win32 rectangles and buffer/input coordinates unchanged;
+do not stretch the image over the frame or strip the application's styles.
+Leave the existing geometry policy for other window states unchanged.
+
+---
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -179,6 +179,9 @@
+ 
+ static BOOL wayland_win_data_is_fullscreen(struct wayland_win_data *data, DWORD style)
+ {
++    const RECT *client = &data->rects.client;
++    MONITORINFO mi;
++    HMONITOR monitor;
+     RECT rect;
+ 
+     if (!data->is_fullscreen) return FALSE;
+@@ -186,7 +189,21 @@
+         (style & (WS_MAXIMIZE | WS_THICKFRAME)) == (WS_MAXIMIZE | WS_THICKFRAME))
+         return FALSE;
+     if (NtUserGetPresentRect(data->hwnd, &rect, -1)) return TRUE;
+-    return !(style & (WS_CAPTION | WS_THICKFRAME));
++    if (!(style & (WS_CAPTION | WS_THICKFRAME))) return TRUE;
++
++    /* Some games retain a thin border outside a monitor-sized client area
++     * in windowed fullscreen mode (e.g. Dragon Age: Inquisition). */
++    if ((style & (WS_CHILD | WS_POPUP | WS_CAPTION | WS_THICKFRAME)) !=
++        (WS_POPUP | WS_BORDER))
++        return FALSE;
++
++    mi.cbSize = sizeof(mi);
++    if (!(monitor = NtUserMonitorFromRect(&data->rects.window, MONITOR_DEFAULTTONEAREST)) ||
++        !NtUserGetMonitorInfo(monitor, &mi))
++        return FALSE;
++
++    return client->right - client->left == mi.rcMonitor.right - mi.rcMonitor.left &&
++           client->bottom - client->top == mi.rcMonitor.bottom - mi.rcMonitor.top;
+ }
+ 
+ static BOOL wayland_win_data_get_pending_config_state(struct wayland_win_data *data,
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -2492,12 +2492,26 @@
+ static void wayland_surface_reconfigure_geometry(struct wayland_surface *surface, RECT rect)
+ {
+     const RECT *current = &surface->current.rect;
++    const RECT *client = &surface->window.client_rect;
++    BOOL fullscreen_client = (surface->current.state & surface->window.state &
++                             WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
++                            !IsRectEmpty(client) &&
++                            client->right - client->left == current->right - current->left &&
++                            client->bottom - client->top == current->bottom - current->top;
++
++    /* Keep a fullscreen client's thin frame outside the visible geometry.
++     * Preserve surface-local coordinates for both buffers and pointer input. */
++    if (fullscreen_client)
++    {
++        rect = *client;
++        OffsetRect(&rect, -surface->window.rect.left, -surface->window.rect.top);
++    }
+     /* If the window size is bigger than the current state accepts, use the
+      * largest visible (from Windows' perspective) subregion of the window. */
+-    if ((surface->current.state & (WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED |
+-                                   WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN)) &&
+-        (rect.right - rect.left > current->right - current->left ||
+-         rect.bottom - rect.top > current->bottom - current->top))
++    else if ((surface->current.state & (WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED |
++                                       WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN)) &&
++             (rect.right - rect.left > current->right - current->left ||
++              rect.bottom - rect.top > current->bottom - current->top))
+     {
+         wayland_surface_get_rect_in_monitor(surface, &rect);
+ 
+@@ -2526,7 +2540,9 @@
+     {
+         int width = rect.right - rect.left, height = rect.bottom - rect.top;
+ 
+-        xdg_surface_set_window_geometry(surface->xdg_surface, 0, 0, width, height);
++        xdg_surface_set_window_geometry(surface->xdg_surface,
++                                        fullscreen_client ? rect.left : 0,
++                                        fullscreen_client ? rect.top : 0, width, height);
+         surface->geometry = rect;
+         /* min/max size are toplevel-only. xdg_popup aliases xdg_toplevel in the union. */
+         if (!wayland_surface_is_toplevel(surface)) return;
