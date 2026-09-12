@@ -318,6 +318,14 @@ apply_all_in_dir() {
     echo "WINE: -HOTFIX- Reject unsupported NCrypt-only private-key requests"
     apply_patch "../patches/wine-hotfixes/pending/crypt32-reject-ncrypt-only-private-keys.patch"
 
+    # Warcraft III 3.0: modern CERT_CHAIN_ENGINE_CONFIG used by ClientSdk login.
+    # Upstream Wine fixes for #59531 and the legacy-layout regression #59600.
+    apply_patch "../patches/wine-hotfixes/pending/crypt32-wc3-modern-chain-engine-config.patch"
+    apply_patch "../patches/wine-hotfixes/pending/crypt32-wc3-trace-chain-engine-config.patch"
+    apply_patch "../patches/wine-hotfixes/pending/crypt32-wc3-check-exclusive-flags-size.patch"
+    apply_patch "../patches/wine-hotfixes/pending/crypt32-wc3-accept-legacy-chain-engine-config.patch"
+    apply_patch "../patches/wine-hotfixes/pending/crypt32-wc3-preserve-exclusive-root-and-test-layouts.patch"
+
     echo "WINE: -HOTFIX- Add GetFileVersionInfoByHandle version export stub"
     apply_patch "../patches/wine-hotfixes/pending/version-GetFileVersionInfoByHandle-stub.patch"
 
