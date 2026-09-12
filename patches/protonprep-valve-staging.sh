@@ -318,6 +318,9 @@ apply_all_in_dir() {
     echo "WINE: -HOTFIX- Reject unsupported NCrypt-only private-key requests"
     apply_patch "../patches/wine-hotfixes/pending/crypt32-reject-ncrypt-only-private-keys.patch"
 
+    echo "WINE: -HOTFIX- Accept the current 88-byte CERT_CHAIN_ENGINE_CONFIG (Warcraft III: Reforged 3.0 login)"
+    apply_patch "../patches/wine-hotfixes/pending/crypt32-accept-88-byte-cert-chain-engine-config.patch"
+
     echo "WINE: -HOTFIX- Add GetFileVersionInfoByHandle version export stub"
     apply_patch "../patches/wine-hotfixes/pending/version-GetFileVersionInfoByHandle-stub.patch"
 
