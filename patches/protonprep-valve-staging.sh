@@ -300,6 +300,11 @@ apply_all_in_dir() {
 ### END GAME PATCH SECTION ###
 
 ### (2-5) WINE HOTFIX/BACKPORT SECTION ###
+    # https://bugs.winehq.org/show_bug.cgi?id=59600
+    # Warcraft III 3.0 uses the current 88-byte CERT_CHAIN_ENGINE_CONFIG.
+    echo "WINE: -HOTFIX- Accept current certificate chain engine configuration layouts"
+    apply_all_in_dir "../patches/wine-hotfixes/crypt32-chain-engine-config/"
+
     echo "WINE: -HOTFIX- Fix Smart Tee negotiation and V4L WoW64 media type marshaling"
     apply_all_in_dir "../patches/wine-hotfixes/qcap-dshow-fixes/"
 
