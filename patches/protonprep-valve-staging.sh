@@ -77,10 +77,11 @@ apply_all_in_dir() {
         lsteamclient/Makefile.in \
         lsteamclient/gen_wrapper.py \
         lsteamclient/steam_input_manual.c \
+        lsteamclient/steamclient_main.c \
         lsteamclient/steamclient_private.h \
         lsteamclient/winISteamInput.c
 
-    echo "LSTEAMCLIENT: add XInput-backed Steam Input fallback"
+    echo "LSTEAMCLIENT: apply Steam Input and initialization fixes"
     apply_all_in_dir "patches/lsteamclient"
 
 ### (2) WINE PATCHING ###
