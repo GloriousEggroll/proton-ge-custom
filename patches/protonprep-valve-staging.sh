@@ -337,6 +337,12 @@ apply_all_in_dir() {
     echo "WINE: -HOTFIX- Keep Steam's OpenGL overlay on visual-compatible X11 drawables"
     apply_patch "../patches/wine-hotfixes/pending/winex11-use-x11-drawables-for-steam-opengl-overlay.patch"
 
+    echo "WINE: -HOTFIX- Keep Forza background windows unmapped on wlroots"
+    apply_patch "../patches/wine-hotfixes/pending/winex11-keep-forza-background-windows-unmapped-on-wlroots.patch"
+
+    echo "WINE: -HOTFIX- Share selected cursor images across processes"
+    apply_patch "../patches/wine-hotfixes/pending/win32u-share-selected-cursors-across-processes.patch"
+
     echo "WINE: -HOTFIX- Limit the extra Vulkan swapchain image workaround to DOOM"
     apply_patch "../patches/wine-hotfixes/pending/win32u-limit-extra-swapchain-image-to-doom.patch"
 
