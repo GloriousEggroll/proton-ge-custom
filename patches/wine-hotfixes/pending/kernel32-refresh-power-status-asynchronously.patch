@@ -1,0 +1,155 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Mon, 14 Sep 2026 16:00:00 -0600
+Subject: [PATCH] kernel32: Refresh system power status asynchronously.
+
+Diablo IV periodically stalls its main thread while reading Linux power
+supply attributes on an AMD Ryzen Z2 handheld. Read-only /proc sampling
+caught multi-second reads of BAT0/status in acpi_battery_get_state, with
+render workers waiting and no GPU work being submitted. ACAD/online was
+also queried on the main thread. Disabling NTSYNC did not prevent the
+stalls.
+
+GetSystemPowerStatus currently calls NtPowerInformation synchronously,
+which reads these sysfs attributes. Move that query to a threadpool worker
+and return a locked snapshot instead. Limit refreshes to one outstanding
+query and at most one attempt per five seconds after completion. Do not
+hold the snapshot lock during hardware I/O or work-item submission, and
+rate-limit retries when submission fails.
+
+Before the first query completes, keep the documented unknown fields
+rather than inventing AC power or an absent battery. Subsequent calls use
+real queried battery data; refreshes are demand-driven. Direct callers of
+NtPowerInformation are unchanged.
+
+Add concurrent power-status queries checking the returned field ranges.
+This does not emulate slow ACPI firmware; validation of the freeze fix
+still requires the affected hardware.
+
+---
+diff --git a/dlls/kernel32/powermgnt.c b/dlls/kernel32/powermgnt.c
+index c4bd97553fe..55f91061c89 100644
+--- a/dlls/kernel32/powermgnt.c
++++ b/dlls/kernel32/powermgnt.c
+@@ -29,6 +29,55 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(powermgnt);
+ 
++static RTL_SRWLOCK battery_lock = RTL_SRWLOCK_INIT;
++static SYSTEM_BATTERY_STATE battery_state;
++static NTSTATUS battery_status = STATUS_NOT_IMPLEMENTED;
++static ULONGLONG battery_refresh_time;
++static BOOL battery_update_pending;
++
++static DWORD WINAPI update_battery_state(void *arg)
++{
++    SYSTEM_BATTERY_STATE bs;
++    NTSTATUS status;
++
++    /* Sysfs battery reads can wait several seconds for ACPI firmware. */
++    status = NtPowerInformation(SystemBatteryState, NULL, 0, &bs, sizeof(bs));
++
++    RtlAcquireSRWLockExclusive(&battery_lock);
++    if (!status) battery_state = bs;
++    battery_status = status;
++    battery_refresh_time = GetTickCount64() + 5000;
++    battery_update_pending = FALSE;
++    RtlReleaseSRWLockExclusive(&battery_lock);
++    return 0;
++}
++
++static NTSTATUS get_cached_battery_state(SYSTEM_BATTERY_STATE *bs)
++{
++    NTSTATUS status;
++    BOOL update;
++
++    RtlAcquireSRWLockExclusive(&battery_lock);
++    *bs = battery_state;
++    status = battery_status;
++    update = !battery_update_pending && GetTickCount64() >= battery_refresh_time;
++    if (update)
++    {
++        battery_update_pending = TRUE;
++        /* Rate-limit retries if queuing the worker fails. */
++        battery_refresh_time = GetTickCount64() + 5000;
++    }
++    RtlReleaseSRWLockExclusive(&battery_lock);
++
++    if (update && !QueueUserWorkItem(update_battery_state, NULL, WT_EXECUTELONGFUNCTION))
++    {
++        RtlAcquireSRWLockExclusive(&battery_lock);
++        battery_update_pending = FALSE;
++        RtlReleaseSRWLockExclusive(&battery_lock);
++    }
++    return status;
++}
++
+ /******************************************************************************
+  *           GetDevicePowerState   (KERNEL32.@)
+  */
+@@ -55,7 +104,7 @@ BOOL WINAPI GetSystemPowerStatus(LPSYSTEM_POWER_STATUS ps)
+     ps->BatteryLifeTime     = BATTERY_LIFE_UNKNOWN;
+     ps->BatteryFullLifeTime = BATTERY_LIFE_UNKNOWN;
+ 
+-    status = NtPowerInformation(SystemBatteryState, NULL, 0, &bs, sizeof(bs));
++    status = get_cached_battery_state(&bs);
+     if (status == STATUS_NOT_IMPLEMENTED) return TRUE;
+     if (FAILED(status)) return FALSE;
+ 
+diff --git a/dlls/kernel32/tests/power.c b/dlls/kernel32/tests/power.c
+index 900362a4a45..724aacbca10 100644
+--- a/dlls/kernel32/tests/power.c
++++ b/dlls/kernel32/tests/power.c
+@@ -77,7 +77,52 @@ void test_GetSystemPowerStatus(void)
+     }
+ }
+ 
++static DWORD WINAPI power_status_thread(void *arg)
++{
++    SYSTEM_POWER_STATUS ps;
++    unsigned int i;
++    BOOL ret;
++
++    for (i = 0; i < 8; ++i)
++    {
++        memset(&ps, 0x23, sizeof(ps));
++        ret = GetSystemPowerStatus(&ps);
++        ok(ret, "GetSystemPowerStatus failed, error %lu\n", GetLastError());
++        if (!ret) continue;
++
++        ok(ps.ACLineStatus == AC_LINE_OFFLINE || ps.ACLineStatus == AC_LINE_ONLINE ||
++           ps.ACLineStatus == AC_LINE_UNKNOWN, "Unexpected ACLineStatus %u\n", ps.ACLineStatus);
++        ok(ps.BatteryLifePercent <= 100 || ps.BatteryLifePercent == BATTERY_PERCENTAGE_UNKNOWN,
++           "Unexpected BatteryLifePercent %u\n", ps.BatteryLifePercent);
++        ok(ps.BatteryFlag == BATTERY_FLAG_UNKNOWN ||
++           !(ps.BatteryFlag & ~(BATTERY_FLAG_HIGH | BATTERY_FLAG_LOW | BATTERY_FLAG_CRITICAL |
++                               BATTERY_FLAG_CHARGING | BATTERY_FLAG_NO_BATTERY)),
++           "Unexpected BatteryFlag %#x\n", ps.BatteryFlag);
++        ok(ps.SystemStatusFlag <= 1, "Unexpected SystemStatusFlag %u\n", ps.SystemStatusFlag);
++    }
++    return 0;
++}
++
++static void test_concurrent_power_status(void)
++{
++    HANDLE threads[4];
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(threads); ++i)
++    {
++        threads[i] = CreateThread(NULL, 0, power_status_thread, NULL, 0, NULL);
++        ok(!!threads[i], "CreateThread failed, error %lu\n", GetLastError());
++    }
++    for (i = 0; i < ARRAY_SIZE(threads); ++i)
++    {
++        if (!threads[i]) continue;
++        WaitForSingleObject(threads[i], INFINITE);
++        CloseHandle(threads[i]);
++    }
++}
++
+ START_TEST(power)
+ {
+     test_GetSystemPowerStatus();
++    test_concurrent_power_status();
+ }
