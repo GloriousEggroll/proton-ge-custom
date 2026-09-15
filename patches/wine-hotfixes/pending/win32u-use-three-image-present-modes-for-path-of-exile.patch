@@ -1,0 +1,213 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Tue, 15 Sep 2026 13:45:00 -0600
+Subject: [PATCH] win32u: Use three-image present modes for Path of Exile on Wayland.
+
+Both Path of Exile and Path of Exile 2 abort their native Vulkan renderer
+with "unsupported backbuffer image count" during swapchain initialization.
+Their September 15 client logs show the error before the secondary Wine
+vkDestroyQueryPool fault during exception cleanup. The first game's
+swapchain initializer compares its configured image count with both legacy
+VkSurfaceCapabilitiesKHR image-count limits before vkCreateSwapchainKHR.
+
+Mesa's Wayland WSI may advertise a conservative four-image legacy minimum,
+while its per-present-mode capabilities allow three images for FIFO and
+IMMEDIATE. Both reproductions have triple buffering enabled.
+
+Reuse the existing Hades maintenance1 path for these games. Query the host
+per-mode limits, and only expose the three-image compatibility range if
+the device supports it. Declare the chosen mode on the host swapchain to
+avoid the legacy image-count bump; fall back to FIFO only when the requested
+mode cannot support three images. Do not hide host images or remap indices.
+
+Match the shared Steam and standalone executable names case-insensitively,
+and exclude DXVK/vkd3d instances (including D3D capability probes inside a
+native Vulkan process). Preserve Hades' TheForge-only match and the existing
+Wayland/host-extension/feature gates. Rename the Hades-specific helpers to
+reflect their shared purpose. X11 and other games remain unchanged.
+
+Apply after win32u-use-three-image-present-modes-for-hades-wayland.patch.
+No game files or renderer settings are modified.
+---
+diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -141,7 +141,7 @@
+ {
+     struct vulkan_instance obj;
+     BOOL enable_win32_surface;
+-    BOOL hades_present_modes;
++    BOOL three_image_present_modes;
+ 
+     struct list utils_messengers;
+     struct list report_callbacks;
+@@ -1143,15 +1143,31 @@
+     }
+ }
+ 
+-static BOOL is_hades(void)
++static BOOL needs_three_image_present_modes( const VkApplicationInfo *info )
+ {
+     static const WCHAR hadesW[] = {'H','a','d','e','s','.','e','x','e',0};
++    static const WCHAR path_of_exileW[] =
++        {'P','a','t','h','O','f','E','x','i','l','e','.','e','x','e',0};
++    static const WCHAR path_of_exile_steamW[] =
++        {'P','a','t','h','O','f','E','x','i','l','e','S','t','e','a','m','.','e','x','e',0};
++    static const WCHAR path_of_exile_x64W[] =
++        {'P','a','t','h','O','f','E','x','i','l','e','_','x','6','4','.','e','x','e',0};
++    static const WCHAR path_of_exile_x64_steamW[] =
++        {'P','a','t','h','O','f','E','x','i','l','e','_','x','6','4','S','t','e','a','m','.','e','x','e',0};
++    const char *engine = info ? info->pEngineName : NULL;
+     const WCHAR *p, *name = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
+ 
+     if (!name) return FALSE;
+     if ((p = wcsrchr( name, '/' ))) name = p + 1;
+     if ((p = wcsrchr( name, '\\' ))) name = p + 1;
+-    return !wcsicmp( name, hadesW );
++
++    if (!wcsicmp( name, hadesW )) return engine && !strcmp( engine, "TheForge" );
++
++    /* Both Path of Exile games use these executable names. Only their native
++     * Vulkan renderer needs this; leave D3D renderer and capability probes alone. */
++    if (engine && (!strcmp( engine, "DXVK" ) || !strcmp( engine, "vkd3d" ))) return FALSE;
++    return !wcsicmp( name, path_of_exileW ) || !wcsicmp( name, path_of_exile_steamW ) ||
++           !wcsicmp( name, path_of_exile_x64W ) || !wcsicmp( name, path_of_exile_x64_steamW );
+ }
+ 
+ static VkResult convert_instance_create_info( struct mempool *pool, VkInstanceCreateInfo *info, struct instance *instance )
+@@ -1199,14 +1215,13 @@
+         instance->obj.extensions.has_VK_EXT_surface_maintenance1 = 1;
+     if (vulkan_funcs.host_extensions.has_VK_KHR_get_physical_device_properties2)
+         instance->obj.extensions.has_VK_KHR_get_physical_device_properties2 = 1;
+-    if (is_hades() && info->pApplicationInfo && info->pApplicationInfo->pEngineName &&
+-        !strcmp( info->pApplicationInfo->pEngineName, "TheForge" ) &&
++    if (needs_three_image_present_modes( info->pApplicationInfo ) &&
+         instance->obj.extensions.has_VK_KHR_wayland_surface &&
+         vulkan_funcs.host_extensions.has_VK_KHR_get_physical_device_properties2 &&
+         vulkan_funcs.host_extensions.has_VK_KHR_get_surface_capabilities2 &&
+         vulkan_funcs.host_extensions.has_VK_EXT_surface_maintenance1)
+     {
+-        instance->hades_present_modes = TRUE;
++        instance->three_image_present_modes = TRUE;
+         instance->obj.extensions.has_VK_KHR_get_surface_capabilities2 = 1;
+         instance->obj.extensions.has_VK_EXT_surface_maintenance1 = 1;
+     }
+@@ -1502,14 +1517,14 @@
+     if (next > str) add_device_extension( str, next - str, extensions );
+ }
+ 
+-static BOOL use_hades_present_modes( struct vulkan_physical_device *physical_device )
++static BOOL use_three_image_present_modes( struct vulkan_physical_device *physical_device )
+ {
+     struct vulkan_instance *instance = physical_device->instance;
+     VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT maintenance =
+         {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT};
+     VkPhysicalDeviceFeatures2 features = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &maintenance};
+ 
+-    if (!CONTAINING_RECORD( instance, struct instance, obj )->hades_present_modes ||
++    if (!CONTAINING_RECORD( instance, struct instance, obj )->three_image_present_modes ||
+         !physical_device->extensions.has_VK_EXT_swapchain_maintenance1 ||
+         !instance->p_vkGetPhysicalDeviceFeatures2KHR || !instance->p_vkGetPhysicalDeviceSurfaceCapabilities2KHR)
+         return FALSE;
+@@ -1573,7 +1588,7 @@
+         physical_device->extensions.has_VK_EXT_swapchain_maintenance1)
+         device->extensions.has_VK_EXT_swapchain_maintenance1 = 1;
+ 
+-    if (device->extensions.has_VK_KHR_swapchain && use_hades_present_modes( physical_device ))
++    if (device->extensions.has_VK_KHR_swapchain && use_three_image_present_modes( physical_device ))
+     {
+         VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT *maintenance;
+ 
+@@ -2582,7 +2597,7 @@
+     capabilities->currentExtent.height = client_rect.bottom - client_rect.top;
+ }
+ 
+-static BOOL get_hades_surface_capabilities( struct vulkan_physical_device *physical_device, struct surface *surface,
++static BOOL get_three_image_surface_capabilities( struct vulkan_physical_device *physical_device, struct surface *surface,
+                                              VkPresentModeKHR present_mode, VkSurfaceCapabilitiesKHR *capabilities )
+ {
+     struct vulkan_instance *instance = physical_device->instance;
+@@ -2591,7 +2606,7 @@
+                                           .pNext = &mode, .surface = surface->obj.host.surface};
+     VkSurfaceCapabilities2KHR caps = {.sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR};
+ 
+-    if (!use_hades_present_modes( physical_device )) return FALSE;
++    if (!use_three_image_present_modes( physical_device )) return FALSE;
+     if (instance->p_vkGetPhysicalDeviceSurfaceCapabilities2KHR( physical_device->host.physical_device, &info, &caps ))
+         return FALSE;
+     if (caps.surfaceCapabilities.minImageCount > 3 ||
+@@ -2608,15 +2623,15 @@
+     struct vulkan_physical_device *physical_device = vulkan_physical_device_from_handle( client_physical_device );
+     struct surface *surface = surface_from_handle( client_surface );
+     struct vulkan_instance *instance = physical_device->instance;
+-    VkSurfaceCapabilitiesKHR hades_caps;
++    VkSurfaceCapabilitiesKHR three_image_caps;
+     VkResult res;
+ 
+     if (!NtUserIsWindow( surface->hwnd )) return VK_ERROR_SURFACE_LOST_KHR;
+     res = instance->p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR( physical_device->host.physical_device,
+                                                        surface->obj.host.surface, capabilities );
+-    if (!res && get_hades_surface_capabilities( physical_device, surface, VK_PRESENT_MODE_FIFO_KHR, &hades_caps ))
++    if (!res && get_three_image_surface_capabilities( physical_device, surface, VK_PRESENT_MODE_FIFO_KHR, &three_image_caps ))
+     {
+-        capabilities->minImageCount = hades_caps.minImageCount;
++        capabilities->minImageCount = three_image_caps.minImageCount;
+         capabilities->maxImageCount = 3;
+     }
+     if (!res) adjust_surface_capabilities( instance, surface, capabilities );
+@@ -2630,7 +2645,7 @@
+     struct surface *surface = surface_from_handle( surface_info->surface );
+     VkPhysicalDeviceSurfaceInfo2KHR surface_info_host = *surface_info;
+     struct vulkan_instance *instance = physical_device->instance;
+-    VkSurfaceCapabilitiesKHR hades_caps;
++    VkSurfaceCapabilitiesKHR three_image_caps;
+     VkResult res;
+ 
+     if (!instance->p_vkGetPhysicalDeviceSurfaceCapabilities2KHR)
+@@ -2647,9 +2662,9 @@
+     res = instance->p_vkGetPhysicalDeviceSurfaceCapabilities2KHR( physical_device->host.physical_device,
+                                                                      &surface_info_host, capabilities );
+     if (!res && !find_next_struct( surface_info->pNext, VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_EXT ) &&
+-        get_hades_surface_capabilities( physical_device, surface, VK_PRESENT_MODE_FIFO_KHR, &hades_caps ))
++        get_three_image_surface_capabilities( physical_device, surface, VK_PRESENT_MODE_FIFO_KHR, &three_image_caps ))
+     {
+-        capabilities->surfaceCapabilities.minImageCount = hades_caps.minImageCount;
++        capabilities->surfaceCapabilities.minImageCount = three_image_caps.minImageCount;
+         capabilities->surfaceCapabilities.maxImageCount = 3;
+     }
+     if (!res) adjust_surface_capabilities( instance, surface, &capabilities->surfaceCapabilities );
+@@ -5120,20 +5135,20 @@
+                surface->hwnd, device->extensions.has_VK_EXT_external_memory_dma_buf );
+     }
+ 
+-    /* Hades indexes three-entry command-pool arrays with the acquired image.
+-     * Use per-mode limits instead of Wayland's conservative legacy minimum,
++    /* Hades requires three images; Path of Exile also rejects the conservative
++     * Wayland minimum before creating its swapchain. Use per-mode limits,
+      * and declare the mode to prevent an implicit MAILBOX image-count bump. */
+     if (device->extensions.has_VK_EXT_swapchain_maintenance1 &&
+         !find_next_struct( create_info_host.pNext, VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT ) &&
+-        use_hades_present_modes( physical_device ))
++        use_three_image_present_modes( physical_device ))
+     {
+         VkPresentModeKHR mode = create_info_host.presentMode;
+-        BOOL supported = get_hades_surface_capabilities( physical_device, surface, mode, &capabilities );
++        BOOL supported = get_three_image_surface_capabilities( physical_device, surface, mode, &capabilities );
+ 
+         if (!supported)
+         {
+             mode = VK_PRESENT_MODE_FIFO_KHR;
+-            supported = get_hades_surface_capabilities( physical_device, surface, mode, &capabilities );
++            supported = get_three_image_surface_capabilities( physical_device, surface, mode, &capabilities );
+         }
+         if (supported)
+         {
+@@ -5143,7 +5158,7 @@
+             present_modes.pPresentModes = &create_info_host.presentMode;
+             present_modes.pNext = create_info_host.pNext;
+             create_info_host.pNext = &present_modes;
+-            TRACE( "Hades host swapchain: 3 images, present mode %u (requested %u)\n",
++            TRACE( "Compatibility host swapchain: 3 images, present mode %u (requested %u)\n",
+                    create_info_host.presentMode, create_info->presentMode );
+         }
+     }
