@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Tue, 15 Sep 2026 15:30:00 -0600
+Subject: [PATCH] winewayland: Preserve DOOM Eternal's idle Vulkan client surface
+
+DOOM Eternal recreates VkSurfaces along with its HDR swapchains, retaining
+references to the old VkSurfaces after their swapchains have been destroyed.
+The ref == 1 condition added by the background-presenter isolation patch
+prevents the client-surface cache from serving these replacements. Each new
+client loses the previous wl_surface's DMA-BUF feedback and replaces its
+visible subsurface.
+
+Allow DOOM Eternal to reuse an idle cached client despite those old surface
+references. Keep its attachment intact until the regular attach/update path
+finds an actual parent or role change. The cache reference transfers to the
+new VkSurface as before; old VkSurfaces keep their own references. Never reuse
+a client while busy_ref is nonzero.
+
+Keep the existing reference isolation and detach behavior for other programs:
+in particular, Purple's independently reusable graphics probes must not alias
+its active game presenter. Do not suppress Vulkan out-of-date/suboptimal
+results, disable HDR, or change swapchain image counts.
+
+This restores the surface-cache behavior needed by this application, based
+on Etaash Mathamsetty's client-surface caching work (508b956d6447). It relies
+on the same Mesa WSI object-lifetime support as that existing patch:
+https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/34918
+
+The live capture established Wine generation rejection and repeated client
+replacement; the effect of this change on HDR flicker still needs a runtime
+retest. No game binaries or installed Proton files are modified.
+---
+
+diff --git a/dlls/winewayland.drv/vulkan.c b/dlls/winewayland.drv/vulkan.c
+--- a/dlls/winewayland.drv/vulkan.c
++++ b/dlls/winewayland.drv/vulkan.c
+@@ -46,6 +46,7 @@
+ {
+     struct wayland_client_surface *ret = NULL;
+     struct wayland_win_data *data;
++    BOOL preserve = process_name && !strcmp(process_name, "doometernalx64vk.exe");
+ 
+     if (!(data = wayland_win_data_get(hwnd))) return NULL;
+ 
+@@ -59,23 +60,30 @@
+         client_surface_add_ref(&surface->client);
+         data->stashed_client = surface;
+     }
+-    else if ((ret = data->stashed_client) && ReadAcquire(&ret->client.ref) == 1 &&
+-             !ReadAcquire(&ret->client.busy_ref))
++    else if ((ret = data->stashed_client) && !ReadAcquire(&ret->client.busy_ref) &&
++             (ReadAcquire(&ret->client.ref) == 1 || preserve))
+     {
+         /* cannot decrease the ref count here as there is a
+          * new VkSurface referencing this client surface */
+         data->stashed_client = NULL;
+-        /* detach the client surface to ensure it is reparented */
+-        wayland_client_surface_attach(ret, NULL);
+-        if (data->client_surface == ret)
++        /* DOOM retains old VkSurfaces after destroying their swapchains.
++         * Preserve its idle wl_surface and attachment so HDR replacements
++         * keep the compositor's DMA-BUF feedback and the last visible frame.
++         * Attachment updates still handle an actual parent/role change. */
++        if (!preserve)
+         {
+-            InterlockedExchange(&ret->client.presentation_owner, FALSE);
+-            data->client_surface = NULL;
+-        }
+-        if (!list_empty(&ret->hwnd_entry))
+-        {
+-            list_remove(&ret->hwnd_entry);
+-            list_init(&ret->hwnd_entry);
++            /* detach the client surface to ensure it is reparented */
++            wayland_client_surface_attach(ret, NULL);
++            if (data->client_surface == ret)
++            {
++                InterlockedExchange(&ret->client.presentation_owner, FALSE);
++                data->client_surface = NULL;
++            }
++            if (!list_empty(&ret->hwnd_entry))
++            {
++                list_remove(&ret->hwnd_entry);
++                list_init(&ret->hwnd_entry);
++            }
+         }
+     }
+     else ret = NULL;
+
