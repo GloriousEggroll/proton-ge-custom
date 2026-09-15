@@ -1,0 +1,118 @@
+From: Codex <codex@local>
+Subject: [PATCH] crypt32: Preserve legacy exclusive roots and test chain configuration layouts.
+
+Backport follow-up: increasing the public structure size must not make
+CRYPT_CreateChainEngine ignore hExclusiveRoot in the existing 80-byte ABI.
+Exercise all supported layouts at a guard page and preserve trust validation.
+
+--- a/dlls/crypt32/chain.c
++++ b/dlls/crypt32/chain.c
+@@ -120,7 +120,7 @@
+     if (root) {
+         root = CertDuplicateStore(root);
+     } else {
+-        if(config->cbSize >= sizeof(CERT_CHAIN_ENGINE_CONFIG) && config->hExclusiveRoot)
++        if(config->cbSize >= FIELD_OFFSET(CERT_CHAIN_ENGINE_CONFIG, dwExclusiveFlags) && config->hExclusiveRoot)
+             root = CertDuplicateStore(config->hExclusiveRoot);
+         else if (config->hRestrictedRoot)
+             root = CertDuplicateStore(config->hRestrictedRoot);
+--- a/dlls/crypt32/tests/chain.c
++++ b/dlls/crypt32/tests/chain.c
+@@ -119,6 +119,89 @@
+         "Expected CRYPT_E_NOT_FOUND or ERROR_FILE_NOT_FOUND, got %08lx\n", GetLastError());
+ 
+     CertCloseStore(store, 0);
++}
++
++static void testChainEngineConfigLayouts(void)
++{
++    static const DWORD sizes[] = {
++        sizeof(CERT_CHAIN_ENGINE_CONFIG_NO_EXCLUSIVE_ROOT),
++        FIELD_OFFSET(CERT_CHAIN_ENGINE_CONFIG, dwExclusiveFlags),
++        sizeof(CERT_CHAIN_ENGINE_CONFIG)
++    };
++    CERT_CHAIN_PARA para = { sizeof(para) };
++    CERT_CHAIN_ENGINE_CONFIG invalid = { 0 }, *config;
++    PCCERT_CHAIN_CONTEXT chain;
++    PCCERT_CONTEXT cert;
++    HCERTCHAINENGINE engine;
++    HCERTSTORE store;
++    SYSTEM_INFO info;
++    DWORD old_protect, i;
++    BYTE *memory;
++    BOOL ret;
++
++    GetSystemInfo(&info);
++    memory = VirtualAlloc(NULL, info.dwPageSize * 2, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
++    ok(!!memory, "VirtualAlloc failed: %lu\n", GetLastError());
++    if (!memory) return;
++    ret = VirtualProtect(memory + info.dwPageSize, info.dwPageSize, PAGE_NOACCESS, &old_protect);
++    ok(ret, "VirtualProtect failed: %lu\n", GetLastError());
++    if (!ret)
++    {
++        VirtualFree(memory, 0, MEM_RELEASE);
++        return;
++    }
++
++    store = CertOpenStore(CERT_STORE_PROV_MEMORY, 0, 0, CERT_STORE_CREATE_NEW_FLAG, NULL);
++    ok(!!store, "CertOpenStore failed: %lu\n", GetLastError());
++    ret = CertAddEncodedCertificateToStore(store, X509_ASN_ENCODING, selfSignedCert,
++        sizeof(selfSignedCert), CERT_STORE_ADD_ALWAYS, &cert);
++    ok(ret, "CertAddEncodedCertificateToStore failed: %lu\n", GetLastError());
++    if (!ret)
++    {
++        CertCloseStore(store, 0);
++        VirtualFree(memory, 0, MEM_RELEASE);
++        return;
++    }
++
++    for (i = 0; i < ARRAY_SIZE(sizes); ++i)
++    {
++        /* Each legacy structure ends at a guard page: no reading newer fields. */
++        config = (CERT_CHAIN_ENGINE_CONFIG *)(memory + info.dwPageSize - sizes[i]);
++        memset(config, 0, sizes[i]);
++        config->cbSize = sizes[i];
++        if (i) config->hExclusiveRoot = store;
++        engine = NULL;
++        ret = CertCreateCertificateChainEngine(config, &engine);
++        ok(ret, "layout %lu: engine creation failed: %08lx\n", sizes[i], GetLastError());
++        if (!ret) continue;
++        if (i)
++        {
++            /* The old 80-byte layout must still honor its exclusive root. */
++            chain = NULL;
++            ret = CertGetCertificateChain(engine, cert, NULL, NULL, &para,
++                CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL, NULL, &chain);
++            ok(ret, "layout %lu: chain creation failed: %08lx\n", sizes[i], GetLastError());
++            if (ret)
++            {
++                ok(!(chain->TrustStatus.dwErrorStatus & CERT_TRUST_IS_UNTRUSTED_ROOT),
++                    "layout %lu: exclusive root ignored, trust status %08lx\n",
++                    sizes[i], chain->TrustStatus.dwErrorStatus);
++                CertFreeCertificateChain(chain);
++            }
++        }
++        CertFreeCertificateChainEngine(engine);
++    }
++
++    invalid.cbSize = sizeof(invalid) + sizeof(void *);
++    SetLastError(0xdeadbeef);
++    ret = CertCreateCertificateChainEngine(&invalid, &engine);
++    ok(!ret && GetLastError() == E_INVALIDARG,
++        "Invalid layout accepted: ret %d, error %08lx\n", ret, GetLastError());
++    if (ret) CertFreeCertificateChainEngine(engine);
++
++    CertFreeCertificateContext(cert);
++    CertCloseStore(store, 0);
++    VirtualFree(memory, 0, MEM_RELEASE);
+ }
+ 
+ static const BYTE bigCert[] = { 0x30, 0x7a, 0x02, 0x01, 0x01, 0x30, 0x02, 0x06,
+@@ -5570,6 +5653,7 @@
+ START_TEST(chain)
+ {
+     testCreateCertChainEngine();
++    testChainEngineConfigLayouts();
+     testVerifyCertChainPolicy();
+     testGetCertChain();
+     test_CERT_CHAIN_PARA_cbSize();
