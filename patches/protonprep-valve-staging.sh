@@ -336,6 +336,9 @@ apply_all_in_dir() {
     echo "WINE: -HOTFIX- Keep Steam's OpenGL overlay on visual-compatible X11 drawables"
     apply_patch "../patches/wine-hotfixes/pending/winex11-use-x11-drawables-for-steam-opengl-overlay.patch"
 
+    echo "WINE: -HOTFIX- Limit the extra Vulkan swapchain image workaround to DOOM"
+    apply_patch "../patches/wine-hotfixes/pending/win32u-limit-extra-swapchain-image-to-doom.patch"
+
     echo "WINE: -HOTFIX- Retry virtual allocations with effective bounds after clearing native mappings"
     apply_patch "../patches/wine-hotfixes/pending/ntdll-retry-native-view-allocation-with-effective-range.patch"
 
