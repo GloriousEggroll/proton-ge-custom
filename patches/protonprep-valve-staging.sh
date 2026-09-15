@@ -22,14 +22,14 @@ apply_all_in_dir() {
     git reset --hard HEAD
     git clean -xdf
     patch -Np1 < ../patches/dxvk/layered-overlay-dxvk.patch
+    # Keep child-rendering backpressure from repeatedly recreating launcher swapchains.
+    apply_patch "../patches/dxvk/dxvk-preserve-swapchain-on-acquire-backpressure.patch"
     apply_patch "../patches/dxvk/dxgi-defer-initial-fullscreen-for-probe-swapchains.patch"
     apply_patch "../patches/dxvk/dxgi-follow-d3d12-fullscreen-client-resizes.patch"
     # FFXIV: keep emulated fullscreen when focus moves to another window (#639).
     apply_patch "../patches/dxvk/dxgi-keep-fullscreen-on-focus-loss.patch"
     # Black Desert also needs the matching Wine activation compatibility patch below.
     apply_patch "../patches/dxvk/black-desert-keep-fullscreen-on-focus-loss.patch"
-    # Painkiller: Reset must apply fullscreen to the new device window (#579).
-    apply_patch "../patches/dxvk/d3d9-update-device-window-on-reset.patch"
     popd
 
     pushd vkd3d-proton
@@ -356,6 +356,9 @@ apply_all_in_dir() {
 
     echo "WINE: -HOTFIX- Use three-image presentation modes for Hades on Wayland"
     apply_patch "../patches/wine-hotfixes/pending/win32u-use-three-image-present-modes-for-hades-wayland.patch"
+
+    echo "WINE: -HOTFIX- Use three-image presentation modes for Path of Exile on Wayland"
+    apply_patch "../patches/wine-hotfixes/pending/win32u-use-three-image-present-modes-for-path-of-exile.patch"
 
     echo "WINE: -HOTFIX- Retry virtual allocations with effective bounds after clearing native mappings"
     apply_patch "../patches/wine-hotfixes/pending/ntdll-retry-native-view-allocation-with-effective-range.patch"

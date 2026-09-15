@@ -1,0 +1,83 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] dxvk: Preserve the swapchain when image acquisition is not ready.
+
+Marvel Rivals' launcher repeatedly recreates an unchanged 1762x833 SDR
+swapchain after VK_NOT_READY on Wine-Wayland. Wine's managed child-surface
+producer deliberately returns without waiting when its image ring is full,
+even for an infinite acquire timeout. This avoids deadlocking synchronous
+window changes against the producer thread (Wine-Wineland child-rendering
+patch 0068, originally by Erhan Bilgili).
+
+Handle this compatibility case in the presenter without adding a blocking
+retry loop to Wine. Preserve the swapchain and last frame, and return the
+existing no-image result to the D3D9/D3D11 callers so they can skip this
+presentation attempt. A later acquire retries normally; real out-of-date,
+suboptimal, resize and surface-loss handling remains unchanged. Normalize
+VK_TIMEOUT to the same retry state, including after background acquisition.
+
+Handle a transient failure on a fresh swapchain too. Previously that path
+could set m_presentPending and expose an image without having acquired it,
+although the caller would skip presentation, leaving future acquires stuck.
+
+Keep the actual PresenterSync by reference while waiting on its fence.
+Resetting a copy loses the fenceSignaled update and could make a retry wait
+on the already-reset fence with no intervening presentation to signal it.
+
+This is tolerance for Wine's early acquire return, not a change to Vulkan's
+timeout contract. No game-specific configuration, Wine-Wayland driver
+changes, forced HDR changes or overlay changes are needed.
+
+Runtime validation pending a rebuilt DXVK: launcher startup/idle, resizing,
+minimize/restore, navigation and game launch. VK_NOT_READY should no longer
+cause repeated swapchain recreation. The separate DOOM native Vulkan fix
+is unaffected.
+---
+diff --git a/src/dxvk/dxvk_presenter.cpp b/src/dxvk/dxvk_presenter.cpp
+--- a/src/dxvk/dxvk_presenter.cpp
++++ b/src/dxvk/dxvk_presenter.cpp
+@@ -98,8 +98,8 @@ namespace dxvk {
+     updateSwapChain();
+ 
+     // Don't acquire if we already did so after present
+-    if (m_acquireStatus == VK_NOT_READY && m_swapchain) {
+-      PresenterSync sync = m_semaphores.at(m_frameIndex);
++    if ((m_acquireStatus == VK_NOT_READY || m_acquireStatus == VK_TIMEOUT) && m_swapchain) {
++      PresenterSync& sync = m_semaphores.at(m_frameIndex);
+ 
+       waitForSwapchainFence(sync);
+ 
+@@ -108,6 +108,13 @@ namespace dxvk {
+         sync.acquire, VK_NULL_HANDLE, &m_imageIndex);
+     }
+ 
++    // Wine's managed child surfaces can return early to avoid blocking window
++    // updates. Keep the last frame and let the caller retry without recreating.
++    if (m_swapchain && (m_acquireStatus == VK_NOT_READY || m_acquireStatus == VK_TIMEOUT)) {
++      m_acquireStatus = VK_NOT_READY;
++      return VK_NOT_READY;
++    }
++
+     // This is a normal occurence, but may be useful for
+     // debugging purposes in case WSI goes wrong somehow.
+     if (m_acquireStatus != VK_SUCCESS && m_swapchain)
+@@ -125,12 +132,19 @@ namespace dxvk {
+       if (vr != VK_SUCCESS)
+         return softError(vr);
+ 
+-      PresenterSync sync = m_semaphores.at(m_frameIndex);
++      PresenterSync& sync = m_semaphores.at(m_frameIndex);
+ 
+       m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
+         m_swapchain, std::numeric_limits<uint64_t>::max(),
+         sync.acquire, VK_NULL_HANDLE, &m_imageIndex);
+ 
++      // A fresh swapchain can also be temporarily unavailable. Do not expose
++      // an image or set m_presentPending until acquisition actually succeeds.
++      if (m_acquireStatus == VK_NOT_READY || m_acquireStatus == VK_TIMEOUT) {
++        m_acquireStatus = VK_NOT_READY;
++        return VK_NOT_READY;
++      }
++
+       if (m_acquireStatus < 0) {
+         Logger::info(str::format("Presenter: Got ", m_acquireStatus, " from fresh swapchain"));
+         return softError(m_acquireStatus);
