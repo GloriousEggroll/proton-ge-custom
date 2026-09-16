@@ -109,7 +109,7 @@ apply_all_in_dir() {
     cp -R ../wineopenxr/* dlls/wineopenxr/
 
     echo "WINE: -CUSTOM- ETAASH WINE-WAYLAND+ PATCHES"
-   apply_all_in_dir "../patches/wine-hotfixes/wine-wayland/"
+    apply_all_in_dir "../patches/wine-hotfixes/wine-wayland/"
 
     echo "WINE: -CUSTOM- ETAASH WINE-WAYLAND+ SNI SUPPORT"
     apply_patch "../patches/wine-hotfixes/em-fixups/0001-winewayland-add-SNI-tray-icons-and-native-context-me.patch"
