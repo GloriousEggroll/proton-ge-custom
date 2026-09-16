@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Date: Wed, 16 Sep 2026 15:30:00 -0600
+Subject: [PATCH] winebus: Give mapped Switch Pro controllers an XInput identity
+
+Wine's SDL backend translates Switch Pro input into its standard gamepad
+report, while retaining the Nintendo 057e:2009 identity. Applications such
+as Little Big Adventure: Twinsen's Quest (Rewired) reject this combination
+instead of using the translated controller. Exposing the same input with
+045e:028e fixes controller input, including an 8BitDo Pro 2 in Switch mode.
+
+Give only SDL-mapped Switch Pro controllers an Xbox 360 Windows identity
+when Steam Input is disabled. Snapshot Steam Input's environment before
+SDL initialization clears SteamVirtualGamepadInfo, and retain the existing
+SDL device filters and explicit emulation overrides. Leave native hidraw,
+unmapped joysticks, other controllers and Steam Input devices unchanged.
+
+Keep the physical VID/PID internally for hidraw preference, per-device
+configuration and duplicate-device matching. Change only the Windows PnP
+IDs, HID attributes and product name, not the reports or SDL mapping.
+
+Apply after the proton-ds5-haptic series, which supplies the shared Windows
+identity helpers.
+---
+diff --git a/dlls/winebus.sys/bus_sdl.c b/dlls/winebus.sys/bus_sdl.c
+--- a/dlls/winebus.sys/bus_sdl.c
++++ b/dlls/winebus.sys/bus_sdl.c
+@@ -62,6 +62,7 @@
+ 
+ static pthread_mutex_t sdl_cs = PTHREAD_MUTEX_INITIALIZER;
+ static const struct bus_options *options;
++static BOOL steam_input_enabled;
+ 
+ static void *sdl_handle = NULL;
+ static UINT quit_event = -1;
+@@ -950,6 +951,26 @@
+     return env && atoi(env);
+ }
+ 
++static BOOL is_steam_input_enabled(void)
++{
++    static const char * const names[] =
++    {
++        "SteamVirtualGamepadInfo",
++        "SteamVirtualGamepadInfo_Proton",
++        "SDL_GAMECONTROLLER_ALLOW_STEAM_VIRTUAL_GAMEPAD",
++    };
++    const char *env = getenv("PROTON_NO_STEAMINPUT");
++    unsigned int i;
++
++    if (env && atoi(env)) return FALSE;
++    for (i = 0; i < ARRAY_SIZE(names); ++i)
++    {
++        env = getenv(names[i]);
++        if (env && *env && strcmp(env, "0")) return TRUE;
++    }
++    return FALSE;
++}
++
+ static void fixup_steaminput_vidpid( struct device_desc *desc )
+ {
+     static int cached = -1;
+@@ -1047,6 +1068,11 @@
+     if (controller)
+     {
+         desc.is_gamepad = TRUE;
++        /* These are translated reports, not the Nintendo HID protocol. Keep the
++         * physical IDs for backend selection, but advertise an XInput identity. */
++        desc.use_xbox_identity = !steam_input_enabled && desc.vid == 0x057e && desc.pid == 0x2009;
++        if (desc.use_xbox_identity)
++            TRACE("exposing mapped Switch Pro controller %04x:%04x as Xbox 360.\n", desc.vid, desc.pid);
+         axis_count = 6;
+     }
+     else
+@@ -1219,6 +1245,7 @@
+ 
+     /* CW-Bug-Id: #23185: Disable SDL 2.30 new behavior, we need the steam virtual
+      * controller name to figure which slot number it represents. */
++    steam_input_enabled = is_steam_input_enabled();
+     pSDL_SetHintWithPriority("SteamVirtualGamepadInfo", "", SDL_HINT_OVERRIDE);
+     unsetenv("SteamVirtualGamepadInfo");
+ 
+diff --git a/dlls/winebus.sys/main.c b/dlls/winebus.sys/main.c
+--- a/dlls/winebus.sys/main.c
++++ b/dlls/winebus.sys/main.c
+@@ -582,8 +582,15 @@
+     L"BTHENUM", /* BUS_TYPE_BLUETOOTH */
+ };
+ 
++static UINT get_windows_vendor_id(const struct device_extension *ext)
++{
++    if (ext->desc.use_xbox_identity) return 0x045e;
++    return ext->desc.vid;
++}
++
+ static UINT get_windows_product_id(const struct device_extension *ext)
+ {
++    if (ext->desc.use_xbox_identity) return 0x028e;
+     if (ext->desc.spoof_dualshock4_v1) return 0x05c4;
+     if (ext->desc.spoof_dualshock4) return 0x09cc;
+     return ext->desc.pid;
+@@ -591,6 +598,7 @@
+ 
+ static const WCHAR *get_windows_product_string(const struct device_extension *ext)
+ {
++    if (ext->desc.use_xbox_identity) return L"Xbox 360 Controller for Windows";
+     if (ext->desc.spoof_dualshock4 || ext->desc.spoof_dualshock4_v1)
+         return L"Wireless Controller";
+     return ext->desc.product;
+@@ -614,7 +622,7 @@
+     if ((dst = ExAllocatePool(PagedPool, len * sizeof(WCHAR))))
+     {
+         pos += swprintf(dst + pos, len - pos, winebus_format, bus_str,
+-                ext->desc.vid, get_windows_product_id(ext));
++                get_windows_vendor_id(ext), get_windows_product_id(ext));
+         if (input_len) pos += swprintf(dst + pos, len - pos, input_format, ext->desc.input);
+     }
+ 
+@@ -636,7 +644,7 @@
+     if ((dst = ExAllocatePool(PagedPool, (len + 1) * sizeof(WCHAR))))
+     {
+         pos += swprintf(dst + pos, len - pos, winebus_format,
+-                ext->desc.vid, get_windows_product_id(ext));
++                get_windows_vendor_id(ext), get_windows_product_id(ext));
+         if (input_len) pos += swprintf(dst + pos, len - pos, input_format, ext->desc.input);
+         pos += 1;
+         dst[pos] = 0;
+@@ -2778,7 +2786,7 @@
+ 
+             memset(attr, 0, sizeof(*attr));
+             attr->Size = sizeof(*attr);
+-            attr->VendorID = ext->desc.vid;
++            attr->VendorID = get_windows_vendor_id(ext);
+             attr->ProductID = get_windows_product_id(ext);
+             attr->VersionNumber = (ext->desc.spoof_dualshock4 || ext->desc.spoof_dualshock4_v1)
+                     ? 0x0100 : ext->desc.version;
+diff --git a/dlls/winebus.sys/unixlib.h b/dlls/winebus.sys/unixlib.h
+--- a/dlls/winebus.sys/unixlib.h
++++ b/dlls/winebus.sys/unixlib.h
+@@ -43,6 +43,7 @@
+     BOOL is_hidraw;
+     BOOL spoof_dualshock4;
+     BOOL spoof_dualshock4_v1;
++    BOOL use_xbox_identity;
+ 
+     WCHAR manufacturer[MAX_PATH];
+     WCHAR product[MAX_PATH];

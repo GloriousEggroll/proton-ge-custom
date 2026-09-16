@@ -467,6 +467,9 @@ apply_all_in_dir() {
         apply_patch "$patch"
     done
 
+    echo "WINE: expose mapped Switch Pro controllers as Xbox when Steam Input is disabled"
+    apply_patch "../patches/wine-hotfixes/pending/winebus-switch-pro-xinput-identity.patch"
+
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
     ./tools/make_requests
