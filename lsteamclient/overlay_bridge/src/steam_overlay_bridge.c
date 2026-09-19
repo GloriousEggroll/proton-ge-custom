@@ -1253,7 +1253,8 @@ static int init_overlay_bridge(int force_retry)
     unsigned long bypass_compositor = 0;
     unsigned int window_width = 1;
     unsigned int window_height = 1;
-    int window_depth = CopyFromParent;
+    unsigned int window_type = InputOnly;
+    int window_depth = 0;
     int window_x = -1;
     int window_y = -1;
     int screen;
@@ -1320,6 +1321,7 @@ static int init_overlay_bridge(int force_retry)
         window_width = overlay_glx_requested_width ? overlay_glx_requested_width : 1;
         window_height = overlay_glx_requested_height ? overlay_glx_requested_height : 1;
         pthread_mutex_unlock(&overlay_glx_mutex);
+        window_type = InputOutput;
         window_depth = glx_visual->depth;
         window_visual = glx_visual->visual;
         overlay_glx_colormap = XCreateColormap(
@@ -1339,9 +1341,13 @@ static int init_overlay_bridge(int force_retry)
         window_mask |= CWColormap | CWBackPixel | CWBorderPixel;
     }
 
+    /* Steam focuses its event target when opening the overlay, independently
+     * of our focus proxy. Vulkan needs no X11 drawable: an InputOutput target
+     * can deactivate the Wayland game and send subsequent Guide presses to
+     * Steam's desktop context. Only the GLX presenter needs InputOutput. */
     overlay_window = XCreateWindow(
         overlay_display, overlay_root, window_x, window_y,
-        window_width, window_height, 0, window_depth, InputOutput,
+        window_width, window_height, 0, window_depth, window_type,
         window_visual, window_mask, &attributes);
     if (!overlay_window)
     {
@@ -1470,7 +1476,7 @@ static int init_overlay_bridge(int force_retry)
     pthread_mutex_unlock(&overlay_mutex);
 
     overlay_trace("created X11 %s window %#lx\n",
-                  overlay_opengl_requested ? "GLX overlay" : "input proxy",
+                  overlay_opengl_requested ? "GLX overlay" : "InputOnly input proxy",
                   overlay_window);
     overlay_trace("created InputOnly Steam focus window %#lx\n", overlay_focus_window);
     return 1;
@@ -1542,7 +1548,7 @@ static void sync_overlay_focus(void)
     else if (overlay_focus_owner)
     {
         XGetInputFocus(overlay_display, &current_focus, &revert_to);
-        if (current_focus == overlay_focus_window)
+        if (current_focus == overlay_focus_window || current_focus == overlay_window)
             XSetInputFocus(overlay_display, PointerRoot,
                            RevertToPointerRoot, CurrentTime);
 
@@ -1921,7 +1927,7 @@ static void destroy_overlay_bridge(void)
         XSetSelectionOwner(overlay_display, overlay_owner_atom, None, CurrentTime);
 
     XGetInputFocus(overlay_display, &current_focus, &revert_to);
-    if (current_focus == overlay_focus_window)
+    if (current_focus == overlay_focus_window || current_focus == overlay_window)
         XSetInputFocus(overlay_display, PointerRoot,
                        RevertToPointerRoot, CurrentTime);
 
