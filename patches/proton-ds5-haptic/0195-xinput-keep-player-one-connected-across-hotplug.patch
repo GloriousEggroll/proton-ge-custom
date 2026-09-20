@@ -1,0 +1,257 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Sun, 20 Sep 2026 05:00:00 -0600
+Subject: [PATCH] xinput: Optionally keep player one connected across hotplug.
+
+Castlevania Anniversary Collection caches its playable controller list at
+startup. Its worker keeps polling XInput, but newly connected controllers
+are not added to that list. The no-controller startup trace shows Wine
+opening a subsequently connected Xbox controller at index zero without
+the game ever adopting it. Replacing a startup DirectInput controller with
+a different Sony model has the same problem.
+
+Add PROTON_XINPUT_PERSISTENT_PLAYER1=1 for games needing a stable first
+slot. Proton enables this only for Castlevania (1018010), together with
+the existing Sony HID-to-XInput mapping. Other slots and the normal
+physical-device assignment remain unchanged.
+
+Keep the logical neutral state separate from physical connection state.
+Discovery must still run while disconnected, and the logical packet
+number must not reset when a replacement controller arrives. Suppress
+input while the Steam overlay is active, including for the persistent
+slot. Discard rumble while disconnected rather than replaying it later.
+
+Report gamepad capabilities for the empty first slot, but do not invent
+a HID device, Sony identity, speaker or battery. Real devices, including
+Steam Input virtual controllers, retain their existing capabilities and
+routing.
+
+Add focused API checks for an empty slot, stable neutral packets, ordinary
+and extended state agreement, capabilities, rumble, and untouched other
+slots. Run the xinput tests in an isolated controller-free prefix, both
+with the environment variable unset and set to 1. Actual hotplug and
+controller replacement still require in-game validation.
+---
+diff --git a/dlls/xinput1_3/main.c b/dlls/xinput1_3/main.c
+--- a/dlls/xinput1_3/main.c
++++ b/dlls/xinput1_3/main.c
+@@ -124,6 +124,8 @@
+ 
+ static SRWLOCK state_lock = SRWLOCK_INIT;
+ static XINPUT_STATE current_state[XUSER_MAX_COUNT];
++static BOOL persistent_player1;
++static XINPUT_STATE persistent_state;
+ 
+ DWORD WINAPI __wine_XInputGetDeviceVidPid(DWORD index, WORD *vendor_id, WORD *product_id);
+ DWORD WINAPI __wine_XInputGetSonyProductId(DWORD index, WORD *product_id);
+@@ -150,6 +152,26 @@
+     return state->dwPacketNumber;
+ }
+ 
++static BOOL is_persistent_player1(DWORD index)
++{
++    return persistent_player1 && !index;
++}
++
++static void get_persistent_state(XINPUT_STATE *state, BOOL suppress_input)
++{
++    XINPUT_GAMEPAD gamepad = {0};
++
++    AcquireSRWLockExclusive(&state_lock);
++    if (!suppress_input) gamepad = current_state[0].Gamepad;
++    if (!persistent_state.dwPacketNumber || memcmp(&persistent_state.Gamepad, &gamepad, sizeof(gamepad)))
++    {
++        persistent_state.Gamepad = gamepad;
++        if (!++persistent_state.dwPacketNumber) ++persistent_state.dwPacketNumber;
++    }
++    *state = persistent_state;
++    ReleaseSRWLockExclusive(&state_lock);
++}
++
+ static void check_value_caps(struct xinput_controller *controller, USHORT usage, HIDP_VALUE_CAPS *caps)
+ {
+     switch (usage)
+@@ -976,12 +998,17 @@
+ 
+ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
+ {
++    char value[2];
++
+     TRACE("inst %p, reason %lu, reserved %p.\n", inst, reason, reserved);
+ 
+     switch (reason)
+     {
+     case DLL_PROCESS_ATTACH:
+         xinput_instance = inst;
++        persistent_player1 = GetEnvironmentVariableA("PROTON_XINPUT_PERSISTENT_PLAYER1", value, sizeof(value)) == 1 &&
++                             value[0] == '1';
++        if (persistent_player1) TRACE("Keeping XInput player 1 connected across hotplug.\n");
+         DisableThreadLibraryCalls(inst);
+         break;
+     }
+@@ -1023,7 +1050,7 @@
+     EnterCriticalSection(&xinput_cs);
+     if (!controllers[index].device) update_controller_list();
+     if (!controllers[index].device)
+-        ret = ERROR_DEVICE_NOT_CONNECTED;
++        ret = is_persistent_player1(index) ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
+     else if (WaitForSingleObject(steam_overlay_event, 0) == WAIT_OBJECT_0)
+         ret = ERROR_SUCCESS;
+     else
+@@ -1057,6 +1084,13 @@
+     LeaveCriticalSection(&xinput_cs);
+ 
+ done:
++    if (is_persistent_player1(index))
++    {
++        /* Keep the logical state separate: a placeholder must not hide device
++         * removal from discovery or reset its packet number on reconnection. */
++        get_persistent_state(state, WaitForSingleObject(steam_overlay_event, 0) == WAIT_OBJECT_0);
++        return ERROR_SUCCESS;
++    }
+     if (ret == ERROR_SUCCESS && WaitForSingleObject(steam_overlay_event, 0) == WAIT_OBJECT_0)
+         memset(state, 0, sizeof(*state));
+     return ret;
+@@ -1370,7 +1404,7 @@
+     if (index >= XUSER_MAX_COUNT || !render_guid || !capture_guid) return ERROR_BAD_ARGUMENTS;
+ 
+     EnterCriticalSection(&xinput_cs);
+-    ret = controllers[index].device ? ERROR_NOT_SUPPORTED : ERROR_DEVICE_NOT_CONNECTED;
++    ret = controllers[index].device || is_persistent_player1(index) ? ERROR_NOT_SUPPORTED : ERROR_DEVICE_NOT_CONNECTED;
+     LeaveCriticalSection(&xinput_cs);
+ 
+     return ret;
+@@ -1386,7 +1420,7 @@
+     if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
+ 
+     EnterCriticalSection(&xinput_cs);
+-    ret = controllers[index].device ? ERROR_NOT_SUPPORTED : ERROR_DEVICE_NOT_CONNECTED;
++    ret = controllers[index].device || is_persistent_player1(index) ? ERROR_NOT_SUPPORTED : ERROR_DEVICE_NOT_CONNECTED;
+     LeaveCriticalSection(&xinput_cs);
+ 
+     return ret;
+@@ -1409,11 +1443,17 @@
+ 
+     EnterCriticalSection(&xinput_cs);
+     if (!controllers[index].device) update_controller_list();
+-    if (!controllers[index].device)
+-        ret = ERROR_DEVICE_NOT_CONNECTED;
+-    else if (!HidD_GetAttributes(controllers[index].device, &attr))
++    if (!controllers[index].device && is_persistent_player1(index))
++    {
++        memset(&attr, 0, sizeof(attr));
++        attr.VendorID = 0x045e;
++        attr.ProductID = 0x028e;
++        attr.VersionNumber = 0x0114;
++    }
++    else if (!controllers[index].device || !HidD_GetAttributes(controllers[index].device, &attr))
+         ret = ERROR_DEVICE_NOT_CONNECTED;
+-    else
++
++    if (ret == ERROR_SUCCESS)
+     {
+         memset(caps, 0, sizeof(*caps));
+ 
+@@ -1427,6 +1467,11 @@
+ #if XINPUT_VER >= 3
+         caps->Capabilities.Flags |= XINPUT_CAPS_VOICE_SUPPORTED;
+ #endif
++        if (!controllers[index].device)
++        {
++            caps->Capabilities.Type = XINPUT_DEVTYPE_GAMEPAD;
++            caps->Capabilities.Flags = XINPUT_CAPS_FFB_SUPPORTED;
++        }
+ 
+         caps->Capabilities.Gamepad.wButtons = XINPUT_BUTTONS_ALL;
+         caps->Capabilities.Gamepad.bLeftTrigger = 0xff;
+diff --git a/dlls/xinput1_3/tests/xinput.c b/dlls/xinput1_3/tests/xinput.c
+--- a/dlls/xinput1_3/tests/xinput.c
++++ b/dlls/xinput1_3/tests/xinput.c
+@@ -797,6 +797,79 @@
+     SetupDiDestroyDeviceInfoList(set);
+ }
+ 
++/* Run with and without PROTON_XINPUT_PERSISTENT_PLAYER1=1 in an isolated
++ * prefix without controllers. Physical hotplug is covered by the game test. */
++static void test_persistent_player1(HMODULE module)
++{
++    DWORD (WINAPI *get_device_vidpid)(DWORD, WORD *, WORD *);
++    XINPUT_GAMEPAD neutral = {0};
++    XINPUT_VIBRATION vibration = {0};
++    XINPUT_CAPABILITIES caps;
++    XINPUT_KEYSTROKE keystroke;
++    XINPUT_STATE state, previous;
++    WORD vendor, product;
++    DWORD index, ret, expected;
++    char value[2];
++    BOOL enabled;
++
++    get_device_vidpid = (void *)GetProcAddress(module, "__wine_XInputGetDeviceVidPid");
++    if (!get_device_vidpid) return;
++
++    enabled = GetEnvironmentVariableA("PROTON_XINPUT_PERSISTENT_PLAYER1", value, sizeof(value)) == 1 && value[0] == '1';
++    for (index = 0; index < XUSER_MAX_COUNT; index++)
++    {
++        ret = get_device_vidpid(index, &vendor, &product);
++        if (ret != ERROR_DEVICE_NOT_CONNECTED)
++        {
++            skip("Slot %lu has a physical device; skipping placeholder checks.\n", index);
++            continue;
++        }
++
++        winetest_push_context("persistent %u, slot %lu", enabled, index);
++        expected = enabled && !index ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
++        memset(&state, 0xcc, sizeof(state));
++        ret = pXInputGetState(index, &state);
++        ok(ret == expected, "XInputGetState returned %lu, expected %lu\n", ret, expected);
++        if (ret == ERROR_SUCCESS)
++        {
++            ok(!memcmp(&state.Gamepad, &neutral, sizeof(neutral)), "Non-neutral placeholder state\n");
++            ok(state.dwPacketNumber != 0, "Missing placeholder packet number\n");
++            previous = state;
++            ret = pXInputGetState(index, &state);
++            ok(ret == ERROR_SUCCESS, "XInputGetState returned %lu\n", ret);
++            ok(!memcmp(&state, &previous, sizeof(state)), "Unchanged state has a different packet\n");
++            if (pXInputGetStateEx)
++            {
++                ret = pXInputGetStateEx(index, &state);
++                ok(ret == ERROR_SUCCESS, "XInputGetStateEx returned %lu\n", ret);
++                ok(!memcmp(&state, &previous, sizeof(state)), "GetStateEx disagrees with GetState\n");
++            }
++        }
++
++        ret = pXInputGetCapabilities(index, XINPUT_FLAG_GAMEPAD, &caps);
++        ok(ret == expected, "XInputGetCapabilities returned %lu, expected %lu\n", ret, expected);
++        if (ret == ERROR_SUCCESS)
++        {
++            ok(caps.Type == XINPUT_DEVTYPE_GAMEPAD, "Unexpected type %u\n", caps.Type);
++            ok(caps.SubType == XINPUT_DEVSUBTYPE_GAMEPAD, "Unexpected subtype %u\n", caps.SubType);
++            ok(caps.Flags == XINPUT_CAPS_FFB_SUPPORTED, "Unexpected flags %#x\n", caps.Flags);
++        }
++
++        ret = pXInputSetState(index, &vibration);
++        ok(ret == expected, "XInputSetState returned %lu, expected %lu\n", ret, expected);
++        if (pXInputGetKeystroke)
++        {
++            ret = pXInputGetKeystroke(index, 0, &keystroke);
++            expected = enabled && !index ? ERROR_EMPTY : ERROR_DEVICE_NOT_CONNECTED;
++            ok(ret == expected, "XInputGetKeystroke returned %lu, expected %lu\n", ret, expected);
++        }
++
++        ret = get_device_vidpid(index, &vendor, &product);
++        ok(ret == ERROR_DEVICE_NOT_CONNECTED, "Placeholder created a physical device: %lu\n", ret);
++        winetest_pop_context();
++    }
++}
++
+ START_TEST(xinput)
+ {
+     struct
+@@ -839,6 +912,7 @@
+         if (!pXInputGetStateEx)
+             pXInputGetStateEx = pXInputGetStateEx_Ordinal;
+ 
++        test_persistent_player1(hXinput);
+         test_hid_reports();
+         test_set_state();
+         test_get_state();
