@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Sun, 20 Sep 2026 10:00:00 -0600
+Subject: [PATCH] winewayland: Set client opacity from swapchain alpha mode.
+
+The Vulkan alpha callback introduced by Erhan Bilgili already records whether
+the swapchain uses alpha, but the client wl_surface itself keeps an empty
+opaque region. The flag only affects the parent carrier and stacking policy.
+
+As reported and diagnosed by Marjinoz in #786, NVIDIA can export scRGB buffers
+with an alpha-bearing DRM format even for VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR.
+With no opaque region on the client surface, dark areas can show the desktop
+through unused buffer alpha. Setting opacity on the parent does not fix the
+child surface, and the parent may need to remain transparent for GDI content.
+
+Apply the swapchain alpha mode to the client surface's opaque region, without
+changing the parent carrier, stacking, or child-rendering policy. Use a
+surface-local region covering every possible surface size, which Wayland
+clips to the surface, so resizing and fractional scaling need no updates.
+Clear the region again for alpha-enabled swapchains, including cached surface
+reuse. Apply this even when has_alpha was already FALSE on a new surface.
+
+Leave the state pending for the next WSI buffer commit. An extra commit here
+could publish unrelated pending surface state during swapchain recreation.
+This is driver-independent and does not force transparent swapchains opaque.
+
+Reported-by: Marjinoz (https://github.com/Marjinoz)
+Link: https://github.com/GloriousEggroll/proton-ge-custom/issues/786
+---
+ dlls/winewayland.drv/wayland_surface.c | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -5319,8 +5319,26 @@ void wayland_client_surface_set_alpha(struct client_surface *client, BOOL alpha)
+ {
+     struct wayland_client_surface *surface = impl_from_client_surface(client);
++    struct wl_region *region = NULL;
++
+     surface->has_alpha = alpha;
++
++    if (!alpha)
++    {
++        if (!(region = wl_compositor_create_region(process_wayland.wl_compositor)))
++        {
++            ERR("Failed to create client opaque region\n");
++            return;
++        }
++        /* Surface-local regions are clipped by the compositor. Cover future
++         * resizes as well, independently of buffer scale and viewport size. */
++        wl_region_add(region, 0, 0, INT32_MAX, INT32_MAX);
++    }
++
++    /* Let the next WSI buffer commit apply the pending opacity state. */
++    wl_surface_set_opaque_region(surface->wl_surface, region);
++    if (region) wl_region_destroy(region);
+ }
+ 
+ /**********************************************************************
+  *          wayland_surface_ensure_contents
+  *
