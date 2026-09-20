@@ -1,0 +1,248 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Sun, 20 Sep 2026 08:00:00 -0600
+Subject: [PATCH] winewayland: Dispatch clipboard work on the Windows clipboard thread.
+
+The Unix-only event dispatcher introduced for cross-process rendering cannot
+call back into PE code. Both receiving a Wayland selection and exporting Wine
+clipboard contents can enter NtUser clipboard APIs which release cached data
+through KeUserModeCallback. This crashes when the dispatcher has no syscall
+callback frame.
+
+The WoW reproduction on GNOME confirms that the dispatcher executes
+handle_selection and NtUserEmptyClipboard after copying text in Firefox and
+returning focus to the game. The existing Windows clipboard thread is idle.
+
+Queue selection offers and export requests, and wake the existing clipboard
+window with WM_USER. Both the per-process fallback window and the desktop
+data-control window already forward this message to the driver. Keep native
+pointers in the Unix queue instead of message parameters for WoW64 safety.
+Transfer offer and descriptor ownership to the queue, release them if posting
+fails, and process events without a queue lock across Windows callbacks.
+Guard against nested message dispatch reordering selection updates.
+
+This covers both wl_data_device and ext_data_control, preserves the system
+dispatcher, and leaves clipboard format conversion and self-offer filtering
+unchanged. Share the export queuing path and free its temporary MIME string.
+
+Reporter validation: copy text both ways between WoW and Firefox, switching
+focus repeatedly on GNOME. With +clipboard,+threadname, selection handling and
+exports must run on winewayland_clipboard, not winewayland_dispatcher. Also
+check the ext_data_control desktop path and 32-bit clipboard clients.
+
+Fixes: https://github.com/GloriousEggroll/proton-ge-custom/issues/793
+---
+diff --git a/dlls/winewayland.drv/wayland_data_device.c b/dlls/winewayland.drv/wayland_data_device.c
+--- a/dlls/winewayland.drv/wayland_data_device.c
++++ b/dlls/winewayland.drv/wayland_data_device.c
+@@ -57,6 +57,23 @@
+     struct wl_array types;
+ };
+ 
++struct clipboard_event
++{
++    struct list entry;
++    enum { CLIPBOARD_SELECTION, CLIPBOARD_SEND } type;
++    union
++    {
++        struct wayland_data_offer *offer;
++        struct
++        {
++            struct data_device_format *format;
++            int fd;
++        } send;
++    };
++};
++
++static pthread_mutex_t clipboard_events_mutex = PTHREAD_MUTEX_INITIALIZER;
++static struct list clipboard_events = LIST_INIT(clipboard_events);
+ static HWND clipboard_hwnd;
+ static const WCHAR rich_text_formatW[] = {'R','i','c','h',' ','T','e','x','t',' ','F','o','r','m','a','t',0};
+ static const WCHAR pngW[] = {'P','N','G',0};
+@@ -273,6 +290,45 @@
+     return NtUserRegisterWindowMessage(&name_str);
+ }
+ 
++static BOOL post_clipboard_event(struct clipboard_event *event)
++{
++    BOOL ret;
++
++    /* The Unix dispatcher cannot make Windows callbacks. Keep native pointers
++     * in this queue, not in the message parameters which pass through WoW64. */
++    pthread_mutex_lock(&clipboard_events_mutex);
++    list_add_tail(&clipboard_events, &event->entry);
++    if (!(ret = clipboard_hwnd && NtUserPostMessage(clipboard_hwnd, WM_USER, 0, 0)))
++        list_remove(&event->entry);
++    pthread_mutex_unlock(&clipboard_events_mutex);
++
++    if (!ret) WARN("failed to post clipboard event %u\n", event->type);
++    return ret;
++}
++
++static void post_clipboard_send(const char *mime_type, int fd)
++{
++    struct clipboard_event *event;
++    struct data_device_format *format = NULL;
++    const char *normalized;
++
++    if ((normalized = normalize_mime_type(mime_type)))
++    {
++        format = data_device_format_for_mime_type(normalized);
++        free((void *)normalized);
++    }
++
++    if (format && (event = malloc(sizeof(*event))))
++    {
++        event->type = CLIPBOARD_SEND;
++        event->send.format = format;
++        event->send.fd = fd;
++        if (post_clipboard_event(event)) return;
++        free(event);
++    }
++    close(fd);
++}
++
+ /**********************************************************************
+  *          ext_data_control_source_v1 handling
+  */
+@@ -316,15 +372,7 @@
+                                      struct ext_data_control_source_v1 *source,
+                                      const char *mime_type, int32_t fd)
+ {
+-    struct data_device_format *format;
+-    const char *normalized;
+-
+-    if ((normalized = normalize_mime_type(mime_type)) &&
+-        (format = data_device_format_for_mime_type(normalized)))
+-    {
+-        wayland_data_source_export(format, fd);
+-    }
+-    close(fd);
++    post_clipboard_send(mime_type, fd);
+ }
+ 
+ static void data_control_source_cancelled(void *data,
+@@ -419,6 +467,20 @@
+     free(data_offer);
+ }
+ 
++static void post_clipboard_selection(struct wayland_data_offer *data_offer)
++{
++    struct clipboard_event *event;
++
++    if ((event = malloc(sizeof(*event))))
++    {
++        event->type = CLIPBOARD_SELECTION;
++        event->offer = data_offer;
++        if (post_clipboard_event(event)) return;
++        free(event);
++    }
++    if (data_offer) wayland_data_offer_destroy(data_offer);
++}
++
+ static int wayland_data_offer_get_import_fd(struct wayland_data_offer *data_offer,
+                                             const char *mime_type)
+ {
+@@ -571,10 +633,9 @@
+     struct ext_data_control_device_v1 *ext_data_control_device_v1,
+     struct ext_data_control_offer_v1 *ext_data_control_offer_v1)
+ {
+-    handle_selection(data,
+-                     ext_data_control_offer_v1 ?
+-                     ext_data_control_offer_v1_get_user_data(ext_data_control_offer_v1) :
+-                     NULL);
++    post_clipboard_selection(ext_data_control_offer_v1 ?
++                            ext_data_control_offer_v1_get_user_data(ext_data_control_offer_v1) :
++                            NULL);
+ }
+ 
+ static void data_control_device_finished(
+@@ -611,15 +672,7 @@
+ static void data_source_send(void *data, struct wl_data_source *source,
+                              const char *mime_type, int32_t fd)
+ {
+-    struct data_device_format *format;
+-    const char *normalized;
+-
+-    if ((normalized = normalize_mime_type(mime_type)) &&
+-        (format = data_device_format_for_mime_type(normalized)))
+-    {
+-        wayland_data_source_export(format, fd);
+-    }
+-    close(fd);
++    post_clipboard_send(mime_type, fd);
+ }
+ 
+ static void data_source_cancelled(void *data, struct wl_data_source *source)
+@@ -690,7 +743,7 @@
+ static void data_device_selection(void *data, struct wl_data_device *wl_data_device,
+                                   struct wl_data_offer *wl_data_offer)
+ {
+-    handle_selection(data, wl_data_offer ? wl_data_offer_get_user_data(wl_data_offer) : NULL);
++    post_clipboard_selection(wl_data_offer ? wl_data_offer_get_user_data(wl_data_offer) : NULL);
+ }
+ 
+ static const struct wl_data_device_listener data_device_listener =
+@@ -915,6 +968,42 @@
+     return !wcscmp(buffer, clipboard_classnameW);
+ }
+ 
++static void process_clipboard_events(void)
++{
++    static BOOL processing;
++    struct clipboard_event *event;
++    struct list *entry;
++
++    /* Clipboard callbacks can reenter the message loop. Finish the current
++     * selection before processing a newer one, without holding our mutex. */
++    if (processing) return;
++    processing = TRUE;
++
++    for (;;)
++    {
++        pthread_mutex_lock(&clipboard_events_mutex);
++        if ((entry = list_head(&clipboard_events))) list_remove(entry);
++        pthread_mutex_unlock(&clipboard_events_mutex);
++        if (!entry) break;
++
++        event = LIST_ENTRY(entry, struct clipboard_event, entry);
++        switch (event->type)
++        {
++        case CLIPBOARD_SELECTION:
++            handle_selection(&process_wayland.data_device, event->offer);
++            break;
++        case CLIPBOARD_SEND:
++            wayland_data_source_export(event->send.format, event->send.fd);
++            close(event->send.fd);
++            break;
++        }
++        free(event);
++    }
++
++    wl_display_flush(process_wayland.wl_display);
++    processing = FALSE;
++}
++
+ LRESULT WAYLAND_ClipboardWindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
+ {
+     switch (msg)
+@@ -928,7 +1017,9 @@
+         {
+             return FALSE;
+         }
++        pthread_mutex_lock(&clipboard_events_mutex);
+         clipboard_hwnd = hwnd;
++        pthread_mutex_unlock(&clipboard_events_mutex);
+         NtUserAddClipboardFormatListener(hwnd);
+         pthread_mutex_lock(&process_wayland.seat.mutex);
+         if (process_wayland.seat.wl_seat) wayland_data_device_init();
+@@ -944,6 +1035,9 @@
+     case WM_DESTROYCLIPBOARD:
+         destroy_clipboard();
+         break;
++    case WM_USER:
++        process_clipboard_events();
++        return 0;
+     }
+ 
+     return NtUserMessageCall(hwnd, msg, wparam, lparam, NULL, NtUserDefWindowProc, FALSE);
