@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Sun, 20 Sep 2026 11:00:00 -0600
+Subject: [PATCH] winepulse: Prefer public quad sinks for Sony split audio.
+
+igrikus diagnosed and tested the public-sink routing fix in GE-Proton issue
+778: SteamOS exposes the DualSense UCM split parent as Audio/Sink/Internal,
+while SpeakerHaptic is a public four-channel sink on the same PCM. Targeting
+the internal parent can leave effects streams unlinked and stall audio
+initialization in Death Stranding Director's Cut. Related hangs were also
+reported with a DualSense Edge in Cyberpunk 2077.
+
+Adapt that routing fix after sink enumeration completes. If a Sony split
+group has a public quad endpoint, use its real Pulse node name for all haptic
+targets in that group. Match the exact split-parent name, not a controller
+model name or the last enumerated pad, and keep the physical-container
+binding and endpoint identities unchanged. This also lets streams requested
+on a mono sibling reach all four hardware channels without downmixing into
+that mono sink.
+
+Unlike unconditionally dropping non-quad split targets, leave the existing
+raw route intact for older profiles which publish only mono/stereo sinks.
+Direct-profile routing, ordinary speaker/microphone audio, and Steam Input
+selection are unchanged. Public-sink haptics follow that sink's volume/mute.
+
+Refresh cached routing metadata even when an endpoint name survives a profile
+change. Otherwise a mono endpoint enumerated before the new quad sink can
+retain its old hidden-parent target through the hotplug path.
+
+The original proposal and SteamOS verification are by igrikus; this adaptation
+still needs runtime retesting with the current GE build. No host WirePlumber
+rules or ALSA profile changes are required.
+
+Reported-by: igrikus (https://github.com/igrikus)
+Link: https://github.com/GloriousEggroll/proton-ge-custom/issues/778
+---
+ dlls/winepulse.drv/pulse.c | 54 ++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 52 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/winepulse.drv/pulse.c b/dlls/winepulse.drv/pulse.c
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -1980,11 +1980,49 @@
+     TRACE("%s\n", debugstr_w(dev->name));
+ }
+ 
++static void pulse_resolve_dualsense_split_targets(struct list *devices)
++{
++    PhysDevice *quad, *dev;
++    char *parent, *target;
++
++    LIST_FOR_EACH_ENTRY(quad, devices, PhysDevice, entry)
++    {
++        if (!is_dualsense_audio_device(quad) || !quad->raw_haptic_target ||
++                (quad->channel_mask & KSAUDIO_SPEAKER_QUAD) != KSAUDIO_SPEAKER_QUAD ||
++                !strcmp(quad->raw_haptic_target, quad->pulse_name))
++            continue;
++        if (!(parent = strdup(quad->raw_haptic_target)))
++            continue;
++
++        /* UCM split parents may be Audio/Sink/Internal. Prefer the public
++         * quad sink for every endpoint of this exact split group, but leave
++         * profiles without a quad sink on their existing raw path. */
++        LIST_FOR_EACH_ENTRY(dev, devices, PhysDevice, entry)
++        {
++            if (!is_dualsense_audio_device(dev) || !dev->raw_haptic_target ||
++                    strcmp(dev->raw_haptic_target, parent))
++                continue;
++            if (!(target = strdup(quad->pulse_name)))
++                continue;
++            TRACE("Routing Sony split endpoint %s through public quad sink %s instead of %s.\n",
++                    debugstr_a(dev->pulse_name), debugstr_a(target), debugstr_a(parent));
++            free(dev->raw_haptic_target);
++            dev->raw_haptic_target = target;
++        }
++        free(parent);
++    }
++}
++
+ static void pulse_phys_speakers_cb(pa_context *c, const pa_sink_info *i, int eol, void *userdata)
+ {
+     struct list *speaker;
+     UINT channel_mask;
+ 
++    if (eol > 0)
++    {
++        pulse_resolve_dualsense_split_targets(userdata ? userdata : &g_phys_speakers);
++        return;
++    }
+     if (!i || !i->name || !i->name[0])
+         return;
+     channel_mask = pulse_channel_map_to_channel_mask(&i->channel_map);
+@@ -2132,7 +2170,7 @@ static BOOL pulse_refresh_devices(EDataFlow flow)
+     struct list *active = flow == eRender ? &g_phys_speakers : &g_phys_sources;
+     struct list *added = flow == eRender ? &g_phys_speakers_added : &g_phys_sources_added;
+     struct list *removed = flow == eRender ? &g_phys_speakers_removed : &g_phys_sources_removed;
+-    PhysDevice *dev, *next;
++    PhysDevice *dev, *next, *existing;
+     pa_mainloop *ml;
+     pa_context *ctx;
+     pa_operation *o;
+@@ -2201,8 +2239,20 @@ static BOOL pulse_refresh_devices(EDataFlow flow)
+ 
+     LIST_FOR_EACH_ENTRY_SAFE(dev, next, &current, PhysDevice, entry)
+     {
+-        if (pulse_find_device(active, dev->pulse_name) || pulse_find_device(added, dev->pulse_name))
++        if ((existing = pulse_find_device(active, dev->pulse_name)) ||
++                (existing = pulse_find_device(added, dev->pulse_name)))
+         {
++            /* A public quad sink can appear after its mono sibling without
++             * changing that sibling's endpoint name or identity. */
++            if (flow == eRender && is_dualsense_audio_device(dev))
++            {
++                free(existing->raw_haptic_target);
++                free(existing->raw_haptic_alsa_path);
++                existing->raw_haptic_target = dev->raw_haptic_target;
++                existing->raw_haptic_alsa_path = dev->raw_haptic_alsa_path;
++                dev->raw_haptic_target = NULL;
++                dev->raw_haptic_alsa_path = NULL;
++            }
+             list_remove(&dev->entry);
+             pulse_dev_free(dev);
+             continue;
