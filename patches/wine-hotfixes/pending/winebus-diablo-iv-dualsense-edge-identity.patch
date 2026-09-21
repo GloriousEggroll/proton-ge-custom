@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Subject: [PATCH] winebus: Expose native DualSense Edge as DualSense for Diablo IV.
+
+Diablo IV supports DualSense but does not recognize DualSense Edge. Add
+PROTON_SONY_DUALSENSE_EDGE_AS_DUALSENSE, enabled by Proton for app 2344520,
+to expose native 054c:0df2 HID devices as 054c:0ce6.
+
+Use the existing Windows identity helpers for PnP IDs, HID attributes and
+the product string. Keep the physical PID, serial and container ID for
+device matching, hotplug, audio association and haptics. The standard
+DualSense controls, calibration and output reports are shared with Edge;
+do not replace the descriptor, firmware, feature reports or report data.
+Edge-specific controls are not advertised as new in-game bindings.
+
+Leave native DualSense, DualShock, SDL/XInput-mapped controllers and Steam
+Input virtual devices unchanged. Existing SDL ignore filters remain in
+force. In addition, skip the mapping if Steam Input emulation is enabled
+or a Steam virtual input device exists and has not been explicitly disabled.
+Probe the virtual device independently of enumeration order: Steam can
+export its integration environment variables even when per-game Steam
+Input is disabled. On enumeration failure, leave the identity unchanged.
+
+Honor an explicit DS4 or XInput mapping ahead of this identity-only mode.
+The existing Diablo startup HID refresh recognizes the resulting USB
+DualSense interface without any further change.
+
+Apply after winebus-switch-pro-xinput-identity.patch. Native report
+compatibility reference (no code copied):
+https://github.com/torvalds/linux/blob/master/drivers/hid/hid-playstation.c
+---
+diff --git a/dlls/winebus.sys/bus_udev.c b/dlls/winebus.sys/bus_udev.c
+--- a/dlls/winebus.sys/bus_udev.c
++++ b/dlls/winebus.sys/bus_udev.c
+@@ -1526,6 +1526,31 @@
+     return env && env[0] == '1' && !env[1];
+ }
+ 
++static BOOL spoof_dualsense_edge_as_dualsense(void)
++{
++    const char *env = getenv("PROTON_SONY_DUALSENSE_EDGE_AS_DUALSENSE");
++    struct udev_enumerate *enumerate;
++    BOOL enabled = FALSE;
++
++    if (!env || strcmp(env, "1")) return FALSE;
++    env = getenv("PROTON_EMULATE_STEAMINPUT");
++    if (env && atoi(env)) return FALSE;
++    env = getenv("PROTON_NO_STEAMINPUT");
++    if (env && !strcmp(env, "1")) return TRUE;
++
++    /* Steam can export its integration variables even with per-game input
++     * disabled. Check for an actual virtual controller, independent of the
++     * order in which udev reports physical and virtual devices. */
++    if (!(enumerate = udev_enumerate_new(udev_context))) return FALSE;
++    if (udev_enumerate_add_match_subsystem(enumerate, "input") >= 0 &&
++            udev_enumerate_add_match_sysattr(enumerate, "id/vendor", "28de") >= 0 &&
++            udev_enumerate_add_match_sysattr(enumerate, "id/product", "11ff") >= 0 &&
++            udev_enumerate_scan_devices(enumerate) >= 0)
++        enabled = !udev_enumerate_get_list_entry(enumerate);
++    udev_enumerate_unref(enumerate);
++    return enabled;
++}
++
+ static NTSTATUS hidraw_device_create(struct udev_device *dev, int fd, const char *devnode, struct device_desc desc)
+ {
+ #ifdef HAVE_LINUX_HIDRAW_H
+@@ -1562,6 +1587,15 @@
+         TRACE("exposing DualShock 4 v2 hidraw controller %04x:%04x directly as DualShock 4 v1.\n",
+                 desc.vid, desc.pid);
+     }
++    else if (!desc.is_gamepad && desc.vid == 0x054c && desc.pid == 0x0df2 &&
++            spoof_dualsense_edge_as_dualsense())
++    {
++        /* Keep the physical PID for hotplug identity, audio and haptics. The
++         * Edge uses the same standard input/output reports as DualSense. */
++        desc.spoof_dualsense = TRUE;
++        TRACE("exposing native DualSense Edge %04x:%04x as DualSense 054c:0ce6.\n",
++                desc.vid, desc.pid);
++    }
+ 
+     if (!desc.product[0] && ioctl(fd, HIDIOCGRAWNAME(sizeof(buffer) - 1), buffer) >= 0)
+         ntdll_umbstowcs(buffer, strlen(buffer) + 1, desc.product, ARRAY_SIZE(desc.product));
+diff --git a/dlls/winebus.sys/main.c b/dlls/winebus.sys/main.c
+--- a/dlls/winebus.sys/main.c
++++ b/dlls/winebus.sys/main.c
+@@ -593,6 +593,7 @@
+     if (ext->desc.use_xbox_identity) return 0x028e;
+     if (ext->desc.spoof_dualshock4_v1) return 0x05c4;
+     if (ext->desc.spoof_dualshock4) return 0x09cc;
++    if (ext->desc.spoof_dualsense) return 0x0ce6;
+     return ext->desc.pid;
+ }
+ 
+@@ -601,6 +602,7 @@
+     if (ext->desc.use_xbox_identity) return L"Xbox 360 Controller for Windows";
+     if (ext->desc.spoof_dualshock4 || ext->desc.spoof_dualshock4_v1)
+         return L"Wireless Controller";
++    if (ext->desc.spoof_dualsense) return L"DualSense Wireless Controller";
+     return ext->desc.product;
+ }
+ 
+diff --git a/dlls/winebus.sys/unixlib.h b/dlls/winebus.sys/unixlib.h
+--- a/dlls/winebus.sys/unixlib.h
++++ b/dlls/winebus.sys/unixlib.h
+@@ -43,6 +43,7 @@
+     BOOL is_hidraw;
+     BOOL spoof_dualshock4;
+     BOOL spoof_dualshock4_v1;
++    BOOL spoof_dualsense;
+     BOOL use_xbox_identity;
+ 
+     WCHAR manufacturer[MAX_PATH];
+
