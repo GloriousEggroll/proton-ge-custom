@@ -471,6 +471,9 @@ apply_all_in_dir() {
     echo "WINE: expose mapped Switch Pro controllers as Xbox when Steam Input is disabled"
     apply_patch "../patches/wine-hotfixes/pending/winebus-switch-pro-xinput-identity.patch"
 
+    echo "WINE: expose native DualSense Edge as DualSense for Diablo IV"
+    apply_patch "../patches/wine-hotfixes/pending/winebus-diablo-iv-dualsense-edge-identity.patch"
+
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
     ./tools/make_requests
