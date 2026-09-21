@@ -79,6 +79,7 @@ apply_all_in_dir() {
         lsteamclient/steam_input_manual.c \
         lsteamclient/steamclient_main.c \
         lsteamclient/steamclient_private.h \
+        lsteamclient/unixlib.cpp \
         lsteamclient/winISteamInput.c
 
     echo "LSTEAMCLIENT: apply Steam Input and initialization fixes"

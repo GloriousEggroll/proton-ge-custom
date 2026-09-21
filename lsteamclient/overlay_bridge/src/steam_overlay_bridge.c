@@ -166,6 +166,7 @@ typedef int (*overlay_needs_present_fn)(void);
 typedef int (*overlay_is_enabled_fn)(void);
 typedef void (*overlay_input_stream_write_fn)(void *, const void *, size_t);
 typedef void (*wine_reapply_cursor_fn)(void);
+typedef void (*wine_suppress_cursor_fn)(int);
 
 #define STEAM_OVERLAY_WINDOW_TYPE_XLIB 2
 #define STEAM_OVERLAY_INPUT_SOURCE_X11 2
@@ -180,6 +181,7 @@ static pthread_mutex_t overlay_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t cursor_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_once_t wine_cursor_api_once = PTHREAD_ONCE_INIT;
 static wine_reapply_cursor_fn wine_reapply_cursor;
+static wine_suppress_cursor_fn wine_suppress_cursor;
 static pthread_once_t overlay_event_api_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t overlay_event_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct wine_ntdll_api wine_ntdll;
@@ -209,6 +211,7 @@ static int overlay_focus_owner;
 static Window overlay_focus_window;
 static int overlay_requested_focus;
 static int overlay_advertised_focus = -1;
+static int overlay_x11_focus_rejected;
 static int overlay_bridge_suspended;
 static unsigned int overlay_surface_count;
 static unsigned int overlay_focused_surface_count;
@@ -270,7 +273,15 @@ static void load_wine_cursor_api(void)
     if (!(module = dlopen("win32u.so", RTLD_NOW | RTLD_NOLOAD))) return;
     wine_reapply_cursor = (wine_reapply_cursor_fn)dlsym(
         module, "__wine_reapply_driver_cursor");
-    if (!wine_reapply_cursor) dlclose(module);
+    wine_suppress_cursor = (wine_suppress_cursor_fn)dlsym(
+        module, "__wine_suppress_driver_cursor");
+    if (!wine_reapply_cursor && !wine_suppress_cursor) dlclose(module);
+}
+
+static void suppress_wine_game_cursor(int suppress)
+{
+    pthread_once(&wine_cursor_api_once, load_wine_cursor_api);
+    if (wine_suppress_cursor) wine_suppress_cursor(suppress);
 }
 
 static void reapply_wine_game_cursor(void)
@@ -1184,9 +1195,17 @@ static int update_overlay_active(void)
     if (changed)
     {
         overlay_trace("overlay is now %s\n", active ? "active" : "inactive");
-        if (active) bridge_set_cursor_shape(GE_STEAM_OVERLAY_CURSOR_DEFAULT);
+        if (active)
+        {
+            suppress_wine_game_cursor(1);
+            bridge_set_cursor_shape(GE_STEAM_OVERLAY_CURSOR_DEFAULT);
+        }
         ge_overlay_wayland_set_overlay_active(active);
-        if (!active) reapply_wine_game_cursor();
+        if (!active)
+        {
+            suppress_wine_game_cursor(0);
+            reapply_wine_game_cursor();
+        }
     }
 
     return active;
@@ -1521,6 +1540,7 @@ static void sync_overlay_focus(void)
     }
 
     XLockDisplay(overlay_display);
+    overlay_x11_focus_rejected = 0;
     if (focused)
     {
         selection_owner =
@@ -1585,6 +1605,37 @@ static void sync_overlay_focus(void)
 static void update_overlay_focus(void)
 {
     sync_overlay_focus();
+}
+
+int ge_overlay_bridge_needs_controller_focus(void)
+{
+    Window current_focus;
+    int revert_to;
+    int needed;
+
+    if (pthread_mutex_trylock(&overlay_mutex)) return -1;
+    needed = overlay_initialized > 0 && !overlay_bridge_suspended &&
+             overlay_requested_focus && overlay_focus_owner;
+    if (needed)
+    {
+        /* Xwayland can accept XSetInputFocus before the compositor resets it
+         * to PointerRoot. Check the current state, not the initial reply. */
+        XLockDisplay(overlay_display);
+        needed = XGetSelectionOwner(overlay_display, overlay_owner_atom) == overlay_window;
+        if (needed)
+        {
+            XGetInputFocus(overlay_display, &current_focus, &revert_to);
+            needed = current_focus != overlay_focus_window;
+            if (overlay_x11_focus_rejected != needed)
+                overlay_trace("controller focus fallback %s (X11 focus %#lx, proxy %#lx)\n",
+                              needed ? "required" : "not required", current_focus,
+                              overlay_focus_window);
+            overlay_x11_focus_rejected = needed;
+        }
+        XUnlockDisplay(overlay_display);
+    }
+    pthread_mutex_unlock(&overlay_mutex);
+    return needed;
 }
 
 static int dispatch_overlay_event(XEvent *event)
@@ -1903,6 +1954,7 @@ static void destroy_overlay_bridge(void)
     overlay_requested_focus = 0;
     overlay_bridge_suspended = 1;
     overlay_advertised_focus = -1;
+    overlay_x11_focus_rejected = 0;
     overlay_next_init_retry_ms = 0;
     overlay_wait_logged = 0;
     if (overlay_initialized <= 0)
@@ -1975,6 +2027,7 @@ static void destroy_overlay_bridge(void)
     pthread_mutex_unlock(&overlay_mutex);
 
     ge_overlay_wayland_set_overlay_active(0);
+    suppress_wine_game_cursor(0);
     reapply_wine_game_cursor();
     ge_overlay_wayland_set_cursor_shape(GE_STEAM_OVERLAY_CURSOR_DEFAULT);
     overlay_trace("destroyed X11 overlay bridge window\n");

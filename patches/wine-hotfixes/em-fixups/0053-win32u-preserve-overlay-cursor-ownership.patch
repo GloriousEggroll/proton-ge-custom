@@ -1,0 +1,112 @@
+From: GE-Proton <noreply@localhost>
+Subject: [PATCH] win32u: preserve native overlay cursor ownership
+
+The native overlay bridge's one-shot wl_pointer.set_cursor(NULL) can be
+overwritten by Wine's cursor updates or pointer re-entry. Add a generic cursor
+suppression helper beside the existing replay helper. Keep caching the real
+game cursor while applying NULL to the driver, so the driver's own pointer
+re-entry path also replays a hidden cursor. Restore the latest game cursor
+when suppression ends.
+
+Retry if the cached state changes during a driver call, without holding the
+cache mutex across that call. This prevents an in-flight cursor update from
+undoing suppression without introducing a driver-lock ordering dependency.
+No overlay policy or X11 dependency is added to winewayland.
+
+--- a/dlls/win32u/cursoricon.c
++++ b/dlls/win32u/cursoricon.c
+@@ -66,4 +66,7 @@ static struct list icon_cache = LIST_INIT( icon_cache );
+ static pthread_mutex_t driver_cursor_mutex = PTHREAD_MUTEX_INITIALIZER;
++static BOOL driver_cursor_suppressed;
++static BOOL driver_cursor_valid;
++static unsigned int driver_cursor_generation;
+ static HWND driver_cursor_window;
+ static HCURSOR driver_cursor_handle;
+ 
+@@ -138,20 +141,47 @@ static struct cursoricon_object *get_icon_ptr( HICON handle )
+-W32KAPI void __wine_reapply_driver_cursor(void)
++static void apply_driver_cursor(void)
+ {
+-    RECT clip;
+     HWND window;
+     HCURSOR handle;
+-    UINT context;
++    unsigned int generation;
++    BOOL current, valid;
+ 
++    /* A concurrent SetCursor must not reinstate a cursor after suppression.
++     * Do not hold our lock across driver calls, which may reapply clipping. */
++    do
++    {
++        pthread_mutex_lock( &driver_cursor_mutex );
++        window = driver_cursor_window;
++        handle = driver_cursor_suppressed ? 0 : driver_cursor_handle;
++        valid = driver_cursor_valid;
++        generation = driver_cursor_generation;
++        pthread_mutex_unlock( &driver_cursor_mutex );
++
++        if (valid) user_driver->pSetCursor( window, handle );
++
++        pthread_mutex_lock( &driver_cursor_mutex );
++        current = generation == driver_cursor_generation;
++        pthread_mutex_unlock( &driver_cursor_mutex );
++    } while (!current);
++}
++
++W32KAPI void __wine_suppress_driver_cursor(BOOL suppress)
++{
++    BOOL changed;
++
+     pthread_mutex_lock( &driver_cursor_mutex );
+-    window = driver_cursor_window;
+-    handle = driver_cursor_handle;
++    changed = driver_cursor_suppressed != !!suppress;
++    driver_cursor_suppressed = !!suppress;
++    if (changed) ++driver_cursor_generation;
+     pthread_mutex_unlock( &driver_cursor_mutex );
++    if (changed) apply_driver_cursor();
++}
+ 
+-    if (window)
+-    {
+-        TRACE( "reapplying window %p, hcursor %p\n", window, handle );
+-        user_driver->pSetCursor( window, handle );
+-    }
++W32KAPI void __wine_reapply_driver_cursor(void)
++{
++    RECT clip;
++    UINT context;
++
++    apply_driver_cursor();
+ 
+     context = NtUserSetThreadDpiAwarenessContext( NTUSER_DPI_PER_MONITOR_AWARE );
+     if (NtUserGetClipCursor( &clip )) NtUserClipCursor( &clip );
+@@ -162,10 +192,15 @@ BOOL process_wine_setcursor( HWND hwnd, HWND window, HCURSOR handle )
+ {
+     TRACE( "hwnd %p, window %p, hcursor %p\n", hwnd, window, handle );
+     pthread_mutex_lock( &driver_cursor_mutex );
+-    driver_cursor_window = window;
+-    driver_cursor_handle = handle;
++    if (!driver_cursor_valid || driver_cursor_window != window || driver_cursor_handle != handle)
++    {
++        driver_cursor_valid = TRUE;
++        driver_cursor_window = window;
++        driver_cursor_handle = handle;
++        ++driver_cursor_generation;
++    }
+     pthread_mutex_unlock( &driver_cursor_mutex );
+-    user_driver->pSetCursor( window, handle );
++    apply_driver_cursor();
+     return TRUE;
+ }
+ 
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -39,6 +39,7 @@ extern void release_clipboard_owner( HWND hwnd );
+ /* cursoricon.c */
+ extern BOOL process_wine_setcursor( HWND hwnd, HWND window, HCURSOR handle );
+ extern W32KAPI void __wine_reapply_driver_cursor(void);
++extern W32KAPI void __wine_suppress_driver_cursor(BOOL suppress);
+ extern HICON alloc_cursoricon_handle( BOOL is_icon );
+ extern ULONG_PTR get_icon_param( HICON handle );
+ extern ULONG_PTR set_icon_param( HICON handle, const struct free_icon_params *params );

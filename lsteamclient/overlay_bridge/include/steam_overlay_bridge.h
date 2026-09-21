@@ -62,6 +62,8 @@ struct ge_overlay_wayland_surface;
 
 GE_OVERLAY_API void ge_overlay_focus_proxy_instance_created(void);
 GE_OVERLAY_API void ge_overlay_focus_proxy_instance_destroyed(void);
+/* Rechecks X11 focus; returns -1 if the bridge is busy. No Steam IPC. */
+GE_OVERLAY_API int ge_overlay_bridge_needs_controller_focus(void);
 
 GE_OVERLAY_API struct ge_overlay_wayland_surface *ge_overlay_wayland_surface_create(
     struct wl_display *display, struct wl_surface *surface);
