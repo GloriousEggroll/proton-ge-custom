@@ -30,6 +30,8 @@ apply_all_in_dir() {
     apply_patch "../patches/dxvk/dxgi-keep-fullscreen-on-focus-loss.patch"
     # Black Desert also needs the matching Wine activation compatibility patch below.
     apply_patch "../patches/dxvk/black-desert-keep-fullscreen-on-focus-loss.patch"
+    # Assassin's Creed DX10: preserve fullscreen presentation across Alt+Tab.
+    apply_patch "../patches/dxvk/assassins-creed-keep-fullscreen-on-focus-loss.patch"
     popd
 
     pushd vkd3d-proton
@@ -80,6 +82,7 @@ apply_all_in_dir() {
         lsteamclient/steamclient_main.c \
         lsteamclient/steamclient_private.h \
         lsteamclient/unixlib.cpp \
+        lsteamclient/winISteamController.c \
         lsteamclient/winISteamInput.c
 
     echo "LSTEAMCLIENT: apply Steam Input and initialization fixes"
