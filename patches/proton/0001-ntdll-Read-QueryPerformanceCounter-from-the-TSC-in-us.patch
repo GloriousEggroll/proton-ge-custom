@@ -8,42 +8,51 @@ Windows has served QueryPerformanceCounter from the time-stamp counter in
 user mode since Windows 8 (~15 ns). Wine routes RtlQueryPerformanceCounter
 through NtQueryPerformanceCounter and the syscall dispatcher (~50 ns plus a
 full xsave), which is invisible for most programs but dominates games that
-instrument themselves with it.
+instrument themselves with it: DCS World calls it ~200,000 times per frame
+from its main thread, where the dispatcher accounts for 28 % of the samples.
+On a Ryzen 7 9700X that is 39 FPS stock against 62 FPS patched, 51 ns against
+15 ns per call.
 
-DCS World calls it ~200,000 times per frame from its main thread (its
-profiler, ED_get_ticks, and its Lua bindings). Measured on a Ryzen 7 9700X
-with GE-Proton11-3, Grayflag multiplayer, graphics at minimum:
+The TSC path is taken only when the host kernel uses the TSC as its own
+clocksource. The invariant TSC bit in CPUID promises a constant tick rate,
+not that the per-core counters agree with each other; aligning them is the
+firmware's job, and on some Ryzen mobile parts they sit seconds apart. Linux
+tests that at boot with check_tsc_sync_source and demotes itself to hpet or
+acpi_pm when it fails, which is also what Windows does when its own boot-time
+check fails. Gating on the CPUID bit alone breaks those machines: a thread
+migrating onto a core behind the calibrated base wraps the unsigned
+subtraction, so QueryPerformanceCounter returns a timestamp centuries away
+and snaps back on the next read. current_clocksource is the kernel's verdict;
+it is read from the PE side through the unix namespace, so nothing below
+ntdll.dll changes, then again on the first call made more than a second after
+the last check, so that a TSC demoted later is dropped too. A TSC below the
+base takes the syscall path for that call.
 
-  - 28 % of the main thread and 55 % of the render thread sampled inside
-    __wine_syscall_dispatcher, all reached from RtlQueryPerformanceCounter;
-  - 39 FPS with the stock ntdll, 62 FPS with this patch, nothing else changed;
-  - cost per call 51 ns -> 15 ns, unchanged with three threads calling
-    concurrently; Sleep(500) reads 500.0 ms through the new path.
+Calibration publishes a rate only once two consecutive 125 ms passes agree,
+from (counter, TSC) pairs bracketed by two rdtscp and discarded unless both
+report the same processor and lie close enough together. The hot path is then rdtscp,
+two predictable compares and one 64x64->128 multiply, with plain loads only:
+no locked instruction and no shared write, because an earlier version
+enforcing monotonicity with an interlocked clamp bounced a cache line between
+the calling threads and gave no gain at all.
 
-The first call records the real counter and the TSC; until 250 ms of real
-time have elapsed callers keep getting the real counter, then a second
-sample fixes the TSC rate as a 32.32 fixed-point multiplier and the base is
-rebased on that sample so the switch is continuous. The hot path is rdtscp,
-one 64x64->128-bit multiply and an add: no locked instruction and no shared
-write, because an earlier version with an interlocked monotonic clamp
-bounced a cache line between the calling threads and gave no gain at all.
+The decision is made at start-up and the counter is not disciplined
+afterwards, so processes drift apart by their calibration error, parts per
+million. WINE_DISABLE_QPC_TSC=1 forces the syscall path;
+WINE_ENABLE_QPC_TSC=1 takes the TSC path even though the kernel selected
+another clocksource, for diagnosis only. WINEDEBUG=+qpc reports which path was
+chosen and why, the calibrated rate, and every later change of mind. Nothing
+on the unix side changes.
 
-The TSC path is used only when CPUID reports an invariant TSC and rdtscp,
-and can be disabled with WINE_DISABLE_QPC_TSC=1 in the environment; both
-fall back to the unchanged syscall path. No cross-thread clamp is applied:
-an invariant TSC is synchronized across cores on the CPUs that report it,
-which is what Windows relies on too. Nothing on the unix side changes.
-
-GE build fix: exclude ARM64EC from the x86 intrinsic headers, helper
-definitions and fast-path call. Clang defines __x86_64__ for ARM64EC ABI
-compatibility, but the target cannot execute CPUID/RDTSCP. ARM64EC keeps
-using NtQueryPerformanceCounter; native x86-64 retains the TSC fast path.
+ARM64EC is excluded throughout: clang defines __x86_64__ there for ABI
+compatibility, but the target cannot execute CPUID or RDTSCP, so it keeps
+using NtQueryPerformanceCounter.
 ---
- dlls/ntdll/time.c | 108 ++++++++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 108 insertions(+)
+ dlls/ntdll/time.c | 347 ++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 347 insertions(+)
 
 diff --git a/dlls/ntdll/time.c b/dlls/ntdll/time.c
-index 105a6cf..c87475f 100644
+index 105a6cf5bc8..06163f88117 100644
 --- a/dlls/ntdll/time.c
 +++ b/dlls/ntdll/time.c
 @@ -29,6 +29,10 @@
@@ -57,48 +66,79 @@ index 105a6cf..c87475f 100644
  
  #include "ntstatus.h"
  #define WIN32_NO_STATUS
-@@ -377,11 +381,115 @@ LONGLONG WINAPI RtlGetSystemTimePrecise( void )
+@@ -377,11 +381,354 @@ LONGLONG WINAPI RtlGetSystemTimePrecise( void )
      return ret;
  }
  
 +#if defined(__x86_64__) && !defined(__arm64ec__)
-+/* User-mode performance counter based on the invariant TSC (dcs-linux, 2026-09-10).
-+ * Calibration: the first call records (qpc0, tsc0) from the real counter; once at least
-+ * QPC_TSC_CALIBRATION_TICKS of real time have elapsed, a second sample fixes the TSC rate as a
-+ * 32.32 fixed-point multiplier. The hot path is then rdtscp + one 64x64->128 multiply, with
-+ * plain loads only: no locked instruction, so concurrent callers never share a cache line
-+ * write. No cross-thread clamp: the invariant TSC is synchronized across cores on the CPUs
-+ * that report it (Windows does not clamp either). */
-+#define QPC_TSC_CALIBRATION_TICKS (TICKSPERSEC / 4)   /* 250 ms */
++/* WINEDEBUG=+qpc reports which path was chosen and why, and every later change of mind. */
++WINE_DECLARE_DEBUG_CHANNEL(qpc);
 +
-+static volatile LONG qpc_tsc_state;          /* 0 = unknown, 1 = calibrating, 2 = ready, -1 = disabled */
-+static LONGLONG qpc_tsc_base_qpc;
-+static ULONGLONG qpc_tsc_base_tsc;
-+static ULONGLONG qpc_tsc_mult;               /* TICKSPERSEC * 2^32 / tsc_hz */
++/* User-mode performance counter based on the invariant TSC.
++ *
++ * Only used while the kernel uses the TSC as its own clocksource. The invariant TSC bit in
++ * CPUID promises a constant tick rate, not that the per-core counters agree with each other;
++ * keeping them aligned is the firmware's job and some machines are seconds off. Linux tests
++ * that at boot (check_tsc_sync_source) and falls back to hpet or acpi_pm when it fails, as
++ * Windows does when its own boot-time check fails. current_clocksource is that verdict, read
++ * through the unix namespace at start-up, then on the first call made more than a second
++ * after the last check, so a TSC the kernel demotes later is dropped too.
++ *
++ * Calibration publishes a rate once two consecutive passes agree. Each (counter, TSC) pair is
++ * bracketed by two rdtscp and discarded unless both report the same processor and lie within
++ * QPC_TSC_SAMPLE_CYCLES of each other.
++ *
++ * The hot path is rdtscp, two predictable compares and one 64x64->128 multiply, with plain
++ * loads only: no locked instruction and no shared write, because an earlier version enforcing
++ * monotonicity with an interlocked clamp bounced a cache line between the callers and gave no
++ * gain at all. A TSC read below the calibrated base would wrap the unsigned subtraction into
++ * a timestamp centuries away, so that call takes the syscall path instead.
++ *
++ * The decision is made at start-up; the counter is not disciplined afterwards. */
++#define QPC_TSC_CALIBRATION_TICKS (TICKSPERSEC / 8)    /* 125 ms per calibration pass */
++#define QPC_TSC_SAMPLE_CYCLES     50000                /* a sample pair wider than this is discarded */
++#define QPC_TSC_RATE_TOLERANCE    2000                 /* two rates agree when within 1/2000 */
++#define QPC_TSC_MAX_PASSES        32                   /* give up calibrating if they never do */
++#define QPC_TSC_MAX_PROBES        64                   /* retries while the clocksource is unreadable */
++#define QPC_TSC_CHECK_TICKS       TICKSPERSEC          /* ask the kernel again once a second */
 +
-+static BOOL qpc_tsc_supported(void)
++enum
 +{
-+    unsigned int eax, ebx, ecx, edx;
-+    UNICODE_STRING name, value;
-+    WCHAR buffer[8];
++    QPC_TSC_DISABLED = -1,   /* the syscall path, for good */
++    QPC_TSC_UNKNOWN = 0,     /* nothing probed yet */
++    QPC_TSC_PROBING,         /* one thread is probing support and taking the first sample */
++    QPC_TSC_CALIBRATING,     /* the base is valid, waiting for the window to elapse */
++    QPC_TSC_PUBLISHING,      /* one thread owns the end of a calibration pass */
++    QPC_TSC_READY,           /* the hot path is live */
++};
 +
-+    /* escape hatch: WINE_DISABLE_QPC_TSC=1 in the environment */
-+    RtlInitUnicodeString( &name, L"WINE_DISABLE_QPC_TSC" );
-+    value.Buffer = buffer;
-+    value.MaximumLength = sizeof(buffer);
-+    value.Length = 0;
-+    if (!RtlQueryEnvironmentVariable_U( NULL, &name, &value ) && value.Length && buffer[0] != '0')
-+        return FALSE;
++static volatile LONG qpc_tsc_state;
++static volatile LONG qpc_tsc_checking;   /* one thread asking the kernel at a time */
++static BOOL      qpc_tsc_forced;         /* WINE_ENABLE_QPC_TSC: do not follow the kernel clocksource */
 +
-+    /* invariant TSC: CPUID 0x80000007 EDX bit 8 ; rdtscp: CPUID 0x80000001 EDX bit 27 */
-+    __cpuid( 0x80000000, eax, ebx, ecx, edx );
-+    if (eax < 0x80000007) return FALSE;
-+    __cpuid( 0x80000007, eax, ebx, ecx, edx );
-+    if (!(edx & (1u << 8))) return FALSE;
-+    __cpuid( 0x80000001, eax, ebx, ecx, edx );
-+    if (!(edx & (1u << 27))) return FALSE;
-+    return TRUE;
-+}
++/* written before qpc_tsc_state releases them, then constant; qpc_tsc_base_qpc is also read by
++ * calibrating callers while a pass is being closed, hence the relaxed atomics on it */
++static LONGLONG  qpc_tsc_base_qpc;
++static ULONGLONG qpc_tsc_base_tsc;
++static ULONGLONG qpc_tsc_mult;           /* TICKSPERSEC * 2^32 / tsc_hz */
++static ULONGLONG qpc_tsc_check_step;     /* QPC_TSC_CHECK_TICKS expressed in TSC cycles */
++
++/* calibration state, owned by whoever holds QPC_TSC_PROBING or QPC_TSC_PUBLISHING */
++static LONGLONG  qpc_tsc_first_qpc;      /* the very first sample, for the full-span rate */
++static ULONGLONG qpc_tsc_first_tsc;
++static ULONGLONG qpc_tsc_prev_hz;        /* rate measured by the previous pass */
++static LONG      qpc_tsc_passes;
++static LONG      qpc_tsc_probes;
++
++/* written after publication while every caller reads it: relaxed atomics, which on x86-64
++ * are plain 64-bit loads and stores, keep the compiler from tearing or caching it */
++static ULONGLONG qpc_tsc_check_start;    /* TSC at the last check; the next one is due a step later */
++
++struct qpc_tsc_sample
++{
++    LONGLONG  qpc;
++    ULONGLONG tsc;
++};
 +
 +static inline ULONGLONG qpc_read_tsc(void)
 +{
@@ -106,59 +146,267 @@ index 105a6cf..c87475f 100644
 +    return __rdtscp( &aux );
 +}
 +
++static inline LONGLONG qpc_tsc_ticks( ULONGLONG tsc )
++{
++    return qpc_tsc_base_qpc +
++           (LONGLONG)(((unsigned __int128)(tsc - qpc_tsc_base_tsc) * qpc_tsc_mult) >> 32);
++}
++
++/* Read the real counter and the TSC together, bracketed by two rdtscp so that a pair taken
++ * across a preemption or a core migration can be recognised and thrown away. sample->qpc is
++ * filled in either way, so the caller can still serve the counter from a rejected pair. */
++static BOOL qpc_tsc_get_sample( struct qpc_tsc_sample *sample )
++{
++    unsigned int cpu_before, cpu_after;
++    ULONGLONG before, after;
++    LARGE_INTEGER now;
++
++    before = __rdtscp( &cpu_before );
++    NtQueryPerformanceCounter( &now, NULL );
++    after = __rdtscp( &cpu_after );
++
++    sample->qpc = now.QuadPart;
++    sample->tsc = before + (after - before) / 2;
++    return cpu_before == cpu_after && after - before <= QPC_TSC_SAMPLE_CYCLES;
++}
++
++static BOOL qpc_tsc_env_set( const WCHAR *name )
++{
++    UNICODE_STRING nameU, value;
++    WCHAR buffer[8];
++
++    RtlInitUnicodeString( &nameU, name );
++    value.Buffer = buffer;
++    value.MaximumLength = sizeof(buffer);
++    value.Length = 0;
++    if (RtlQueryEnvironmentVariable_U( NULL, &nameU, &value )) return FALSE;
++    return value.Length && buffer[0] != '0';
++}
++
++/* Does the host kernel use the TSC as its own clocksource? 1 yes, 0 no, -1 not readable. */
++static int qpc_tsc_kernel_clocksource(void)
++{
++    OBJECT_ATTRIBUTES attr;
++    UNICODE_STRING nameU;
++    IO_STATUS_BLOCK io;
++    LARGE_INTEGER offset;
++    HANDLE handle;
++    char buffer[16];
++    int ret = -1;
++
++    RtlInitUnicodeString( &nameU,
++        L"\\??\\unix\\sys\\devices\\system\\clocksource\\clocksource0\\current_clocksource" );
++    InitializeObjectAttributes( &attr, &nameU, OBJ_CASE_INSENSITIVE, NULL, NULL );
++    if (NtOpenFile( &handle, GENERIC_READ | SYNCHRONIZE, &attr, &io,
++                    FILE_SHARE_READ | FILE_SHARE_WRITE,
++                    FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE ))
++        return -1;
++    offset.QuadPart = 0;
++    if (!NtReadFile( handle, NULL, NULL, NULL, &io, buffer, sizeof(buffer), &offset, NULL ))
++        ret = io.Information >= 3 && !memcmp( buffer, "tsc", 3 ) &&
++              (io.Information == 3 || buffer[3] == '\n');
++    NtClose( handle );
++    return ret;
++}
++
++/* May the TSC be used? 1 yes, 0 no, -1 undecided, ask again later. */
++static int qpc_tsc_usable(void)
++{
++    unsigned int eax, ebx, ecx, edx;
++    int clocksource;
++
++    /* escape hatch: WINE_DISABLE_QPC_TSC=1 in the environment */
++    if (qpc_tsc_env_set( L"WINE_DISABLE_QPC_TSC" ))
++    {
++        TRACE_(qpc)( "disabled by WINE_DISABLE_QPC_TSC\n" );
++        return 0;
++    }
++
++    /* invariant TSC: CPUID 0x80000007 EDX bit 8 ; rdtscp: CPUID 0x80000001 EDX bit 27 */
++    __cpuid( 0x80000000, eax, ebx, ecx, edx );
++    if (eax >= 0x80000007) __cpuid( 0x80000007, eax, ebx, ecx, edx );
++    else edx = 0;
++    if (!(edx & (1u << 8)))
++    {
++        TRACE_(qpc)( "no invariant TSC\n" );
++        return 0;
++    }
++    __cpuid( 0x80000001, eax, ebx, ecx, edx );
++    if (!(edx & (1u << 27)))
++    {
++        TRACE_(qpc)( "no rdtscp\n" );
++        return 0;
++    }
++
++    if ((qpc_tsc_forced = qpc_tsc_env_set( L"WINE_ENABLE_QPC_TSC" )))
++    {
++        TRACE_(qpc)( "WINE_ENABLE_QPC_TSC set, not following the kernel clocksource\n" );
++        return 1;
++    }
++    clocksource = qpc_tsc_kernel_clocksource();
++    TRACE_(qpc)( "kernel clocksource is %s\n", clocksource == 1 ? "tsc" :
++                 clocksource == 0 ? "not tsc, staying on the syscall path" : "not readable" );
++    return clocksource;
++}
++
++/* Owner of QPC_TSC_PROBING: decide whether the TSC may be used at all and take the first
++ * sample. Re-entrant callers see QPC_TSC_PROBING and are served by the syscall path, so it is
++ * safe for this to open a file. */
++static void qpc_tsc_probe(void)
++{
++    struct qpc_tsc_sample sample;
++    int i, usable = qpc_tsc_usable();
++
++    if (usable > 0)
++    {
++        for (i = 0; i < 16; i++)
++        {
++            if (!qpc_tsc_get_sample( &sample )) continue;
++            qpc_tsc_first_qpc = sample.qpc;
++            qpc_tsc_first_tsc = qpc_tsc_base_tsc = sample.tsc;
++            __atomic_store_n( &qpc_tsc_base_qpc, sample.qpc, __ATOMIC_RELAXED );
++            InterlockedExchange( (LONG *)&qpc_tsc_state, QPC_TSC_CALIBRATING );
++            return;
++        }
++    }
++    else if (usable < 0 && ++qpc_tsc_probes < QPC_TSC_MAX_PROBES)
++    {
++        /* the clocksource was not readable, most likely too early in process start-up:
++         * fall back for now and look again on a later call */
++        InterlockedExchange( (LONG *)&qpc_tsc_state, QPC_TSC_UNKNOWN );
++        return;
++    }
++    TRACE_(qpc)( "using the syscall path for this process\n" );
++    InterlockedExchange( (LONG *)&qpc_tsc_state, QPC_TSC_DISABLED );
++}
++
++/* End of one calibration pass, owner of QPC_TSC_PUBLISHING. */
++static void qpc_tsc_calibrate( const struct qpc_tsc_sample *sample )
++{
++    LONGLONG dqpc = sample->qpc - qpc_tsc_base_qpc;
++    ULONGLONG prev = qpc_tsc_prev_hz, hz, span_hz, delta;
++    unsigned __int128 wide;
++
++    /* another thread may have closed a pass and moved the base between the caller's check of
++     * the window and its taking ownership: its sample is then stale, possibly older than the
++     * new base, and nothing can be computed from it */
++    if (dqpc < QPC_TSC_CALIBRATION_TICKS)
++    {
++        InterlockedExchange( (LONG *)&qpc_tsc_state, QPC_TSC_CALIBRATING );
++        return;
++    }
++
++    wide = (unsigned __int128)(sample->tsc - qpc_tsc_base_tsc) * TICKSPERSEC / (ULONGLONG)dqpc;
++    hz = wide > ~0ull ? ~0ull : (ULONGLONG)wide;
++    qpc_tsc_prev_hz = 0;
++    if (hz > 100000000ull && hz < 20000000000ull)   /* 100 MHz .. 20 GHz : sane */
++    {
++        delta = prev > hz ? prev - hz : hz - prev;
++        if (prev && delta * QPC_TSC_RATE_TOLERANCE <= prev)
++        {
++            /* the passes agree. The rate over the whole span since the first sample is the
++             * more accurate one, so prefer it, but only while it agrees with this pass to the
++             * same tolerance */
++            wide = (unsigned __int128)(sample->tsc - qpc_tsc_first_tsc) * TICKSPERSEC
++                   / (ULONGLONG)(sample->qpc - qpc_tsc_first_qpc);
++            span_hz = wide > ~0ull ? ~0ull : (ULONGLONG)wide;
++            delta = span_hz > hz ? span_hz - hz : hz - span_hz;
++            if (delta * QPC_TSC_RATE_TOLERANCE <= hz) hz = span_hz;
++
++            /* rebase on this sample so the switch is continuous, arm the first check, then
++             * publish (release) */
++            qpc_tsc_mult = (ULONGLONG)(((unsigned __int128)TICKSPERSEC << 32) / hz);
++            qpc_tsc_base_tsc = sample->tsc;
++            qpc_tsc_check_step = hz * QPC_TSC_CHECK_TICKS / TICKSPERSEC;
++            __atomic_store_n( &qpc_tsc_base_qpc, sample->qpc, __ATOMIC_RELAXED );
++            __atomic_store_n( &qpc_tsc_check_start, sample->tsc, __ATOMIC_RELAXED );
++            TRACE_(qpc)( "calibrated at %I64u Hz after %ld passes, using the TSC\n",
++                         hz, qpc_tsc_passes + 1 );
++            InterlockedExchange( (LONG *)&qpc_tsc_state, QPC_TSC_READY );
++            return;
++        }
++        qpc_tsc_prev_hz = hz;
++    }
++    if (++qpc_tsc_passes >= QPC_TSC_MAX_PASSES)
++    {
++        WARN_(qpc)( "no two calibration passes agreed in %d tries, using the syscall path\n",
++                    QPC_TSC_MAX_PASSES );
++        InterlockedExchange( (LONG *)&qpc_tsc_state, QPC_TSC_DISABLED );
++        return;
++    }
++    qpc_tsc_base_tsc = sample->tsc;
++    __atomic_store_n( &qpc_tsc_base_qpc, sample->qpc, __ATOMIC_RELAXED );
++    InterlockedExchange( (LONG *)&qpc_tsc_state, QPC_TSC_CALIBRATING );
++}
++
++/* Once a second, one caller asks the kernel whether it still uses the TSC. Returns FALSE
++ * once it does not and the TSC path has been given up. */
++static BOOL qpc_tsc_check( ULONGLONG tsc )
++{
++    BOOL ok = TRUE;
++
++    if (InterlockedCompareExchange( (LONG *)&qpc_tsc_checking, 1, 0 )) return TRUE;
++    if (__atomic_load_n( &qpc_tsc_state, __ATOMIC_ACQUIRE ) != QPC_TSC_READY) ok = FALSE;
++    else if (!qpc_tsc_forced && qpc_tsc_kernel_clocksource() != 1)
++    {
++        WARN_(qpc)( "the kernel no longer selects the TSC, falling back to the syscall path\n" );
++        InterlockedExchange( (LONG *)&qpc_tsc_state, QPC_TSC_DISABLED );
++        ok = FALSE;
++    }
++    else __atomic_store_n( &qpc_tsc_check_start, tsc, __ATOMIC_RELAXED );
++    InterlockedExchange( (LONG *)&qpc_tsc_checking, 0 );
++    return ok;
++}
++
 +static BOOL qpc_tsc_counter( LARGE_INTEGER *counter )
 +{
-+    LONG state = qpc_tsc_state;   /* plain load: the publish below is a release via InterlockedExchange */
++    /* acquire: the values published below must not be loaded before the state that releases
++     * them, which the compiler would otherwise be free to do */
++    LONG state = __atomic_load_n( &qpc_tsc_state, __ATOMIC_ACQUIRE );
++    struct qpc_tsc_sample sample;
++    ULONGLONG tsc;
 +
-+    if (state == 2)
++    if (state == QPC_TSC_READY)
 +    {
-+        ULONGLONG delta = qpc_read_tsc() - qpc_tsc_base_tsc;
-+        counter->QuadPart = qpc_tsc_base_qpc + (LONGLONG)(((unsigned __int128)delta * qpc_tsc_mult) >> 32);
-+        return TRUE;
-+    }
-+    if (state < 0) return FALSE;
-+
-+    if (state == 0)
-+    {
-+        if (!qpc_tsc_supported())
++        tsc = qpc_read_tsc();
++        /* a core running behind the calibrated base would wrap this subtraction and hand out a
++         * timestamp centuries away: this call takes the real counter instead */
++        if ((LONGLONG)(tsc - qpc_tsc_base_tsc) < 0)
 +        {
-+            InterlockedExchange( (LONG *)&qpc_tsc_state, -1 );
++            unsigned int cpu;
++
++            __rdtscp( &cpu );   /* only to name the core in the message */
++            WARN_(qpc)( "TSC %I64u below the calibrated base %I64u on cpu %u\n",
++                        tsc, qpc_tsc_base_tsc, cpu );
 +            return FALSE;
 +        }
-+        if (InterlockedCompareExchange( (LONG *)&qpc_tsc_state, 1, 0 ) == 0)
-+        {
-+            LARGE_INTEGER now;
-+            ULONGLONG tsc = qpc_read_tsc();
-+            NtQueryPerformanceCounter( &now, NULL );
-+            qpc_tsc_base_qpc = now.QuadPart;
-+            qpc_tsc_base_tsc = tsc;
-+        }
-+        return FALSE;
-+    }
-+
-+    /* state == 1: still calibrating, use the real counter and try to finish */
-+    {
-+        LARGE_INTEGER now;
-+        ULONGLONG tsc = qpc_read_tsc();
-+        NtQueryPerformanceCounter( &now, NULL );
-+        if (now.QuadPart - qpc_tsc_base_qpc >= QPC_TSC_CALIBRATION_TICKS)
-+        {
-+            ULONGLONG dtsc = tsc - qpc_tsc_base_tsc;
-+            LONGLONG dqpc = now.QuadPart - qpc_tsc_base_qpc;
-+            unsigned __int128 hz = (unsigned __int128)dtsc * TICKSPERSEC / (ULONGLONG)dqpc;
-+            if (hz > 100000000ull && hz < 20000000000ull &&   /* 100 MHz .. 20 GHz : sane */
-+                InterlockedCompareExchange( (LONG *)&qpc_tsc_state, 3, 1 ) == 1)   /* single publisher */
-+            {
-+                /* rebase on this sample so the switch is continuous, then publish (release) */
-+                qpc_tsc_mult = (ULONGLONG)(((unsigned __int128)TICKSPERSEC << 32) / (ULONGLONG)hz);
-+                qpc_tsc_base_qpc = now.QuadPart;
-+                qpc_tsc_base_tsc = tsc;
-+                InterlockedExchange( (LONG *)&qpc_tsc_state, 2 );
-+            }
-+        }
-+        counter->QuadPart = now.QuadPart;
++        /* unsigned: a TSC that went backwards wraps this and asks the kernel at once */
++        if (tsc - __atomic_load_n( &qpc_tsc_check_start, __ATOMIC_RELAXED ) >= qpc_tsc_check_step &&
++            !qpc_tsc_check( tsc ))
++            return FALSE;
++        counter->QuadPart = qpc_tsc_ticks( tsc );
 +        return TRUE;
 +    }
++    if (state == QPC_TSC_DISABLED) return FALSE;
++
++    if (state == QPC_TSC_UNKNOWN)
++    {
++        if (InterlockedCompareExchange( (LONG *)&qpc_tsc_state, QPC_TSC_PROBING,
++                                        QPC_TSC_UNKNOWN ) == QPC_TSC_UNKNOWN)
++            qpc_tsc_probe();
++        return FALSE;
++    }
++    if (state != QPC_TSC_CALIBRATING) return FALSE;   /* another thread owns the transition */
++
++    /* still calibrating: serve the real counter, and close the pass if the window elapsed */
++    if (qpc_tsc_get_sample( &sample ) &&
++        sample.qpc - __atomic_load_n( &qpc_tsc_base_qpc, __ATOMIC_RELAXED ) >= QPC_TSC_CALIBRATION_TICKS &&
++        InterlockedCompareExchange( (LONG *)&qpc_tsc_state, QPC_TSC_PUBLISHING,
++                                    QPC_TSC_CALIBRATING ) == QPC_TSC_CALIBRATING)
++        qpc_tsc_calibrate( &sample );
++
++    counter->QuadPart = sample.qpc;
++    return TRUE;
 +}
 +#endif
 +
@@ -175,3 +423,4 @@ index 105a6cf..c87475f 100644
  }
 -- 
 2.55.0
+
