@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gabriel Rodrigues Campos <84474751+Huijiro@users.noreply.github.com>
+Date: Sat, 12 Sep 2026 23:07:31 -0300
+Subject: [PATCH] winedmo: Open progressive HTTP MP4 streams directly.
+
+URLMon may expose remote MP4 resources as incomplete streams to winedmo,
+causing FFmpeg probing to fail even though local copies of the same media
+play correctly. Generalize the existing direct Googlevideo path to open
+HTTP and HTTPS MP4 URLs through FFmpeg.
+
+Some progressive MP4 endpoints are unbounded fragmented live streams.
+Their HTTP transport can advertise seeking even though the container has
+no duration at open time. Treat these inputs as non-seekable, retain their
+unknown duration after probing, and ignore application requests to seek
+them to zero. Also discard an initial explicit start position for sources
+which do not advertise MFMEDIASOURCE_CAN_SEEK.
+
+This preserves seeking for finite progressive MP4 files while allowing
+fragmented live MP4 playback to continue from FFmpeg's current position.
+---
+ dlls/winedmo/media_source.c |  9 +++++++--
+ dlls/winedmo/unix_demuxer.c | 28 ++++++++++++++++++++--------
+ 2 files changed, 27 insertions(+), 10 deletions(-)
+
+diff --git a/dlls/winedmo/media_source.c b/dlls/winedmo/media_source.c
+index edc311f..294d81a 100644
+--- a/dlls/winedmo/media_source.c
++++ b/dlls/winedmo/media_source.c
+@@ -870,6 +870,11 @@ static HRESULT media_source_start(struct media_source *source, IMFPresentationDe
+         position->vt = VT_I8;
+         position->hVal.QuadPart = 0;
+     }
++    else if (!source->has_duration && position->vt == VT_I8)
++    {
++        position->vt = VT_EMPTY;
++    }
++
+     if (!(descriptors = calloc(source->stream_count, sizeof(*descriptors))))
+         return E_OUTOFMEMORY;
+ 
+@@ -2797,9 +2802,9 @@ static HRESULT WINAPI scheme_handler_BeginCreateObject(IMFSchemeHandler *iface,
+         *cancel_cookie = NULL;
+ 
+     if ((!wcsnicmp(url, L"http://", 7) || !wcsnicmp(url, L"https://", 8))
+-            && wcsstr(url, L".googlevideo.com/videoplayback"))
++            && (wcsstr(url, L".googlevideo.com/videoplayback") || wcsstr(url, L".mp4")))
+     {
+-        /* The demuxer opens signed Googlevideo URLs directly through FFmpeg. */
++        /* The demuxer opens progressive HTTP media directly through FFmpeg. */
+         if (FAILED(hr = CreateStreamOnHGlobal(0, TRUE, &stream)))
+             return hr;
+     }
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+index aa8fe07..606e484 100644
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -56,6 +56,7 @@ struct demuxer
+     INT64 duration;
+     INT64 live_timestamp_base;
+     BOOL direct_url;
++    BOOL nonseekable;
+ 
+     AVPacket *last_packet; /* last read packet */
+     struct stream *last_stream; /* last read packet stream */
+@@ -801,11 +802,11 @@ static BOOL is_http_hls_url( const char *url )
+     return !!strstr( url, ".m3u8" ) || !!strstr( url, "/hls_playlist/" );
+ }
+ 
+-static BOOL is_googlevideo_url( const char *url )
++static BOOL is_http_progressive_url( const char *url )
+ {
+     if (!url || (strncmp( url, "http://", 7 ) && strncmp( url, "https://", 8 ))) return FALSE;
+ 
+-    return !!strstr( url, ".googlevideo.com/videoplayback" );
++    return !!strstr( url, ".googlevideo.com/videoplayback" ) || !!strstr( url, ".mp4" );
+ }
+ 
+ static void demuxer_free_context( struct demuxer *demuxer )
+@@ -843,17 +844,17 @@ NTSTATUS demuxer_create( void *arg )
+     demuxer->live_timestamp_base = AV_NOPTS_VALUE;
+ 
+     if (!(demuxer->ctx = avformat_alloc_context())) goto failed;
+-    if (is_http_hls_url( params->url ) || is_googlevideo_url( params->url ))
++    if (is_http_hls_url( params->url ) || is_http_progressive_url( params->url ))
+     {
+-        BOOL googlevideo = is_googlevideo_url( params->url );
++        BOOL progressive = is_http_progressive_url( params->url );
+         AVDictionary *options = NULL;
+-        const AVInputFormat *format = googlevideo ? NULL : av_find_input_format( "hls" );
++        const AVInputFormat *format = progressive ? NULL : av_find_input_format( "hls" );
+ 
+         /* HLS playlists need the source URL as their base URI, while URLMon
+-         * can expose signed Googlevideo streams as successful, empty streams.
+-         * Let FFmpeg handle both remote YouTube source forms directly. */
++         * can expose progressive streams as non-seekable or incomplete streams.
++         * Let FFmpeg handle both remote source forms directly. */
+         demuxer->direct_url = TRUE;
+-        if (googlevideo)
++        if (progressive)
+         {
+             /* Replayed byte-range requests can be reset before media EOF. */
+             av_dict_set( &options, "reconnect", "1", 0 );
+@@ -869,6 +870,10 @@ NTSTATUS demuxer_create( void *arg )
+             ERR( "Failed to open remote URL, error %s.\n", debugstr_averr(ret) );
+             goto failed;
+         }
++        if (progressive && (!demuxer->ctx->pb ||
++                !(demuxer->ctx->pb->seekable & AVIO_SEEKABLE_NORMAL) ||
++                demuxer->ctx->duration == AV_NOPTS_VALUE))
++            demuxer->nonseekable = TRUE;
+     }
+     else
+     {
+@@ -896,6 +901,7 @@ NTSTATUS demuxer_create( void *arg )
+         }
+         params->duration = get_context_duration( demuxer->ctx );
+     }
++    if (demuxer->nonseekable) params->duration = AV_NOPTS_VALUE;
+     demuxer->duration = params->duration;
+     if (demuxer->duration == AV_NOPTS_VALUE && demuxer->ctx->start_time != AV_NOPTS_VALUE &&
+         strstr( format->name, "hls" ))
+@@ -1103,6 +1109,12 @@ NTSTATUS demuxer_seek( void *arg )
+ 
+     TRACE( "demuxer %p, timestamp 0x%s\n", demuxer, wine_dbgstr_longlong( params->timestamp ) );
+ 
++    if (demuxer->nonseekable)
++    {
++        TRACE( "Ignoring seek on non-seekable remote stream.\n" );
++        return STATUS_SUCCESS;
++    }
++
+     if (!(status = raw_mpegvideo_seek( demuxer, params->timestamp )))
+         goto done;
+     if (status != STATUS_NOT_SUPPORTED)
+
+-- 
+2.53.0
