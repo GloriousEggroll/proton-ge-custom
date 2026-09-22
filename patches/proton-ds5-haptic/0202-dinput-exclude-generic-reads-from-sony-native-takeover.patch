@@ -1,0 +1,197 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Subject: [PATCH] dinput: Exclude generic HID transport reads from Sony takeover.
+
+Lunar acquires its DirectInput joystick before initializing Steam Input and
+polls it even while checking XInput. DirectInput's continuous background HID
+reads were counted as native PlayStation consumption, so automatic Sony
+XInput and its Steam identity were withdrawn before the game could use them.
+A fresh-prefix reproduction shows the takeover is already active when both
+XInput DLLs register their readers.
+
+Mark DirectInput's transport handle before its first read. Exempt only that
+open file from Sony native takeover; leave DirectInput reports unchanged.
+Separate application HID readers and consumed Raw Input retain priority,
+and the exemption does not survive closing and reopening the file. This
+does not force Steam Input or change the controller's native identity.
+
+Extend the ownership tests for transport read exclusion, native priority,
+idempotent/late registration, and lifetime isolation. Runtime validation is
+pending; no build was run while preparing this patch.
+---
+diff --git a/dlls/dinput/joystick_hid.c b/dlls/dinput/joystick_hid.c
+index e8d2ac19..5c51739d 100644
+--- a/dlls/dinput/joystick_hid.c
++++ b/dlls/dinput/joystick_hid.c
+@@ -1236,6 +1236,20 @@ static HRESULT hid_joystick_acquire( IDirectInputDevice8W *iface )
+         if (impl->device == INVALID_HANDLE_VALUE) return DIERR_UNPLUGGED;
+     }
+ 
++    if (impl->attrs.VendorID == 0x054c)
++    {
++        OVERLAPPED ovl = {.hEvent = impl->base.read_event};
++        DWORD count;
++
++        /* Mark before the first read: acquired devices read continuously even
++         * when the game intends to use XInput instead of DirectInput. */
++        ret = DeviceIoControl( impl->device, IOCTL_HID_WINE_MARK_DINPUT_READER,
++                               NULL, 0, NULL, 0, &count, &ovl );
++        if (!ret && GetLastError() == ERROR_IO_PENDING)
++            ret = GetOverlappedResult( impl->device, &ovl, &count, TRUE );
++        if (ret) TRACE( "Registered DirectInput transport reader for %s.\n", debugstr_w(impl->device_path) );
++    }
++
+     memset( &impl->read_ovl, 0, sizeof(impl->read_ovl) );
+     impl->read_ovl.hEvent = impl->base.read_event;
+     ret = ReadFile( impl->device, impl->input_report_buf, report_len, NULL, &impl->read_ovl );
+diff --git a/dlls/dinput/tests/hid.c b/dlls/dinput/tests/hid.c
+index cdb0907f..b4021667 100644
+--- a/dlls/dinput/tests/hid.c
++++ b/dlls/dinput/tests/hid.c
+@@ -4281,6 +4281,7 @@ static void test_sony_xinput_takeover(void)
+     struct hid_xinput_fallback_registration registration;
+     HANDLE fallback[2] = {INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE}, events[2] = {0};
+     HANDLE native = INVALID_HANDLE_VALUE, second = INVALID_HANDLE_VALUE, second_event = NULL;
++    HANDLE dinput_reader = INVALID_HANDLE_VALUE;
+     WCHAR path[2][MAX_PATH];
+     HIDD_ATTRIBUTES attributes = {sizeof(attributes)};
+     BOOL ret, active;
+@@ -4340,12 +4341,32 @@ static void test_sony_xinput_takeover(void)
+     test_sony_fallback_read( fallback[0], fallback[0] );
+     test_sony_fallback_read( fallback[0], fallback[0] );
+     ok( WaitForSingleObject( events[0], 0 ) == WAIT_TIMEOUT, "Internal reads claimed native ownership\n" );
++
++    dinput_reader = CreateFileW( path[0], GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
++                                 NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL );
++    ok( dinput_reader != INVALID_HANDLE_VALUE, "DirectInput reader open failed, error %lu\n", GetLastError() );
++    if (dinput_reader == INVALID_HANDLE_VALUE) goto done;
++    active = TRUE;
++    ret = sync_ioctl( dinput_reader, IOCTL_HID_WINE_MARK_DINPUT_READER, &active, sizeof(active), NULL, NULL, 5000 );
++    ok( !ret && GetLastError() == ERROR_INVALID_PARAMETER, "Invalid reader registration returned %u, error %lu\n",
++        ret, GetLastError() );
++    ret = sync_ioctl( dinput_reader, IOCTL_HID_WINE_MARK_DINPUT_READER, NULL, 0, NULL, NULL, 5000 );
++    ok( ret, "DirectInput reader registration failed, error %lu\n", GetLastError() );
++    test_sony_fallback_read( dinput_reader, fallback[0] );
++    test_sony_fallback_read( dinput_reader, fallback[0] );
++    ok( WaitForSingleObject( events[0], 0 ) == WAIT_TIMEOUT, "DirectInput reads claimed native ownership\n" );
++
+     test_sony_fallback_read( native, fallback[0] );
+     ok( WaitForSingleObject( events[0], 0 ) == WAIT_TIMEOUT, "One probe claimed native ownership\n" );
+     test_sony_fallback_read( native, fallback[0] );
+     ok( WaitForSingleObject( events[0], 0 ) == WAIT_OBJECT_0, "Native reads did not withdraw fallback\n" );
+     ok( WaitForSingleObject( events[1], 0 ) == WAIT_TIMEOUT, "Native reads affected another controller\n" );
+ 
++    ret = sync_ioctl( dinput_reader, IOCTL_HID_WINE_MARK_DINPUT_READER, NULL, 0, NULL, NULL, 5000 );
++    ok( ret, "Repeated reader registration failed, error %lu\n", GetLastError() );
++    test_sony_fallback_read( dinput_reader, fallback[0] );
++    ok( WaitForSingleObject( events[0], 0 ) == WAIT_OBJECT_0, "DirectInput reader released a native owner\n" );
++
+     second = CreateFileW( path[0], GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL );
+     ok( second != INVALID_HANDLE_VALUE, "Second fallback open failed, error %lu\n", GetLastError() );
+@@ -4375,7 +4396,29 @@ static void test_sony_xinput_takeover(void)
+     ok( wait == WAIT_TIMEOUT, "Closing native consumer did not restore fallback, wait %#lx\n", wait );
+     ok( WaitForSingleObject( second_event, 0 ) == WAIT_TIMEOUT, "Close missed second fallback\n" );
+ 
++    test_sony_fallback_read( dinput_reader, fallback[0] );
++    test_sony_fallback_read( dinput_reader, fallback[0] );
++    ok( WaitForSingleObject( events[0], 0 ) == WAIT_TIMEOUT, "Remaining DirectInput reader reclaimed ownership\n" );
++
++    /* Classification belongs to the file, not the device or process. */
++    CloseHandle( dinput_reader );
++    dinput_reader = CreateFileW( path[0], GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
++                                 NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL );
++    ok( dinput_reader != INVALID_HANDLE_VALUE, "Reader reopen failed, error %lu\n", GetLastError() );
++    if (dinput_reader == INVALID_HANDLE_VALUE) goto done;
++    test_sony_fallback_read( dinput_reader, fallback[0] );
++    test_sony_fallback_read( dinput_reader, fallback[0] );
++    ok( WaitForSingleObject( events[0], 0 ) == WAIT_OBJECT_0, "Reader exemption leaked to a new handle\n" );
++    ret = sync_ioctl( dinput_reader, IOCTL_HID_WINE_MARK_DINPUT_READER, NULL, 0, NULL, NULL, 5000 );
++    ok( ret, "Late reader registration failed, error %lu\n", GetLastError() );
++    ok( WaitForSingleObject( events[0], 0 ) == WAIT_TIMEOUT, "Late registration did not release its claim\n" );
++    ok( WaitForSingleObject( second_event, 0 ) == WAIT_TIMEOUT, "Late registration missed second fallback\n" );
++    test_sony_fallback_read( dinput_reader, fallback[0] );
++    test_sony_fallback_read( dinput_reader, fallback[0] );
++    ok( WaitForSingleObject( events[0], 0 ) == WAIT_TIMEOUT, "Late-registered reader reclaimed ownership\n" );
++
+ done:
++    if (dinput_reader != INVALID_HANDLE_VALUE) CloseHandle( dinput_reader );
+     if (native != INVALID_HANDLE_VALUE) CloseHandle( native );
+     if (second != INVALID_HANDLE_VALUE) CloseHandle( second );
+     if (second_event) CloseHandle( second_event );
+diff --git a/dlls/hidclass.sys/device.c b/dlls/hidclass.sys/device.c
+index d4c3f33a..57c13b87 100644
+--- a/dlls/hidclass.sys/device.c
++++ b/dlls/hidclass.sys/device.c
+@@ -144,7 +144,8 @@ static void update_xinput_takeover( struct phys_device *pdo, HANDLE process_id )
+     BOOL native = FALSE;
+ 
+     LIST_FOR_EACH_ENTRY( queue, &pdo->queues, struct hid_queue, entry )
+-        if (queue->process_id == process_id && !queue->takeover_event && queue->native_reads >= 2)
++        if (queue->process_id == process_id && !queue->takeover_event &&
++            !queue->dinput_reader && queue->native_reads >= 2)
+             native = TRUE;
+ 
+     LIST_FOR_EACH_ENTRY( queue, &pdo->queues, struct hid_queue, entry )
+@@ -170,7 +171,8 @@ static BOOL is_sony_controller( struct phys_device *pdo )
+ 
+ static void record_native_read( struct phys_device *pdo, struct hid_queue *queue )
+ {
+-    if (!queue || queue->takeover_event || queue->native_reads >= 2 || !is_sony_controller( pdo )) return;
++    if (!queue || queue->takeover_event || queue->dinput_reader ||
++        queue->native_reads >= 2 || !is_sony_controller( pdo )) return;
+     if (++queue->native_reads == 2) update_xinput_takeover( pdo, queue->process_id );
+ }
+ 
+@@ -776,6 +778,27 @@ NTSTATUS WINAPI pdo_ioctl( DEVICE_OBJECT *device, IRP *irp )
+             else status = register_xinput_fallback( pdo, irp );
+             break;
+ 
++        case IOCTL_HID_WINE_MARK_DINPUT_READER:
++        {
++            struct hid_queue *queue = irp->Tail.Overlay.OriginalFileObject->FsContext;
++
++            if (irpsp->Parameters.DeviceIoControl.InputBufferLength ||
++                irpsp->Parameters.DeviceIoControl.OutputBufferLength)
++                status = STATUS_INVALID_PARAMETER;
++            else if (!queue || !is_sony_controller( pdo )) status = STATUS_NOT_SUPPORTED;
++            else
++            {
++                /* DirectInput's generic transport is not a native Sony handler. */
++                KeAcquireSpinLock( &pdo->lock, &irql );
++                queue->dinput_reader = TRUE;
++                queue->native_reads = 0;
++                update_xinput_takeover( pdo, queue->process_id );
++                KeReleaseSpinLock( &pdo->lock, irql );
++                status = STATUS_SUCCESS;
++            }
++            break;
++        }
++
+         case IOCTL_HID_WINE_NATIVE_INPUT_ACTIVITY:
+             if (irpsp->Parameters.DeviceIoControl.InputBufferLength != sizeof(BOOL))
+                 status = STATUS_INVALID_PARAMETER;
+diff --git a/dlls/hidclass.sys/hid.h b/dlls/hidclass.sys/hid.h
+index 76c36dce..21307218 100644
+--- a/dlls/hidclass.sys/hid.h
++++ b/dlls/hidclass.sys/hid.h
+@@ -127,6 +127,7 @@ struct hid_queue
+     HANDLE             takeover_event;
+     BOOL               takeover_signalled;
+     unsigned int       native_reads;
++    BOOL               dinput_reader;
+ };
+ 
+ typedef struct _minidriver
+diff --git a/include/wine/hid.h b/include/wine/hid.h
+index d20c6ce5..3e23d41d 100644
+--- a/include/wine/hid.h
++++ b/include/wine/hid.h
+@@ -244,6 +244,7 @@ struct hid_preparsed_data
+ #define IOCTL_HID_GET_WINE_RAWINPUT_HANDLE         HID_BUFFER_CTL_CODE(300)
+ #define IOCTL_HID_WINE_REGISTER_XINPUT_FALLBACK    HID_BUFFER_CTL_CODE(301)
+ #define IOCTL_HID_WINE_NATIVE_INPUT_ACTIVITY       HID_BUFFER_CTL_CODE(302)
++#define IOCTL_HID_WINE_MARK_DINPUT_READER          HID_BUFFER_CTL_CODE(303)
+ 
+ /* Fixed-width handle for WOW64 callers. The driver duplicates the event. */
+ struct hid_xinput_fallback_registration

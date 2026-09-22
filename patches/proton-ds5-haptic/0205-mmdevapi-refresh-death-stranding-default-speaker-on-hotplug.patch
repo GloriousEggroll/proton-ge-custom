@@ -1,0 +1,246 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Subject: [PATCH] mmdevapi: Refresh Death Stranding's default speaker on hotplug.
+
+Death Stranding Director's Cut discovers replacement Sony speakers but does
+not select their new Wwise endpoint hashes until its audio settings are
+applied again. A DS4/DualSense endpoint can survive replacement through its
+shared endpoint ID; an Edge with a different ID receives native haptics but
+no replacement speaker stream. Manually selecting that Edge restores audio.
+
+The existing compatibility hook consumes endpoint arrivals only in the
+settings transaction, and overwrites the default selection with a concrete
+hash. Keep the current default endpoint separately and leave the game's
+saved default sentinel untouched. An explicit device selection remains
+authoritative instead of being overwritten by the next endpoint arrival.
+
+Create a message-only window on the thread that applies game audio settings.
+A changed endpoint posts one coalesced refresh, with no polling timer or
+worker. Recheck default mode when dispatching, validate the current endpoint
+through the existing native selector, and request the already identified
+Wwise output transition. This avoids invoking game code from the MMDevAPI
+device worker while its device locks may be held. Guard nested dispatch and
+retain endpoint updates arriving during a refresh.
+
+Validate the complete transition bounds and epilogue, and the requested-hash
+reference, before retaining its function pointer. Pin the DLL containing the
+existing runtime hooks and window procedure for their process lifetime.
+The existing game-specific opt-in gates all of this. No endpoint identities,
+physical audio bindings, other games, or game files on disk are changed.
+---
+diff --git a/dlls/mmdevapi/main.c b/dlls/mmdevapi/main.c
+index d33c1a1d..51af1b52 100644
+--- a/dlls/mmdevapi/main.c
++++ b/dlls/mmdevapi/main.c
+@@ -58,9 +58,18 @@ static DriverFuncs midi_driver;
+ const WCHAR drv_keyW[] = L"Software\\Wine\\Drivers";
+ 
+ typedef BOOL (WINAPI *death_stranding_output_selector_t)(DWORD output_id);
++typedef void (WINAPI *death_stranding_output_switch_t)(void);
++
++#define WM_DEATH_STRANDING_OUTPUT_CHANGED (WM_APP + 1)
+ 
+ static death_stranding_output_selector_t death_stranding_output_selector;
+-static LONG death_stranding_pending_output_id = -1;
++static death_stranding_output_switch_t death_stranding_output_switch;
++static LONG death_stranding_default_output_id = -1;
++static LONG death_stranding_follow_default_output;
++static LONG death_stranding_output_message_pending;
++static DWORD death_stranding_output_thread;
++static HWND death_stranding_output_window;
++static DWORD *death_stranding_requested_output;
+ static void **death_stranding_audio_system;
+ static BYTE *death_stranding_environment_name;
+ static void *death_stranding_environment_original_callback;
+@@ -215,38 +224,128 @@ static BOOL death_stranding_update_environment_callback(void)
+     return entry != NULL;
+ }
+ 
++static void death_stranding_queue_controller_output_update(void)
++{
++    HWND window = InterlockedCompareExchangePointer((void **)&death_stranding_output_window, NULL, NULL);
++
++    if (!window || !InterlockedCompareExchange(&death_stranding_follow_default_output, 0, 0) ||
++            InterlockedExchange(&death_stranding_output_message_pending, TRUE))
++        return;
++
++    if (!PostMessageW(window, WM_DEATH_STRANDING_OUTPUT_CHANGED, 0, 0))
++    {
++        InterlockedExchange(&death_stranding_output_message_pending, FALSE);
++        WARN("Could not queue Death Stranding controller output refresh, error %lu.\n", GetLastError());
++    }
++}
++
++static LRESULT CALLBACK death_stranding_output_wndproc(HWND window, UINT msg, WPARAM wparam, LPARAM lparam)
++{
++    static BOOL refreshing;
++    LONG hash;
++
++    if (msg == WM_DEATH_STRANDING_OUTPUT_CHANGED)
++    {
++        InterlockedExchange(&death_stranding_output_message_pending, FALSE);
++        if (refreshing || !InterlockedCompareExchange(&death_stranding_follow_default_output, 0, 0) ||
++                !death_stranding_output_switch || !*death_stranding_audio_system)
++            return 0;
++
++        hash = InterlockedCompareExchange(&death_stranding_default_output_id, -1, -1);
++        if (hash == -1 || *death_stranding_requested_output == (DWORD)hash) return 0;
++
++        /* Re-enter Wwise only on the settings thread, never under MMDevAPI's device locks. */
++        refreshing = TRUE;
++        if (death_stranding_output_selector(hash))
++        {
++            death_stranding_output_switch();
++            TRACE("Refreshed Death Stranding default controller output to %#lx on settings thread %04lx.\n",
++                    (DWORD)hash, GetCurrentThreadId());
++        }
++        else
++            WARN("Death Stranding rejected replacement controller output %#lx.\n", (DWORD)hash);
++        refreshing = FALSE;
++        if (hash != InterlockedCompareExchange(&death_stranding_default_output_id, -1, -1))
++            death_stranding_queue_controller_output_update();
++        return 0;
++    }
++    if (msg == WM_NCDESTROY)
++    {
++        InterlockedCompareExchangePointer((void **)&death_stranding_output_window, NULL, window);
++        InterlockedExchange(&death_stranding_output_message_pending, FALSE);
++        InterlockedExchange((LONG *)&death_stranding_output_thread, 0);
++    }
++    return DefWindowProcW(window, msg, wparam, lparam);
++}
++
++static void death_stranding_init_output_window(void)
++{
++    static const WCHAR class_name[] = L"WineDeathStrandingControllerOutput";
++    DWORD thread = GetCurrentThreadId(), owner;
++    WNDCLASSW class = {0};
++    HMODULE module;
++    HWND window;
++
++    if (!death_stranding_output_switch) return;
++    owner = InterlockedCompareExchange((LONG *)&death_stranding_output_thread, thread, 0);
++    if (owner && owner != thread) return;
++    if (InterlockedCompareExchangePointer((void **)&death_stranding_output_window, NULL, NULL)) return;
++
++    /* The existing game hooks and this window must remain valid until process exit. */
++    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
++            (const WCHAR *)death_stranding_output_wndproc, &module)) return;
++    class.lpfnWndProc = death_stranding_output_wndproc;
++    class.hInstance = module;
++    class.lpszClassName = class_name;
++    if (!RegisterClassW(&class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
++    {
++        WARN("Could not register Death Stranding output window, error %lu.\n", GetLastError());
++        return;
++    }
++    if (!(window = CreateWindowExW(0, class_name, NULL, 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, module, NULL)))
++    {
++        WARN("Could not create Death Stranding output window, error %lu.\n", GetLastError());
++        return;
++    }
++    InterlockedExchangePointer((void **)&death_stranding_output_window, window);
++    TRACE("Created Death Stranding output notification window %p on settings thread %04lx.\n", window, thread);
++}
++
+ BOOL WINAPI death_stranding_select_controller_output(DWORD output_id)
+ {
++    DWORD requested_output = output_id;
++    LONG hash;
+     BOOL ret;
+ 
++    InterlockedExchange(&death_stranding_follow_default_output, output_id == ~0u);
++    if (output_id == ~0u)
++    {
++        hash = InterlockedCompareExchange(&death_stranding_default_output_id, -1, -1);
++        if (hash != -1) output_id = hash;
++    }
+     ret = death_stranding_output_selector(output_id);
+-    TRACE("Death Stranding stored requested output %#lx through its settings path: %d.\n",
+-            output_id, ret);
++    TRACE("Death Stranding selected output %#lx for setting %#lx: %d.\n", output_id, requested_output, ret);
+     return ret;
+ }
+ 
+ void * WINAPI death_stranding_prepare_controller_output(void *settings, BYTE setting)
+ {
+     DWORD *selected_output = (DWORD *)((BYTE *)settings + 0xdc);
+-    DWORD output_id;
+-    LONG hash;
+     BOOL ret;
+ 
+     death_stranding_update_environment_callback();
+ 
+     if (setting == 0x7b || setting == 0x7c || setting == 0xff)
+     {
+-        hash = InterlockedExchange(&death_stranding_pending_output_id, -1);
+-        output_id = hash == -1 ? *selected_output : hash;
+-        ret = death_stranding_output_selector(output_id);
+-        if (ret && hash != -1)
+-            *selected_output = output_id;
+-
+-        TRACE("Death Stranding preselected output %#lx before applying setting %#x: %d.\n",
+-                output_id, setting, ret);
++        death_stranding_init_output_window();
++        ret = death_stranding_select_controller_output(*selected_output);
++        death_stranding_queue_controller_output_update();
++
++        TRACE("Death Stranding preselected setting output %#lx before applying setting %#x: %d.\n",
++                *selected_output, setting, ret);
+         if (!ret)
+             WARN("Death Stranding rejected output %#lx before its audio settings transaction.\n",
+-                    output_id);
++                    *selected_output);
+     }
+ 
+     return *death_stranding_audio_system;
+@@ -568,7 +667,7 @@ static BOOL enable_death_stranding_controller_effects(void)
+     }
+     if (!selector_call) return FALSE;
+ 
+-    if (output_selector + 0xdaeb > base + nt->OptionalHeader.SizeOfImage ||
++    if (output_selector + 0xdb31 > base + nt->OptionalHeader.SizeOfImage ||
+             output_selector[0xaf] != 0x89 || output_selector[0xb0] != 0x1d)
+         return FALSE;
+ 
+@@ -577,13 +676,15 @@ static BOOL enable_death_stranding_controller_effects(void)
+             output_switch[0x2c] != 0x44 || output_switch[0x2d] != 0x8b ||
+             output_switch[0x2e] != 0x05 || output_switch[0x33] != 0x8b ||
+             output_switch[0x34] != 0x1d ||
++            memcmp(output_switch + 0xec, "\x48\x83\xc4\x58\xc3", 5) ||
+             memcmp(output_switch + 0xa0, output_switch_old, sizeof(output_switch_old)))
+         return FALSE;
+ 
+     memcpy(&jump_offset, output_selector + 0xb1, sizeof(jump_offset));
+     requested_output = output_selector + 0xb5 + jump_offset;
+     memcpy(&jump_offset, output_switch + 0x35, sizeof(jump_offset));
+-    if (output_switch + 0x39 + jump_offset != requested_output)
++    if (output_switch + 0x39 + jump_offset != requested_output || requested_output < base ||
++            requested_output + sizeof(DWORD) > base + nt->OptionalHeader.SizeOfImage)
+         return FALSE;
+ 
+     if ((SIZE_T)(selector_call - base) < 0x579) return FALSE;
+@@ -685,6 +786,8 @@ static BOOL enable_death_stranding_controller_effects(void)
+     memcpy(output_switch + 0xa0, output_switch_new, sizeof(output_switch_new));
+     FlushInstructionCache(GetCurrentProcess(), output_switch + 0xa0, sizeof(output_switch_new));
+     VirtualProtect(output_switch + 0xa0, sizeof(output_switch_old), old_protect, &old_protect);
++    death_stranding_requested_output = (DWORD *)requested_output;
++    death_stranding_output_switch = (death_stranding_output_switch_t)output_switch;
+ 
+     if (force_death_stranding_environment_effects() && !environment_registered_early)
+     {
+@@ -740,11 +843,12 @@ void death_stranding_controller_endpoint_seen(const WCHAR *id)
+         hash ^= ch;
+     }
+ 
+-    if (hash == ~0u || (DWORD)InterlockedExchange(&death_stranding_pending_output_id, hash) == hash)
++    if (hash == ~0u || (DWORD)InterlockedExchange(&death_stranding_default_output_id, hash) == hash)
+         return;
+ 
+-    TRACE("Queued Death Stranding controller endpoint %s (Wwise device %#lx) for its settings path.\n",
++    TRACE("Discovered Death Stranding default controller endpoint %s (Wwise device %#lx).\n",
+             wine_dbgstr_w(id), hash);
++    death_stranding_queue_controller_output_update();
+ }
+ 
+ BOOL death_stranding_controller_output_hook_active(void)

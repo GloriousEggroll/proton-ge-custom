@@ -1,0 +1,193 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Subject: [PATCH] xinput: Keep Sony hotplug discovery independent of speaker readiness.
+
+Castlevania's automatic Sony fallback opened a replacement Edge in slot zero,
+but processed one input report every three seconds while the HID bus kept
+delivering reports. There was no native takeover in the game process.
+
+Empty XInput slots are re-enumerated by both the game and Steam's polling
+thread. SetupAPI's Sony speaker wait runs under xinput_cs in this path,
+blocking the HID reader along with other discovery calls. Use cfgmgr32's
+present interface list, as DirectInput already does: XInput needs device paths
+and has no dependency on the native speaker endpoint ordering.
+
+Preserve virtual Steam device priority, Sony ownership checks and explicit
+device overrides. Treat a missing interface class as an empty list so a fresh
+prefix without WINEXINPUT devices still reaches automatic Sony discovery.
+Update imports for all four DLLs which compile the shared implementation.
+
+Also release sechost's speaker ordering gate when its bounded wait ends.
+On timeout it previously closed an unsignalled event after notification
+dispatch. Concurrent enumerators could keep that named object alive and
+repeat the timeout indefinitely. Releasing the gate ends the ordering wait;
+it does not publish or claim the existence of a speaker endpoint. Keep the
+normal native HID/speaker ordering otherwise unchanged.
+---
+diff --git a/dlls/sechost/service.c b/dlls/sechost/service.c
+index 320a28d2..5d43ef98 100644
+--- a/dlls/sechost/service.c
++++ b/dlls/sechost/service.c
+@@ -2262,6 +2262,10 @@ static DWORD WINAPI pending_sony_hid_proc( void *arg )
+ 
+     wait = WaitForSingleObject( pending->ready_event, 3000 );
+ 
++    /* The gate is released even when no speaker was published. Enumerators
++     * can keep the named event alive after this worker closes its handle. */
++    SetEvent( pending->ready_event );
++
+     AcquireSRWLockExclusive( &pending_sony_hid_lock );
+     dispatch = !pending->cancelled;
+     ReleaseSRWLockExclusive( &pending_sony_hid_lock );
+diff --git a/dlls/xinput1_1/Makefile.in b/dlls/xinput1_1/Makefile.in
+index 770937e7..98438fb1 100644
+--- a/dlls/xinput1_1/Makefile.in
++++ b/dlls/xinput1_1/Makefile.in
+@@ -1,6 +1,6 @@
+ EXTRADEFS = -DXINPUT_VER=1
+ MODULE    = xinput1_1.dll
+-IMPORTS   = hid setupapi advapi32 user32
++IMPORTS   = hid cfgmgr32 advapi32 user32
+ PARENTSRC = ../xinput1_3
+ 
+ SOURCES = \
+diff --git a/dlls/xinput1_2/Makefile.in b/dlls/xinput1_2/Makefile.in
+index a8c71b40..6804d8e8 100644
+--- a/dlls/xinput1_2/Makefile.in
++++ b/dlls/xinput1_2/Makefile.in
+@@ -1,6 +1,6 @@
+ EXTRADEFS = -DXINPUT_VER=2
+ MODULE    = xinput1_2.dll
+-IMPORTS   = hid setupapi advapi32 user32
++IMPORTS   = hid cfgmgr32 advapi32 user32
+ PARENTSRC = ../xinput1_3
+ 
+ SOURCES = \
+diff --git a/dlls/xinput1_3/Makefile.in b/dlls/xinput1_3/Makefile.in
+index d2ffaf29..eb7ec111 100644
+--- a/dlls/xinput1_3/Makefile.in
++++ b/dlls/xinput1_3/Makefile.in
+@@ -1,7 +1,7 @@
+ EXTRADEFS = -DXINPUT_VER=3
+ MODULE    = xinput1_3.dll
+ IMPORTLIB = xinput
+-IMPORTS   = hid setupapi advapi32 user32 ntdll
++IMPORTS   = hid cfgmgr32 advapi32 user32 ntdll
+ 
+ SOURCES = \
+ 	main.c \
+diff --git a/dlls/xinput1_3/main.c b/dlls/xinput1_3/main.c
+index 49facd58..72d9b520 100644
+--- a/dlls/xinput1_3/main.c
++++ b/dlls/xinput1_3/main.c
+@@ -36,7 +36,7 @@
+ #include "winternl.h"
+ 
+ #include "dbt.h"
+-#include "setupapi.h"
++#include "cfgmgr32.h"
+ #include "devpkey.h"
+ #include "hidusage.h"
+ #include "winioctl.h"
+@@ -770,51 +770,67 @@ static void try_remove_device(const WCHAR *device_path)
+         controller_destroy(&controllers[i], FALSE);
+ }
+ 
++static WCHAR *get_device_interfaces(GUID *guid)
++{
++    CONFIGRET ret;
++    WCHAR *paths;
++    ULONG size;
++
++    /* XInput needs only interface paths, not SetupAPI's native Sony speaker
++     * ordering. Waiting for audio here holds up all controller report reads. */
++    for (;;)
++    {
++        ret = CM_Get_Device_Interface_List_SizeW(&size, guid, NULL, CM_GET_DEVICE_INTERFACE_LIST_PRESENT);
++        /* A fresh prefix may not have any WINEXINPUT interfaces yet. */
++        if (ret == CR_NO_SUCH_REGISTRY_KEY) return calloc(2, sizeof(*paths));
++        if (ret != CR_SUCCESS) break;
++        if (!(paths = calloc(max(size, 2), sizeof(*paths)))) return NULL;
++        ret = CM_Get_Device_Interface_ListW(guid, NULL, paths, size, CM_GET_DEVICE_INTERFACE_LIST_PRESENT);
++        if (ret == CR_SUCCESS) return paths;
++        free(paths);
++        if (ret == CR_NO_SUCH_REGISTRY_KEY) return calloc(2, sizeof(*paths));
++        if (ret != CR_BUFFER_SMALL) break;
++    }
++
++    WARN("Failed to enumerate interfaces for %s, status %#lx\n", debugstr_guid(guid), ret);
++    return NULL;
++}
++
+ static void update_controller_list(void)
+ {
+-    char buffer[sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W) + MAX_PATH * sizeof(WCHAR)];
+-    SP_DEVICE_INTERFACE_DETAIL_DATA_W *detail = (SP_DEVICE_INTERFACE_DETAIL_DATA_W *)buffer;
+-    SP_DEVICE_INTERFACE_DATA iface = {sizeof(iface)};
+     GUID guid = GUID_DEVINTERFACE_WINEXINPUT;
+-    HDEVINFO set;
+-    DWORD idx;
++    WCHAR *paths, *path;
+     BOOL native_present = FALSE;
+ 
+     EnterCriticalSection(&xinput_cs);
+ 
+-    set = SetupDiGetClassDevsW(&guid, NULL, NULL, DIGCF_DEVICEINTERFACE | DIGCF_PRESENT);
+-    detail->cbSize = sizeof(*detail);
+-
+-    idx = 0;
+-    while (SetupDiEnumDeviceInterfaces(set, NULL, &guid, idx++, &iface))
++    if (!(paths = get_device_interfaces(&guid))) goto done;
++    for (path = paths; *path; path += wcslen(path) + 1)
+     {
+-        if (!SetupDiGetDeviceInterfaceDetailW(set, &iface, detail, sizeof(buffer), NULL, NULL))
+-            continue;
+-        if (steam_virtual_path(detail->DevicePath))
++        if (steam_virtual_path(path))
+         {
+             native_present = TRUE;
+             InterlockedExchange(&steam_virtual_present, TRUE);
+         }
+-        try_add_device(detail->DevicePath, FALSE);
++        try_add_device(path, FALSE);
+     }
+ 
+-    SetupDiDestroyDeviceInfoList(set);
++    free(paths);
+     InterlockedExchange(&steam_virtual_present, native_present);
+ 
+     if (auto_sony_xinput && !steam_virtual_present)
+     {
+         HidD_GetHidGuid(&guid);
+-        set = SetupDiGetClassDevsW(&guid, NULL, NULL, DIGCF_DEVICEINTERFACE | DIGCF_PRESENT);
+-        idx = 0;
+-        while (SetupDiEnumDeviceInterfaces(set, NULL, &guid, idx++, &iface))
++        if (!(paths = get_device_interfaces(&guid))) goto done;
++        for (path = paths; *path; path += wcslen(path) + 1)
+         {
+-            if (!SetupDiGetDeviceInterfaceDetailW(set, &iface, detail, sizeof(buffer), NULL, NULL)) continue;
+-            if (!automatic_sony_path(detail->DevicePath)) continue;
+-            if (!try_add_device(detail->DevicePath, TRUE)) break;
++            if (!automatic_sony_path(path)) continue;
++            if (!try_add_device(path, TRUE)) break;
+         }
+-        SetupDiDestroyDeviceInfoList(set);
++        free(paths);
+     }
+ 
++done:
+     LeaveCriticalSection(&xinput_cs);
+ }
+ 
+diff --git a/dlls/xinput1_4/Makefile.in b/dlls/xinput1_4/Makefile.in
+index 482f75d0..e282d450 100644
+--- a/dlls/xinput1_4/Makefile.in
++++ b/dlls/xinput1_4/Makefile.in
+@@ -1,6 +1,6 @@
+ EXTRADEFS = -DXINPUT_VER=4
+ MODULE    = xinput1_4.dll
+-IMPORTS   = hid setupapi advapi32 user32
++IMPORTS   = hid cfgmgr32 advapi32 user32
+ PARENTSRC = ../xinput1_3
+ 
+ SOURCES = \

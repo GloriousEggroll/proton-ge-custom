@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Subject: [PATCH] xinput: Do not rescan devices for private controller metadata.
+
+Steam's per-frame GetConnectedControllers queries all four XInput slots via
+__wine_XInputGetDeviceVidPid, then checks eligible Sony slots. Every missing
+slot caused a full interface scan under xinput_cs. Automatic Sony discovery
+also scans the HID class, so this repeatedly walks the HID registry on the
+game's main thread while blocking controller report processing.
+
+The Spider-Man Remastered slowdown reproduced without debug logging. Live
+main-thread captures showed SteamInput006 GetConnectedControllers calling
+steaminput_xinput_refresh_mode, __wine_XInputGetDeviceVidPid,
+update_controller_list and cfgmgr32's HID interface enumeration.
+
+Make the three private identity/ownership queries read the controller list.
+start_update_thread still waits for initial discovery, even when a DirectInput
+probe is the first caller. The update thread maintains the list on device
+notifications and timeout. Availability/native ownership is still checked on
+each query, so this does not cache stale ownership or synthesize absent pads.
+
+Keep public XInput's synchronous missing-slot rescans. Those are needed for
+games such as RiME which query slots from a device-arrival notification before
+the XInput worker has processed its own notification. No audio ordering,
+controller mapping or native Steam Input priority changes are needed.
+---
+diff --git a/dlls/xinput1_3/main.c b/dlls/xinput1_3/main.c
+index 72d9b520..6ccc4110 100644
+--- a/dlls/xinput1_3/main.c
++++ b/dlls/xinput1_3/main.c
+@@ -1498,6 +1498,9 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetCapabilities(DWORD index, DWORD flags, X
+     return ret;
+ }
+ 
++/* Metadata probes use the initial scan and hotplug-maintained controller list.
++ * Rescanning empty slots here makes Steam's per-frame enumeration block on HID
++ * discovery. Public XInput calls retain their synchronous hotplug rescans. */
+ BOOL WINAPI __wine_XInputIsSonyFallback(const WCHAR *device_path)
+ {
+     BOOL available = FALSE;
+@@ -1507,8 +1510,6 @@ BOOL WINAPI __wine_XInputIsSonyFallback(const WCHAR *device_path)
+     start_update_thread();
+ 
+     EnterCriticalSection(&xinput_cs);
+-    /* DirectInput identity probes can precede the game's first XInput call. */
+-    update_controller_list();
+     if (find_opened_device(device_path, &index) && controllers[index].native_input_event)
+         available = controller_available(&controllers[index]);
+     LeaveCriticalSection(&xinput_cs);
+@@ -1527,7 +1528,6 @@ DWORD WINAPI __wine_XInputGetSonyProductId(DWORD index, WORD *product_id)
+     start_update_thread();
+ 
+     EnterCriticalSection(&xinput_cs);
+-    if (!controllers[index].device) update_controller_list();
+     if (!controller_available(&controllers[index]))
+         ret = ERROR_DEVICE_NOT_CONNECTED;
+     else
+@@ -1549,7 +1549,6 @@ DWORD WINAPI __wine_XInputGetDeviceVidPid(DWORD index, WORD *vendor_id, WORD *pr
+     start_update_thread();
+ 
+     EnterCriticalSection(&xinput_cs);
+-    if (!controllers[index].device) update_controller_list();
+     if (!controller_available(&controllers[index]))
+         ret = ERROR_DEVICE_NOT_CONNECTED;
+     else if (swscanf(controllers[index].device_path, L"\\\\?\\HID#VID_%04x&PID_%04x", &vid, &pid) != 2 &&

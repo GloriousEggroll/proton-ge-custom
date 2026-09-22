@@ -1,0 +1,1036 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Subject: [PATCH] xinput: Offer Sony fallback without replacing native HID.
+
+When PROTON_SONY_AUTO_XINPUT is enabled, discover native Sony gamepads as
+automatic XInput slots, without reclassifying the HID devices in winebus.
+Keep Steam Input and explicit compatibility policies authoritative.
+
+Mark internal XInput file handles with a private HID-class ioctl before
+reading. Track repeated successful input consumption on other handles in
+the same process. Signal an event to withdraw only the matching automatic
+slot, including state, capabilities and rumble. Restore eligibility when
+the last native consumer closes. Track consumed Raw Input separately from
+enumeration and preserve that claim across cache refreshes.
+
+This is a two-read native-use heuristic, not proof that an application has
+selected its native device. Do not count feature queries, probing opens,
+other processes, or our own XInput reads. No timers, device removal, global
+XInput disable, Wine-Wayland changes, or controller audio changes.
+
+Include HID-class tests with two synthetic Sony collections. These tests
+and the runtime integration still require validation in a built tree.
+---
+diff --git a/dlls/hidclass.sys/device.c b/dlls/hidclass.sys/device.c
+--- a/dlls/hidclass.sys/device.c
++++ b/dlls/hidclass.sys/device.c
+@@ -27,6 +27,7 @@
+ #include "ddk/hidsdi.h"
+ #include "ddk/hidtypes.h"
+ #include "ddk/wdm.h"
++#include "ddk/ntifs.h"
+ 
+ #include "wine/debug.h"
+ #include "wine/list.h"
+@@ -132,7 +133,77 @@
+     hid_queue_remove_pending_irps( queue );
+     while (queue->length--) hid_report_decref( queue->reports[queue->length] );
+     list_remove( &queue->entry );
++    if (queue->takeover_event) CloseHandle( queue->takeover_event );
+     free( queue );
++}
++
++/* pdo->lock protects both the consumer list and the fallback event state. */
++static void update_xinput_takeover( struct phys_device *pdo, HANDLE process_id )
++{
++    struct hid_queue *queue;
++    BOOL native = FALSE;
++
++    LIST_FOR_EACH_ENTRY( queue, &pdo->queues, struct hid_queue, entry )
++        if (queue->process_id == process_id && !queue->takeover_event && queue->native_reads >= 2)
++            native = TRUE;
++
++    LIST_FOR_EACH_ENTRY( queue, &pdo->queues, struct hid_queue, entry )
++    {
++        if (queue->process_id != process_id || !queue->takeover_event ||
++                queue->takeover_signalled == native) continue;
++        if (native) SetEvent( queue->takeover_event );
++        else ResetEvent( queue->takeover_event );
++        queue->takeover_signalled = native;
++        TRACE( "Sony native takeover %u for process %p, device %p.\n", native, process_id, pdo );
++    }
++}
++
++static BOOL is_sony_controller( struct phys_device *pdo )
++{
++    HID_COLLECTION_INFORMATION *info = &pdo->information;
++    HIDP_COLLECTION_DESC *desc = pdo->collection_desc;
++
++    return info->VendorID == 0x054c && (info->ProductID == 0x05c4 || info->ProductID == 0x09cc ||
++            info->ProductID == 0x0ce6 || info->ProductID == 0x0df2) &&
++            desc->UsagePage == HID_USAGE_PAGE_GENERIC && desc->Usage == HID_USAGE_GENERIC_GAMEPAD;
++}
++
++static void record_native_read( struct phys_device *pdo, struct hid_queue *queue )
++{
++    if (!queue || queue->takeover_event || queue->native_reads >= 2 || !is_sony_controller( pdo )) return;
++    if (++queue->native_reads == 2) update_xinput_takeover( pdo, queue->process_id );
++}
++
++static NTSTATUS register_xinput_fallback( struct phys_device *pdo, IRP *irp )
++{
++    struct hid_xinput_fallback_registration *registration = irp->AssociatedIrp.SystemBuffer;
++    struct hid_queue *queue = irp->Tail.Overlay.OriginalFileObject->FsContext;
++    HANDLE event, process;
++    BOOL ret;
++    KIRQL irql;
++
++    if (!queue || !is_sony_controller( pdo )) return STATUS_NOT_SUPPORTED;
++    if (!(process = OpenProcess( PROCESS_DUP_HANDLE, FALSE,
++                                HandleToUlong( PsGetProcessId( IoGetRequestorProcess( irp ) ) ) )))
++        return STATUS_ACCESS_DENIED;
++    ret = DuplicateHandle( process, ULongToHandle( registration->takeover_event ), GetCurrentProcess(),
++                           &event, EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE, 0 );
++    CloseHandle( process );
++    if (!ret) return STATUS_INVALID_HANDLE;
++    if (!ResetEvent( event ))
++    {
++        CloseHandle( event );
++        return STATUS_OBJECT_TYPE_MISMATCH;
++    }
++
++    KeAcquireSpinLock( &pdo->lock, &irql );
++    if (queue->takeover_event) CloseHandle( queue->takeover_event );
++    queue->takeover_event = event;
++    queue->takeover_signalled = FALSE;
++    queue->native_reads = 0;
++    update_xinput_takeover( pdo, queue->process_id );
++    KeReleaseSpinLock( &pdo->lock, irql );
++    return STATUS_SUCCESS;
+ }
+ 
+ static NTSTATUS hid_queue_resize( struct hid_queue *queue, ULONG length )
+@@ -282,6 +353,8 @@
+             irp->IoStatus.Information = report->length;
+             irp->IoStatus.Status = STATUS_SUCCESS;
+             hid_report_decref( report );
++
++            record_native_read( pdo, queue );
+ 
+             InsertTailList( &completed, &irp->Tail.Overlay.ListEntry );
+         }
+@@ -447,17 +520,25 @@
+     HID_XFER_PACKET packet;
+     ULONG padding;
+     IRP *irp;
++    struct phys_device *input_pdo;
+ };
+ 
+ static NTSTATUS CALLBACK xfer_completion( DEVICE_OBJECT *device, IRP *irp, void *context )
+ {
+     struct completion_params *params = context;
+     IRP *orig_irp = params->irp;
++    KIRQL irql;
+ 
+     TRACE( "device %p, irp %p, context %p\n", device, irp, context );
+ 
+     orig_irp->IoStatus = irp->IoStatus;
+     orig_irp->IoStatus.Information -= params->padding;
++    if (params->input_pdo && orig_irp->IoStatus.Status == STATUS_SUCCESS && orig_irp->IoStatus.Information)
++    {
++        KeAcquireSpinLock( &params->input_pdo->lock, &irql );
++        record_native_read( params->input_pdo, orig_irp->Tail.Overlay.OriginalFileObject->FsContext );
++        KeReleaseSpinLock( &params->input_pdo->lock, irql );
++    }
+     IoCompleteRequest( orig_irp, IO_NO_INCREMENT );
+ 
+     free( params );
+@@ -517,6 +598,7 @@
+     params->packet.reportId = report->ReportID;
+     params->packet.reportBuffer = buffer + offset;
+     params->irp = irp;
++    if (code == IOCTL_HID_GET_INPUT_REPORT) params->input_pdo = pdo;
+ 
+     switch (code)
+     {
+@@ -688,6 +770,30 @@
+             status = hid_device_xfer_report( pdo, code, irp );
+             break;
+ 
++        case IOCTL_HID_WINE_REGISTER_XINPUT_FALLBACK:
++            if (irpsp->Parameters.DeviceIoControl.InputBufferLength != sizeof(struct hid_xinput_fallback_registration))
++                status = STATUS_INVALID_PARAMETER;
++            else status = register_xinput_fallback( pdo, irp );
++            break;
++
++        case IOCTL_HID_WINE_NATIVE_INPUT_ACTIVITY:
++            if (irpsp->Parameters.DeviceIoControl.InputBufferLength != sizeof(BOOL))
++                status = STATUS_INVALID_PARAMETER;
++            else
++            {
++                struct hid_queue *queue = irp->Tail.Overlay.OriginalFileObject->FsContext;
++                KeAcquireSpinLock( &pdo->lock, &irql );
++                if (*(BOOL *)irp->AssociatedIrp.SystemBuffer) record_native_read( pdo, queue );
++                else if (queue)
++                {
++                    queue->native_reads = 0;
++                    update_xinput_takeover( pdo, queue->process_id );
++                }
++                KeReleaseSpinLock( &pdo->lock, irql );
++                status = STATUS_SUCCESS;
++            }
++            break;
++
+         case IOCTL_HID_GET_WINE_RAWINPUT_HANDLE:
+             if (irpsp->Parameters.DeviceIoControl.OutputBufferLength < sizeof(ULONG))
+                 status = STATUS_BUFFER_OVERFLOW;
+@@ -753,6 +859,9 @@
+         irp->IoStatus.Status = STATUS_SUCCESS;
+         hid_report_decref( report );
+ 
++        KeAcquireSpinLock( &pdo->lock, &irql );
++        record_native_read( pdo, queue );
++        KeReleaseSpinLock( &pdo->lock, irql );
+         IoCompleteRequest( irp, IO_NO_INCREMENT );
+         return STATUS_SUCCESS;
+     }
+@@ -796,6 +905,7 @@
+     if (!(queue = hid_queue_create())) irp->IoStatus.Status = STATUS_NO_MEMORY;
+     else
+     {
++        queue->process_id = PsGetProcessId( IoGetRequestorProcess( irp ) );
+         KeAcquireSpinLock( &pdo->lock, &irql );
+         list_add_tail( &pdo->queues, &queue->entry );
+         KeReleaseSpinLock( &pdo->lock, irql );
+@@ -832,6 +942,8 @@
+     {
+         KeAcquireSpinLock( &pdo->lock, &irql );
+         list_remove( &queue->entry );
++        list_init( &queue->entry );
++        update_xinput_takeover( pdo, queue->process_id );
+         KeReleaseSpinLock( &pdo->lock, irql );
+         hid_queue_destroy( queue );
+     }
+diff --git a/dlls/hidclass.sys/hid.h b/dlls/hidclass.sys/hid.h
+--- a/dlls/hidclass.sys/hid.h
++++ b/dlls/hidclass.sys/hid.h
+@@ -23,7 +23,7 @@
+ #include "winternl.h"
+ #include "winioctl.h"
+ #include "winreg.h"
+-#include "ddk/wdm.h"
++#include "ddk/ntddk.h"
+ #include "hidusage.h"
+ #include "ddk/hidport.h"
+ #include "ddk/hidclass.h"
+@@ -123,6 +123,10 @@
+     ULONG              write_idx;
+     struct hid_report *reports[512];
+     LIST_ENTRY         irp_queue;
++    HANDLE             process_id;
++    HANDLE             takeover_event;
++    BOOL               takeover_signalled;
++    unsigned int       native_reads;
+ };
+ 
+ typedef struct _minidriver
+diff --git a/dlls/win32u/rawinput.c b/dlls/win32u/rawinput.c
+--- a/dlls/win32u/rawinput.c
++++ b/dlls/win32u/rawinput.c
+@@ -67,6 +67,23 @@
+ static struct list devices = LIST_INIT( devices );
+ static pthread_mutex_t rawinput_mutex = PTHREAD_MUTEX_INITIALIZER;
+ 
++/* Keep the consuming file alive across rawinput's device-cache refreshes. */
++struct sony_consumer
++{
++    struct list entry;
++    HANDLE handle;
++    HANDLE file;
++    unsigned int reads;
++};
++static struct list sony_consumers = LIST_INIT( sony_consumers );
++
++static void remove_sony_consumer( struct sony_consumer *consumer )
++{
++    list_remove( &consumer->entry );
++    NtClose( consumer->file );
++    free( consumer );
++}
++
+ static struct device *add_device( HKEY key, DWORD type )
+ {
+     static const WCHAR symbolic_linkW[] = {'S','y','m','b','o','l','i','c','L','i','n','k',0};
+@@ -287,6 +304,7 @@
+     unsigned int ticks = NtGetTickCount();
+     static unsigned int last_check;
+     struct device *device, *next;
++    struct sony_consumer *consumer, *next_consumer;
+ 
+     TRACE( "\n" );
+ 
+@@ -304,6 +322,14 @@
+     enumerate_devices( RIM_TYPEMOUSE, guid_devinterface_mouseW );
+     enumerate_devices( RIM_TYPEKEYBOARD, guid_devinterface_keyboardW );
+     enumerate_devices( RIM_TYPEHID, guid_devinterface_hidW );
++
++    LIST_FOR_EACH_ENTRY_SAFE( consumer, next_consumer, &sony_consumers, struct sony_consumer, entry )
++    {
++        BOOL found = FALSE;
++        LIST_FOR_EACH_ENTRY( device, &devices, struct device, entry )
++            if (device->handle == consumer->handle) found = TRUE;
++        if (!found) remove_sony_consumer( consumer );
++    }
+ }
+ 
+ static struct device *find_device_from_handle( HANDLE handle, BOOL refresh )
+@@ -320,6 +346,41 @@
+         if (device->handle == handle) return device;
+ 
+     return NULL;
++}
++
++static void record_sony_rawinput( HANDLE handle )
++{
++    struct sony_consumer *consumer;
++    struct device *device;
++    IO_STATUS_BLOCK io;
++    BOOL active = TRUE;
++    const char *value = getenv( "PROTON_SONY_AUTO_XINPUT" );
++
++    if (!value || strcmp( value, "1" )) return;
++    pthread_mutex_lock( &rawinput_mutex );
++    LIST_FOR_EACH_ENTRY( consumer, &sony_consumers, struct sony_consumer, entry )
++        if (consumer->handle == handle) goto found;
++
++    if (!(device = find_device_from_handle( handle, TRUE )) || device->info.dwType != RIM_TYPEHID ||
++            device->info.hid.dwVendorId != 0x054c || device->info.hid.usUsagePage != HID_USAGE_PAGE_GENERIC ||
++            device->info.hid.usUsage != HID_USAGE_GENERIC_GAMEPAD) goto done;
++    if (device->info.hid.dwProductId != 0x05c4 && device->info.hid.dwProductId != 0x09cc &&
++            device->info.hid.dwProductId != 0x0ce6 && device->info.hid.dwProductId != 0x0df2) goto done;
++    if (!(consumer = calloc( 1, sizeof(*consumer) ))) goto done;
++    if (NtDuplicateObject( NtCurrentProcess(), device->file, NtCurrentProcess(), &consumer->file,
++                          0, 0, DUPLICATE_SAME_ACCESS ))
++    {
++        free( consumer );
++        goto done;
++    }
++    consumer->handle = handle;
++    list_add_tail( &sony_consumers, &consumer->entry );
++
++found:
++    if (consumer->reads < 2 && !NtDeviceIoControlFile( consumer->file, NULL, NULL, NULL, &io,
++            IOCTL_HID_WINE_NATIVE_INPUT_ACTIVITY, &active, sizeof(active), NULL, 0 )) ++consumer->reads;
++done:
++    pthread_mutex_unlock( &rawinput_mutex );
+ }
+ 
+ /**********************************************************************
+@@ -520,7 +581,7 @@
+ UINT WINAPI NtUserGetRawInputBuffer( RAWINPUT *data, UINT *data_size, UINT header_size )
+ {
+     struct user_thread_info *thread_info;
+-    UINT count;
++    UINT count, i, align = NtCurrentTeb()->WowTebOffset ? 3 : sizeof(void *) - 1;
+ 
+     TRACE( "data %p, data_size %p, header_size %u\n", data, data_size, header_size );
+ 
+@@ -551,6 +612,21 @@
+     }
+     SERVER_END_REQ;
+ 
++    if (data && count != ~0u)
++    {
++        BYTE *ptr = (BYTE *)data;
++        for (i = 0; i < count; ++i)
++        {
++            RAWINPUTHEADER *header = (RAWINPUTHEADER *)ptr;
++            if (header->dwType == RIM_TYPEHID)
++            {
++                HANDLE handle = header_size == sizeof(RAWINPUTHEADER64) ?
++                        (HANDLE)(ULONG_PTR)((RAWINPUTHEADER64 *)ptr)->hDevice : header->hDevice;
++                record_sony_rawinput( handle );
++            }
++            ptr += (header->dwSize + align) & ~align;
++        }
++    }
+     return count;
+ }
+ 
+@@ -616,6 +692,7 @@
+         if (size < offsetof(RAWHID, bRawData[0])) goto failed;
+         if (size != offsetof(RAWHID, bRawData[hid->dwCount * hid->dwSizeHid])) goto failed;
+         memcpy( &rawinput->data.hid, msg_data + 1, size );
++        if (hid->dwCount) record_sony_rawinput( rawinput->header.hDevice );
+     }
+     else
+     {
+@@ -641,6 +718,12 @@
+         struct device *device;
+ 
+         pthread_mutex_lock( &rawinput_mutex );
++        if (msg->wParam == GIDC_REMOVAL)
++        {
++            struct sony_consumer *consumer, *next;
++            LIST_FOR_EACH_ENTRY_SAFE( consumer, next, &sony_consumers, struct sony_consumer, entry )
++                if (consumer->handle == UlongToHandle( msg_data->rawinput.device )) remove_sony_consumer( consumer );
++        }
+         if ((device = find_device_from_handle( UlongToHandle( msg_data->rawinput.device ), refresh )))
+         {
+             if (msg->wParam == GIDC_REMOVAL)
+@@ -703,6 +786,20 @@
+ 
+     if (device->dwFlags & RIDEV_REMOVE)
+     {
++        if (device->usUsagePage == HID_USAGE_PAGE_GENERIC &&
++                (!device->usUsage || device->usUsage == HID_USAGE_GENERIC_GAMEPAD))
++        {
++            struct sony_consumer *consumer, *next;
++            BOOL active = FALSE;
++            IO_STATUS_BLOCK io;
++
++            LIST_FOR_EACH_ENTRY_SAFE( consumer, next, &sony_consumers, struct sony_consumer, entry )
++            {
++                NtDeviceIoControlFile( consumer->file, NULL, NULL, NULL, &io,
++                        IOCTL_HID_WINE_NATIVE_INPUT_ACTIVITY, &active, sizeof(active), NULL, 0 );
++                remove_sony_consumer( consumer );
++            }
++        }
+         if (pos != end && pos->usUsagePage == device->usUsagePage && pos->usUsage == device->usUsage)
+         {
+             memmove( pos, pos + 1, (char *)end - (char *)(pos + 1) );
+diff --git a/dlls/xinput1_3/main.c b/dlls/xinput1_3/main.c
+--- a/dlls/xinput1_3/main.c
++++ b/dlls/xinput1_3/main.c
+@@ -24,6 +24,8 @@
+ #include <string.h>
+ #include <stdlib.h>
+ 
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
+ #include "windef.h"
+ #include "winbase.h"
+ #include "winerror.h"
+@@ -37,12 +39,15 @@
+ #include "setupapi.h"
+ #include "devpkey.h"
+ #include "hidusage.h"
++#include "winioctl.h"
++#include "ddk/hidclass.h"
+ #include "ddk/hidsdi.h"
+ #include "initguid.h"
+ #include "devguid.h"
+ #include "xinput.h"
+ 
+ #include "wine/debug.h"
++#include "wine/hid.h"
+ 
+ DEFINE_GUID(GUID_DEVINTERFACE_WINEXINPUT,0x6c53d5fd,0x6480,0x440f,0xb6,0x18,0x47,0x67,0x50,0xc5,0xe1,0xa6);
+ 
+@@ -79,6 +84,7 @@
+     WCHAR device_path[MAX_PATH];
+     HANDLE read_event;
+     BOOL enabled;
++    HANDLE native_input_event;
+ 
+     struct
+     {
+@@ -121,9 +127,13 @@
+ static HANDLE start_event;
+ static HANDLE update_event;
+ static HANDLE steam_overlay_event;
++static HANDLE steam_input_event;
++static BOOL auto_sony_xinput;
++static LONG steam_virtual_present;
+ 
+ static SRWLOCK state_lock = SRWLOCK_INIT;
+ static XINPUT_STATE current_state[XUSER_MAX_COUNT];
++static HANDLE current_native_input_event[XUSER_MAX_COUNT];
+ static BOOL persistent_player1;
+ static XINPUT_STATE persistent_state;
+ 
+@@ -131,9 +141,60 @@
+ DWORD WINAPI __wine_XInputGetSonyProductId(DWORD index, WORD *product_id);
+ static USHORT sony_gamepad_product_id(const WCHAR *path);
+ 
++static BOOL automatic_sony_enabled(void)
++{
++    static const char * const overrides[] =
++    {
++        "PROTON_SONY_HIDRAW_XINPUT", "PROTON_XINPUT_PERSISTENT_PLAYER1",
++        "PROTON_SONY_DUALSENSE_AS_DUALSHOCK4", "PROTON_SONY_DUALSHOCK4_V2_AS_V1",
++        "PROTON_SONY_DUALSENSE_EDGE_AS_DUALSENSE",
++    };
++    static const char * const steam_vars[] =
++    {
++        "SteamVirtualGamepadInfo", "SteamVirtualGamepadInfo_Proton",
++        "SDL_GAMECONTROLLER_ALLOW_STEAM_VIRTUAL_GAMEPAD",
++    };
++    const char *value = getenv("PROTON_SONY_AUTO_XINPUT");
++    unsigned int i;
++
++    if (!value || strcmp(value, "1")) return FALSE;
++    for (i = 0; i < ARRAY_SIZE(overrides); ++i)
++        if (getenv(overrides[i])) return FALSE;
++    if ((value = getenv("PROTON_EMULATE_STEAMINPUT")) && atoi(value)) return FALSE;
++    if ((value = getenv("PROTON_NO_STEAMINPUT")) && atoi(value)) return TRUE;
++    for (i = 0; i < ARRAY_SIZE(steam_vars); ++i)
++        if ((value = getenv(steam_vars[i])) && *value && strcmp(value, "0")) return FALSE;
++    return TRUE;
++}
++
++/* Only the automatic slot is withdrawn; native HID and other XInput pads stay live. */
++static BOOL controller_available(const struct xinput_controller *controller)
++{
++    if (!controller->device) return FALSE;
++    if (!controller->native_input_event) return TRUE;
++    return !steam_virtual_present && WaitForSingleObject(steam_input_event, 0) != WAIT_OBJECT_0 &&
++            WaitForSingleObject(controller->native_input_event, 0) == WAIT_TIMEOUT;
++}
++
++static BOOL steam_virtual_path(const WCHAR *path)
++{
++    unsigned int vendor, product;
++
++    return ((swscanf(path, L"\\\\?\\hid#vid_%04x&pid_%04x", &vendor, &product) == 2 ||
++             swscanf(path, L"\\\\?\\HID#VID_%04x&PID_%04x", &vendor, &product) == 2) &&
++            vendor == 0x28de && product == 0x11ff);
++}
++
++static BOOL automatic_sony_path(const WCHAR *path)
++{
++    return auto_sony_xinput && sony_gamepad_product_id(path) &&
++            !wcsstr(path, L"&IG_") && !wcsstr(path, L"&ig_");
++}
++
+ static void set_current_state(UINT index, const XINPUT_STATE *state)
+ {
+     AcquireSRWLockExclusive(&state_lock);
++    current_native_input_event[index] = state ? controllers[index].native_input_event : NULL;
+     if (!state) memset(current_state + index, 0, sizeof(*state));
+     else
+     {
+@@ -145,11 +206,17 @@
+ 
+ static BOOL get_current_state(UINT index, XINPUT_STATE *state)
+ {
++    BOOL available = TRUE;
++
+     AcquireSRWLockShared(&state_lock);
+     memcpy(state, current_state + index, sizeof(*state));
++    if (current_native_input_event[index])
++        available = !InterlockedCompareExchange(&steam_virtual_present, 0, 0) &&
++                WaitForSingleObject(steam_input_event, 0) != WAIT_OBJECT_0 &&
++                WaitForSingleObject(current_native_input_event[index], 0) == WAIT_TIMEOUT;
+     ReleaseSRWLockShared(&state_lock);
+ 
+-    return state->dwPacketNumber;
++    return available && state->dwPacketNumber;
+ }
+ 
+ static BOOL is_persistent_player1(DWORD index)
+@@ -455,7 +522,7 @@
+     XINPUT_VIBRATION state = {0};
+ 
+     if (!controller->enabled) return;
+-    HID_set_state(controller, &state);
++    if (controller_available(controller)) HID_set_state(controller, &state);
+     controller->enabled = FALSE;
+ 
+     if (CancelIoEx(controller->device, &controller->hid.read_ovl))
+@@ -477,6 +544,8 @@
+ 
+         CloseHandle(controller->device);
+         controller->device = NULL;
++        if (controller->native_input_event) CloseHandle(controller->native_input_event);
++        controller->native_input_event = NULL;
+ 
+         free(controller->hid.input_report_buf);
+         free(controller->hid.output_report_buf);
+@@ -495,7 +564,7 @@
+     BOOL ret;
+ 
+     if (controller->enabled) return TRUE;
+-    HID_set_state(controller, &state);
++    if (!controller->native_input_event) HID_set_state(controller, &state);
+ 
+     memset(&controller->hid.read_ovl, 0, sizeof(controller->hid.read_ovl));
+     controller->hid.read_ovl.hEvent = controller->read_event;
+@@ -592,19 +661,38 @@
+ }
+ 
+ /* open a device with the given path at the given index, xinput_cs must be held */
+-static BOOL open_device_at_index(const WCHAR *device_path, int index)
+-{
+-    SP_DEVICE_INTERFACE_DATA iface = {sizeof(iface)};
++static BOOL open_device_at_index(const WCHAR *device_path, int index, BOOL automatic)
++{
++    struct hid_xinput_fallback_registration registration;
++    OVERLAPPED overlapped = {0};
+     PHIDP_PREPARSED_DATA preparsed;
+     HIDP_CAPS caps;
+     NTSTATUS status;
+     HANDLE device;
++    DWORD size;
++    BOOL ret;
+ 
+     device = CreateFileW(device_path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                          NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING, NULL);
+     if (device == INVALID_HANDLE_VALUE) return TRUE;
+ 
+     preparsed = NULL;
++    if (automatic)
++    {
++        if (!(controllers[index].native_input_event = CreateEventW(NULL, TRUE, FALSE, NULL))) goto failed;
++        if (!(overlapped.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL))) goto failed;
++        registration.takeover_event = (ULONG_PTR)controllers[index].native_input_event;
++        ret = DeviceIoControl(device, IOCTL_HID_WINE_REGISTER_XINPUT_FALLBACK, &registration,
++                sizeof(registration), NULL, 0, &size, &overlapped);
++        if (!ret && GetLastError() == ERROR_IO_PENDING)
++            ret = GetOverlappedResult(device, &overlapped, &size, TRUE);
++        CloseHandle(overlapped.hEvent);
++        if (!ret)
++        {
++            WARN("Failed to register Sony fallback for %s, error %lu\n", debugstr_w(device_path), GetLastError());
++            goto failed;
++        }
++    }
+     if (!HidD_GetPreparsedData(device, &preparsed))
+         WARN("ignoring HID device, HidD_GetPreparsedData failed with error %lu\n", GetLastError());
+     else if ((status = HidP_GetCaps(preparsed, &caps)) != HIDP_STATUS_SUCCESS)
+@@ -620,10 +708,13 @@
+         WARN("ignoring HID device, failed to initialize\n");
+     else
+     {
+-        TRACE("opened device %s at index %u\n", debugstr_w(device_path), index);
++        TRACE("opened device %s at index %u, automatic Sony fallback %u\n", debugstr_w(device_path), index, automatic);
+         return TRUE;
+     }
+ 
++failed:
++    if (controllers[index].native_input_event) CloseHandle(controllers[index].native_input_event);
++    controllers[index].native_input_event = NULL;
+     CloseHandle(device);
+     HidD_FreePreparsedData(preparsed);
+     return TRUE;
+@@ -649,8 +740,9 @@
+          swscanf(device_path, L"\\\\?\\HID#VID_28DE&PID_11FF&XI_%02u#", &i) == 1) &&
+         i < XUSER_MAX_COUNT && *slot != i)
+     {
++        BOOL automatic = !!controllers[i].native_input_event;
+         controller_destroy(&controllers[i], FALSE);
+-        if (*slot != XUSER_MAX_COUNT) open_device_at_index(controllers[i].device_path, *slot);
++        if (*slot != XUSER_MAX_COUNT) open_device_at_index(controllers[i].device_path, *slot, automatic);
+         *slot = i;
+     }
+ 
+@@ -658,14 +750,20 @@
+ }
+ 
+ /* try opening a new controller device from the given path, xinput_cs must be held */
+-static BOOL try_add_device(const WCHAR *device_path)
+-{
+-    SP_DEVICE_INTERFACE_DATA iface = {sizeof(iface)};
++static BOOL try_add_device(const WCHAR *device_path, BOOL automatic)
++{
+     int i;
+ 
+     if (find_opened_device(device_path, &i)) return TRUE; /* already opened */
++    if (i == XUSER_MAX_COUNT && !automatic)
++    {
++        for (i = XUSER_MAX_COUNT - 1; i >= 0; --i)
++            if (controllers[i].native_input_event) break;
++        if (i < 0) return FALSE;
++        controller_destroy(&controllers[i], FALSE);
++    }
+     if (i == XUSER_MAX_COUNT) return FALSE; /* no more slots */
+-    return open_device_at_index(device_path, i);
++    return open_device_at_index(device_path, i, automatic);
+ }
+ 
+ /* try closing an open controller device with the given path, xinput_cs must be held */
+@@ -685,6 +783,7 @@
+     GUID guid = GUID_DEVINTERFACE_WINEXINPUT;
+     HDEVINFO set;
+     DWORD idx;
++    BOOL native_present = FALSE;
+ 
+     EnterCriticalSection(&xinput_cs);
+ 
+@@ -696,11 +795,30 @@
+     {
+         if (!SetupDiGetDeviceInterfaceDetailW(set, &iface, detail, sizeof(buffer), NULL, NULL))
+             continue;
+-        if (!try_add_device(detail->DevicePath))
+-            break;
++        if (steam_virtual_path(detail->DevicePath))
++        {
++            native_present = TRUE;
++            InterlockedExchange(&steam_virtual_present, TRUE);
++        }
++        try_add_device(detail->DevicePath, FALSE);
+     }
+ 
+     SetupDiDestroyDeviceInfoList(set);
++    InterlockedExchange(&steam_virtual_present, native_present);
++
++    if (auto_sony_xinput && !steam_virtual_present)
++    {
++        HidD_GetHidGuid(&guid);
++        set = SetupDiGetClassDevsW(&guid, NULL, NULL, DIGCF_DEVICEINTERFACE | DIGCF_PRESENT);
++        idx = 0;
++        while (SetupDiEnumDeviceInterfaces(set, NULL, &guid, idx++, &iface))
++        {
++            if (!SetupDiGetDeviceInterfaceDetailW(set, &iface, detail, sizeof(buffer), NULL, NULL)) continue;
++            if (!automatic_sony_path(detail->DevicePath)) continue;
++            if (!try_add_device(detail->DevicePath, TRUE)) break;
++        }
++        SetupDiDestroyDeviceInfoList(set);
++    }
+ 
+     LeaveCriticalSection(&xinput_cs);
+ }
+@@ -887,9 +1005,22 @@
+     {
+         DEV_BROADCAST_DEVICEINTERFACE_W *iface = (DEV_BROADCAST_DEVICEINTERFACE_W *)lparam;
+ 
++        if (!iface || iface->dbcc_devicetype != DBT_DEVTYP_DEVICEINTERFACE) return 0;
+         EnterCriticalSection(&xinput_cs);
+-        if (wparam == DBT_DEVICEARRIVAL) try_add_device(iface->dbcc_name);
+-        if (wparam == DBT_DEVICEREMOVECOMPLETE) try_remove_device(iface->dbcc_name);
++        if (wparam == DBT_DEVICEARRIVAL)
++        {
++            if (IsEqualGUID(&iface->dbcc_classguid, &GUID_DEVINTERFACE_WINEXINPUT))
++            {
++                if (steam_virtual_path(iface->dbcc_name)) InterlockedExchange(&steam_virtual_present, TRUE);
++                try_add_device(iface->dbcc_name, FALSE);
++            }
++            else if (automatic_sony_path(iface->dbcc_name)) try_add_device(iface->dbcc_name, TRUE);
++        }
++        if (wparam == DBT_DEVICEREMOVECOMPLETE)
++        {
++            try_remove_device(iface->dbcc_name);
++            update_controller_list();
++        }
+         LeaveCriticalSection(&xinput_cs);
+     }
+ 
+@@ -914,7 +1045,7 @@
+         .lpszClassName = L"__wine_xinput_devnotify",
+         .lpfnWndProc = xinput_devnotify_wndproc,
+     };
+-    HDEVNOTIFY notif;
++    HDEVNOTIFY notif, hid_notif = NULL;
+     HWND hwnd;
+     MSG msg;
+ 
+@@ -924,6 +1055,11 @@
+     hwnd = CreateWindowExW(0, cls.lpszClassName, NULL, 0, 0, 0, 0, 0,
+                            HWND_MESSAGE, NULL, NULL, NULL);
+     notif = RegisterDeviceNotificationW(hwnd, &filter, DEVICE_NOTIFY_WINDOW_HANDLE);
++    if (auto_sony_xinput)
++    {
++        HidD_GetHidGuid(&filter.dbcc_classguid);
++        hid_notif = RegisterDeviceNotificationW(hwnd, &filter, DEVICE_NOTIFY_WINDOW_HANDLE);
++    }
+ 
+     update_controller_list();
+     SetEvent(start_event);
+@@ -953,6 +1089,7 @@
+     ERR("wait failed in the update thread, ret %lu, error %lu\n", ret, GetLastError());
+ 
+     UnregisterDeviceNotification(notif);
++    if (hid_notif) UnregisterDeviceNotification(hid_notif);
+     DestroyWindow(hwnd);
+     UnregisterClassW(cls.lpszClassName, xinput_instance);
+ 
+@@ -961,6 +1098,7 @@
+ 
+ static BOOL WINAPI start_update_thread_once( INIT_ONCE *once, void *param, void **context )
+ {
++    WCHAR name[64];
+     HANDLE thread;
+     HMODULE module;
+     int i;
+@@ -969,6 +1107,8 @@
+         WARN("Failed to increase module's reference count, error: %lu\n", GetLastError());
+ 
+     steam_overlay_event = CreateEventA(NULL, TRUE, FALSE, "__wine_steamclient_GameOverlayActivated");
++    swprintf(name, ARRAY_SIZE(name), L"Local\\__wine_xinput_steam_input_%08lx", GetCurrentProcessId());
++    steam_input_event = CreateEventW(NULL, TRUE, FALSE, name);
+ 
+     start_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+     if (!start_event) ERR("failed to create start event, error %lu\n", GetLastError());
+@@ -1006,6 +1146,7 @@
+     {
+     case DLL_PROCESS_ATTACH:
+         xinput_instance = inst;
++        auto_sony_xinput = automatic_sony_enabled();
+         persistent_player1 = GetEnvironmentVariableA("PROTON_XINPUT_PERSISTENT_PLAYER1", value, sizeof(value)) == 1 &&
+                              value[0] == '1';
+         if (persistent_player1) TRACE("Keeping XInput player 1 connected across hotplug.\n");
+@@ -1049,7 +1190,7 @@
+ 
+     EnterCriticalSection(&xinput_cs);
+     if (!controllers[index].device) update_controller_list();
+-    if (!controllers[index].device)
++    if (!controller_available(&controllers[index]))
+         ret = is_persistent_player1(index) ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
+     else if (WaitForSingleObject(steam_overlay_event, 0) == WAIT_OBJECT_0)
+         ret = ERROR_SUCCESS;
+@@ -1079,7 +1220,7 @@
+     if (sgi && !strcmp(sgi, "298110")) goto done;
+ 
+     EnterCriticalSection(&xinput_cs);
+-    update_controller_list();
++    if (!controllers[index].device) update_controller_list();
+     ret = get_current_state(index, state) ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
+     LeaveCriticalSection(&xinput_cs);
+ 
+@@ -1357,7 +1498,7 @@
+ 
+     EnterCriticalSection(&xinput_cs);
+     if (!controllers[index].device) update_controller_list();
+-    if (!controllers[index].device)
++    if (!controller_available(&controllers[index]))
+         ret = ERROR_DEVICE_NOT_CONNECTED;
+     else
+         *product_id = controllers[index].hid.sony_product_id;
+@@ -1379,7 +1520,7 @@
+ 
+     EnterCriticalSection(&xinput_cs);
+     if (!controllers[index].device) update_controller_list();
+-    if (!controllers[index].device)
++    if (!controller_available(&controllers[index]))
+         ret = ERROR_DEVICE_NOT_CONNECTED;
+     else if (swscanf(controllers[index].device_path, L"\\\\?\\HID#VID_%04x&PID_%04x", &vid, &pid) != 2 &&
+             swscanf(controllers[index].device_path, L"\\\\?\\hid#vid_%04x&pid_%04x", &vid, &pid) != 2)
+@@ -1404,7 +1545,7 @@
+     if (index >= XUSER_MAX_COUNT || !render_guid || !capture_guid) return ERROR_BAD_ARGUMENTS;
+ 
+     EnterCriticalSection(&xinput_cs);
+-    ret = controllers[index].device || is_persistent_player1(index) ? ERROR_NOT_SUPPORTED : ERROR_DEVICE_NOT_CONNECTED;
++    ret = controller_available(&controllers[index]) || is_persistent_player1(index) ? ERROR_NOT_SUPPORTED : ERROR_DEVICE_NOT_CONNECTED;
+     LeaveCriticalSection(&xinput_cs);
+ 
+     return ret;
+@@ -1420,7 +1561,7 @@
+     if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
+ 
+     EnterCriticalSection(&xinput_cs);
+-    ret = controllers[index].device || is_persistent_player1(index) ? ERROR_NOT_SUPPORTED : ERROR_DEVICE_NOT_CONNECTED;
++    ret = controller_available(&controllers[index]) || is_persistent_player1(index) ? ERROR_NOT_SUPPORTED : ERROR_DEVICE_NOT_CONNECTED;
+     LeaveCriticalSection(&xinput_cs);
+ 
+     return ret;
+@@ -1450,7 +1591,7 @@
+         attr.ProductID = 0x028e;
+         attr.VersionNumber = 0x0114;
+     }
+-    else if (!controllers[index].device || !HidD_GetAttributes(controllers[index].device, &attr))
++    else if (!controller_available(&controllers[index]) || !HidD_GetAttributes(controllers[index].device, &attr))
+         ret = ERROR_DEVICE_NOT_CONNECTED;
+ 
+     if (ret == ERROR_SUCCESS)
+diff --git a/include/wine/hid.h b/include/wine/hid.h
+--- a/include/wine/hid.h
++++ b/include/wine/hid.h
+@@ -242,5 +242,13 @@
+ #define MAX_PID_AXES                               6
+ 
+ #define IOCTL_HID_GET_WINE_RAWINPUT_HANDLE         HID_BUFFER_CTL_CODE(300)
++#define IOCTL_HID_WINE_REGISTER_XINPUT_FALLBACK    HID_BUFFER_CTL_CODE(301)
++#define IOCTL_HID_WINE_NATIVE_INPUT_ACTIVITY       HID_BUFFER_CTL_CODE(302)
++
++/* Fixed-width handle for WOW64 callers. The driver duplicates the event. */
++struct hid_xinput_fallback_registration
++{
++    ULONGLONG takeover_event;
++};
+ 
+ #endif /* __WINE_PARSE_H */
+diff --git a/dlls/dinput/tests/hid.c b/dlls/dinput/tests/hid.c
+--- a/dlls/dinput/tests/hid.c
++++ b/dlls/dinput/tests/hid.c
+@@ -58,6 +58,7 @@
+ #include "gameinput.h"
+ 
+ #include "wine/mssign.h"
++#include "wine/hid.h"
+ 
+ #include "dinput_test.h"
+ 
+@@ -4227,6 +4228,165 @@
+     hid_device_stop( &desc, 1 );
+ }
+ 
++static void test_sony_fallback_read( HANDLE file, HANDLE sender )
++{
++    struct hid_expect input =
++    {
++        .code = IOCTL_HID_READ_REPORT,
++        .report_len = 2,
++        .report_buf = {1, 0x42},
++        .ret_length = 2,
++        .ret_status = STATUS_SUCCESS,
++    };
++    OVERLAPPED overlapped = {0};
++    BYTE report[2];
++    DWORD size, wait;
++    BOOL ret;
++
++    overlapped.hEvent = CreateEventW( NULL, TRUE, FALSE, NULL );
++    ret = ReadFile( file, report, sizeof(report), &size, &overlapped );
++    ok( ret || GetLastError() == ERROR_IO_PENDING, "ReadFile failed, error %lu\n", GetLastError() );
++    if (!ret && GetLastError() == ERROR_IO_PENDING)
++    {
++        send_hid_input( sender, &input, sizeof(input) );
++        wait = WaitForSingleObject( overlapped.hEvent, 5000 );
++        ok( wait == WAIT_OBJECT_0, "ReadFile timed out, wait %#lx\n", wait );
++        if (wait != WAIT_OBJECT_0) CancelIoEx( file, &overlapped );
++        ret = GetOverlappedResult( file, &overlapped, &size, TRUE );
++        ok( ret, "GetOverlappedResult failed, error %lu\n", GetLastError() );
++    }
++    if (ret) ok( size == sizeof(report), "Unexpected report size %lu\n", size );
++    CloseHandle( overlapped.hEvent );
++}
++
++static void test_sony_xinput_takeover(void)
++{
++#include "psh_hid_macros.h"
++    const BYTE report_desc[] =
++    {
++        USAGE_PAGE(1, HID_USAGE_PAGE_GENERIC),
++        USAGE(1, HID_USAGE_GENERIC_GAMEPAD),
++        COLLECTION(1, Application),
++            REPORT_ID(1, 1),
++            USAGE(1, HID_USAGE_GENERIC_X),
++            LOGICAL_MINIMUM(1, 0),
++            LOGICAL_MAXIMUM(2, 255),
++            REPORT_SIZE(1, 8),
++            REPORT_COUNT(1, 1),
++            INPUT(1, Data|Var|Abs),
++        END_COLLECTION,
++    };
++#include "pop_hid_macros.h"
++    struct hid_device_desc desc[2] = {0};
++    struct hid_xinput_fallback_registration registration;
++    HANDLE fallback[2] = {INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE}, events[2] = {0};
++    HANDLE native = INVALID_HANDLE_VALUE, second = INVALID_HANDLE_VALUE, second_event = NULL;
++    WCHAR path[2][MAX_PATH];
++    HIDD_ATTRIBUTES attributes = {sizeof(attributes)};
++    BOOL ret, active;
++    unsigned int i;
++    DWORD wait;
++
++    if (strcmp( winetest_platform, "wine" ))
++    {
++        win_skip( "Wine-specific Sony fallback ownership protocol.\n" );
++        return;
++    }
++
++    for (i = 0; i < 2; ++i)
++    {
++        desc[i].use_report_id = TRUE;
++        desc[i].caps.InputReportByteLength = 2;
++        desc[i].attributes.Size = sizeof(desc[i].attributes);
++        desc[i].attributes.VendorID = 0x054c;
++        desc[i].attributes.ProductID = 0x0ce6;
++        desc[i].attributes.VersionNumber = 0x0100;
++        swprintf( desc[i].serial_str, ARRAY_SIZE(desc[i].serial_str), L"sony-fallback-test-%u", i );
++        desc[i].report_descriptor_len = sizeof(report_desc);
++        memcpy( desc[i].report_descriptor_buf, report_desc, sizeof(report_desc) );
++    }
++    if (!hid_device_start( desc, 2 )) return;
++
++    for (i = 0; i < 2; ++i)
++    {
++        swprintf( path[i], MAX_PATH, L"\\\\?\\hid#vid_054c&pid_0ce6#sony-fallback-test-%u", i );
++        ret = find_hid_device_path( path[i] );
++        ok( ret, "Missing test device %s\n", debugstr_w(path[i]) );
++        if (!ret) goto done;
++        fallback[i] = CreateFileW( path[i], GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
++                                   NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL );
++        ok( fallback[i] != INVALID_HANDLE_VALUE, "Open failed, error %lu\n", GetLastError() );
++        if (fallback[i] == INVALID_HANDLE_VALUE) goto done;
++        events[i] = CreateEventW( NULL, TRUE, FALSE, NULL );
++        registration.takeover_event = (ULONG_PTR)events[i];
++        ret = sync_ioctl( fallback[i], IOCTL_HID_WINE_REGISTER_XINPUT_FALLBACK, &registration,
++                          sizeof(registration) - 1, NULL, NULL, 5000 );
++        ok( !ret && GetLastError() == ERROR_INVALID_PARAMETER, "Invalid registration returned %u, error %lu\n",
++            ret, GetLastError() );
++        ret = sync_ioctl( fallback[i], IOCTL_HID_WINE_REGISTER_XINPUT_FALLBACK, &registration,
++                          sizeof(registration), NULL, NULL, 5000 );
++        ok( ret, "Registration failed, error %lu\n", GetLastError() );
++        if (!ret) goto done;
++    }
++
++    native = CreateFileW( path[0], GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
++                          NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL );
++    ok( native != INVALID_HANDLE_VALUE, "Native open failed, error %lu\n", GetLastError() );
++    if (native == INVALID_HANDLE_VALUE) goto done;
++    ret = HidD_GetAttributes( native, &attributes );
++    ok( ret, "Attributes query failed, error %lu\n", GetLastError() );
++    ok( WaitForSingleObject( events[0], 0 ) == WAIT_TIMEOUT, "Enumeration claimed native ownership\n" );
++
++    test_sony_fallback_read( fallback[0], fallback[0] );
++    test_sony_fallback_read( fallback[0], fallback[0] );
++    ok( WaitForSingleObject( events[0], 0 ) == WAIT_TIMEOUT, "Internal reads claimed native ownership\n" );
++    test_sony_fallback_read( native, fallback[0] );
++    ok( WaitForSingleObject( events[0], 0 ) == WAIT_TIMEOUT, "One probe claimed native ownership\n" );
++    test_sony_fallback_read( native, fallback[0] );
++    ok( WaitForSingleObject( events[0], 0 ) == WAIT_OBJECT_0, "Native reads did not withdraw fallback\n" );
++    ok( WaitForSingleObject( events[1], 0 ) == WAIT_TIMEOUT, "Native reads affected another controller\n" );
++
++    second = CreateFileW( path[0], GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
++                          NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL );
++    ok( second != INVALID_HANDLE_VALUE, "Second fallback open failed, error %lu\n", GetLastError() );
++    if (second == INVALID_HANDLE_VALUE) goto done;
++    second_event = CreateEventW( NULL, TRUE, FALSE, NULL );
++    registration.takeover_event = (ULONG_PTR)second_event;
++    ret = sync_ioctl( second, IOCTL_HID_WINE_REGISTER_XINPUT_FALLBACK, &registration,
++                      sizeof(registration), NULL, NULL, 5000 );
++    ok( ret, "Second registration failed, error %lu\n", GetLastError() );
++    ok( WaitForSingleObject( second_event, 0 ) == WAIT_OBJECT_0, "Late fallback missed native owner\n" );
++
++    active = FALSE;
++    ret = sync_ioctl( native, IOCTL_HID_WINE_NATIVE_INPUT_ACTIVITY, &active, sizeof(active), NULL, NULL, 5000 );
++    ok( ret, "Release failed, error %lu\n", GetLastError() );
++    ok( WaitForSingleObject( events[0], 0 ) == WAIT_TIMEOUT, "Release did not restore fallback\n" );
++    ok( WaitForSingleObject( second_event, 0 ) == WAIT_TIMEOUT, "Release missed second fallback\n" );
++    active = TRUE;
++    for (i = 0; i < 2; ++i)
++    {
++        ret = sync_ioctl( native, IOCTL_HID_WINE_NATIVE_INPUT_ACTIVITY, &active, sizeof(active), NULL, NULL, 5000 );
++        ok( ret, "Raw Input activity failed, error %lu\n", GetLastError() );
++    }
++    ok( WaitForSingleObject( events[0], 0 ) == WAIT_OBJECT_0, "Raw Input did not withdraw fallback\n" );
++    CloseHandle( native );
++    native = INVALID_HANDLE_VALUE;
++    for (i = 0; i < 500 && (wait = WaitForSingleObject( events[0], 0 )) == WAIT_OBJECT_0; ++i) Sleep( 10 );
++    ok( wait == WAIT_TIMEOUT, "Closing native consumer did not restore fallback, wait %#lx\n", wait );
++    ok( WaitForSingleObject( second_event, 0 ) == WAIT_TIMEOUT, "Close missed second fallback\n" );
++
++done:
++    if (native != INVALID_HANDLE_VALUE) CloseHandle( native );
++    if (second != INVALID_HANDLE_VALUE) CloseHandle( second );
++    if (second_event) CloseHandle( second_event );
++    for (i = 0; i < 2; ++i)
++    {
++        if (fallback[i] != INVALID_HANDLE_VALUE) CloseHandle( fallback[i] );
++        if (events[i]) CloseHandle( events[i] );
++    }
++    hid_device_stop( desc, 2 );
++}
++
+ START_TEST( hid )
+ {
+     dinput_test_init();
+@@ -4240,6 +4400,7 @@
+     test_hid_driver( 0, TRUE );
+     test_hid_driver( 1, TRUE );
+     test_hid_multiple_tlc();
++    test_sony_xinput_takeover();
+ 
+ done:
+     bus_device_stop();

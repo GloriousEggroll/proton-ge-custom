@@ -1,0 +1,272 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Subject: [PATCH] lsteamclient: Project Sony fallback metadata for older interfaces.
+
+SteamInput001 and SteamController006/007 predate the PS5 input type added
+in SDK 151. Grandia's type switch accepts values 1-12; a synthetic PS5
+type 13 selects its generic controller icons instead of PlayStation icons.
+
+Project synthetic DualSense/Edge types and Xbox-to-action origins to PS4
+metadata only on those old interfaces. Keep PS5 metadata for newer APIs.
+Do not rewrite physical IDs or synthetic handles: availability checks must
+still reject stale handles on native takeover and controller replacement.
+Real Steam handles retain the host Steam implementation.
+
+Update the wrapper generator and checked-in wrappers together.
+---
+diff --git a/lsteamclient/gen_wrapper.py b/lsteamclient/gen_wrapper.py
+index 6e1c520a..876851ae 100755
+--- a/lsteamclient/gen_wrapper.py
++++ b/lsteamclient/gen_wrapper.py
+@@ -1180,6 +1180,9 @@ def handle_method_c(klass, method, winclassname, out):
+     is_legacy_steaminput = klass.full_name in (
+         "ISteamController_SteamController006", "ISteamController_SteamController007",
+         "ISteamController_SteamController008")
++    legacy_sony = "TRUE" if klass.full_name in (
++        "ISteamInput_SteamInput001", "ISteamController_SteamController006",
++        "ISteamController_SteamController007") else "FALSE"
+     session_config_method = None
+     connected_controllers_method = None
+ 
+@@ -1249,13 +1252,13 @@ def handle_method_c(klass, method, winclassname, out):
+             "    if (steaminput006_xinput_trigger_vibration_extended( inputHandle, usLeftSpeed, usRightSpeed,\n"
+             "            usLeftTriggerSpeed, usRightTriggerSpeed )) return;\n",
+         "GetInputTypeForHandle":
+-            "    if (steaminput006_xinput_get_input_type( &params._ret, inputHandle )) return params._ret;\n",
++            f"    if (steaminput006_xinput_get_input_type( &params._ret, inputHandle, {legacy_sony} )) return params._ret;\n",
+         "GetGamepadIndexForController":
+             "    if (steaminput006_xinput_get_gamepad_index_for_controller( &params._ret, ulinputHandle )) return params._ret;\n",
+         "GetControllerForGamepadIndex":
+             "    if (steaminput006_xinput_get_controller_for_gamepad_index( &params._ret, nIndex )) return params._ret;\n",
+         "GetActionOriginFromXboxOrigin":
+-            "    if (steaminput_xinput_get_action_origin( &params._ret, inputHandle, eOrigin )) return params._ret;\n",
++            f"    if (steaminput_xinput_get_action_origin( &params._ret, inputHandle, eOrigin, {legacy_sony} )) return params._ret;\n",
+     }
+     if is_steaminput and method.name in steaminput_hooks:
+         out(steaminput_hooks[method.name])
+diff --git a/lsteamclient/steam_input_manual.c b/lsteamclient/steam_input_manual.c
+index 6f0ef881..f7395f64 100644
+--- a/lsteamclient/steam_input_manual.c
++++ b/lsteamclient/steam_input_manual.c
+@@ -654,7 +654,7 @@ int steaminput006_xinput_trigger_vibration_extended(uint64_t input_handle, uint1
+     return steaminput006_xinput_trigger_vibration(input_handle, left, right);
+ }
+ 
+-int steaminput006_xinput_get_input_type(uint32_t *type, uint64_t input_handle)
++int steaminput006_xinput_get_input_type(uint32_t *type, uint64_t input_handle, BOOL legacy_sony)
+ {
+     int index;
+     uint32_t handle_type;
+@@ -666,6 +666,9 @@ int steaminput006_xinput_get_input_type(uint32_t *type, uint64_t input_handle)
+     *type = 0;
+     if (steaminput_xinput_controller_available(index, &state) &&
+             handle_type == steaminput_xinput_fallback_type(index)) *type = handle_type;
++    /* SteamInput001 and SteamController006/007 predate PS5 types and origins.
++     * Keep the handle's physical identity for ownership and hotplug checks. */
++    if (legacy_sony && *type == STEAM_INPUT_TYPE_PS5) *type = STEAM_INPUT_TYPE_PS4;
+     return TRUE;
+ }
+ 
+@@ -689,12 +692,13 @@ int steaminput006_xinput_get_gamepad_index_for_controller(int32_t *index, uint64
+     if ((xinput_index = xinput_index_from_steam_handle(input_handle)) < 0)
+         return FALSE;
+ 
+-    steaminput006_xinput_get_input_type(&type, input_handle);
++    steaminput006_xinput_get_input_type(&type, input_handle, FALSE);
+     *index = type ? xinput_index : -1;
+     return TRUE;
+ }
+ 
+-int steaminput_xinput_get_action_origin(uint32_t *origin, uint64_t input_handle, uint32_t xbox_origin)
++int steaminput_xinput_get_action_origin(uint32_t *origin, uint64_t input_handle, uint32_t xbox_origin,
++        BOOL legacy_sony)
+ {
+     /* EInputActionOrigin values from the Steamworks SDK, indexed by EXboxOrigin.
+      * X/Y map to Square/Triangle, not the declaration order Triangle/Square. */
+@@ -710,7 +714,7 @@ int steaminput_xinput_get_action_origin(uint32_t *origin, uint64_t input_handle,
+     };
+     uint32_t type;
+ 
+-    if (!steaminput006_xinput_get_input_type(&type, input_handle)) return FALSE;
++    if (!steaminput006_xinput_get_input_type(&type, input_handle, legacy_sony)) return FALSE;
+     *origin = 0;
+     if (xbox_origin >= ARRAY_SIZE(ps4)) return TRUE;
+     if (type == STEAM_INPUT_TYPE_PS4) *origin = ps4[xbox_origin];
+@@ -719,10 +723,11 @@ int steaminput_xinput_get_action_origin(uint32_t *origin, uint64_t input_handle,
+     return TRUE;
+ }
+ 
+-int steamcontroller_xinput_get_action_origin(uint32_t *origin, uint64_t input_handle, uint32_t xbox_origin)
++int steamcontroller_xinput_get_action_origin(uint32_t *origin, uint64_t input_handle, uint32_t xbox_origin,
++        BOOL legacy_sony)
+ {
+     /* The legacy ISteamController enum has a different numbering scheme. */
+-    if (!steaminput_xinput_get_action_origin(origin, input_handle, xbox_origin)) return FALSE;
++    if (!steaminput_xinput_get_action_origin(origin, input_handle, xbox_origin, legacy_sony)) return FALSE;
+     if (*origin >= 50 && *origin <= 98) *origin -= 11;
+     else if (*origin >= 114 && *origin <= 141) *origin -= 22;
+     else if (*origin >= 258 && *origin <= 303) *origin -= 13;
+diff --git a/lsteamclient/steamclient_private.h b/lsteamclient/steamclient_private.h
+index 142fbd97..865aba05 100644
+--- a/lsteamclient/steamclient_private.h
++++ b/lsteamclient/steamclient_private.h
+@@ -63,11 +63,13 @@ int steaminput006_xinput_get_motion_data( InputMotionData_t *data, uint64_t inpu
+ int steaminput006_xinput_trigger_vibration( uint64_t input_handle, uint16_t left, uint16_t right );
+ int steaminput006_xinput_trigger_vibration_extended( uint64_t input_handle, uint16_t left, uint16_t right,
+         uint16_t left_trigger, uint16_t right_trigger );
+-int steaminput006_xinput_get_input_type( uint32_t *type, uint64_t input_handle );
++int steaminput006_xinput_get_input_type( uint32_t *type, uint64_t input_handle, BOOL legacy_sony );
+ int steaminput006_xinput_get_controller_for_gamepad_index( uint64_t *handle, int32_t index );
+ int steaminput006_xinput_get_gamepad_index_for_controller( int32_t *index, uint64_t input_handle );
+-int steaminput_xinput_get_action_origin( uint32_t *origin, uint64_t input_handle, uint32_t xbox_origin );
+-int steamcontroller_xinput_get_action_origin( uint32_t *origin, uint64_t input_handle, uint32_t xbox_origin );
++int steaminput_xinput_get_action_origin( uint32_t *origin, uint64_t input_handle, uint32_t xbox_origin,
++        BOOL legacy_sony );
++int steamcontroller_xinput_get_action_origin( uint32_t *origin, uint64_t input_handle, uint32_t xbox_origin,
++        BOOL legacy_sony );
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/lsteamclient/winISteamInput.c b/lsteamclient/winISteamInput.c
+index e0a8b676..585923a6 100644
+--- a/lsteamclient/winISteamInput.c
++++ b/lsteamclient/winISteamInput.c
+@@ -386,7 +386,7 @@ uint32_t __thiscall winISteamInput_SteamInput001_GetInputTypeForHandle(struct w_
+         .inputHandle = inputHandle,
+     };
+     TRACE("%p\n", _this);
+-    if (steaminput006_xinput_get_input_type( &params._ret, inputHandle )) return params._ret;
++    if (steaminput006_xinput_get_input_type( &params._ret, inputHandle, TRUE )) return params._ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput001_GetInputTypeForHandle, &params );
+     return params._ret;
+ }
+@@ -438,7 +438,7 @@ uint32_t __thiscall winISteamInput_SteamInput001_GetActionOriginFromXboxOrigin(s
+         .eOrigin = eOrigin,
+     };
+     TRACE("%p\n", _this);
+-    if (steaminput_xinput_get_action_origin( &params._ret, inputHandle, eOrigin )) return params._ret;
++    if (steaminput_xinput_get_action_origin( &params._ret, inputHandle, eOrigin, TRUE )) return params._ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput001_GetActionOriginFromXboxOrigin, &params );
+     return params._ret;
+ }
+@@ -918,7 +918,7 @@ uint32_t __thiscall winISteamInput_SteamInput002_GetInputTypeForHandle(struct w_
+         .inputHandle = inputHandle,
+     };
+     TRACE("%p\n", _this);
+-    if (steaminput006_xinput_get_input_type( &params._ret, inputHandle )) return params._ret;
++    if (steaminput006_xinput_get_input_type( &params._ret, inputHandle, FALSE )) return params._ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput002_GetInputTypeForHandle, &params );
+     return params._ret;
+ }
+@@ -970,7 +970,7 @@ uint32_t __thiscall winISteamInput_SteamInput002_GetActionOriginFromXboxOrigin(s
+         .eOrigin = eOrigin,
+     };
+     TRACE("%p\n", _this);
+-    if (steaminput_xinput_get_action_origin( &params._ret, inputHandle, eOrigin )) return params._ret;
++    if (steaminput_xinput_get_action_origin( &params._ret, inputHandle, eOrigin, FALSE )) return params._ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput002_GetActionOriginFromXboxOrigin, &params );
+     return params._ret;
+ }
+@@ -1584,7 +1584,7 @@ uint32_t __thiscall winISteamInput_SteamInput005_GetInputTypeForHandle(struct w_
+         .inputHandle = inputHandle,
+     };
+     TRACE("%p\n", _this);
+-    if (steaminput006_xinput_get_input_type( &params._ret, inputHandle )) return params._ret;
++    if (steaminput006_xinput_get_input_type( &params._ret, inputHandle, FALSE )) return params._ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput005_GetInputTypeForHandle, &params );
+     return params._ret;
+ }
+@@ -1636,7 +1636,7 @@ uint32_t __thiscall winISteamInput_SteamInput005_GetActionOriginFromXboxOrigin(s
+         .eOrigin = eOrigin,
+     };
+     TRACE("%p\n", _this);
+-    if (steaminput_xinput_get_action_origin( &params._ret, inputHandle, eOrigin )) return params._ret;
++    if (steaminput_xinput_get_action_origin( &params._ret, inputHandle, eOrigin, FALSE )) return params._ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput005_GetActionOriginFromXboxOrigin, &params );
+     return params._ret;
+ }
+@@ -2275,7 +2275,7 @@ uint32_t __thiscall winISteamInput_SteamInput006_GetInputTypeForHandle(struct w_
+         .inputHandle = inputHandle,
+     };
+     TRACE("%p\n", _this);
+-    if (steaminput006_xinput_get_input_type( &params._ret, inputHandle )) return params._ret;
++    if (steaminput006_xinput_get_input_type( &params._ret, inputHandle, FALSE )) return params._ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput006_GetInputTypeForHandle, &params );
+     return params._ret;
+ }
+@@ -2327,7 +2327,7 @@ uint32_t __thiscall winISteamInput_SteamInput006_GetActionOriginFromXboxOrigin(s
+         .eOrigin = eOrigin,
+     };
+     TRACE("%p\n", _this);
+-    if (steaminput_xinput_get_action_origin( &params._ret, inputHandle, eOrigin )) return params._ret;
++    if (steaminput_xinput_get_action_origin( &params._ret, inputHandle, eOrigin, FALSE )) return params._ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput006_GetActionOriginFromXboxOrigin, &params );
+     return params._ret;
+ }
+@@ -2979,7 +2979,7 @@ uint32_t __thiscall winISteamInput_SteamInput007_GetInputTypeForHandle(struct w_
+         .inputHandle = inputHandle,
+     };
+     TRACE("%p\n", _this);
+-    if (steaminput006_xinput_get_input_type( &params._ret, inputHandle )) return params._ret;
++    if (steaminput006_xinput_get_input_type( &params._ret, inputHandle, FALSE )) return params._ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput007_GetInputTypeForHandle, &params );
+     return params._ret;
+ }
+@@ -3031,7 +3031,7 @@ uint32_t __thiscall winISteamInput_SteamInput007_GetActionOriginFromXboxOrigin(s
+         .eOrigin = eOrigin,
+     };
+     TRACE("%p\n", _this);
+-    if (steaminput_xinput_get_action_origin( &params._ret, inputHandle, eOrigin )) return params._ret;
++    if (steaminput_xinput_get_action_origin( &params._ret, inputHandle, eOrigin, FALSE )) return params._ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput007_GetActionOriginFromXboxOrigin, &params );
+     return params._ret;
+ }
+diff --git a/lsteamclient/winISteamController.c b/lsteamclient/winISteamController.c
+index 73c33006..bcc426e0 100644
+--- a/lsteamclient/winISteamController.c
++++ b/lsteamclient/winISteamController.c
+@@ -1556,7 +1556,7 @@ uint32_t __thiscall winISteamController_SteamController006_GetInputTypeForHandle
+         .controllerHandle = controllerHandle,
+     };
+     TRACE("%p\n", _this);
+-    if (steaminput006_xinput_get_input_type( &params._ret, controllerHandle )) return params._ret;
++    if (steaminput006_xinput_get_input_type( &params._ret, controllerHandle, TRUE )) return params._ret;
+     STEAMCLIENT_CALL( ISteamController_SteamController006_GetInputTypeForHandle, &params );
+     return params._ret;
+ }
+@@ -1986,7 +1986,7 @@ uint32_t __thiscall winISteamController_SteamController007_GetInputTypeForHandle
+         .controllerHandle = controllerHandle,
+     };
+     TRACE("%p\n", _this);
+-    if (steaminput006_xinput_get_input_type( &params._ret, controllerHandle )) return params._ret;
++    if (steaminput006_xinput_get_input_type( &params._ret, controllerHandle, TRUE )) return params._ret;
+     STEAMCLIENT_CALL( ISteamController_SteamController007_GetInputTypeForHandle, &params );
+     return params._ret;
+ }
+@@ -2038,7 +2038,7 @@ uint32_t __thiscall winISteamController_SteamController007_GetActionOriginFromXb
+         .eOrigin = eOrigin,
+     };
+     TRACE("%p\n", _this);
+-    if (steamcontroller_xinput_get_action_origin( &params._ret, controllerHandle, eOrigin )) return params._ret;
++    if (steamcontroller_xinput_get_action_origin( &params._ret, controllerHandle, eOrigin, TRUE )) return params._ret;
+     STEAMCLIENT_CALL( ISteamController_SteamController007_GetActionOriginFromXboxOrigin, &params );
+     return params._ret;
+ }
+@@ -2498,7 +2498,7 @@ uint32_t __thiscall winISteamController_SteamController008_GetInputTypeForHandle
+         .controllerHandle = controllerHandle,
+     };
+     TRACE("%p\n", _this);
+-    if (steaminput006_xinput_get_input_type( &params._ret, controllerHandle )) return params._ret;
++    if (steaminput006_xinput_get_input_type( &params._ret, controllerHandle, FALSE )) return params._ret;
+     STEAMCLIENT_CALL( ISteamController_SteamController008_GetInputTypeForHandle, &params );
+     return params._ret;
+ }
+@@ -2550,7 +2550,7 @@ uint32_t __thiscall winISteamController_SteamController008_GetActionOriginFromXb
+         .eOrigin = eOrigin,
+     };
+     TRACE("%p\n", _this);
+-    if (steamcontroller_xinput_get_action_origin( &params._ret, controllerHandle, eOrigin )) return params._ret;
++    if (steamcontroller_xinput_get_action_origin( &params._ret, controllerHandle, eOrigin, FALSE )) return params._ret;
+     STEAMCLIENT_CALL( ISteamController_SteamController008_GetActionOriginFromXboxOrigin, &params );
+     return params._ret;
+ }

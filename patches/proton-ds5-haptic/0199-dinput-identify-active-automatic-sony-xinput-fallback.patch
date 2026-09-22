@@ -1,0 +1,119 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] dinput: Identify an active automatic Sony fallback as Xbox.
+
+Some games, including Assassin's Creed, choose their XInput handler by
+querying DirectInput DIPROP_VIDPID before making any XInput calls. The
+automatic Sony fallback provides correct XInput reports but leaves this
+query reporting Sony, selecting the game's generic joystick mapping.
+
+Extend the forced companion's identity treatment to an available automatic
+slot for the exact device. Ask Wine's XInput provider rather than guessing
+ownership from an environment variable. It performs initial discovery and
+retains native HID consumption, Steam Input priority, explicit overrides,
+device removal and slot-capacity checks. Return the original Sony VID/PID
+when no eligible automatic slot exists.
+
+Only the DirectInput property is projected. HID descriptors, attributes,
+paths, instance GUIDs, audio identity and native report consumers are not
+changed. Missing private exports fail back to the original Sony property.
+Do not globally set PROTON_SONY_HIDRAW_XINPUT: that forces device creation
+and disables the automatic native takeover policy.
+
+Apply after 0197 and 0198. This supports removing Proton's broad per-game
+forced-XInput list; separate persistent-slot and action-manifest defaults
+remain. Assassin's Creed requires choosing controller input in its menu.
+
+Validation: patch consistency and source checks only. No build or runtime
+test was performed for this extension. Verify DirectInput identity before
+the first XInput call, after native takeover and release, with Steam Input
+active, with no free slots, and with the automatic feature disabled. Verify
+the existing forced flag still uses the companion path.
+
+---
+diff --git a/dlls/dinput/joystick_hid.c b/dlls/dinput/joystick_hid.c
+--- a/dlls/dinput/joystick_hid.c
++++ b/dlls/dinput/joystick_hid.c
+@@ -1067,6 +1067,27 @@ static void hid_joystick_destroy( IDirectInputDevice8W *iface )
+     CloseHandle( impl->device );
+ }
+ 
++static BOOL sony_auto_xinput_available( struct hid_joystick *impl )
++{
++    BOOL (WINAPI *is_fallback)( const WCHAR * );
++    BOOL available = FALSE;
++    HMODULE module;
++    WCHAR option[2];
++
++    if (impl->attrs.VendorID != 0x054c ||
++        (impl->attrs.ProductID != 0x05c4 && impl->attrs.ProductID != 0x09cc &&
++         impl->attrs.ProductID != 0x0ce6 && impl->attrs.ProductID != 0x0df2)) return FALSE;
++    if (GetEnvironmentVariableW( L"PROTON_SONY_AUTO_XINPUT", option, ARRAY_SIZE(option) ) != 1 ||
++        option[0] != '1') return FALSE;
++
++    /* Ask the slot owner so Steam Input and per-device native takeover retain priority. */
++    if (!(module = LoadLibraryExW( L"xinput1_3.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32 ))) return FALSE;
++    if ((is_fallback = (void *)GetProcAddress( module, "__wine_XInputIsSonyFallback" )))
++        available = is_fallback( impl->device_path );
++    FreeLibrary( module );
++    return available;
++}
++
+ static HRESULT hid_joystick_get_property( IDirectInputDevice8W *iface, DWORD property,
+                                           DIPROPHEADER *header, const DIDEVICEOBJECTINSTANCEW *instance )
+ {
+@@ -1105,6 +1126,11 @@ static HRESULT hid_joystick_get_property( IDirectInputDevice8W *iface, DWORD pro
+             value->dwData = MAKELONG( 0x045e, 0x028e );
+             TRACE( "Reporting forced Sony XInput companion %s as Xbox 360.\n", debugstr_w(impl->device_path) );
+         }
++        else if (sony_auto_xinput_available( impl ))
++        {
++            value->dwData = MAKELONG( 0x045e, 0x028e );
++            TRACE( "Reporting automatic Sony XInput fallback %s as Xbox 360.\n", debugstr_w(impl->device_path) );
++        }
+         return DI_OK;
+     }
+     case (DWORD_PTR)DIPROP_JOYSTICKID:
+diff --git a/dlls/xinput1_3/main.c b/dlls/xinput1_3/main.c
+--- a/dlls/xinput1_3/main.c
++++ b/dlls/xinput1_3/main.c
+@@ -139,6 +139,7 @@ static XINPUT_STATE persistent_state;
+ 
+ DWORD WINAPI __wine_XInputGetDeviceVidPid(DWORD index, WORD *vendor_id, WORD *product_id);
+ DWORD WINAPI __wine_XInputGetSonyProductId(DWORD index, WORD *product_id);
++BOOL WINAPI __wine_XInputIsSonyFallback(const WCHAR *device_path);
+ static USHORT sony_gamepad_product_id(const WCHAR *path);
+ 
+ static BOOL automatic_sony_enabled(void)
+@@ -1486,6 +1487,24 @@ DWORD WINAPI DECLSPEC_HOTPATCH XInputGetCapabilities(DWORD index, DWORD flags, X
+     return ret;
+ }
+ 
++BOOL WINAPI __wine_XInputIsSonyFallback(const WCHAR *device_path)
++{
++    BOOL available = FALSE;
++    int index;
++
++    if (!device_path || !automatic_sony_path(device_path)) return FALSE;
++    start_update_thread();
++
++    EnterCriticalSection(&xinput_cs);
++    /* DirectInput identity probes can precede the game's first XInput call. */
++    update_controller_list();
++    if (find_opened_device(device_path, &index) && controllers[index].native_input_event)
++        available = controller_available(&controllers[index]);
++    LeaveCriticalSection(&xinput_cs);
++
++    return available;
++}
++
+ DWORD WINAPI __wine_XInputGetSonyProductId(DWORD index, WORD *product_id)
+ {
+     DWORD ret = ERROR_SUCCESS;
+diff --git a/dlls/xinput1_3/xinput1_3.spec b/dlls/xinput1_3/xinput1_3.spec
+--- a/dlls/xinput1_3/xinput1_3.spec
++++ b/dlls/xinput1_3/xinput1_3.spec
+@@ -9,3 +9,4 @@
+ 100 stdcall XInputGetStateEx(long ptr)
+ @ stdcall -private __wine_XInputGetSonyProductId(long ptr)
+ @ stdcall -private __wine_XInputGetDeviceVidPid(long ptr ptr)
++@ stdcall -private __wine_XInputIsSonyFallback(wstr)
