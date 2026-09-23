@@ -1,5 +1,24 @@
 # EM-11 patch import
 
+## Bleeding-edge refresh (2026-09-22)
+
+Current validated Wine base: `1c78596625336a73dbfc035dbbcf0dbdd95b06eb`.
+The EM import snapshot below is unchanged. Imports 0295 and 0296 now live in
+`../disabled/`, because Wine includes Remi Bernon's fixes as `a16c7d16e5b`
+and `15b9d161776`. Preserve the base's constructor/alias signature and avoid
+duplicating its returnedonly property. See the disabled README for provenance.
+
+The accompanying GE video rebase refreshes the old GStreamer parser deletion
+over Conor McCarthy's `3cd4638c4dc` read-buffer change and fixes blank-line
+context in video patch 0062. The FFmpeg replacement and the non-seekable live
+source behavior remain enabled; no video fix is dropped.
+
+A clean isolated checkout replayed all 774 GE Wine patch entries and the
+selected automatic Wine-staging patches in prep order without failures,
+skipped patches, or rejects. The two rebased video patches applied with zero
+fuzz. The affected live source files match that replay. No autoconf, source
+generators, builds, or runtime tests were run.
+
 ## Source snapshot (2026-09-09)
 
 - Wine bleeding-edge base: `542ca26b64ed53cc61de065ed4c0b0ab8802e7d6`.
@@ -9,7 +28,7 @@
 - Upstream: https://github.com/Etaash-mathamsetty/wine-valve/tree/em-11
 - Wine-staging snapshot: `6cc805ea57132eeaf44764e9213823c9b8d0d300`.
 
-Existing patch numbers are retained for review. There are 287 active patches
+Existing patch numbers are retained for review. There are 285 active patches
 in this directory; gaps are intentional. Unused imports are kept under
 `../disabled/` with their original author headers.
 
@@ -29,8 +48,8 @@ dates, and original commit IDs are preserved in the patch mail headers.
 | 0292 | `f035e2fc6e50` | Reset size hints only on state changes | Etaash Mathamsetty |
 | 0293 | `0484cd7b40cd` | Use wl_output version 4 | Etaash Mathamsetty |
 | 0294 | `c68ed3899afe` | Remove optional window-move hack | Etaash Mathamsetty; disabled, duplicates Wineland 0073 |
-| 0295 | `21f4d8ae1e9e` | Check individual Vulkan returnedonly members | Remi Bernon |
-| 0296 | `73e68369d2f2` | Exclude dynamic arrays from returnedonly | Remi Bernon |
+| 0295 | `21f4d8ae1e9e` | Check individual Vulkan returnedonly members | Remi Bernon; disabled on 2026-09-22, now in Wine |
+| 0296 | `73e68369d2f2` | Exclude dynamic arrays from returnedonly | Remi Bernon; disabled on 2026-09-22, now in Wine |
 | 0297 | `a886bddc2a9d` | Move display flush out of image-description helper | Etaash Mathamsetty |
 | 0298 | `cc0e38f99125` | Extract flash-window helper | Etaash Mathamsetty |
 | 0299 | `ce0fa7a14ec0` | Activation-token handling | Etaash Mathamsetty |
@@ -83,7 +102,7 @@ under `../wine-staging/`: `ntdll-Hide_Wine_Exports`, `kernel32-Debugger`,
 rebased context without modifying the Wine-staging submodule. Their original
 patch authors are retained.
 
-## Validation
+## Original Snapshot Validation
 
 A clean, isolated replay on the pinned Wine base applied all 909 Wine patch
 entries in prep order. GE/manual patches were checked and applied with GNU

@@ -3,6 +3,24 @@
 These files are retained for provenance, not applied by protonprep. Do not
 restore them just to fill numbering gaps in an active series.
 
+## Bleeding-edge refresh (2026-09-22)
+
+Wine base: `1c78596625336a73dbfc035dbbcf0dbdd95b06eb`.
+
+- `0295-winevulkan-Check-for-returnedonly-on-individual-memb.patch`:
+  EM `21f4d8ae1e9e79b419784e3104c7061d31cd6cd1`, by Remi Bernon.
+  Wine already includes the member-level returnedonly behavior in
+  `a16c7d16e5b31a08733dd200c98d3a5129725e73` (upstream
+  `1ffafe4655f25b0f16a31759152908f3671d4bdd`). Keep Wine's constructor
+  signature and matching alias call; the EM patch partially applies and
+  breaks that call while duplicating the returnedonly property.
+- `0296-winevulkan-Don-t-flag-dynamic-array-lengths-as-retur.patch`:
+  EM `73e68369d2f2e7220fc27120fd6d24784f795152`, by Remi Bernon.
+  Already included in Wine as `15b9d16177695756d95285442070e0494a4d95f2`
+  (upstream `9ce1651515d93d9760e2438a53bf2c117238bc2b`).
+
+Both original patch files and author headers are retained unchanged.
+
 ## EM-11 rebase (2026-09-09)
 
 - `0190-win32u-Reset-variables-to-zero-within-WM_WINE_WINDOW.patch`:
