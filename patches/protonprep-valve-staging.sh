@@ -32,6 +32,8 @@ apply_all_in_dir() {
     apply_patch "../patches/dxvk/black-desert-keep-fullscreen-on-focus-loss.patch"
     # Assassin's Creed DX10: preserve fullscreen presentation across Alt+Tab.
     apply_patch "../patches/dxvk/assassins-creed-keep-fullscreen-on-focus-loss.patch"
+    # HDR colorspaces require an instance extension, not a device extension.
+    apply_patch "../patches/dxvk/dxvk-enable-swapchain-colorspace-on-instance.patch"
     popd
 
     pushd vkd3d-proton
@@ -373,6 +375,9 @@ apply_all_in_dir() {
 
     echo "WINE: -HOTFIX- Remove redundant packed-code split locks"
     apply_patch "../patches/wine-hotfixes/pending/ntdll-remove-redundant-packed-split-lock.patch"
+
+    # Publish process-exit state before pending I/O APCs can take orphaned locks.
+    apply_patch "../patches/wine-hotfixes/pending/ntdll-block-apcs-until-process-exit-state-is-set.patch"
 
     # https://gitlab.winehq.org/wine/wine/-/commit/a31ec8da9572672e04ae46792a398da942649875
     echo "WINE: -HOTFIX- Prefer native non-Microsoft DLLs using version resources"

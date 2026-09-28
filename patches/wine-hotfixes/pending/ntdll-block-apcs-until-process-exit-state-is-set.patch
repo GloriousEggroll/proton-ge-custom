@@ -1,0 +1,60 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Mon, 28 Sep 2026 00:00:00 -0600
+Subject: [PATCH] ntdll: Block signals until process termination state is updated.
+
+NtTerminateProcess(NULL, ...) kills the other threads before returning to
+the caller for process detach. wine_server_call() restores the signal mask
+before NtTerminateProcess sets process_exiting. A pending SIGUSR1 can thus
+dispatch a system APC with process_exiting still FALSE even though the
+threads which owned ntdll's internal mutexes have already been terminated.
+
+Warframe was observed hanging after "Main Shutdown Complete" in this exact
+window: NtTerminateProcess -> wine_server_call -> pthread_sigmask ->
+usr1_handler -> wait_suspend -> irp_completion -> virtual_locked_server_call.
+virtual_mutex was owned by a thread no longer present in the process, and
+process_exiting was still FALSE. The call's process handle was NULL.
+
+Keep server signals blocked across the server request and its local state
+update. Once signals are restored, callbacks use the existing process-exit
+mutex handling rather than waiting forever for a terminated owner. Error
+and remote-process paths restore the original mask without changing their
+termination behavior. This does not skip process detach or force an exit.
+---
+ dlls/ntdll/unix/process.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/ntdll/unix/process.c b/dlls/ntdll/unix/process.c
+--- a/dlls/ntdll/unix/process.c
++++ b/dlls/ntdll/unix/process.c
+@@ -967,6 +967,7 @@ LONG terminate_process_exit_code;
+  */
+ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
+ {
++    sigset_t sigset;
+     unsigned int ret;
+     BOOL self;
+ 
+@@ -983,11 +984,14 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
+         terminate_process_exit_code = exit_code;
+     }
+ 
++    /* Do not dispatch APCs after killing the other threads until process_exiting
++     * is set: they may need a mutex left locked by one of those threads. */
++    pthread_sigmask( SIG_BLOCK, &server_block_set, &sigset );
+     SERVER_START_REQ( terminate_process )
+     {
+         req->handle    = wine_server_obj_handle( handle );
+         req->exit_code = exit_code;
+-        ret = wine_server_call( req );
++        ret = server_call_unlocked( req );
+         self = reply->self;
+     }
+     SERVER_END_REQ;
+@@ -999,6 +1003,7 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
+         else if (process_exiting) exit_process( exit_code );
+         else abort_process( exit_code );
+     }
++    pthread_sigmask( SIG_SETMASK, &sigset, NULL );
+     return ret;
+ }
+ 
