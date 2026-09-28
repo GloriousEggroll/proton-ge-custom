@@ -104,7 +104,6 @@ def log_environment(env: dict, log_file: io.TextIOWrapper):
         'PROTON_XESS_UPGRADE',
         'PROTON_FSR3_UPGRADE',
         'PROTON_FSR4_UPGRADE',
-        'PROTON_FSR4_RDNA3_UPGRADE',
         'PROTON_FFX3_UPGRADE',
         'PROTON_FFX4_UPGRADE',
         'PROTON_USE_OPTISCALER',

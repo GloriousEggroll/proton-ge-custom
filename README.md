@@ -511,6 +511,20 @@ If on a non-systemd system with an inadequate `ulimit -Hn`, adjusting limits is 
 *               hard    nofile             524288
 ```
 
+##### Enabling FSR 4
+
+To download and install `amdxcffx64.dll` for FSR 4 upgrades in compatible games with FSR 3.1, use:
+
+```bash
+PROTON_FSR4_UPGRADE=1 %command%
+```
+
+Use the same option for RDNA3 GPUs. The old `PROTON_FSR4_RDNA3_UPGRADE` option is obsolete and has no effect; replace it with `PROTON_FSR4_UPGRADE`. GPU, driver, and game compatibility are still required.
+
+The default DLL version is selected from the `fsr_40_drv` entries in the [upscaler manifest](https://loathingkernel.github.io/proton-upscalers/manifest.json), not pinned to a version in Proton. As of September 27, 2026, the default is **4.1.1**. To request a specific available version, use, for example, `PROTON_FSR4_UPGRADE=4.1.1 %command%`. If the requested version is absent from the manifest, the downloader falls back to the latest non-development entry. In particular, `4.0.2` is currently unavailable and requesting it does not select the old DLL.
+
+GE-Proton's DLL downloader remains opt-in: it does not automatically download `amdxcffx64.dll` without enabling this option. This is separate from a game's own FSR support or Wine using a DLL that is already installed. `PROTON_FSR4_INDICATOR=1` enables the FSR upscaling and frame-generation watermarks.
+
 Environment variable options:
 
 Disable Steam Input for the game before using the Sony controller compatibility options below. This allows Wine to use the physical controller's HIDRAW interface instead of Steam's virtual controller.
@@ -554,12 +568,11 @@ Without HIDRAW access, Wine retains its normal SDL fallback, which does not prov
 |                       | <tt>WINE_FULLSCREEN_FSR_CUSTOM_MODE</tt> | Set fake resolution of the screen. This can be useful in games that render in native resolution regardless of the selected resolution. Parameter `WIDTHxHEIGHT` |
 |                       | <tt>WINE_DO_NOT_CREATE_DXGI_DEVICE_MANAGER</tt> | Set to 1 to enable. Required for video playback in some games to not be miscolored (usually tinted pink) |
 |                       | <tt>COPYPREFIX</tt> | Set to 1 to enable. If -steamdeck is used on steam (or SteamDeck=1 is set), copies the game's prefix and shader cache from the game partition to the local steam steamapps folder. Logic is reversed if -steamdeck not enabled (or SteamDeck=0) |
-| `fsr4`               | `PROTON_FSR4_UPGRADE`          | Automatically download `amdxcffx64.dll` and upgrade games with FSR 3.1 to use FSR 4. Version to download can be specified by supplying it as a value, like so `PROTON_FSR4_UPGRADE="4.0.1"`, instead of `1`. Downloads version `4.0.2` of the required DLL by default. This option also disables AMD Anti-Lag 2 currently due to various issues.                                                                                      |
-| `fsr4hud`            | `PROTON_FSR4_INDICATOR`        | Enable the FSR4 watermark at the top left portion of the screen.                                                                                                                                                                                                                                                                                                                                                                      |
-| `fsr4rdna3`          | `PROTON_FSR4_RDNA3_UPGRADE`    | Identical to `PROTON_FSR4_UPGRADE` but for RDNA3 GPUs. Enables some required compatibility options and downloads version `4.0.0` of the DLL by default.                                                                                                                                                                                                                                                                               |
+| `fsr4`               | `PROTON_FSR4_UPGRADE`          | Download `amdxcffx64.dll` for FSR 4 upgrades in compatible FSR 3.1 games, including on RDNA3. Set to `1` for the manifest-selected default, or specify an available version such as `4.1.1`. See [Enabling FSR 4](#enabling-fsr-4) for version selection and compatibility notes. |
+| `fsr4hud`            | `PROTON_FSR4_INDICATOR`        | Enable the FSR upscaling and frame-generation watermarks (`FSR_WATERMARK=1` and `FSR_FG_WATERMARK=1`). |
 | `fsr3`               | `PROTON_FSR3_UPGRADE`          |                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `dlss`               | `PROTON_DLSS_UPGRADE`          | Automatically download and use newer versions of `nvngx_dlss(d\|g).dll` DLLs. Version to download can be specified by supplying it as a value, like so `PROTON_DLSS_UPGRADE="310.2"`, instead of `1`, to download version `310.2.1.0`. This option also sets `DXVK_NVAPI_DRS_SETTINGS` to use the latest preset. If you provide your own config for it through this environment variable, your configuration is going to be applied.. |
-| `dlsshud`            | `PROTON_DLSS_INDICATOR`        | Enable the DLSS overlay at the bottom left portion of the screen. This is exactly the same as `FSR4_WATERMARK=1`                                                                                                                                                                                                                                                                                                                      |
+| `dlsshud`            | `PROTON_DLSS_INDICATOR`        | Enable the DLSS indicator through DXVK-NVAPI. This is separate from `PROTON_FSR4_INDICATOR`. |
 | `xess`               | `PROTON_XESS_UPGRADE`          |                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `sdlinput`           | `PROTON_USE_SDL` or `PROTON_PREFER_SDL` | Uses SDL input instead of HIDRAW/Steam Input. |
 |                      | `PROTON_SONY_DUALSENSE_EDGE_AS_DUALSENSE` | Expose a native DualSense Edge as a regular DualSense to games without Edge support. Enabled automatically for Diablo IV; set to `0` to disable. Skipped when a Steam Input virtual controller is present. Physical controller identity and native reports are preserved for audio, haptics, and hotplug handling. |
