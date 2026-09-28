@@ -2,7 +2,7 @@
 """Probe Steam focus IPC from a separate process, without attaching to a game.
 
 This is a diagnostic, not an installed component. Private ABI calls are limited
-to the ELF build manually inspected during the September 2026 investigation.
+to the ELF builds manually inspected during the September 2026 investigation.
 By default, only read focus. Writing focus requires both --focus-game and
 --focus-pid, and the target game's overlay must already be open.
 """
@@ -16,7 +16,16 @@ import time
 from pathlib import Path
 
 
-BUILD_ID = "7b0847f04cf284f01a1a165561df054902df31a7"
+BUILDS = {
+    "7b0847f04cf284f01a1a165561df054902df31a7": {
+        "get_utils": 0x1610a10, "set_focus": 0x13b4ea0,
+        "get_window": 0x1366f20, "get_game": 0x1330f20, "get_pid": 0x12edcf0,
+    },
+    "24adc837a4068a882b963cc9531cf05a11a50a0c": {
+        "get_utils": 0x1611e70, "set_focus": 0x13b5fd0,
+        "get_window": 0x1369500, "get_game": 0x1337000, "get_pid": 0x12f53a0,
+    },
+}
 ENGINE_VERSION = b"CLIENTENGINE_INTERFACE_VERSION005"
 DESKTOP_GAME_ID = 413080
 
@@ -33,8 +42,11 @@ def emit(*args):
 class SteamFocus:
     def __init__(self, library):
         notes = subprocess.check_output(["readelf", "-n", str(library)], text=True)
-        if f"Build ID: {BUILD_ID}" not in notes:
+        self.build_id = next((line.partition("Build ID:")[2].strip()
+                              for line in notes.splitlines() if "Build ID:" in line), None)
+        if self.build_id not in BUILDS:
             raise RuntimeError("Uninspected Steam build; refusing private ABI calls")
+        self.abi = BUILDS[self.build_id]
         if c.sizeof(c.c_void_p) != 8:
             raise RuntimeError("This diagnostic requires a 64-bit Python process")
 
@@ -71,7 +83,7 @@ class SteamFocus:
         engine = self.lib.CreateInterface(ENGINE_VERSION, c.byref(error))
         if not engine or error.value:
             raise RuntimeError("Missing expected client engine")
-        get_utils = self.member(engine, 14, 0x1610a10, c.c_void_p,
+        get_utils = self.member(engine, 14, self.abi["get_utils"], c.c_void_p,
                                 c.c_void_p, c.c_int)
         self.pipe = self.lib.Steam_CreateSteamPipe()
         if not self.pipe:
@@ -83,19 +95,19 @@ class SteamFocus:
         if not self.utils:
             raise RuntimeError("IClientUtils is unavailable")
         self.set_focus = self.member(
-            self.utils, 48, 0x13b4ea0, None, c.c_void_p, c.POINTER(c.c_uint64),
+            self.utils, 48, self.abi["set_focus"], None, c.c_void_p, c.POINTER(c.c_uint64),
             c.c_bool, c.c_bool, c.c_uint32, c.c_uint16, c.c_uint16)
         # CGameID has an implicit result pointer in this C++ ABI. Slot 54 reads
         # the actual focused overlay instance, without slot 53's game fallback.
         self.get_focus = self.member(
-            self.utils, 54, 0x1366f20, c.c_void_p, c.POINTER(c.c_uint64),
+            self.utils, 54, self.abi["get_window"], c.c_void_p, c.POINTER(c.c_uint64),
             c.c_void_p, c.POINTER(c.c_bool), c.POINTER(c.c_uint32))
         self.get_context = self.member(
-            self.utils, 103, 0x1330f20, c.c_void_p,
+            self.utils, 103, self.abi["get_game"], c.c_void_p,
             c.POINTER(c.c_uint64), c.c_void_p)
         self.get_context_pid = self.member(
-            self.utils, 104, 0x12edcf0, c.c_uint32, c.c_void_p)
-        emit("connected to IClientUtils through an independent Steam pipe")
+            self.utils, 104, self.abi["get_pid"], c.c_uint32, c.c_void_p)
+        emit("connected to IClientUtils through an independent Steam pipe, build", self.build_id)
 
     def state(self):
         game, active, pid = c.c_uint64(), c.c_bool(), c.c_uint32()
@@ -155,7 +167,8 @@ def main():
         client.connect()
         initial = client.state()
         emit("focused overlay (game, active, pipe PID):", initial)
-        emit("controller context (game, PID):", client.context())
+        previous_context = client.context()
+        emit("controller context (game, PID):", previous_context)
         if args.focus_game is not None:
             deadline = time.monotonic() + args.wait_focus
             while (initial[0] != args.focus_game or not initial[1]) and time.monotonic() < deadline:
@@ -177,6 +190,10 @@ def main():
             if current != previous:
                 emit("focused overlay (game, active, pipe PID):", current)
                 previous = current
+            context = client.context()
+            if context != previous_context:
+                emit("controller context (game, PID):", context)
+                previous_context = context
     finally:
         try:
             if changed:

@@ -1,9 +1,81 @@
 # Steam controller focus IPC experiment
 
-Status: standalone feasibility test succeeded. The first integrated build did
-not fix Guide closing. Its stale X11 focus check is corrected in source, awaiting
-the user's build and runtime test.
+Status: the user confirmed Guide closing worked after the September 20 focus
+timing correction. Warframe later reproduced a failure after a Steam update.
+Support for the inspected September 27 library is now active in the user's
+build. Guide toggling recovered after focus reassignment, but fresh-launch
+ClientUI recovery is a new source change awaiting integrated testing.
 The diagnostic files themselves are not installed or run by Proton.
+
+## Warframe follow-up on 2026-09-27
+
+- `~/steam-230410-guide.log`, collected at 21:15-21:16 using
+  `GE-Proton11-7-26-g10ba9e362`, confirms the adapter is enabled, its bridge
+  query is loaded, X11 focus is PointerRoot, and the focused/open overlay is
+  230410 while controller context is 769. No assignment occurs because the
+  existing guard only accepts Desktop (413080).
+- Steam's `controller_ui.txt` records the DualSense Edge Guide presses.
+  `webhelper_js.txt` routes them to `ControllerConfigurator_uid2382871`.
+  The installed desktop overlay's `HandleGamepadGuideButtonEvents` ignores
+  events whose `nAppID` differs from the overlay's app ID. This supports an
+  app-focus routing mismatch, not missing controller button reports. The
+  event's actual `nAppID` is not printed in those logs.
+- The first standalone write attempt (21:31:26-21:32:56) timed out on desktop
+  focus without writing anything. In the second, overlay state became
+  `(230410, True, 0)` at 21:34:23; the probe assigned game 230410/PID 2409498
+  and read back that context. No Guide presses occurred during its 60-second
+  observation. It restored Desktop and exited at 21:35:23; the integrated
+  adapter reassigned Warframe at 21:35:24.
+- At 21:36:14, 21:36:19 and 21:36:23, Steam recorded Guide presses under the
+  Warframe context. The user confirmed close/open/close all worked. There
+  were intervening native focus transitions and Desktop corrections. Thus
+  recovery works, but this is NOT proof that forcing a still-active ClientUI
+  assignment has been tested or that a fresh launch is fixed.
+- The new candidate accepts ClientUI only for this game's focused/open
+  overlay with rejected X11 proxy focus, and only when the versioned public
+  `SteamClient017` / `SteamUtils009` interface reports non-Big-Picture mode.
+  Missing public interfaces fail closed for ClientUI. Overlay state and
+  bridge ownership are rechecked after IPC, before assigning focus. Desktop
+  behavior, other games, input suppression and focus-loss cleanup remain.
+- No build or patch-prep is run by the agent. Next manual checks: fresh
+  desktop launch, repeated Guide cycles without Alt+Tab, controller-settings
+  navigation, actual Alt+Tab away/back, and a Big Picture regression check.
+- The user reports frame-time jitter disappeared after restarting the
+  desktop session and explicitly deferred that investigation. No performance
+  change is being made for it.
+
+## Steam update on 2026-09-27
+
+- The installed host `linux64/steamclient.so` now has ELF build ID
+  `24adc837a4068a882b963cc9531cf05a11a50a0c`. The old adapter correctly rejects
+  this previously uninspected build, so its focus correction cannot run.
+- Disassembled the five relevant methods and inspected the actual interface
+  table through an independent Steam connection. Slots and argument layouts
+  are unchanged; addresses are not. The new offsets are:
+
+  | Interface / slot | Method | Offset |
+  | --- | --- | --- |
+  | ClientEngine / 14 | GetIClientUtils | `0x1611e70` |
+  | ClientUtils / 48 | SetFocusedWindow | `0x13b5fd0` |
+  | ClientUtils / 54 | GetFocusedGameWindow | `0x1369500` |
+  | ClientUtils / 103 | GetFocusedGameID | `0x1337000` |
+  | ClientUtils / 104 | GetFocusedWindowPID | `0x12f53a0` |
+
+- Added a separate allowlisted build profile rather than relaxing validation.
+  The probe also reports controller-context transitions, independently of
+  overlay visibility transitions. No game attachment or focus write was used
+  to inspect the new interface table.
+- At 19:47:30-19:47:31, the updated probe's read-only path completed with no
+  game running. It returned overlay `(0, False, 0)` and controller context
+  `(413080, 0)`, then released its connection (exit 0). No focus writes were
+  performed. `git diff --check` also passed.
+- In the Warframe capture, Steam's `controller_ui.txt` switches from Warframe
+  (230410) to ClientUI (769), not Desktop (413080), when the overlay opens.
+  Guide presses are still logged. ClientUI must not be overwritten blindly:
+  the adapter intentionally preserves Big Picture. See the later follow-up
+  above for live evidence and the guarded integration candidate.
+- No build or full patch-prep was run. The new allowlist alone is not yet a
+  verified fix for Warframe's Guide-close failure.
 
 ## Failed integration run and focus timing correction
 
@@ -100,7 +172,8 @@ Steam's own focus update still needs runtime validation.
   snapshot-only implementation was insufficient; see the timing correction above.
 - At most every 250 ms of Steam callback servicing, the adapter queries the
   focused overlay and controller context. Only a focused/open overlay with
-  Desktop context gets reassigned. It does not change Steam Input enablement.
+  Desktop or eligible non-Big-Picture ClientUI context gets reassigned. It
+  does not change Steam Input enablement.
   It reads back context rather than relying on an activation edge, so Steam's
   later Desktop assignment can be corrected without artificial key presses or
   an assumed activation delay. Genuine focus loss releases only the adapter's
