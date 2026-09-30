@@ -1,0 +1,64 @@
+From 4fcef5462e55bb3f0005e9762fb2e9592c85b095 Mon Sep 17 00:00:00 2001
+From: giantorth <56210456+giantorth@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 12:29:23 -0700
+Subject: [PATCH] server: Don't touch a freed handle table in close_handle().
+
+If a process closes the last handle to a job with
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE set and it's a member of that job
+itself, job_close_handle() kills it on the spot. Killing the process
+frees its handle table, but close_handle() then carries on clearing the
+entry and shrinking the table, writing into freed memory. That can take
+down wineserver.
+
+Richard Burns Rally (RallySimFans) hits this every time you quit. It
+puts itself and its helper processes in a kill-on-close job and closes
+that handle on the way out.
+
+Hold a reference on the process and the object across the callback, and
+skip the table update if the table is already gone. The teardown has
+released the handle by then.
+---
+ server/handle.c | 25 ++++++++++++++++++++-----
+ 1 file changed, 20 insertions(+), 5 deletions(-)
+
+diff --git a/server/handle.c b/server/handle.c
+index a88f94a3395..3169c826fdc 100644
+--- a/server/handle.c
++++ b/server/handle.c
+@@ -434,13 +434,28 @@ unsigned int close_handle( struct process *process, obj_handle_t handle )
+     if (!(entry = get_handle( process, handle ))) return STATUS_INVALID_HANDLE;
+     if (entry->access & RESERVED_CLOSE_PROTECT) return STATUS_HANDLE_NOT_CLOSABLE;
+     obj = entry->ptr;
+-    if (!obj->ops->close_handle( obj, process, handle )) return STATUS_HANDLE_NOT_CLOSABLE;
++
++    /* the close_handle callback may terminate the process itself (e.g. the last
++     * handle to a kill-on-close job containing it), which frees its handle table */
++    grab_object( process );
++    grab_object( obj );
++    if (!obj->ops->close_handle( obj, process, handle ))
++    {
++        release_object( obj );
++        release_object( process );
++        return STATUS_HANDLE_NOT_CLOSABLE;
++    }
+ 
+     table = handle_is_global(handle) ? global_table : process->handles;
+-    table->entries[index].ptr = NULL;
+-    if (index < table->free) table->free = index;
+-    if (index == table->last) shrink_handle_table( table );
+-    release_object_from_handle( obj );
++    if (table)  /* otherwise the table teardown already released the handle */
++    {
++        table->entries[index].ptr = NULL;
++        if (index < table->free) table->free = index;
++        if (index == table->last) shrink_handle_table( table );
++        release_object_from_handle( obj );
++    }
++    release_object( obj );
++    release_object( process );
+     return STATUS_SUCCESS;
+ }
+ 
+-- 
+2.55.0
+
