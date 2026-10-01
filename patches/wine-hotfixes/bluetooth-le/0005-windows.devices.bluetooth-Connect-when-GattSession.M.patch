@@ -1,0 +1,68 @@
+From 4bf6993172608db94b31ae5ee9252fdc005909fd Mon Sep 17 00:00:00 2001
+From: David Szendrei <618011+pocker@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 11:42:35 +0200
+Subject: [PATCH 5/8] windows.devices.bluetooth: Connect when
+ GattSession.MaintainConnection is set.
+
+winebth only connects an LE device when its GATT services are requested.
+On Windows, setting MaintainConnection connects the device, and apps such
+as Zwift wait for ConnectionStatusChanged before they request services,
+so they waited forever. Keep a device handle open with a pending services
+request while MaintainConnection is set, and re-issue it every 5 seconds
+so that a dropped link gets re-established.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/windows.devices.bluetooth/gatt.c | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/dlls/windows.devices.bluetooth/gatt.c b/dlls/windows.devices.bluetooth/gatt.c
+index a8405a4a..3e312c2f 100644
+--- a/dlls/windows.devices.bluetooth/gatt.c
++++ b/dlls/windows.devices.bluetooth/gatt.c
+@@ -987,6 +987,7 @@ struct gatt_session
+     LONG ref;
+     IBluetoothDeviceId *id;
+     boolean maintain_connection;
++    struct gatt_link *link;
+     struct event_handlers pdu_changed;
+     struct event_handlers status_changed;
+ };
+@@ -1031,6 +1032,7 @@ static ULONG WINAPI gatt_session_Release( IGattSession *iface )
+     ULONG ref = InterlockedDecrement( &impl->ref );
+     if (!ref)
+     {
++        gatt_link_stop( InterlockedExchangePointer( (void **)&impl->link, NULL ) );
+         IBluetoothDeviceId_Release( impl->id );
+         event_handlers_free( &impl->pdu_changed );
+         event_handlers_free( &impl->status_changed );
+@@ -1074,8 +1076,17 @@ static HRESULT WINAPI gatt_session_get_CanMaintainConnection( IGattSession *ifac
+ static HRESULT WINAPI gatt_session_put_MaintainConnection( IGattSession *iface, boolean value )
+ {
+     struct gatt_session *impl = impl_from_IGattSession( iface );
++    struct gatt_link *link;
++
+     TRACE( "(%p, %d)\n", iface, value );
+     impl->maintain_connection = value;
++    if (value && !impl->link)
++    {
++        if ((link = gatt_link_start( impl->id )) && InterlockedCompareExchangePointer( (void **)&impl->link, link, NULL ))
++            gatt_link_stop( link );
++    }
++    else if (!value)
++        gatt_link_stop( InterlockedExchangePointer( (void **)&impl->link, NULL ) );
+     return S_OK;
+ }
+ 
+@@ -1157,7 +1168,11 @@ DEFINE_IINSPECTABLE_( gatt_session_closable, IClosable, struct gatt_session, gat
+ 
+ static HRESULT WINAPI gatt_session_closable_Close( IClosable *iface )
+ {
++    struct gatt_session *impl = CONTAINING_RECORD( iface, struct gatt_session, IClosable_iface );
++
+     TRACE( "(%p)\n", iface );
++    gatt_link_stop( InterlockedExchangePointer( (void **)&impl->link, NULL ) );
++    impl->maintain_connection = FALSE;
+     return S_OK;
+ }
+ 

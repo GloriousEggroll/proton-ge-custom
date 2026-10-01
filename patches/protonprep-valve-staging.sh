@@ -482,6 +482,12 @@ apply_all_in_dir() {
     echo "WINE: expose native DualSense Edge as DualSense for Diablo IV"
     apply_patch "../patches/wine-hotfixes/pending/winebus-diablo-iv-dualsense-edge-identity.patch"
 
+    # Bluetooth LE GATT and WinRT BLE (Zwift, Rouvy trainers). winebth.sys stays disabled
+    # unless PROTON_ENABLE_WINEBTH=1. https://github.com/GloriousEggroll/proton-ge-custom/issues/814
+    # https://github.com/evanjt/wine
+    echo "WINE: -HOTFIX- Add Bluetooth LE GATT and WinRT BLE support"
+    apply_all_in_dir "../patches/wine-hotfixes/bluetooth-le/"
+
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
     ./tools/make_requests
