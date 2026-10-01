@@ -1,0 +1,103 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] winewayland: Do not give tray menus exclusive keyboard focus.
+
+Tray menus use top-layer surfaces to preserve their position next to the
+tray icon. EXCLUSIVE keyboard interactivity on that layer takes precedence
+over application focus, so clicking Firefox does not transfer keyboard
+events away from Battle.net's menu. Menu accelerators can then invoke
+Exit or Log Out while the user is typing in another application.
+
+Use ON_DEMAND interactivity on layer-shell v4 and keep older versions
+pointer-only instead of taking an exclusive keyboard grab. Set the mode
+once when creating the role, not on every geometry update: compositors
+may treat another ON_DEMAND request as relinquishing layer focus.
+
+On dismissal, deliver WM_CANCELMODE to custom menu windows as well as
+ending standard Win32 menus. When Wayland keyboard focus has already
+moved elsewhere, follow that focus instead of reactivating the menu's
+owner. Preserve the original restore target across geometry updates.
+
+Initial keyboard focus is compositor-controlled with ON_DEMAND. A menu
+that has never received keyboard focus has no keyboard-leave event to
+trigger outside-click dismissal; this change does not implement a
+compositor-wide pointer grab. That case still needs runtime verification.
+
+Follow-up to Erhan Bilgili (nanomatters)'s native SNI menu support from
+https://github.com/nanomatters/wine-wineland.
+
+Related: https://github.com/GloriousEggroll/proton-ge-custom/issues/803
+References: https://gitlab.freedesktop.org/wlroots/wlr-protocols/-/blob/master/unstable/wlr-layer-shell-unstable-v1.xml
+---
+ 
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -2007,10 +2007,6 @@
+     zwlr_layer_surface_v1_set_margin(surface->zwlr_layer_surface_v1,
+                                      position.y, 0, 0, position.x);
+     zwlr_layer_surface_v1_set_exclusive_zone(surface->zwlr_layer_surface_v1, -1);
+-    zwlr_layer_surface_v1_set_keyboard_interactivity(
+-        surface->zwlr_layer_surface_v1,
+-        surface->layer_menu ? ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE :
+-                              ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
+ }
+ 
+ /**********************************************************************
+@@ -2022,6 +2018,7 @@
+  */
+ void wayland_surface_make_layer(struct wayland_surface *surface, const RECT *rect, BOOL menu)
+ {
++    uint32_t keyboard_interactivity = ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE;
+     struct wl_output *output;
+     double initial_scale;
+     RECT output_rect;
+@@ -2055,6 +2052,16 @@
+                                               menu ? "wine-menu" : "wine-notification");
+     if (!surface->zwlr_layer_surface_v1) goto err;
+ 
++    /* Exclusive layer focus prevents other applications from receiving keys,
++     * even after a click outside the menu. Older layer-shell versions cannot
++     * provide non-exclusive keyboard focus. Set this only when creating the
++     * role: repeating ON_DEMAND on a geometry update may relinquish focus. */
++    if (menu && zwlr_layer_surface_v1_get_version(surface->zwlr_layer_surface_v1) >=
++        ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_ON_DEMAND_SINCE_VERSION)
++        keyboard_interactivity = ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_ON_DEMAND;
++    zwlr_layer_surface_v1_set_keyboard_interactivity(surface->zwlr_layer_surface_v1,
++                                                    keyboard_interactivity);
++
+     zwlr_layer_surface_v1_add_listener(surface->zwlr_layer_surface_v1,
+                                        &zwlr_layer_surface_v1_listener,
+                                        surface->hwnd);
+
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -705,6 +705,9 @@
+     HWND desktop = NtUserGetDesktopWindow();
+     HWND foreground = NtUserGetForegroundWindow();
+ 
++    /* Updating the layer geometry must not replace the pre-menu foreground. */
++    if (NtUserGetProp(desktop, layer_menu_hwnd_prop) == hwnd) return;
++
+     NtUserSetProp(desktop, layer_menu_hwnd_prop, hwnd);
+     if (foreground && foreground != hwnd && NtUserIsWindow(foreground) &&
+         same_window_process(foreground, hwnd))
+@@ -1325,12 +1328,16 @@
+ 
+         if (wp)
+         {
+-            restore = (HWND)lp;
++            /* On host focus loss, do not reactivate the menu's owner over the
++             * application the user just selected. Only restore it when we
++             * still have keyboard focus (e.g. Escape). */
++            restore = focused == hwnd ? (HWND)lp : focused;
+             if (!restore || !NtUserIsWindow(restore)) restore = NtUserGetDesktopWindow();
++            wayland_clear_layer_menu_hwnd(hwnd);
+             if (NtUserGetForegroundWindow() == hwnd)
+                 NtUserSetForegroundWindowInternal(restore);
++            send_message(hwnd, WM_CANCELMODE, 0, 0);
+             if (wayland_is_popup_menu_class(hwnd)) NtUserEndMenu();
+-            wayland_clear_layer_menu_hwnd(hwnd);
+         }
+         else if (focused == hwnd)
+         {

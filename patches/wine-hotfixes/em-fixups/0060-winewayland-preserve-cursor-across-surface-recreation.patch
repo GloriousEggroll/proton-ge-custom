@@ -1,0 +1,95 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] winewayland: Preserve the window cursor across surface recreation.
+
+The native tray menu path recreates its Wayland surface when a hidden menu
+is shown again. The Win32 HWND remains alive, but its cached HCURSOR was
+stored on the destroyed surface. Pointer entry then treats the new surface's
+zero-initialized cursor as an instruction to hide the pointer.
+
+The server only sends WM_WINE_SETCURSOR when the cursor window or cursor
+handle changes. A replacement surface is not such a change, so another
+SetCursor call with the same handle need not repair the lost cursor. Updates
+received while a window has no Wayland surface were also discarded.
+
+Keep the last driver cursor in wayland_win_data, including explicit NULL
+updates, so it follows the HWND lifetime instead of the surface lifetime.
+This preserves intentional cursor hiding, including overlay suppression;
+do not substitute an arrow cursor for NULL.
+
+Acquire the pointer mutex before reading or updating the cached cursor,
+using the existing win_data -> pointer lock order. Otherwise a pointer-enter
+callback can read an old cursor, release win_data, and apply it after another
+thread has already installed a newer cursor. Release win_data before the
+GDI and protocol calls, and reapply clipping after releasing the pointer lock.
+
+Extends Alexandros Frantzis's upstream per-window cursor tracking from
+fe1f3e277d25b299c8c526c3d706a38fbde24e11. The native SNI menu support is
+based on Erhan Bilgili (nanomatters)'s work in wine-wineland.
+
+Related: https://github.com/GloriousEggroll/proton-ge-custom/issues/803#issuecomment-5881174211
+---
+diff --git a/dlls/winewayland.drv/wayland_pointer.c b/dlls/winewayland.drv/wayland_pointer.c
+--- a/dlls/winewayland.drv/wayland_pointer.c
++++ b/dlls/winewayland.drv/wayland_pointer.c
+@@ -931,30 +931,25 @@
+ static void wayland_set_cursor(HWND hwnd, HCURSOR hcursor, BOOL use_hcursor)
+ {
+     struct wayland_pointer *pointer = &process_wayland.pointer;
+-    struct wayland_surface *surface;
+     struct wayland_win_data *data;
+-    double scale;
++    double scale = 1.0;
+     BOOL reapply_clip = FALSE;
+ 
+-    if ((data = wayland_win_data_get(hwnd)))
++    /* Serialize the cached cursor and its application, in win_data -> pointer
++     * lock order, so an enter cannot overwrite a concurrent SetCursor update. */
++    data = wayland_win_data_get(hwnd);
++    pthread_mutex_lock(&pointer->mutex);
++    if (data)
+     {
+-        if (!(surface = data->wayland_surface))
+-        {
+-            wayland_win_data_release(data);
+-            return;
+-        }
+-        scale = surface->window.scale;
+-        if (use_hcursor) surface->hcursor = hcursor;
+-        else hcursor = surface->hcursor;
++        /* A hidden window may have no surface yet. Keep its cursor anyway:
++         * the server need not resend an unchanged cursor when it is shown. */
++        if (use_hcursor) data->hcursor = hcursor;
++        else hcursor = data->hcursor;
+         use_hcursor = TRUE;
++        if (data->wayland_surface) scale = data->wayland_surface->window.scale;
+         wayland_win_data_release(data);
+     }
+-    else
+-    {
+-        scale = 1.0;
+-    }
+ 
+-    pthread_mutex_lock(&pointer->mutex);
+     if (pointer->focused_hwnd == hwnd)
+     {
+         if ((!use_hcursor && pointer->wp_cursor_shape_device_v1) ||
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -553,7 +553,6 @@
+     RECT geometry;
+     int content_width, content_height;
+     UINT32 alpha_multiplier;
+-    HCURSOR hcursor;
+ };
+ 
+ BOOL wayland_dmabuf_format_supported(uint32_t format, uint64_t modifier);
+@@ -681,6 +680,8 @@
+     struct rb_entry entry;
+     /* hwnd that this private data belongs to */
+     HWND hwnd;
++    /* last driver cursor, including NULL, survives Wayland surface recreation */
++    HCURSOR hcursor;
+     /* last buffer that was set as window contents */
+     struct wayland_shm_buffer *window_contents;
+     /* whether GDI pixels need to be composited above accelerated content */

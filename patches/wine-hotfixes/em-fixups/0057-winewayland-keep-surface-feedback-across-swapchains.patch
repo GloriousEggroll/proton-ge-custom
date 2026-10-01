@@ -1,0 +1,123 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] winewayland: Keep surface dmabuf feedback across swapchains
+
+Mutter drops a surface's cached DMA-BUF feedback when its last feedback
+resource is destroyed. Creating a new resource starts with default
+feedback without taking the surface's existing scanout candidate into
+account. If the candidate CRTC does not change, the scanout tranche is
+not sent again.
+
+The NVIDIA Vulkan WSI trace in #808 receives a scanout tranche, reports
+an out-of-date swapchain, and destroys its feedback object while
+recreating the swapchain on the same wl_surface. The new feedback only
+contains a non-scanout tranche, and the replacement buffers keep the
+compressed modifier that the primary plane rejects.
+
+Keep a separate feedback subscription for the client surface's lifetime
+so the compositor retains and updates its per-surface feedback across
+WSI swapchain recreation. Leave allocation and modifier selection to WSI;
+discard our feedback payloads and close their format-table descriptors.
+Callbacks do not access surface data, so they cannot race its destruction.
+
+Only request feedback when the compositor supports linux-dmabuf v4 or
+newer. This adds no round trips, buffer copies, compositor changes, or
+Steam overlay dependencies.
+
+Link: https://github.com/GloriousEggroll/proton-ge-custom/issues/808#issuecomment-5872894724
+---
+ dlls/winewayland.drv/wayland_surface.c | 57 +++++++++++++++++++++++++++++
+ dlls/winewayland.drv/waylanddrv.h      |  1 +
+ 2 files changed, 58 insertions(+)
+
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -4816,6 +4816,8 @@ static void wayland_client_surface_destroy(struct client_surface *client)
+         wp_viewport_destroy(surface->wp_viewport);
+     if (surface->wl_subsurface)
+         wl_subsurface_destroy(surface->wl_subsurface);
++    if (surface->dmabuf_feedback)
++        zwp_linux_dmabuf_feedback_v1_destroy(surface->dmabuf_feedback);
+     if (surface->wl_surface)
+         wl_surface_destroy(surface->wl_surface);
+ }
+@@ -5036,6 +5038,44 @@ static const struct client_surface_funcs wayland_client_surface_funcs =
+     .present = wayland_client_surface_present,
+ };
+ 
++static void client_dmabuf_feedback_handle_done(void *data, struct zwp_linux_dmabuf_feedback_v1 *feedback)
++{
++}
++
++static void client_dmabuf_feedback_handle_format_table(void *data,
++        struct zwp_linux_dmabuf_feedback_v1 *feedback, int fd, uint32_t size)
++{
++    /* WSI consumes its own feedback; this subscription only preserves its lifetime. */
++    close(fd);
++}
++
++static void client_dmabuf_feedback_handle_device(void *data,
++        struct zwp_linux_dmabuf_feedback_v1 *feedback, struct wl_array *device)
++{
++}
++
++static void client_dmabuf_feedback_handle_tranche_formats(void *data,
++        struct zwp_linux_dmabuf_feedback_v1 *feedback, struct wl_array *indices)
++{
++}
++
++static void client_dmabuf_feedback_handle_tranche_flags(void *data,
++        struct zwp_linux_dmabuf_feedback_v1 *feedback, uint32_t flags)
++{
++    TRACE("client dmabuf feedback %p tranche flags %#x\n", feedback, flags);
++}
++
++static const struct zwp_linux_dmabuf_feedback_v1_listener client_dmabuf_feedback_listener =
++{
++    client_dmabuf_feedback_handle_done,
++    client_dmabuf_feedback_handle_format_table,
++    client_dmabuf_feedback_handle_device,
++    client_dmabuf_feedback_handle_done,
++    client_dmabuf_feedback_handle_device,
++    client_dmabuf_feedback_handle_tranche_formats,
++    client_dmabuf_feedback_handle_tranche_flags,
++};
++
+ struct wayland_client_surface *wayland_client_surface_create(HWND hwnd)
+ {
+     struct wayland_client_surface *client;
+@@ -5054,6 +5094,23 @@ struct wayland_client_surface *wayland_client_surface_create(HWND hwnd)
+     }
+     wl_surface_set_user_data(client->wl_surface, hwnd);
+ 
++    /* Keep surface feedback alive across WSI swapchain recreation. Mutter drops
++     * its cached scanout tranche when the last feedback subscription is destroyed. */
++    if (process_wayland.zwp_linux_dmabuf_v1 &&
++        zwp_linux_dmabuf_v1_get_version(process_wayland.zwp_linux_dmabuf_v1) >=
++            ZWP_LINUX_DMABUF_V1_GET_SURFACE_FEEDBACK_SINCE_VERSION)
++    {
++        client->dmabuf_feedback = zwp_linux_dmabuf_v1_get_surface_feedback(
++            process_wayland.zwp_linux_dmabuf_v1, client->wl_surface);
++        if (!client->dmabuf_feedback)
++        {
++            ERR("Failed to create client dmabuf feedback\n");
++            goto err;
++        }
++        zwp_linux_dmabuf_feedback_v1_add_listener(client->dmabuf_feedback,
++                                                 &client_dmabuf_feedback_listener, NULL);
++    }
++
+     /* Let parent handle all pointer events. */
+     empty_region = wl_compositor_create_region(process_wayland.wl_compositor);
+     if (!empty_region)
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -452,6 +452,7 @@ struct wayland_client_surface
+     struct wp_color_management_surface_v1 *wp_color_management_surface_v1;
+     struct wp_viewport *wp_viewport;
+     struct wp_content_type_v1 *wp_content_type_v1;
++    struct zwp_linux_dmabuf_feedback_v1 *dmabuf_feedback;
+     /* if true then the client surface has an alpha channel controlling transparency */
+     BOOL has_alpha;
+     BOOL has_presented;

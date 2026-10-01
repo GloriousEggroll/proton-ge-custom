@@ -1,0 +1,132 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] explorer: Forward tray-click foreground permission to the icon owner.
+
+Battle.net's XEmbed tray menu can be dismissed on its first opening, but
+reopening the same popup fails to activate it. The GNOME trace shows
+SetForegroundWindow succeeding for newly created popup handles, then
+returning FALSE when a popup is reused, with explorer's tray icon still
+in the foreground.
+
+The server allows each window to become foreground once. Subsequent
+requests compare the caller's input time with the foreground queue.
+Explorer receives the tray click, but SendNotifyMessage only forwards
+the notification, leaving the application's input time stale.
+
+Before relaying tray button notifications, copy explorer's existing input
+time to the icon owner's thread through a private system-tray call. Keep
+the operation on the same desktop and never replace a newer target
+timestamp. Do not refresh the time to "now", update the session's last
+input time, transfer permission on hover, or forcibly activate the hidden
+owner window. Newer input in another application still takes precedence.
+
+This is limited to explorer's tray-button path. It does not change SNI,
+Wine-Wayland, Mutter, or general foreground-activation policy.
+
+The protocol layout changes; protonprep-valve-staging.sh already runs
+tools/make_requests after the patch stack. Regenerate the protocol files
+when applying this patch independently.
+
+Related: https://github.com/GloriousEggroll/proton-ge-custom/issues/803#issuecomment-5921972023
+---
+diff --git a/dlls/win32u/systray.c b/dlls/win32u/systray.c
+index e5ae7e60be9..0b7e1474722 100644
+--- a/dlls/win32u/systray.c
++++ b/dlls/win32u/systray.c
+@@ -50,6 +50,20 @@ LRESULT system_tray_call( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, voi
+     case WINE_SYSTRAY_DBUS_HAS_ICONS:
+         return sni_has_icons();
+ 
++    case WINE_SYSTRAY_NOTIFY_INPUT:
++    {
++        BOOL ret;
++
++        SERVER_START_REQ( set_user_input_time )
++        {
++            req->forward = wine_server_user_handle( hwnd );
++            ret = !wine_server_call_err( req );
++        }
++        SERVER_END_REQ;
++        TRACE( "forwarded tray input permission to %p, ret %u\n", hwnd, ret );
++        return ret;
++    }
++
+     case WINE_SYSTRAY_DOCK_INIT:
+         user_driver->pSystrayDockInit( hwnd );
+         return 0;
+diff --git a/include/ntuser.h b/include/ntuser.h
+index b9d6a0ca43b..36291898846 100644
+--- a/include/ntuser.h
++++ b/include/ntuser.h
+@@ -704,6 +704,7 @@ enum wine_systray_call
+     WINE_SYSTRAY_NOTIFY_ICON_SNI,
+     WINE_SYSTRAY_DBUS_HAS_ICONS,
+     WINE_SYSTRAY_NOTIFY_BALLOON_SNI,
++    WINE_SYSTRAY_NOTIFY_INPUT,
+ };
+ 
+ /* NtUserDragDropCall calls */
+diff --git a/programs/explorer/systray.c b/programs/explorer/systray.c
+index 2e62a3cfa3d..823894e7d76 100644
+--- a/programs/explorer/systray.c
++++ b/programs/explorer/systray.c
+@@ -553,6 +553,12 @@ static LRESULT WINAPI tray_icon_wndproc( HWND hwnd, UINT msg, WPARAM wparam, LPA
+     {
+         MSG message = {.hwnd = hwnd, .message = msg, .wParam = wparam, .lParam = lparam};
+         SendMessageW( icon->tooltip, TTM_RELAYEVENT, 0, (LPARAM)&message );
++        /* The click belongs to the application, although explorer receives it.
++         * Let its callback activate a reused popup without activating the owner
++         * window ourselves. Hover notifications must not grant this permission. */
++        if (msg != WM_MOUSEMOVE)
++            NtUserMessageCall( icon->owner, WINE_SYSTRAY_NOTIFY_INPUT, 0, 0,
++                               NULL, NtUserSystemTrayCall, FALSE );
+         if (!notify_owner( icon, msg, lparam )) break;
+         if (icon->version > 0)
+         {
+diff --git a/server/protocol.def b/server/protocol.def
+index 68ba3a26ba7..aff8291583d 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -3271,6 +3271,7 @@ enum coords_relative
+ /* Get/Set the time of the input event */
+ @REQ(set_user_input_time)
+     int          set;             /* update queue input time */
++    user_handle_t forward;        /* copy caller's input time to this window's thread */
+ @REPLY
+     unsigned int time;            /* time of the last session-wide user input */
+ @END
+diff --git a/server/queue.c b/server/queue.c
+index 377500ede51..10edad6ca69 100644
+--- a/server/queue.c
++++ b/server/queue.c
+@@ -4157,9 +4157,28 @@ DECL_HANDLER(set_caret_info)
+ /* get/set the time of the last user input event */
+ DECL_HANDLER(set_user_input_time)
+ {
+-    struct msg_queue *queue;
++    struct msg_queue *queue = current->queue;
++
++    if (req->forward)
++    {
++        struct thread *thread;
++        struct thread_input *input;
+ 
+-    if (req->set && (queue = current->queue))
++        if (!(thread = get_window_thread( req->forward )))
++        {
++            set_win32_error( ERROR_INVALID_WINDOW_HANDLE );
++            return;
++        }
++        if (!queue || !queue->input || !thread->queue || !(input = thread->queue->input) ||
++            input->desktop != queue->input->desktop)
++            set_error( STATUS_ACCESS_DENIED );
++        else if (input->user_time < queue->input->user_time)
++            /* Forward the existing input permission, not a new input event. A
++             * subsequent click in another application must still take priority. */
++            input->user_time = queue->input->user_time;
++        release_object( thread );
++    }
++    else if (req->set && queue)
+     {
+         queue->input->user_time = monotonic_time;
+         last_input_time = get_tick_count();
+
