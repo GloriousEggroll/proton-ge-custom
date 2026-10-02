@@ -1,0 +1,78 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] mf: Restore sink requests after seeking a media session.
+
+The media rework removed session_flush_sinks() and its restart call from
+session_set_source_object_state(), but kept flushing the transforms when
+restarting sources. The flush clears transform output requests while the
+sink still has outstanding requests. A sample grabber correctly preserves
+these across a pause/seek, so it will not issue replacement requests.
+Playback can then remain started without delivering any more video.
+
+In the Borderlands 3 issue #792 log, CS_Intro_Video.mp4 goes through
+pause, zero-rate seeks, and a return to normal playback. The first session
+requests four samples before the seek sequence, but issues no new sink
+requests or delivers any video samples after it restarts.
+
+Restore the upstream sink restart handling: after the sources restart,
+reissue an outstanding request through each sink's upstream branch, flush
+the sinks, and then start the clock. Keep sink request accounting unchanged
+while restarting the flushed decoder pipeline.
+
+The restored code is by Brendan McGrath <bmcgrath@codeweavers.com>, from
+Wine commit 0627acf6cd3dc2fc1e89277a38f2153e87526660,
+"mf: Restart transforms and sinks on seek." All other media-rework changes
+are retained.
+
+The existing test_media_session_seek() in dlls/mf/tests/mf.c covers seeking
+with and without an outstanding sample request, including the sink flush
+and source request ordering. Runtime verification with the game is still
+needed.
+
+Reference:
+https://github.com/GloriousEggroll/proton-ge-custom/issues/792
+
+---
+ dlls/mf/session.c | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/dlls/mf/session.c b/dlls/mf/session.c
+--- a/dlls/mf/session.c
++++ b/dlls/mf/session.c
+@@ -1112,6 +1112,24 @@
+ static HRESULT session_get_stream_sink_type(IMFStreamSink *sink, IMFMediaType **media_type);
+ static HRESULT session_start_clock(struct media_session *session);
+ 
++static void session_flush_sinks(struct media_session *session)
++{
++    struct topo_node *node;
++
++    LIST_FOR_EACH_ENTRY(node, &session->presentation.nodes, struct topo_node, entry)
++    {
++        if (node->type == MF_TOPOLOGY_OUTPUT_NODE)
++        {
++            if (node->u.sink.requests)
++            {
++                node->u.sink.requests--; /* session_request_sample will increment this back */
++                session_request_sample(session, node->object.sink_stream);
++            }
++            IMFStreamSink_Flush(node->object.sink_stream);
++        }
++    }
++}
++
+ static void session_flush_nodes(struct media_session *session)
+ {
+     struct topo_node *node;
+@@ -3331,6 +3349,12 @@
+             }
+             else
+             {
++                if (session->presentation.flags & SESSION_FLAG_RESTARTING)
++                {
++                    session->presentation.flags &= ~SESSION_FLAG_RESTARTING;
++                    session_flush_sinks(session);
++                }
++
+                 if (SUCCEEDED(hr = session_start_clock(session)))
+                 {
+                     /* If sinks are already started, start session immediately. This can happen when doing a
