@@ -8,11 +8,270 @@ Keep genuine Big Picture ClientUI assignments untouched, using the public
 ISteamUtils query to distinguish them.
 
 Run the guarded native focus adapter after callback retrieval, using the
-game's existing Steam pipe. The adapter and bridge focus query are maintained
-directly in lsteamclient/steam_overlay_focus.h and overlay_bridge/, like the
-other bridge implementation files. Do not create extra threads or pipes, and
-do not perform Steam IPC from the Wayland event dispatcher.
+game's existing Steam pipe. Create the adapter header as part of this patch;
+the preparation script removes its generated copy before reapplying the
+lsteamclient patches. Only the custom overlay_bridge/ implementation is
+maintained directly in the repository. Do not create extra threads or pipes,
+and do not perform Steam IPC from the Wayland event dispatcher.
 
+diff --git a/lsteamclient/steam_overlay_focus.h b/lsteamclient/steam_overlay_focus.h
+new file mode 100644
+--- /dev/null
++++ b/lsteamclient/steam_overlay_focus.h
+@@ -0,0 +1,252 @@
++/* Native Steam controller focus for Wayland compositors that reject the
++ * bridge's InputOnly focus window. Included by unixlib.cpp after the exports.
++ * This is a private Steam ABI: uninspected libraries must fail closed. */
++
++#if defined(__linux__) && defined(__x86_64__)
++#include <errno.h>
++#include <link.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <time.h>
++#include <unistd.h>
++
++namespace overlay_focus
++{
++static const uint64_t desktop_game = 413080;
++static const uint64_t client_ui_game = 769;
++static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
++static uintptr_t library_base;
++static bool initialized, supported, assigned;
++static uint64_t game_id, next_poll;
++static void *engine, *bridge_module;
++static int (*bridge_needs_focus)(void);
++
++static void trace( const char *format, ... )
++{
++    const char *env = getenv( "GE_WAYLAND_STEAM_OVERLAY_DEBUG" );
++    va_list args;
++
++    if (!env || !atoi(env)) return;
++    fputs( "steam-overlay-wayland: controller focus: ", stderr );
++    va_start( args, format );
++    vfprintf( stderr, format, args );
++    va_end( args );
++}
++
++struct abi_build
++{
++    unsigned char id[20];
++    uintptr_t get_utils, set_focus, get_window, get_game, get_pid;
++};
++
++static const abi_build builds[] =
++{
++    {
++        {0x7b, 0x08, 0x47, 0xf0, 0x4c, 0xf2, 0x84, 0xf0, 0x1a, 0x1a,
++         0x16, 0x55, 0x61, 0xdf, 0x05, 0x49, 0x02, 0xdf, 0x31, 0xa7},
++        0x1610a10, 0x13b4ea0, 0x1366f20, 0x1330f20, 0x12edcf0,
++    },
++    {
++        {0x24, 0xad, 0xc8, 0x37, 0xa4, 0x06, 0x8a, 0x88, 0x2b, 0x96,
++         0x3c, 0xc9, 0x53, 0x1c, 0xf0, 0x5a, 0x11, 0xa5, 0x0a, 0x0c},
++        0x1611e70, 0x13b5fd0, 0x1369500, 0x1337000, 0x12f53a0,
++    },
++};
++static const abi_build *abi;
++
++struct build_check
++{
++    uintptr_t base;
++    const abi_build *build;
++};
++
++static int check_build( struct dl_phdr_info *info, size_t size, void *data )
++{
++    auto *check = static_cast<build_check *>(data);
++
++    (void)size;
++    if (info->dlpi_addr != check->base) return 0;
++    for (unsigned int i = 0; i < info->dlpi_phnum; ++i)
++    {
++        const auto &phdr = info->dlpi_phdr[i];
++        if (phdr.p_type != PT_NOTE) continue;
++        const auto *note = reinterpret_cast<const unsigned char *>(info->dlpi_addr + phdr.p_vaddr);
++        size_t remaining = phdr.p_memsz;
++        while (remaining >= sizeof(ElfW(Nhdr)))
++        {
++            ElfW(Nhdr) header;
++            memcpy( &header, note, sizeof(header) );
++            note += sizeof(header);
++            remaining -= sizeof(header);
++            size_t namesz = (static_cast<size_t>(header.n_namesz) + 3) & ~size_t(3);
++            size_t descsz = (static_cast<size_t>(header.n_descsz) + 3) & ~size_t(3);
++            if (namesz > remaining || descsz > remaining - namesz) break;
++            if (header.n_type == NT_GNU_BUILD_ID && header.n_namesz == 4 &&
++                header.n_descsz == sizeof(builds[0].id) && !memcmp( note, "GNU", 4 ))
++            {
++                for (const auto &build : builds)
++                    if (!memcmp( note + namesz, build.id, sizeof(build.id) ))
++                    {
++                        check->build = &build;
++                        return 1;
++                    }
++            }
++            note += namesz + descsz;
++            remaining -= namesz + descsz;
++        }
++    }
++    return 1;
++}
++
++template<typename T>
++static T member( void *object, unsigned int slot, uintptr_t offset )
++{
++    if (!object) return nullptr;
++    void *address = (*static_cast<void ***>(object))[slot];
++    Dl_info info;
++    if (!dladdr( address, &info ) || reinterpret_cast<uintptr_t>(info.dli_fbase) != library_base ||
++        reinterpret_cast<uintptr_t>(address) - library_base != offset)
++        return nullptr;
++    /* Validate offsets, but invoke the interface member, never a computed address. */
++    return reinterpret_cast<T>(address);
++}
++
++static void init(void)
++{
++    const char *env;
++    char *end;
++    Dl_info info;
++    int error = -1;
++
++    initialized = true;
++    if (!(env = getenv( "WINE_WAYLAND_STEAM_OVERLAY_LAYER" )) || !atoi(env)) return;
++    if ((env = getenv( "DISABLE_WINE_WAYLAND_STEAM_OVERLAY_LAYER" )) && atoi(env)) return;
++    if (!(env = getenv( "SteamGameId" )) || !*env) env = getenv( "SteamAppId" );
++    if (!env || *env < '0' || *env > '9') return;
++    errno = 0;
++    game_id = strtoull( env, &end, 10 );
++    if (errno || *end || !game_id || game_id == desktop_game || game_id == client_ui_game) return;
++    if (!dladdr( reinterpret_cast<void *>(p_CreateInterface), &info )) return;
++    build_check check = {reinterpret_cast<uintptr_t>(info.dli_fbase), nullptr};
++    dl_iterate_phdr( check_build, &check );
++    if (!check.build)
++    {
++        WARN( "Steam controller focus bridge disabled: uninspected private ABI.\n" );
++        trace( "disabled: uninspected Steam private ABI\n" );
++        return;
++    }
++    abi = check.build;
++    library_base = check.base;
++    engine = p_CreateInterface( "CLIENTENGINE_INTERFACE_VERSION005", &error );
++    supported = engine && !error;
++    trace( "adapter %s for game %llu, pid %u\n", supported ? "enabled" : "unavailable",
++           (unsigned long long)game_id, (unsigned int)getpid() );
++}
++
++static void sync_locked( int32_t pipe )
++{
++    using get_utils_fn = void *(*)(void *, int32_t);
++    using set_focus_fn = void (*)(void *, const uint64_t *, bool, bool, uint32_t, uint16_t, uint16_t);
++    using get_window_fn = void *(*)(uint64_t *, void *, bool *, uint32_t *);
++    using get_game_fn = void *(*)(uint64_t *, void *);
++    using get_pid_fn = uint32_t (*)(void *);
++    void *utils;
++    uint64_t overlay_game = 0, current_game = 0;
++    uint32_t overlay_pid = 0;
++    bool active = false;
++    int needed;
++
++    if (!initialized) init();
++    if (!supported || pipe <= 0) return;
++    if (!bridge_module)
++    {
++        bridge_module = dlopen( "liblsteamclient_overlay_bridge.so.1", RTLD_NOW | RTLD_NOLOAD );
++        if (!bridge_module) return;
++        bridge_needs_focus = reinterpret_cast<int (*)(void)>(dlsym(
++            bridge_module, "ge_overlay_bridge_needs_controller_focus" ));
++        trace( "bridge focus query %s\n", bridge_needs_focus ? "loaded" : "unavailable" );
++    }
++    if (!bridge_needs_focus) return;
++    needed = bridge_needs_focus();
++    if (needed < 0 || (!needed && !assigned)) return;
++
++    auto get_utils = member<get_utils_fn>( engine, 14, abi->get_utils );
++    if (!get_utils || !(utils = get_utils( engine, pipe ))) return;
++    auto set_focus = member<set_focus_fn>( utils, 48, abi->set_focus );
++    auto get_window = member<get_window_fn>( utils, 54, abi->get_window );
++    auto get_game = member<get_game_fn>( utils, 103, abi->get_game );
++    auto get_pid = member<get_pid_fn>( utils, 104, abi->get_pid );
++    if (!set_focus || !get_window || !get_game || !get_pid)
++    {
++        WARN( "Steam controller focus bridge disabled: private interface layout changed.\n" );
++        trace( "disabled: Steam private interface layout changed\n" );
++        supported = false;
++        return;
++    }
++
++    get_window( &overlay_game, utils, &active, &overlay_pid );
++    if (needed && active && overlay_game == game_id)
++    {
++        static uint64_t previous_context = ~uint64_t(0);
++        get_game( &current_game, utils );
++        if (current_game != previous_context)
++        {
++            trace( "open overlay %llu, controller context %llu\n",
++                   (unsigned long long)overlay_game, (unsigned long long)current_game );
++            previous_context = current_game;
++        }
++        /* The desktop overlay's configurator can also claim ClientUI focus.
++         * Distinguish it from Big Picture through the versioned public API. */
++        if (current_game == client_ui_game)
++        {
++            int error = -1;
++            auto *client = static_cast<u_ISteamClient_SteamClient017 *>(
++                p_CreateInterface( "SteamClient017", &error ));
++            if (!client || error) return;
++            auto *public_utils = static_cast<u_ISteamUtils_SteamUtils009 *>(
++                client->GetISteamUtils( pipe, "SteamUtils009" ));
++            if (!public_utils || public_utils->IsSteamInBigPictureMode()) return;
++        }
++        else if (current_game != desktop_game) return;
++
++        /* Focus or overlay visibility may have changed during the IPC calls. */
++        get_window( &overlay_game, utils, &active, &overlay_pid );
++        if (!active || overlay_game != game_id || bridge_needs_focus() != 1) return;
++        set_focus( utils, &game_id, true, false, getpid(), 0, 0 );
++        assigned = true;
++        TRACE( "Assigned Steam controller focus to game %llu, pid %u.\n",
++               (unsigned long long)game_id, (unsigned int)getpid() );
++        trace( "assigned game %llu, pid %u (previous context %llu)\n",
++               (unsigned long long)game_id, (unsigned int)getpid(),
++               (unsigned long long)current_game );
++    }
++    else if (!needed && assigned)
++    {
++        get_game( &current_game, utils );
++        if ((!overlay_game || overlay_game == game_id) && current_game == game_id &&
++            get_pid( utils ) == static_cast<uint32_t>(getpid()) && bridge_needs_focus() == 0)
++        {
++            set_focus( utils, &desktop_game, true, false, 0, 0, 0 );
++            TRACE( "Released Steam controller focus on Wayland focus loss.\n" );
++            trace( "released on Wayland focus loss\n" );
++        }
++        assigned = false;
++    }
++}
++
++static void sync( int32_t pipe )
++{
++    struct timespec ts;
++    if (clock_gettime( CLOCK_MONOTONIC, &ts ) || pthread_mutex_trylock( &mutex )) return;
++    uint64_t now = static_cast<uint64_t>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
++    if (now >= next_poll)
++    {
++        next_poll = now + 250;
++        sync_locked( pipe );
++    }
++    pthread_mutex_unlock( &mutex );
++}
++}
++#else
++namespace overlay_focus { static void sync( int32_t ) {} }
++#endif
+diff --git a/lsteamclient/unixlib.cpp b/lsteamclient/unixlib.cpp
 --- a/lsteamclient/unixlib.cpp
 +++ b/lsteamclient/unixlib.cpp
 @@ -327,6 +327,8 @@ static void (*p_Steam_ReleaseThreadLocalMemory)( int );
