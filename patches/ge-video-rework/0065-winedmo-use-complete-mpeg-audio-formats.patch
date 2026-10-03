@@ -1,0 +1,154 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] winedmo: Describe MPEG Layer I and II audio with MPEG1WAVEFORMAT.
+
+The FFmpeg media type conversion only reserves a MPEG1WAVEFORMAT for MP1,
+leaving MP2 with a plain WAVEFORMATEX. It also leaves the MP1 layer field
+unset and relies on a RIFF tag lookup that has no MP1 entry.
+
+The MPEG audio decoder requires the complete MPEG1WAVEFORMAT. In the
+paired Saku Saku logs for GE-Proton11-7 and 10-34, the new splitter offers
+the MP2 movie audio without the format extension. The decoder rejects it
+with VFW_E_TYPE_NOT_ACCEPTED (0x8004022a), and the graph continues with only
+video. The working GStreamer path supplies the full structure and layer 2.
+
+Build the full format explicitly for both Layer I and Layer II, with the
+MPEG tag, extension size, layer, and known bitrate. Leave MP3 and other
+audio formats on their existing paths.
+
+Add regression coverage using the existing test.mpg and test2.mpg
+resources. Check the splitter format, decoder acceptance, and direct pin
+connection without depending on a sound device.
+
+Reference:
+https://github.com/GloriousEggroll/proton-ge-custom/issues/813#issuecomment-5957686957
+
+---
+diff --git a/dlls/winedmo/unix_media_type.c b/dlls/winedmo/unix_media_type.c
+--- a/dlls/winedmo/unix_media_type.c
++++ b/dlls/winedmo/unix_media_type.c
+@@ -161,6 +161,24 @@
+     return STATUS_SUCCESS;
+ }
+ 
++static NTSTATUS mpeg_wave_format_from_codec_params( const AVCodecParameters *params, MPEG1WAVEFORMAT *format, UINT32 *format_size )
++{
++    UINT32 capacity = *format_size;
++
++    *format_size = sizeof(*format);
++    if (*format_size > capacity) return STATUS_BUFFER_TOO_SMALL;
++
++    wave_format_ex_init( params, &format->wfx, *format_size, WAVE_FORMAT_MPEG );
++    format->fwHeadLayer = params->codec_id == AV_CODEC_ID_MP1 ? ACM_MPEG_LAYER1 : ACM_MPEG_LAYER2;
++    format->dwHeadBitrate = params->bit_rate;
++
++    TRACE( "tag %#x, %u channels, sample rate %u, %u bytes/sec, layer %#x, bitrate %u.\n",
++           format->wfx.wFormatTag, format->wfx.nChannels, format->wfx.nSamplesPerSec,
++           format->wfx.nAvgBytesPerSec, format->fwHeadLayer, format->dwHeadBitrate );
++
++    return STATUS_SUCCESS;
++}
++
+ static NTSTATUS audio_format_from_codec_params( const AVCodecParameters *params, void *format, UINT32 *format_size )
+ {
+     UINT format_tag, wave_format_size = sizeof(WAVEFORMATEX);
+@@ -168,7 +186,8 @@
+     int channels;
+ 
+     if (params->codec_id == AV_CODEC_ID_AAC) return heaac_wave_format_from_codec_params( params, format, format_size );
+-    if (params->codec_id == AV_CODEC_ID_MP1) wave_format_size = sizeof(MPEG1WAVEFORMAT);
++    if (params->codec_id == AV_CODEC_ID_MP1 || params->codec_id == AV_CODEC_ID_MP2)
++        return mpeg_wave_format_from_codec_params( params, format, format_size );
+     if (params->codec_id == AV_CODEC_ID_MP3) wave_format_size = sizeof(MPEGLAYER3WAVEFORMAT);
+     if (params->codec_id == AV_CODEC_ID_WMAV1) wave_format_size = sizeof(MSAUDIO1WAVEFORMAT);
+     if (params->codec_id == AV_CODEC_ID_WMAV2) wave_format_size = sizeof(WMAUDIO2WAVEFORMAT);
+diff --git a/dlls/quartz/tests/mpegsplit.c b/dlls/quartz/tests/mpegsplit.c
+--- a/dlls/quartz/tests/mpegsplit.c
++++ b/dlls/quartz/tests/mpegsplit.c
+@@ -2108,6 +2108,78 @@
+     ok(ret, "Failed to delete file, error %lu.\n", GetLastError());
+ }
+ 
++static void test_mpeg_audio_connection(const WCHAR *resource)
++{
++    const WCHAR *filename = load_resource(resource);
++    IBaseFilter *filter = create_mpeg_splitter(), *decoder = NULL;
++    IFilterGraph2 *graph = connect_input(filter, filename);
++    IPin *source = NULL, *sink = NULL;
++    IEnumMediaTypes *enum_types;
++    const MPEG1WAVEFORMAT *format;
++    AM_MEDIA_TYPE *mt;
++    HRESULT hr;
++    BOOL ret;
++
++    winetest_push_context("%s", wine_dbgstr_w(resource));
++
++    hr = IBaseFilter_FindPin(filter, L"Audio", &source);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++
++    hr = IPin_EnumMediaTypes(source, &enum_types);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++    hr = IEnumMediaTypes_Next(enum_types, 1, &mt, NULL);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    IEnumMediaTypes_Release(enum_types);
++    if (hr != S_OK) goto done;
++
++    ok(IsEqualGUID(&mt->majortype, &MEDIATYPE_Audio), "Unexpected major type %s.\n",
++            wine_dbgstr_guid(&mt->majortype));
++    ok(IsEqualGUID(&mt->subtype, &MEDIASUBTYPE_MPEG1AudioPayload), "Unexpected subtype %s.\n",
++            wine_dbgstr_guid(&mt->subtype));
++    ok(IsEqualGUID(&mt->formattype, &FORMAT_WaveFormatEx), "Unexpected format type %s.\n",
++            wine_dbgstr_guid(&mt->formattype));
++    ok(mt->cbFormat == sizeof(*format), "Got format size %lu.\n", mt->cbFormat);
++    if (mt->cbFormat >= sizeof(*format))
++    {
++        format = (const MPEG1WAVEFORMAT *)mt->pbFormat;
++        ok(format->wfx.wFormatTag == WAVE_FORMAT_MPEG, "Got format tag %#x.\n", format->wfx.wFormatTag);
++        ok(format->wfx.cbSize == sizeof(*format) - sizeof(WAVEFORMATEX),
++                "Got extra size %u.\n", format->wfx.cbSize);
++        ok(format->fwHeadLayer == ACM_MPEG_LAYER2, "Got layer %#x.\n", format->fwHeadLayer);
++    }
++
++    hr = CoCreateInstance(&CLSID_CMpegAudioCodec, NULL, CLSCTX_INPROC_SERVER,
++            &IID_IBaseFilter, (void **)&decoder);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    if (SUCCEEDED(hr))
++    {
++        hr = IFilterGraph2_AddFilter(graph, decoder, L"MPEG Audio Decoder");
++        ok(hr == S_OK, "Got hr %#lx.\n", hr);
++        hr = IBaseFilter_FindPin(decoder, L"XForm In", &sink);
++        ok(hr == S_OK, "Got hr %#lx.\n", hr);
++        if (SUCCEEDED(hr))
++        {
++            hr = IPin_QueryAccept(sink, mt);
++            ok(hr == S_OK, "Decoder rejected the splitter's audio format, hr %#lx.\n", hr);
++            hr = IFilterGraph2_ConnectDirect(graph, source, sink, NULL);
++            ok(hr == S_OK, "Failed to connect MPEG audio, hr %#lx.\n", hr);
++        }
++    }
++    DeleteMediaType(mt);
++
++done:
++    if (sink) IPin_Release(sink);
++    if (source) IPin_Release(source);
++    if (decoder) IBaseFilter_Release(decoder);
++    IFilterGraph2_Release(graph);
++    IBaseFilter_Release(filter);
++    ret = DeleteFileW(filename);
++    ok(ret, "Failed to delete file, error %lu.\n", GetLastError());
++    winetest_pop_context();
++}
++
+ static void test_no_acceptable_type(void)
+ {
+     const WCHAR *filename = load_resource(L"test.wav");
+@@ -2222,6 +2294,8 @@
+     test_streaming();
+     test_large_file();
+     test_video_file();
++    test_mpeg_audio_connection(L"test.mpg");
++    test_mpeg_audio_connection(L"test2.mpg");
+     test_no_acceptable_type();
+     test_video_read_position();
+ 
