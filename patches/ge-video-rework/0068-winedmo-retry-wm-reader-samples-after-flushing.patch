@@ -1,0 +1,58 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Sun, 4 Oct 2026 12:00:00 -0600
+Subject: [PATCH] winedmo: Retry WM reader sample reads interrupted by flushing.
+
+Colin McRae Rally 3 switches stream formats while an asynchronous WM reader
+worker is waiting for a sample from frontend.wmv. Reinitialization wakes
+the worker with S_FALSE, the packet queue's internal flush/retry result.
+GetNextSample currently passes that result through without returning an
+INSSBuffer. The async reader accepts the successful HRESULT and queues a
+null buffer, then crashes releasing it while stopping the stream.
+
+Keep the flush result internal, as the previous winegstreamer reader did.
+Synchronize with reinitialization through reader->cs, then retry stream
+selection and sample delivery. Do not retain this synchronization lock
+across the retry's blocking read. If shutdown caused the flush, report
+NS_E_NO_MORE_SAMPLES instead of retrying against the closed reader.
+
+This fixes the producer contract rather than skipping null releases in
+wmvcore, which would leave invalid samples reaching its callbacks.
+
+Reported by DropboxKenshiro.
+Bug: https://github.com/GloriousEggroll/proton-ge-custom/issues/633
+Log: https://github.com/GloriousEggroll/proton-ge-custom/issues/633#issuecomment-5978191702
+---
+ dlls/winedmo/wm_reader.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/dlls/winedmo/wm_reader.c b/dlls/winedmo/wm_reader.c
+--- a/dlls/winedmo/wm_reader.c
++++ b/dlls/winedmo/wm_reader.c
+@@ -2861,6 +2861,7 @@
+     if (!stream_number && !output_number && !ret_stream_number)
+         return E_INVALIDARG;
+ 
++retry:
+     if (reader->outer == &reader->IUnknown_inner)
+     {
+         EnterCriticalSection(&reader->cs);
+@@ -2947,6 +2948,19 @@
+     }
+ 
+ done:
++    if (hr == S_FALSE)
++    {
++        /* Flushing does not produce a sample. Wait for reinitialization under
++         * reader->cs before retrying, without holding it across a blocking read. */
++        if (!reader_locked)
++            EnterCriticalSection(&reader->cs);
++        hr = reader->demux_shutdown ? NS_E_NO_MORE_SAMPLES : S_FALSE;
++        LeaveCriticalSection(&reader->cs);
++        reader_locked = FALSE;
++        if (hr == S_FALSE)
++            goto retry;
++    }
++
+     if (output_number && hr == S_OK)
+         *output_number = stream_number - 1;
+     if (ret_stream_number && (hr == S_OK || stream_number))
