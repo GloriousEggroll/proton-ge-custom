@@ -1,0 +1,104 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Sat, 3 Oct 2026 01:00:00 -0600
+Subject: [PATCH] win32u: Keep game windows out of tray menu layers.
+
+The latest #800 trace destroys ZenlessZoneZero's xdg_toplevel and recreates
+the game as a monitor-sized wine-menu layer after clicking its launcher's
+tray icon. The existing overlay-layer and on-demand keyboard fixes are
+present, but they do not prevent the game from being mistaken for a menu.
+
+Borderless games can satisfy the popup-style test and cover the tray click
+coordinates. The click context is also published on the Wine desktop, so
+position-only matching can claim a window in an unrelated game process.
+Once selected, a visible window remains latched as the native menu.
+
+Exclude fullscreen windows using the state already computed by
+apply_window_pos(), including fullscreen presentation rectangles. Limit
+position matching to the tray owner's process or an explicit owner chain.
+Keep same-process custom menus whose tray owner is a hidden helper window,
+and preserve menus with explicit cross-process ownership. Rejected windows
+do not consume the shared context needed by the actual menu.
+
+This is a follow-up to the SNI/native context-menu implementation by
+Erhan Bilgili (nanomatters) <erhan.bilgili@gmail.com>:
+https://github.com/nanomatters/wine-wineland
+
+Bug: https://github.com/GloriousEggroll/proton-ge-custom/issues/800
+---
+
+diff --git a/dlls/win32u/ntuser_private.h b/dlls/win32u/ntuser_private.h
+--- a/dlls/win32u/ntuser_private.h
++++ b/dlls/win32u/ntuser_private.h
+@@ -238,7 +238,8 @@
+ extern BOOL sni_has_icons( void );
+ extern BOOL sni_is_available( void );
+ extern BOOL sni_get_context_menu_pos( POINT *pos );
+-extern BOOL sni_should_layer_context_menu( HWND hwnd, DWORD style, DWORD ex_style, const RECT *rect );
++extern BOOL sni_should_layer_context_menu( HWND hwnd, DWORD style, DWORD ex_style, const RECT *rect,
++                                          BOOL fullscreen );
+ extern void sni_adjust_menu_position( HWND hwnd, INT *x, INT *y );
+ 
+ /* opengl.c */
+
+diff --git a/dlls/win32u/sni.c b/dlls/win32u/sni.c
+--- a/dlls/win32u/sni.c
++++ b/dlls/win32u/sni.c
+@@ -578,16 +578,18 @@
+     return ret;
+ }
+ 
+-BOOL sni_should_layer_context_menu( HWND hwnd, DWORD style, DWORD ex_style, const RECT *rect )
++BOOL sni_should_layer_context_menu( HWND hwnd, DWORD style, DWORD ex_style, const RECT *rect, BOOL fullscreen )
+ {
+     BOOL candidate, context_current = FALSE, match_owner = FALSE;
+     BOOL owner_match, position_match, remove_context = FALSE, ret = FALSE;
++    DWORD owner_pid, window_pid;
+     LONG width = rect->right - rect->left;
+     LONG height = rect->bottom - rect->top;
+     HWND owner = NULL;
+     POINT pos;
+ 
+-    candidate = (style & WS_POPUP) && !(style & WS_CHILD) && !(style & WS_THICKFRAME) &&
++    /* Borderless fullscreen games also use WS_POPUP and cover the tray click. */
++    candidate = !fullscreen && (style & WS_POPUP) && !(style & WS_CHILD) && !(style & WS_THICKFRAME) &&
+                 !(ex_style & WS_EX_APPWINDOW) && width > 1 && height > 1 &&
+                 width <= get_system_metrics( SM_CXVIRTUALSCREEN ) &&
+                 height <= get_system_metrics( SM_CYVIRTUALSCREEN );
+@@ -611,7 +613,14 @@
+     if (!context_current && !read_published_native_menu_context( &owner, &pos, &match_owner )) return FALSE;
+     if (owner && hwnd == owner) return FALSE;
+ 
+-    owner_match = match_owner && window_belongs_to_context_owner( hwnd, owner );
++    /* The published context is shared by every process on the Wine desktop.
++     * Position alone must not let an unrelated game claim a launcher's click.
++     * Retain explicitly owned menus, including cross-process owner chains. */
++    owner_match = window_belongs_to_context_owner( hwnd, owner );
++    if (!owner_match && (!get_window_thread( owner, &owner_pid ) ||
++                        !get_window_thread( hwnd, &window_pid ) || owner_pid != window_pid))
++        return FALSE;
++    owner_match = match_owner && owner_match;
+     position_match = (style & WS_VISIBLE) && rect_matches_context_pos( rect, pos );
+     if (!owner_match && !position_match) return FALSE;
+ 
+@@ -1550,7 +1559,7 @@
+ BOOL sni_has_icons( void ) { return FALSE; }
+ BOOL sni_is_available( void ) { return FALSE; }
+ BOOL sni_get_context_menu_pos( POINT *pos ) { return FALSE; }
+-BOOL sni_should_layer_context_menu( HWND hwnd, DWORD style, DWORD ex_style, const RECT *rect ) { return FALSE; }
++BOOL sni_should_layer_context_menu( HWND hwnd, DWORD style, DWORD ex_style, const RECT *rect, BOOL fullscreen ) { return FALSE; }
+ void sni_adjust_menu_position( HWND hwnd, INT *x, INT *y ) { }
+ 
+ #endif  /* SONAME_LIBDBUS_1 */
+
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -2525,7 +2525,7 @@
+         }
+ 
+         if (!is_child && sni_should_layer_context_menu( hwnd, win->dwStyle, win->dwExStyle,
+-                                                        &new_rects->window ))
++                                                        &new_rects->window, !!(swp_flags & WINE_SWP_FULLSCREEN) ))
+             swp_flags |= WINE_SWP_TRAY_MENU;
+     }
+ 
