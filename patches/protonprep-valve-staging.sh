@@ -382,6 +382,11 @@ apply_all_in_dir() {
     # Publish process-exit state before pending I/O APCs can take orphaned locks.
     apply_patch "../patches/wine-hotfixes/pending/ntdll-block-apcs-until-process-exit-state-is-set.patch"
 
+    # Richard Burns Rally (RSF) closes a kill-on-close job it's in when quitting,
+    # which frees its handle table while wineserver is still using it.
+    echo "WINE: -HOTFIX- Don't touch a freed handle table in close_handle() (Richard Burns Rally exit)"
+    apply_patch "../patches/wine-hotfixes/pending/server-dont-touch-freed-handle-table-in-close-handle.patch"
+
     # https://gitlab.winehq.org/wine/wine/-/commit/a31ec8da9572672e04ae46792a398da942649875
     echo "WINE: -HOTFIX- Prefer native non-Microsoft DLLs using version resources"
     apply_patch "../patches/wine-hotfixes/pending/ntdll-prefer-native-version-resource-heuristics.patch"
