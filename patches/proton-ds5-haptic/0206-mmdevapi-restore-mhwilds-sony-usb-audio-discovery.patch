@@ -1,0 +1,102 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Sat, 3 Oct 2026 15:00:00 -0600
+Subject: [PATCH] mmdevapi: Restore Sony USB audio discovery for MH Wilds.
+
+Monster Hunter Wilds locates controller audio through MEDIA devices and
+KSCATEGORY_AUDIO interfaces before opening its four-channel haptic stream.
+f21d9a033b14997d1532f616f276568c5bb4397c excluded Sony device paths from
+this registration and deleted their MEDIA entries. The later per-game
+gating in 0103 retained that exclusion, so enabling the MH Wilds path only
+registered unrelated USB audio devices.
+
+Allow Sony paths through the existing MH Wilds-only registration. Keep the
+environment gate and setupapi's interface filtering intact: exposing fake
+kernel-streaming interfaces to other games previously broke Black Desert
+Online's PortAudio enumeration.
+
+Do not sweep Sony MEDIA entries when registering endpoints in MH Wilds.
+Both repeated endpoint registration and a second connected controller must
+retain the earlier controller's entries. On disconnect, remove only entries
+matching the departing controller's container; an unknown container must
+not remove another controller. Outside MH Wilds, retain the existing cleanup.
+
+Tarruck identified the exclusion and supplied paired logs and a binary-only
+A/B test in #819. The stock log initializes only the normal stereo stream;
+the modified build opens four-channel controller streams and its haptic
+PCM. Credit for the original MH Wilds USB audio registration belongs to
+JS Deck <jsdeckerido@gmail.com>, imported from:
+https://github.com/xzn/proton-ds5-haptic
+
+Bug: https://github.com/GloriousEggroll/proton-ge-custom/issues/819
+---
+ dlls/mmdevapi/devenum.c | 29 +++++++++++++++++++++++++----
+ 1 file changed, 25 insertions(+), 4 deletions(-)
+
+diff --git a/dlls/mmdevapi/devenum.c b/dlls/mmdevapi/devenum.c
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -1307,13 +1307,19 @@
+     }
+ }
+ 
+-static void remove_dualsense_media_devices(void)
++static void remove_dualsense_media_devices(const GUID *remove_container_id)
+ {
+     static const GUID MEDIA_ClassGUID = { 0x4d36e96c, 0xe325, 0x11ce, { 0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18 } };
+     HDEVINFO device_set;
+     SP_DEVINFO_DATA device_info_data;
++    BOOL mhwilds = enable_mhwilds_usb_audio();
+     DWORD index = 0;
+ 
++    /* MH Wilds needs these entries for every connected controller. Do not
++     * sweep them during registration; remove only a known disconnected one. */
++    if (mhwilds && (!remove_container_id || IsEqualGUID(remove_container_id, &GUID_NULL)))
++        return;
++
+     device_set = SetupDiGetClassDevsW(&MEDIA_ClassGUID, NULL, NULL, 0);
+     if (device_set == INVALID_HANDLE_VALUE)
+         return;
+@@ -1331,6 +1337,21 @@
+         if (SetupDiGetDeviceInstanceIdW(device_set, &device_info_data, instance_id, ARRAY_SIZE(instance_id), NULL) &&
+                 is_dualsense_device_path(instance_id))
+         {
++            if (mhwilds)
++            {
++                WCHAR container_id_string[39];
++                GUID container_id;
++
++                if (!SetupDiGetDeviceRegistryPropertyW(device_set, &device_info_data, SPDRP_BASE_CONTAINERID,
++                        NULL, (BYTE *)container_id_string, sizeof(container_id_string), NULL) ||
++                        FAILED(CLSIDFromString(container_id_string, &container_id)) ||
++                        !IsEqualGUID(remove_container_id, &container_id))
++                {
++                    index++;
++                    continue;
++                }
++            }
++
+             TRACE("Removing stale DualSense MEDIA device %s.\n", debugstr_w(instance_id));
+             if (SetupDiRemoveDevice(device_set, &device_info_data))
+                 continue;
+@@ -1628,10 +1649,10 @@
+             WARN("swprintf failed.");
+ 
+         if (is_dualsense_device_path(device_path))
+-            remove_dualsense_media_devices();
++            remove_dualsense_media_devices(NULL);
+ 
+         // HACK on top of hack, create entries that MHWilds expects.
+-        if (enable_mhwilds_usb_audio() && device_path && !is_dualsense_device_path(device_path)) {
++        if (enable_mhwilds_usb_audio() && device_path) {
+             device_path = wcsstr(device_path, L"USB\\VID_");
+             if (device_path) {
+                 memset(&device_info_data, 0, sizeof(device_info_data));
+@@ -2254,7 +2275,7 @@
+             remove_persistent_sony_audioendpoint_devices(NULL, container_id.puuid);
+         else if (!keep_sony_audio_endpoint_visible())
+             remove_dualsense_audioendpoint_devices();
+-        remove_dualsense_media_devices();
++        remove_dualsense_media_devices(container_id.vt == VT_CLSID ? container_id.puuid : NULL);
+     }
+     PropVariantClear(&container_id);
+     notify_endpoint_removed(dev->flow, &id);
