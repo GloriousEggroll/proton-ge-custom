@@ -336,6 +336,9 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/crypt32-wc3-accept-legacy-chain-engine-config.patch"
     apply_patch "../patches/wine-hotfixes/pending/crypt32-wc3-preserve-exclusive-root-and-test-layouts.patch"
 
+    echo "WINE: -HOTFIX- Support SHA-256 certificate hash properties for MTA"
+    apply_patch "../patches/wine-hotfixes/mta-certificate/0001-crypt32-support-sha256-certificate-properties.patch"
+
     echo "WINE: -HOTFIX- Add GetFileVersionInfoByHandle version export stub"
     apply_patch "../patches/wine-hotfixes/pending/version-GetFileVersionInfoByHandle-stub.patch"
 
