@@ -586,6 +586,7 @@ Without HIDRAW access, Wine retains its normal SDL fallback, which does not prov
 |                      | `PROTON_STEAMINPUT_LAYOUT_DS5` | Force the fallback controller to use the DualSense profile instead of automatic layout detection. |
 | `wayland`            | `PROTON_USE_WAYLAND` or `PROTON_ENABLE_WAYLAND` | Enables the Wayland driver. |
 |                      | `PROTON_USE_X11_EXCLUSIVE` | Under Wine-Wayland, use `winex11.drv` only for the executable specified by this value. Accepts an exact executable basename such as `Launcher.exe` or a case-insensitive Windows path fragment such as `Vendor\\Launcher.exe`; other processes remain on Wine-Wayland. |
+| `winebth`            | `PROTON_ENABLE_WINEBTH`        | Enables `winebth.sys`, Wine's Bluetooth driver, which is disabled by default. Needed for Bluetooth LE devices such as smart trainers and controllers in Zwift or Rouvy. Requires BlueZ. |
 | `wow64`              | `PROTON_USE_WOW64`             | Enables wow64. |
 |                      | `WAYLANDDRV_PRIMARY_MONITOR`   | Specify primary monitor where the value is something like `eDP-1`. Requires the Wayland driver. |
 |                      | `PROTON_ENABLE_MEDIACONV`      | Enable media converter for winegstreamer. This is not needed for winedmo, since the mediaconverter implementation of the codecs doesn't override the underlying implementation. |

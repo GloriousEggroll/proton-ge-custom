@@ -1,0 +1,66 @@
+From 83d5142670bcc8903690c2090e7d7befce56b816 Mon Sep 17 00:00:00 2001
+From: David Szendrei <618011+pocker@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 11:08:48 +0200
+Subject: [PATCH 8/8] ntoskrnl.exe: Drop pending relation updates for removed
+ devices.
+
+IoInvalidateDeviceRelations() queues bare device pointers, and removing a
+device never took it out of the queue. When a bus driver invalidates a
+child's relations and the child is then removed, the queued update runs
+handle_bus_relations() on the deleted device and walks a freed children
+list, crashing winedevice.exe.
+
+winebth hits this whenever an LE device disconnects: BlueZ drops the GATT
+services one at a time, each one invalidates the device's relations, and
+BlueZ then drops the device itself. Everything hosted in that winedevice,
+including the radio, is gone afterwards.
+
+Forget queued updates for a device once its IRP_MN_REMOVE_DEVICE has been
+sent, which also covers updates queued by the driver during removal.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/ntoskrnl.exe/pnp.c | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/dlls/ntoskrnl.exe/pnp.c b/dlls/ntoskrnl.exe/pnp.c
+index 11a578a7..678d987e 100644
+--- a/dlls/ntoskrnl.exe/pnp.c
++++ b/dlls/ntoskrnl.exe/pnp.c
+@@ -448,6 +448,24 @@ static void enumerate_new_device( DEVICE_OBJECT *device, HDEVINFO set, DEVICE_OB
+     start_device( device, set, &sp_device );
+ }
+ 
++/* Drop pending bus relation updates for a device that is going away. The queue holds bare
++ * pointers, so an update left behind would be handled after the driver deleted the device. */
++static void forget_invalidated_device( DEVICE_OBJECT *device )
++{
++    size_t i, j;
++
++    EnterCriticalSection( &invalidated_devices_cs );
++    for (i = j = 0; i < invalidated_devices_count; ++i)
++    {
++        if (invalidated_devices[i] != device)
++            invalidated_devices[j++] = invalidated_devices[i];
++    }
++    if (j != invalidated_devices_count)
++        TRACE( "Dropping %Iu pending relation updates for device %p.\n", invalidated_devices_count - j, device );
++    invalidated_devices_count = j;
++    LeaveCriticalSection( &invalidated_devices_cs );
++}
++
+ static void send_remove_device_irp( DEVICE_OBJECT *device, UCHAR code )
+ {
+     struct wine_device *wine_device = CONTAINING_RECORD(device, struct wine_device, device_obj);
+@@ -462,6 +480,11 @@ static void send_remove_device_irp( DEVICE_OBJECT *device, UCHAR code )
+     }
+ 
+     send_pnp_irp( device, code );
++
++    /* The driver may have deleted the device, and may have queued updates for it while removing it.
++     * Only the pointer value is compared from here on. */
++    if (code == IRP_MN_REMOVE_DEVICE)
++        forget_invalidated_device( device );
+ }
+ 
+ static void remove_device( DEVICE_OBJECT *device )
