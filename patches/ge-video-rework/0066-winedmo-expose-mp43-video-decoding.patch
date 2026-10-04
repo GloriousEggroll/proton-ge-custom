@@ -1,0 +1,207 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Sat, 3 Oct 2026 16:00:00 -0600
+Subject: [PATCH] winedmo/wmvdecod: Expose MP43 video decoding.
+
+Fairy Fencer F Advent Dark Force uses MP43 video in logo_if.wmv and
+logo_ch.wmv. The #659 log resolves the ASF source and identifies the video
+correctly, but MFTEnumEx cannot find a decoder for MFVideoFormat_MP43.
+Topology resolution returns MF_E_TOPO_CODEC_NOT_FOUND before any video
+samples can be decoded.
+
+The FFmpeg backend already maps MP43 to AV_CODEC_ID_MSMPEG4V3 through its
+RIFF tag table, and the decoder is enabled by the existing build options.
+The missing pieces are the Windows-side decoder registration and the
+winedmo input-type allowlist; both omissions remain in the current tree.
+
+Advertise MP43 and its documented lowercase spelling in the existing
+WMVideo MFT/DMO bridge, and accept them in its shared decoder. Keep the
+subtype intact so FFmpeg selects Microsoft MPEG-4 V3, not MPEG-4 Part 2
+or H.264. Do not change WMV output ordering, decoder factories, game files,
+or per-game configuration.
+
+Add an MF regression test which enumerates and activates a decoder for
+each spelling, then negotiates the reported 1280x720 input and YUY2 output.
+Committing the output type exercises creation of the FFmpeg transform,
+rather than testing registration alone. Actual movie playback still needs
+validation in the game.
+
+Reported by PerseidLab. This extends the existing decoder bridge based on
+Remi Bernon's Wine/CodeWeavers implementation.
+
+Bug: https://github.com/GloriousEggroll/proton-ge-custom/issues/659
+Reference: https://learn.microsoft.com/en-us/windows/win32/medfound/windowsmediampeg4v3decoder
+---
+
+diff --git a/dlls/mf/tests/transform.c b/dlls/mf/tests/transform.c
+--- a/dlls/mf/tests/transform.c
++++ b/dlls/mf/tests/transform.c
+@@ -60,6 +60,7 @@
+ DEFINE_MEDIATYPE_GUID(MFVideoFormat_ABGR32,D3DFMT_A8B8G8R8);
+ DEFINE_MEDIATYPE_GUID(MFVideoFormat_P208,MAKEFOURCC('P','2','0','8'));
+ DEFINE_MEDIATYPE_GUID(MFVideoFormat_VC1S,MAKEFOURCC('V','C','1','S'));
++DEFINE_MEDIATYPE_GUID(MFVideoFormat_mp43,MAKEFOURCC('m','p','4','3'));
+ 
+ DEFINE_GUID(mft_output_sample_incomplete,0xffffff,0xffff,0xffff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff);
+ 
+@@ -6393,6 +6394,101 @@
+     CoUninitialize();
+ }
+ 
++static void test_mp43_decoder(void)
++{
++    const GUID *subtypes[] = {&MFVideoFormat_MP43, &MFVideoFormat_mp43};
++    const struct attribute_desc input_desc[] =
++    {
++        ATTR_GUID(MF_MT_MAJOR_TYPE, MFMediaType_Video),
++        ATTR_RATIO(MF_MT_FRAME_SIZE, 1280, 720),
++        ATTR_RATIO(MF_MT_FRAME_RATE, 30000, 1001),
++        ATTR_RATIO(MF_MT_PIXEL_ASPECT_RATIO, 1, 1),
++        ATTR_UINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive),
++        {0},
++    };
++    const struct attribute_desc output_desc[] =
++    {
++        ATTR_GUID(MF_MT_MAJOR_TYPE, MFMediaType_Video),
++        ATTR_GUID(MF_MT_SUBTYPE, MFVideoFormat_YUY2),
++        ATTR_RATIO(MF_MT_FRAME_SIZE, 1280, 720),
++        ATTR_RATIO(MF_MT_FRAME_RATE, 30000, 1001),
++        ATTR_RATIO(MF_MT_PIXEL_ASPECT_RATIO, 1, 1),
++        ATTR_UINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive),
++        ATTR_UINT32(MF_MT_DEFAULT_STRIDE, 1280 * 2),
++        ATTR_UINT32(MF_MT_SAMPLE_SIZE, 1280 * 720 * 2),
++        ATTR_UINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, 1),
++        ATTR_UINT32(MF_MT_FIXED_SIZE_SAMPLES, 1),
++        {0},
++    };
++    MFT_REGISTER_TYPE_INFO input_filter = {MFMediaType_Video};
++    MFT_REGISTER_TYPE_INFO output_filter = {MFMediaType_Video, MFVideoFormat_YUY2};
++    IMFMediaType *input_type, *output_type;
++    IMFTransform *transform;
++    IMFActivate **activates;
++    UINT32 count;
++    HRESULT hr;
++    unsigned int i, j;
++
++    CoInitialize(NULL);
++    hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
++    ok(hr == S_OK, "MFStartup returned %#lx.\n", hr);
++    if (FAILED(hr))
++    {
++        CoUninitialize();
++        return;
++    }
++
++    for (i = 0; i < ARRAY_SIZE(subtypes); ++i)
++    {
++        winetest_push_context("%s", wine_dbgstr_guid(subtypes[i]));
++        input_filter.guidSubtype = *subtypes[i];
++        activates = NULL;
++        count = 0;
++        hr = MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG_SYNCMFT,
++                &input_filter, &output_filter, &activates, &count);
++        ok(hr == S_OK, "MFTEnumEx returned %#lx.\n", hr);
++        ok(count != 0, "No MP43 video decoder found.\n");
++        if (SUCCEEDED(hr) && count)
++        {
++            hr = IMFActivate_ActivateObject(activates[0], &IID_IMFTransform, (void **)&transform);
++            ok(hr == S_OK, "ActivateObject returned %#lx.\n", hr);
++            if (SUCCEEDED(hr))
++            {
++                hr = MFCreateMediaType(&input_type);
++                ok(hr == S_OK, "MFCreateMediaType returned %#lx.\n", hr);
++                if (SUCCEEDED(hr))
++                {
++                    init_media_type(input_type, input_desc, -1);
++                    hr = IMFMediaType_SetGUID(input_type, &MF_MT_SUBTYPE, subtypes[i]);
++                    ok(hr == S_OK, "SetGUID returned %#lx.\n", hr);
++                    hr = IMFTransform_SetInputType(transform, 0, input_type, 0);
++                    ok(hr == S_OK, "SetInputType returned %#lx.\n", hr);
++                    IMFMediaType_Release(input_type);
++
++                    hr = MFCreateMediaType(&output_type);
++                    ok(hr == S_OK, "MFCreateMediaType returned %#lx.\n", hr);
++                    if (SUCCEEDED(hr))
++                    {
++                        init_media_type(output_type, output_desc, -1);
++                        hr = IMFTransform_SetOutputType(transform, 0, output_type, 0);
++                        ok(hr == S_OK, "SetOutputType returned %#lx.\n", hr);
++                        IMFMediaType_Release(output_type);
++                    }
++                }
++                IMFTransform_Release(transform);
++                IMFActivate_ShutdownObject(activates[0]);
++            }
++        }
++        for (j = 0; j < count; ++j)
++            IMFActivate_Release(activates[j]);
++        CoTaskMemFree(activates);
++        winetest_pop_context();
++    }
++
++    MFShutdown();
++    CoUninitialize();
++}
++
+ const GUID *wmv_decoder_output_subtypes[] =
+ {
+     &MEDIASUBTYPE_NV12,
+@@ -11618,6 +11714,7 @@
+     test_wmv_decoder_dmo_output_type();
+     test_wmv_decoder_dmo_get_size_info();
+     test_wmv_decoder_media_object();
++    test_mp43_decoder();
+     test_audio_convert();
+     test_color_convert(FALSE);
+     test_color_convert(TRUE);
+
+diff --git a/dlls/winedmo/video_decoder.c b/dlls/winedmo/video_decoder.c
+--- a/dlls/winedmo/video_decoder.c
++++ b/dlls/winedmo/video_decoder.c
+@@ -2519,6 +2519,8 @@
+ 
+ extern const GUID MEDIASUBTYPE_VC1S;
+ extern const GUID MEDIASUBTYPE_WMV_Unknown;
++static const GUID MFVideoFormat_mp43 = {MAKEFOURCC('m','p','4','3'), 0x0000, 0x0010,
++        {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+ static const GUID *const wmv_decoder_input_types[] =
+ {
+     &MEDIASUBTYPE_WMV1,
+@@ -2533,6 +2535,8 @@
+     &MFVideoFormat_theora,
+     &MFVideoFormat_AV1,
+     &MFVideoFormat_VP90,
++    &MFVideoFormat_MP43,
++    &MFVideoFormat_mp43,
+ };
+ static const GUID *const wmv_decoder_output_types[] =
+ {
+
+diff --git a/dlls/wmvdecod/wmvdecod.c b/dlls/wmvdecod/wmvdecod.c
+--- a/dlls/wmvdecod/wmvdecod.c
++++ b/dlls/wmvdecod/wmvdecod.c
+@@ -36,6 +36,7 @@
+ DEFINE_GUID(DMOVideoFormat_RGB565,D3DFMT_R5G6B5,0x524f,0x11ce,0x9f,0x53,0x00,0x20,0xaf,0x0b,0xa7,0x70);
+ DEFINE_GUID(DMOVideoFormat_RGB555,D3DFMT_X1R5G5B5,0x524f,0x11ce,0x9f,0x53,0x00,0x20,0xaf,0x0b,0xa7,0x70);
+ DEFINE_GUID(DMOVideoFormat_RGB8,D3DFMT_P8,0x524f,0x11ce,0x9f,0x53,0x00,0x20,0xaf,0x0b,0xa7,0x70);
++DEFINE_MEDIATYPE_GUID(MFVideoFormat_mp43,MAKEFOURCC('m','p','4','3'));
+ 
+ /***********************************************************************
+  *              DllGetClassObject (wmvdecod.@)
+@@ -69,6 +70,8 @@
+         {MFMediaType_Video, MFVideoFormat_theora},
+         {MFMediaType_Video, MFVideoFormat_AV1},
+         {MFMediaType_Video, MFVideoFormat_VP90},
++        {MFMediaType_Video, MFVideoFormat_MP43},
++        {MFMediaType_Video, MFVideoFormat_mp43},
+     };
+     MFT_REGISTER_TYPE_INFO wmv_decoder_mft_outputs[] =
+     {
+@@ -111,6 +114,8 @@
+         {.type = MEDIATYPE_Video, .subtype = MFVideoFormat_theora},
+         {.type = MEDIATYPE_Video, .subtype = MFVideoFormat_AV1},
+         {.type = MEDIATYPE_Video, .subtype = MFVideoFormat_VP90},
++        {.type = MEDIATYPE_Video, .subtype = MFVideoFormat_MP43},
++        {.type = MEDIATYPE_Video, .subtype = MFVideoFormat_mp43},
+     };
+     HRESULT hr;
+ 
