@@ -18,15 +18,17 @@ splitter + a real "WMVideo Decoder DMO", and the mapping breaks the graph:
 
 Look the exact name up first and only fall back to "Reader" when the graph
 has no such filter; AddFilter only checks exact names.
----
- dlls/quartz/filtergraph.c | 33 +++++++++++++++++++++++----------
- 1 file changed, 23 insertions(+), 10 deletions(-)
 
+Source: https://github.com/GloriousEggroll/proton-ge-custom/pull/823
+
+GE-Proton integration adds regression coverage for both filter insertion
+orders, preservation of exact names, renaming real duplicates, and decoder
+lookup after removing the reader. The production change is unchanged.
+---
 diff --git a/dlls/quartz/filtergraph.c b/dlls/quartz/filtergraph.c
-index 4f49b01..6e1d5f2 100644
 --- a/dlls/quartz/filtergraph.c
 +++ b/dlls/quartz/filtergraph.c
-@@ -549,17 +549,10 @@ static ULONG WINAPI FilterGraph2_Release(IFilterGraph2 *iface)
+@@ -549,17 +549,10 @@
      return IUnknown_Release(graph->outer_unk);
  }
  
@@ -45,7 +47,7 @@ index 4f49b01..6e1d5f2 100644
      LIST_FOR_EACH_ENTRY(filter, &graph->filters, struct filter, entry)
      {
          if (!wcscmp(filter->name, name))
-@@ -569,6 +562,26 @@ static IBaseFilter *find_filter_by_name(struct filter_graph *graph, const WCHAR
+@@ -569,6 +562,26 @@
      return NULL;
  }
  
@@ -72,7 +74,7 @@ index 4f49b01..6e1d5f2 100644
  static BOOL has_output_pins(IBaseFilter *filter)
  {
      IEnumPins *enumpins;
-@@ -670,7 +683,7 @@ static HRESULT WINAPI FilterGraph2_AddFilter(IFilterGraph2 *iface,
+@@ -670,7 +683,7 @@
          return E_OUTOFMEMORY;
      }
  
@@ -81,7 +83,7 @@ index 4f49b01..6e1d5f2 100644
          duplicate_name = TRUE;
  
      if (!name || duplicate_name)
-@@ -684,7 +697,7 @@ static HRESULT WINAPI FilterGraph2_AddFilter(IFilterGraph2 *iface,
+@@ -684,7 +697,7 @@
  
              graph->name_index = (graph->name_index + 1) % 10000;
  
@@ -90,6 +92,83 @@ index 4f49b01..6e1d5f2 100644
                  break;
          }
  
--- 
-2.55.0
 
+diff --git a/dlls/quartz/tests/filtergraph.c b/dlls/quartz/tests/filtergraph.c
+--- a/dlls/quartz/tests/filtergraph.c
++++ b/dlls/quartz/tests/filtergraph.c
+@@ -3091,6 +3091,66 @@
+     ok(filter.ref == 1, "Got outstanding refcount %ld.\n", filter.ref);
+ }
+ 
++static void test_exact_filter_names(BOOL reader_first)
++{
++    static const WCHAR *names[] = {L"Reader", L"WMVideo Decoder DMO"};
++    IFilterGraph2 *graph = create_graph();
++    struct testfilter filters[3];
++    IBaseFilter *ret_filter;
++    unsigned int i, index;
++    HRESULT hr;
++    ULONG ref;
++
++    winetest_push_context("reader_first %u", reader_first);
++    for (i = 0; i < ARRAY_SIZE(filters); ++i)
++        testfilter_init(&filters[i], NULL, 0);
++
++    for (i = 0; i < ARRAY_SIZE(names); ++i)
++    {
++        index = reader_first ? i : 1 - i;
++        hr = IFilterGraph2_AddFilter(graph, &filters[index].IBaseFilter_iface, names[index]);
++        ok(hr == S_OK, "Got hr %#lx for %s.\n", hr, wine_dbgstr_w(names[index]));
++        ok(filters[index].name && !wcscmp(filters[index].name, names[index]),
++                "Got name %s.\n", wine_dbgstr_w(filters[index].name));
++    }
++
++    /* A real duplicate is renamed, without hiding the original decoder. */
++    hr = IFilterGraph2_AddFilter(graph, &filters[2].IBaseFilter_iface, names[1]);
++    ok(hr == VFW_S_DUPLICATE_NAME, "Got hr %#lx.\n", hr);
++    ok(filters[2].name && wcscmp(filters[2].name, names[1]),
++            "Got name %s.\n", wine_dbgstr_w(filters[2].name));
++
++    for (i = 0; i < ARRAY_SIZE(filters); ++i)
++    {
++        const WCHAR *name = i < ARRAY_SIZE(names) ? names[i] : filters[i].name;
++
++        if (!name)
++            continue;
++        ret_filter = NULL;
++        hr = IFilterGraph2_FindFilterByName(graph, name, &ret_filter);
++        ok(hr == S_OK, "Got hr %#lx for %s.\n", hr, wine_dbgstr_w(name));
++        ok(ret_filter == &filters[i].IBaseFilter_iface, "Got filter %p, expected %p.\n",
++                ret_filter, &filters[i].IBaseFilter_iface);
++        if (ret_filter)
++            IBaseFilter_Release(ret_filter);
++    }
++
++    hr = IFilterGraph2_RemoveFilter(graph, &filters[0].IBaseFilter_iface);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    ret_filter = NULL;
++    hr = IFilterGraph2_FindFilterByName(graph, names[1], &ret_filter);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    ok(ret_filter == &filters[1].IBaseFilter_iface, "Got filter %p.\n", ret_filter);
++    if (ret_filter)
++        IBaseFilter_Release(ret_filter);
++
++    ref = IFilterGraph2_Release(graph);
++    ok(!ref, "Got outstanding refcount %lu.\n", ref);
++    for (i = 0; i < ARRAY_SIZE(filters); ++i)
++        ok(filters[i].ref == 1, "Filter %u has outstanding refcount %ld.\n", i, filters[i].ref);
++    winetest_pop_context();
++}
++
+ static HRESULT WINAPI test_connect_direct_Connect(IPin *iface, IPin *peer, const AM_MEDIA_TYPE *mt)
+ {
+     struct testpin *pin = impl_from_IPin(iface);
+@@ -7390,6 +7450,8 @@
+     test_aggregation();
+     test_control_delegation();
+     test_add_remove_filter();
++    test_exact_filter_names(TRUE);
++    test_exact_filter_names(FALSE);
+     test_connect_direct();
+     test_sync_source();
+     test_filter_state();
