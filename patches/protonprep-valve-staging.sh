@@ -310,6 +310,12 @@ apply_all_in_dir() {
 ### END GAME PATCH SECTION ###
 
 ### (2-5) WINE HOTFIX/BACKPORT SECTION ###
+    # https://gitlab.winehq.org/wine/wine/-/commit/2110c64d89ccf90e7865031238456b5f20ed1066
+    # 32-bit games: winedmo demuxer_destroy read the handle from the wrong structure, freeing a
+    # garbage pointer (glibc "free(): invalid size" abort when a DirectShow movie is stopped).
+    echo "WINE: -HOTFIX- Use correct parameter structure in winedmo wow64_demuxer_destroy"
+    apply_patch "../patches/wine-hotfixes/pending/winedmo-use-correct-parameter-structure-in-wow64-demuxer-destroy.patch"
+
     echo "WINE: -HOTFIX- Fix Smart Tee negotiation and V4L WoW64 media type marshaling"
     apply_all_in_dir "../patches/wine-hotfixes/qcap-dshow-fixes/"
 
