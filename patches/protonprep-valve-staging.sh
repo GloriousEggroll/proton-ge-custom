@@ -480,6 +480,11 @@ apply_all_in_dir() {
     echo "WINE: -HOTFIX- Implement GE-Proton ffmpeg + winedmo only video playback rework patches"
     apply_all_in_dir "../patches/ge-video-rework/"
 
+    # King of Fighters XIII: badly interleaved opening.wmv (first audio packet after ~20 s of
+    # video), the DirectShow parser must read ahead or the intro audio arrives late and is dropped.
+    echo "WINE: -HOTFIX- winedmo: read ahead for starving streams in the DirectShow parser"
+    apply_patch "../patches/wine-hotfixes/pending/winedmo-quartz-parser-read-ahead-for-starving-streams.patch"
+
     # https://github.com/xzn/proton-ds5-haptic
     # Includes default VitaPad-to-DS4 translation (issue #691).
     echo "WINE: -HOTFIX- Add proton DS5 patches"

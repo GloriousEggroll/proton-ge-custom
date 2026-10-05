@@ -1,0 +1,138 @@
+From: SPiRiT <aderumier@gmail.com>
+Subject: [PATCH] winedmo: Read ahead for starving streams in the DirectShow parser.
+
+The demux thread waits until every active pin has queue space before reading
+the next packet. With a badly interleaved file this throttles the starving
+stream: King of Fighters XIII Climax's opening.wmv stores its first audio
+packet after ~20 s of video (26 MB into the file), so the 64 packet video
+queue, consumed in real time, only lets the demuxer reach it once playback
+is ~18 s in. The audio samples are then late and dropped: the intro has no
+sound for its first seconds. VLC and Windows play it correctly.
+
+Keep reading past the queue limit while another active stream is starving
+(empty queue, not at EOS), up to 64 MiB queued for the full stream, and wake
+the demux thread when a stream runs out of packets. Well interleaved files
+keep the previous behaviour.
+---
+--- a/dlls/winedmo/winedmo_quartz_parser.c
++++ b/dlls/winedmo/winedmo_quartz_parser.c
+@@ -167,6 +167,9 @@
+ struct dmo_parser;
+ 
+ #define DMO_PARSER_MAX_QUEUED_PACKETS 64
++/* Read-ahead allowed past the queue limit while another stream is starving,
++ * for files whose streams are badly interleaved. */
++#define DMO_PARSER_MAX_READAHEAD_BYTES (64 * 1024 * 1024)
+ 
+ struct dmo_parser_source
+ {
+@@ -179,6 +182,7 @@
+ 
+     struct list packet_queue;
+     unsigned int queued_packets;
++    SIZE_T queued_bytes;
+     CRITICAL_SECTION queue_cs;
+     CONDITION_VARIABLE queue_cv;
+     CONDITION_VARIABLE queue_space_cv;
+@@ -241,6 +245,7 @@
+ {
+     dmo_packet_queue_flush(&pin->packet_queue);
+     pin->queued_packets = 0;
++    pin->queued_bytes = 0;
+     WakeConditionVariable(&pin->queue_space_cv);
+ }
+ 
+@@ -1016,6 +1021,42 @@
+     LeaveCriticalSection(&filter->streaming_cs);
+ }
+ 
++/* An active stream waiting for data the demuxer has not reached yet. */
++static BOOL dmo_parser_source_is_starving(struct dmo_parser_source *pin)
++{
++    BOOL starving;
++
++    if (!dmo_parser_source_is_active(pin))
++        return FALSE;
++
++    EnterCriticalSection(&pin->queue_cs);
++    starving = !pin->eos && !pin->queued_packets;
++    LeaveCriticalSection(&pin->queue_cs);
++    return starving;
++}
++
++static BOOL dmo_parser_other_source_is_starving(struct dmo_parser *filter, struct dmo_parser_source *full)
++{
++    unsigned int i;
++
++    for (i = 0; i < filter->source_count; ++i)
++    {
++        if (filter->sources[i] != full && dmo_parser_source_is_starving(filter->sources[i]))
++            return TRUE;
++    }
++
++    return FALSE;
++}
++
++/* Wakes the demux thread, waiting for queue space, to check for starving streams. */
++static void dmo_parser_wake_demux_thread(struct dmo_parser *filter)
++{
++    unsigned int i;
++
++    for (i = 0; i < filter->source_count; ++i)
++        WakeConditionVariable(&filter->sources[i]->queue_space_cv);
++}
++
+ static void dmo_parser_wait_for_queue_space(struct dmo_parser *filter)
+ {
+     unsigned int i;
+@@ -1038,6 +1079,25 @@
+             if (!wait)
+                 break;
+ 
++            /* Badly interleaved files can store the start of a stream far
++             * after the data of the others (e.g. audio after seconds of
++             * video): keep reading while another stream is starving,
++             * otherwise its samples arrive late and are dropped. */
++            if (pin->queued_bytes < DMO_PARSER_MAX_READAHEAD_BYTES)
++            {
++                BOOL starving;
++
++                LeaveCriticalSection(&pin->queue_cs);
++                starving = dmo_parser_other_source_is_starving(filter, pin);
++                EnterCriticalSection(&pin->queue_cs);
++                if (starving)
++                {
++                    TRACE("Reading ahead past %u queued packets of pin %p for a starving stream.\n",
++                            pin->queued_packets, pin);
++                    break;
++                }
++            }
++
+             SleepConditionVariableCS(&pin->queue_space_cv, &pin->queue_cs, INFINITE);
+         }
+         LeaveCriticalSection(&pin->queue_cs);
+@@ -1235,6 +1295,7 @@
+         EnterCriticalSection(&pin->queue_cs);
+         list_add_tail(&pin->packet_queue, &pkt->entry);
+         ++pin->queued_packets;
++        pin->queued_bytes += pkt->size;
+         LeaveCriticalSection(&pin->queue_cs);
+         WakeConditionVariable(&pin->queue_cv);
+     }
+@@ -1329,6 +1390,8 @@
+         EnterCriticalSection(&pin->queue_cs);
+         while (list_empty(&pin->packet_queue) && !pin->eos)
+         {
++            /* this stream is starving: the demuxer may have to read ahead */
++            dmo_parser_wake_demux_thread(filter);
+             SleepConditionVariableCS(&pin->queue_cv, &pin->queue_cs, INFINITE);
+ 
+             /* Re-check streaming/flushing after wake. */
+@@ -1361,6 +1424,7 @@
+         pkt = LIST_ENTRY(list_head(&pin->packet_queue), struct dmo_packet, entry);
+         list_remove(&pkt->entry);
+         --pin->queued_packets;
++        pin->queued_bytes -= pkt->size;
+         WakeConditionVariable(&pin->queue_space_cv);
+         LeaveCriticalSection(&pin->queue_cs);
+ 
