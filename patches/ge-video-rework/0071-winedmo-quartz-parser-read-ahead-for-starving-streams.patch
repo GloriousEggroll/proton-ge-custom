@@ -1,0 +1,289 @@
+From: SPiRiT <aderumier@gmail.com>
+Subject: [PATCH] winedmo: Read ahead for starving streams in the DirectShow parser.
+
+The demux thread waits until every active pin has queue space before reading
+the next packet. With a badly interleaved file this throttles the starving
+stream: King of Fighters XIII Climax's opening.wmv stores its first audio
+packet after ~20 s of video (26 MB into the file), so the 64 packet video
+queue, consumed in real time, only lets the demuxer reach it once playback
+is ~18 s in. The audio samples are then late and dropped: the intro has no
+sound for its first seconds. VLC and Windows play it correctly.
+
+Keep reading past the normal packet limit while another selected, connected
+stream has an empty queue and has not reached EOS. Stop extra read-ahead
+when a full stream reaches 64 MiB of queued payload; one packet may cross
+that threshold, and the existing normal packet limits remain unchanged.
+
+Original read-ahead change by SPiRiT (aderumier):
+https://github.com/GloriousEggroll/proton-ge-custom/pull/822
+
+GE-Proton integration revises the synchronization to avoid lost wakeups.
+Use one filter-wide queue-space condition variable and a generation counter
+protected by streaming_cs. Snapshot the generation before inspecting the
+per-pin queues, without reversing the queue_cs -> streaming_cs lock order.
+Before sleeping, recheck both the generation and the streaming/flush state
+under the same lock used to notify the demuxer.
+
+Notify on every dequeue (before a potentially blocking downstream Receive),
+queue flush, stream-selection change, seek, start, and stop. This covers a
+queue draining or another stream becoming empty between inspection and
+sleep, including single-stream playback and shutdown. No polling is needed.
+---
+diff --git a/dlls/winedmo/winedmo_quartz_parser.c b/dlls/winedmo/winedmo_quartz_parser.c
+--- a/dlls/winedmo/winedmo_quartz_parser.c
++++ b/dlls/winedmo/winedmo_quartz_parser.c
+@@ -167,6 +167,8 @@
+ struct dmo_parser;
+ 
+ #define DMO_PARSER_MAX_QUEUED_PACKETS 64
++/* Allow extra read-ahead for badly interleaved streams, bounded by queued payload. */
++#define DMO_PARSER_MAX_READAHEAD_BYTES (64 * 1024 * 1024)
+ 
+ struct dmo_parser_source
+ {
+@@ -179,9 +181,9 @@
+ 
+     struct list packet_queue;
+     unsigned int queued_packets;
++    SIZE_T queued_bytes;
+     CRITICAL_SECTION queue_cs;
+     CONDITION_VARIABLE queue_cv;
+-    CONDITION_VARIABLE queue_space_cv;
+ 
+     /* held during IMemInputPin_Receive; seeking acquires to serialize */
+     CRITICAL_SECTION flushing_cs;
+@@ -222,6 +224,8 @@
+ 
+     CRITICAL_SECTION streaming_cs;
+     CONDITION_VARIABLE flushing_cv;
++    CONDITION_VARIABLE queue_space_cv;
++    UINT64 queue_generation;
+     bool streaming;
+     bool sink_connected;
+     bool flushing;
+@@ -237,11 +241,22 @@
+     HRESULT (*source_get_media_type)(struct dmo_parser_source *pin, unsigned int index, AM_MEDIA_TYPE *mt);
+ };
+ 
++static void dmo_parser_wake_demux_thread(struct dmo_parser *filter)
++{
++    EnterCriticalSection(&filter->streaming_cs);
++    ++filter->queue_generation;
++    WakeConditionVariable(&filter->queue_space_cv);
++    LeaveCriticalSection(&filter->streaming_cs);
++}
++
+ static void dmo_parser_source_flush_queue(struct dmo_parser_source *pin)
+ {
++    struct dmo_parser *filter = CONTAINING_RECORD(pin->pin.pin.filter, struct dmo_parser, filter);
++
+     dmo_packet_queue_flush(&pin->packet_queue);
+     pin->queued_packets = 0;
+-    WakeConditionVariable(&pin->queue_space_cv);
++    pin->queued_bytes = 0;
++    dmo_parser_wake_demux_thread(filter);
+ }
+ 
+ /* ========================================================================
+@@ -614,14 +629,12 @@
+     filter->read_flushing = TRUE;
+     ++filter->read_flush_generation;
+     LeaveCriticalSection(&filter->streaming_cs);
++    dmo_parser_wake_demux_thread(filter);
+     WakeAllConditionVariable(&filter->flushing_cv);
+ 
+     /* Wake stream threads that may be sleeping on queue_cv. */
+     for (i = 0; i < filter->source_count; ++i)
+-    {
+         WakeConditionVariable(&filter->sources[i]->queue_cv);
+-        WakeConditionVariable(&filter->sources[i]->queue_space_cv);
+-    }
+ 
+     /* Acquire per-pin flushing_cs to ensure no Receive is in progress. */
+     for (i = 0; i < filter->source_count; ++i)
+@@ -664,7 +677,6 @@
+         {
+             WakeConditionVariable(&filter->sources[i]->eos_cv);
+             WakeConditionVariable(&filter->sources[i]->queue_cv);
+-            WakeConditionVariable(&filter->sources[i]->queue_space_cv);
+             LeaveCriticalSection(&filter->sources[i]->flushing_cs);
+         }
+     }
+@@ -676,6 +688,7 @@
+     filter->flushing = false;
+     filter->read_flushing = FALSE;
+     LeaveCriticalSection(&filter->streaming_cs);
++    dmo_parser_wake_demux_thread(filter);
+     WakeAllConditionVariable(&filter->flushing_cv);
+ 
+     return S_OK;
+@@ -832,6 +845,7 @@
+     if (!(flags & AMSTREAMSELECTENABLE_ENABLE))
+     {
+         pin->selected = false;
++        dmo_parser_wake_demux_thread(filter);
+         return S_OK;
+     }
+ 
+@@ -846,6 +860,7 @@
+     }
+ 
+     pin->selected = true;
++    dmo_parser_wake_demux_thread(filter);
+     return S_OK;
+ }
+ 
+@@ -988,7 +1003,6 @@
+     InitializeCriticalSectionEx(&pin->queue_cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+     pin->queue_cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": pin.queue_cs");
+     InitializeConditionVariable(&pin->queue_cv);
+-    InitializeConditionVariable(&pin->queue_space_cv);
+ 
+     InitializeCriticalSectionEx(&pin->flushing_cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+     pin->flushing_cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": pin.flushing_cs");
+@@ -1018,29 +1032,50 @@
+ 
+ static void dmo_parser_wait_for_queue_space(struct dmo_parser *filter)
+ {
+-    unsigned int i;
+-
+-    for (i = 0; i < filter->source_count; ++i)
++    for (;;)
+     {
+-        struct dmo_parser_source *pin = filter->sources[i];
++        bool full = false, starving = false, limit_reached = false;
++        UINT64 generation;
++        unsigned int i;
+ 
+-        if (!dmo_parser_source_is_active(pin))
+-            continue;
++        /* Queue locks precede streaming_cs. Remember changes while inspecting
++         * the queues without holding streaming_cs, then recheck before sleeping. */
++        EnterCriticalSection(&filter->streaming_cs);
++        if (!filter->streaming || filter->flushing)
++        {
++            LeaveCriticalSection(&filter->streaming_cs);
++            return;
++        }
++        generation = filter->queue_generation;
++        LeaveCriticalSection(&filter->streaming_cs);
+ 
+-        EnterCriticalSection(&pin->queue_cs);
+-        while (pin->queued_packets >= filter->max_queued_packets && !pin->eos)
++        for (i = 0; i < filter->source_count; ++i)
+         {
+-            bool wait;
++            struct dmo_parser_source *pin = filter->sources[i];
+ 
+-            EnterCriticalSection(&filter->streaming_cs);
+-            wait = filter->streaming && !filter->flushing;
+-            LeaveCriticalSection(&filter->streaming_cs);
+-            if (!wait)
+-                break;
++            if (!dmo_parser_source_is_active(pin))
++                continue;
+ 
+-            SleepConditionVariableCS(&pin->queue_space_cv, &pin->queue_cs, INFINITE);
++            EnterCriticalSection(&pin->queue_cs);
++            if (!pin->eos)
++            {
++                starving |= !pin->queued_packets;
++                if (pin->queued_packets >= filter->max_queued_packets)
++                {
++                    full = true;
++                    limit_reached |= pin->queued_bytes >= DMO_PARSER_MAX_READAHEAD_BYTES;
++                }
++            }
++            LeaveCriticalSection(&pin->queue_cs);
+         }
+-        LeaveCriticalSection(&pin->queue_cs);
++
++        if (!full || (starving && !limit_reached))
++            return;
++
++        EnterCriticalSection(&filter->streaming_cs);
++        while (filter->streaming && !filter->flushing && generation == filter->queue_generation)
++            SleepConditionVariableCS(&filter->queue_space_cv, &filter->streaming_cs, INFINITE);
++        LeaveCriticalSection(&filter->streaming_cs);
+     }
+ }
+ 
+@@ -1235,6 +1270,7 @@
+         EnterCriticalSection(&pin->queue_cs);
+         list_add_tail(&pin->packet_queue, &pkt->entry);
+         ++pin->queued_packets;
++        pin->queued_bytes += pkt->size;
+         LeaveCriticalSection(&pin->queue_cs);
+         WakeConditionVariable(&pin->queue_cv);
+     }
+@@ -1361,7 +1397,8 @@
+         pkt = LIST_ENTRY(list_head(&pin->packet_queue), struct dmo_packet, entry);
+         list_remove(&pkt->entry);
+         --pin->queued_packets;
+-        WakeConditionVariable(&pin->queue_space_cv);
++        pin->queued_bytes -= pkt->size;
++        dmo_parser_wake_demux_thread(filter);
+         LeaveCriticalSection(&pin->queue_cs);
+ 
+         dmo_parser_source_wait_for_video_time(pin, pkt);
+@@ -1590,11 +1627,11 @@
+     filter->read_flushing = FALSE;
+     filter->stream_start = start;
+     LeaveCriticalSection(&filter->streaming_cs);
++    dmo_parser_wake_demux_thread(filter);
+ 
+     for (i = 0; i < filter->source_count; ++i)
+     {
+         WakeConditionVariable(&filter->sources[i]->queue_cv);
+-        WakeConditionVariable(&filter->sources[i]->queue_space_cv);
+         WakeConditionVariable(&filter->sources[i]->eos_cv);
+     }
+     WakeAllConditionVariable(&filter->flushing_cv);
+@@ -1615,6 +1652,7 @@
+     filter->read_flushing = TRUE;
+     ++filter->read_flush_generation;
+     LeaveCriticalSection(&filter->streaming_cs);
++    dmo_parser_wake_demux_thread(filter);
+ 
+     dmo_parser_begin_downstream_flush(filter);
+     WakeAllConditionVariable(&filter->flushing_cv);
+@@ -1622,7 +1660,6 @@
+     for (i = 0; i < filter->source_count; ++i)
+     {
+         WakeConditionVariable(&filter->sources[i]->queue_cv);
+-        WakeConditionVariable(&filter->sources[i]->queue_space_cv);
+         WakeConditionVariable(&filter->sources[i]->eos_cv);
+     }
+ 
+@@ -1656,6 +1693,7 @@
+     filter->read_flushing = TRUE;
+     ++filter->read_flush_generation;
+     LeaveCriticalSection(&filter->streaming_cs);
++    dmo_parser_wake_demux_thread(filter);
+     WakeAllConditionVariable(&filter->flushing_cv);
+ 
+     /* Wake stream threads. */
+@@ -1663,7 +1701,6 @@
+     {
+         struct dmo_parser_source *pin = filter->sources[i];
+         WakeConditionVariable(&pin->queue_cv);
+-        WakeConditionVariable(&pin->queue_space_cv);
+         WakeConditionVariable(&pin->eos_cv);
+     }
+ 
+@@ -1686,7 +1723,6 @@
+         {
+             WakeConditionVariable(&pin->eos_cv);
+             WakeConditionVariable(&pin->queue_cv);
+-            WakeConditionVariable(&pin->queue_space_cv);
+             WaitForSingleObject(pin->thread, INFINITE);
+             CloseHandle(pin->thread);
+             pin->thread = NULL;
+@@ -1851,6 +1887,7 @@
+             RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+     filter->streaming_cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": filter.streaming_cs");
+     InitializeConditionVariable(&filter->flushing_cv);
++    InitializeConditionVariable(&filter->queue_space_cv);
+ 
+     *out = filter;
+     return S_OK;
