@@ -1,0 +1,190 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] winedmo: Preserve DirectShow MPEG video sequence headers.
+
+The paired Hatsumira traces in #773 show GE10 rendering the MPEG-1 intro,
+while GE11 repeatedly fails decoding with "Invalid frame dimensions 0x0"
+and never delivers a picture to the Video Renderer. The demuxer has
+already extracted a 76-byte sequence header for the 1280x720 stream.
+
+amt_from_winedmo_video() preserves that data in MPEG1VIDEOINFO, but
+transform_init_stream() reduces the input type to a bare MFVIDEOFORMAT.
+This loses the sequence header before libavcodec sees it. MPEG decoding
+cannot rely on container dimensions alone: it needs the sequence header,
+including any quantization matrices, when samples do not repeat it.
+
+Append the declared sequence header to the transform input format using
+the existing extradata convention. Check the declared length against the
+media type buffer and the allocation/decoder size limits before copying.
+Keep the no-header and other format paths unchanged.
+
+Extend the existing MPEG decoder streaming test to also send pictures
+without an in-band sequence header, including across stop/restart, so it
+must use the header supplied in the media type. Preserve the existing
+in-band test coverage.
+
+Reference: https://github.com/GloriousEggroll/proton-ge-custom/issues/773#issuecomment-5985240555
+---
+diff --git a/dlls/winedmo/quartz_transform.c b/dlls/winedmo/quartz_transform.c
+--- a/dlls/winedmo/quartz_transform.c
++++ b/dlls/winedmo/quartz_transform.c
+@@ -189,7 +189,7 @@
+         {
+             const VIDEOINFOHEADER *input_vih = (const VIDEOINFOHEADER *)sink_mt->pbFormat;
+             const VIDEOINFOHEADER *vih = (const VIDEOINFOHEADER *)source_mt->pbFormat;
+-            MFVIDEOFORMAT input_fmt = {0}, output_fmt = {0};
++            MFVIDEOFORMAT input_fmt = {0}, output_fmt = {0}, *input_format = &input_fmt;
+ 
+             input_fmt.dwSize = sizeof(input_fmt);
+             input_fmt.guidFormat = sink_mt->subtype;
+@@ -201,6 +201,26 @@
+                 input_fmt.videoInfo.FramesPerSecond.Denominator = input_vih->AvgTimePerFrame;
+             }
+ 
++            if (IsEqualGUID(&sink_mt->formattype, &FORMAT_MPEGVideo))
++            {
++                const MPEG1VIDEOINFO *mpeg = (const MPEG1VIDEOINFO *)sink_mt->pbFormat;
++
++                if (sink_mt->cbFormat < sizeof(*mpeg)
++                        || mpeg->cbSequenceHeader > sink_mt->cbFormat - offsetof(MPEG1VIDEOINFO, bSequenceHeader)
++                        || mpeg->cbSequenceHeader > INT_MAX - sizeof(input_fmt))
++                    return VFW_E_INVALIDMEDIATYPE;
++
++                /* The sequence header need not be repeated in the compressed samples. */
++                if (mpeg->cbSequenceHeader)
++                {
++                    if (!(input_format = malloc(sizeof(input_fmt) + mpeg->cbSequenceHeader)))
++                        return E_OUTOFMEMORY;
++                    *input_format = input_fmt;
++                    input_format->dwSize += mpeg->cbSequenceHeader;
++                    memcpy(input_format + 1, mpeg->bSequenceHeader, mpeg->cbSequenceHeader);
++                }
++            }
++
+             output_fmt.dwSize = sizeof(output_fmt);
+             output_fmt.guidFormat = source_mt->subtype;
+             output_fmt.videoInfo.dwWidth = vih->bmiHeader.biWidth;
+@@ -214,9 +234,10 @@
+             }
+ 
+             status = winedmo_transform_create(MFMediaType_Video,
+-                    (union winedmo_format *)&input_fmt, sizeof(input_fmt),
++                    (union winedmo_format *)input_format, input_format->dwSize,
+                     (union winedmo_format *)&output_fmt, sizeof(output_fmt),
+                     &filter->winedmo_transform);
++            if (input_format != &input_fmt) free(input_format);
+         }
+         else
+         {
+diff --git a/dlls/quartz/tests/mpegvideo.c b/dlls/quartz/tests/mpegvideo.c
+--- a/dlls/quartz/tests/mpegvideo.c
++++ b/dlls/quartz/tests/mpegvideo.c
+@@ -1351,7 +1351,7 @@
+     IMemAllocator_Release(ret_allocator);
+ }
+ 
+-static void test_send_video(IMemInputPin *input, IMediaSample *sample);
++static void test_send_video(IMemInputPin *input, IMediaSample *sample, BOOL inband_header);
+ 
+ static void test_source_allocator(IFilterGraph2 *graph, IMediaControl *control,
+         IPin *sink, IPin *source, struct testfilter *testsource, struct testfilter *testsink,
+@@ -1483,7 +1483,7 @@
+     ok(hr == S_OK, "Got hr %#lx.\n", hr);
+ 
+     testsink->expected_start_time = -1; /* native returns start and stop 0xff80000000000001 */
+-    test_send_video(input, sample);
++    test_send_video(input, sample, TRUE);
+     ok(testsink->got_sample == 1, "Got %u calls to Receive().\n", testsink->got_sample);
+     ok(!testsink->wrapped_sample, "Sample was not fully released.\n");
+     testsink->got_sample = 0;
+@@ -1578,7 +1578,7 @@
+     ok(hr == S_OK, "Got hr %#lx.\n", hr);
+ }
+ 
+-static void test_send_video(IMemInputPin *input, IMediaSample *sample)
++static void test_send_video(IMemInputPin *input, IMediaSample *sample, BOOL inband_header)
+ {
+     /* gst-launch-1.0 -v videotestsrc pattern=black num-buffers=10 ! video/x-raw,width=32,height=24 ! mpeg2enc ! filesink location=empty-es2.mpg */
+     /* then truncate to taste */
+@@ -1602,11 +1602,12 @@
+     static const BYTE empty_mpg_eos[] = {
+         0x00, 0x00, 0x01, 0xb7,
+     };
++    unsigned int offset = inband_header ? 0 : sizeof(mpg_format.bSequenceHeader);
+     HRESULT hr;
+     IPin *pin;
+ 
+     /* native won't emit anything until an unknown-sized internal buffer is filled, or EOS is announced */
+-    test_send_sample(input, sample, empty_mpg_frames, ARRAY_SIZE(empty_mpg_frames));
++    test_send_sample(input, sample, empty_mpg_frames + offset, sizeof(empty_mpg_frames) - offset);
+     test_send_sample(input, sample, empty_mpg_eos, ARRAY_SIZE(empty_mpg_eos));
+ 
+     hr = IMemInputPin_QueryInterface(input, &IID_IPin, (void **)&pin);
+@@ -1616,7 +1617,8 @@
+     IPin_Release(pin);
+ }
+ 
+-static void test_sample_processing(IMediaControl *control, IMemInputPin *input, struct testfilter *sink)
++static void test_sample_processing(IMediaControl *control, IMemInputPin *input, struct testfilter *sink,
++        BOOL inband_header)
+ {
+     REFERENCE_TIME start, stop;
+     IMemAllocator *allocator;
+@@ -1659,7 +1661,7 @@
+     hr = IMediaSample_SetTime(sample, &sink->expected_start_time, &sink->expected_stop_time);
+     ok(hr == S_OK, "Got hr %#lx.\n", hr);
+ 
+-    test_send_video(input, sample);
++    test_send_video(input, sample, inband_header);
+     ok(sink->got_sample >= 1, "Got %u calls to Receive().\n", sink->got_sample);
+     ok(sink->got_eos == 1, "Got %u calls to EndOfStream().\n", sink->got_eos);
+     sink->got_sample = 0;
+@@ -1675,7 +1677,7 @@
+     ok(hr == S_OK, "Got hr %#lx.\n", hr);
+ 
+     sink->expected_start_time = -1; /* native returns start and stop 0xff80000000000001 */
+-    test_send_video(input, sample);
++    test_send_video(input, sample, inband_header);
+     ok(sink->got_sample >= 1, "Got %u calls to Receive().\n", sink->got_sample);
+     ok(sink->got_eos == 1, "Got %u calls to EndOfStream().\n", sink->got_eos);
+     sink->got_sample = 0;
+@@ -1693,7 +1695,7 @@
+ 
+     sink->expected_start_time = 22222;
+     sink->expected_stop_time = 22222;
+-    test_send_video(input, sample);
++    test_send_video(input, sample, inband_header);
+     ok(sink->got_sample >= 1, "Got %u calls to Receive().\n", sink->got_sample);
+     ok(sink->got_eos == 1, "Got %u calls to EndOfStream().\n", sink->got_eos);
+     sink->got_sample = 0;
+@@ -1762,7 +1764,7 @@
+ 
+     testsink->expected_start_time = 0;
+     testsink->expected_stop_time = 0;
+-    test_send_video(input, sample);
++    test_send_video(input, sample, TRUE);
+     ok(testsink->got_sample >= 1, "Got %u calls to Receive().\n", testsink->got_sample);
+     testsink->got_sample = 0;
+ 
+@@ -1789,7 +1791,7 @@
+ 
+     testsink->expected_start_time = 0;
+     testsink->expected_stop_time = 0;
+-    test_send_video(input, sample);
++    test_send_video(input, sample, TRUE);
+     ok(testsink->got_sample >= 1, "Got %u calls to Receive().\n", testsink->got_sample);
+     testsink->got_sample = 0;
+ 
+@@ -1998,7 +2000,12 @@
+         hr = IMediaControl_Stop(control);
+         ok(hr == S_OK, "%u: Got hr %#lx.\n", i, hr);
+ 
+-        test_sample_processing(control, meminput, &testsink);
++        winetest_push_context("format %u, in-band sequence header", i);
++        test_sample_processing(control, meminput, &testsink, TRUE);
++        winetest_pop_context();
++        winetest_push_context("format %u, media-type sequence header only", i);
++        test_sample_processing(control, meminput, &testsink, FALSE);
++        winetest_pop_context();
+         test_streaming_events(control, sink, meminput, &testsink);
+ 
+         hr = IFilterGraph2_Disconnect(graph, source);
