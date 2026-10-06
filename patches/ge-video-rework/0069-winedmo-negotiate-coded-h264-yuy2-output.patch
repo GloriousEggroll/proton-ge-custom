@@ -1,0 +1,196 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Sun, 4 Oct 2026 18:00:00 -0600
+Subject: [PATCH] winedmo: Preserve coded H.264 dimensions for YUY2 output.
+
+The #787 trace opens Sword/Mov_Skill_30000.mp4, negotiates H.264 to
+YUY2, decodes frames, and delivers them to the sample grabber. FFmpeg
+reports a coded size of 864x480, but the transform keeps advertising
+854x480, stride 1708, and 819840-byte samples. The first decoder format
+change is discarded as a no-op. The other clips in the capture have
+already aligned dimensions (3840x2160 and 1024x1024).
+
+The previous winegstreamer H.264 decoder requested output_plane_align=15.
+The FFmpeg replacement restored forced coded-size negotiation for NV12
+only, leaving YUY2 with the smaller visible size. Extend that handling to
+YUY2 so the output format and sample length agree with the coded size,
+while retaining the visible dimensions in the display aperture.
+
+Convert the visible image without scaling it into the padding. Fill the
+right and bottom YUY2 padding with neutral black rather than stretching
+the image or exposing uninitialized data. Keep this special handling
+restricted to H.264 coded-size output; raw video resizing is unchanged.
+
+Extend the existing alignment regression test to cover both NV12 and YUY2,
+with and without an input frame size. Check the output dimensions, stride,
+display aperture, and delivered sample length.
+
+Reported by JuanmaMSH. Extends Conor McCarthy's H.264 alignment test
+(upstream commit 3fcaa72891e2f222bc402507901ef6be810cfd64).
+
+Bug: https://github.com/GloriousEggroll/proton-ge-custom/issues/787
+Log: https://github.com/GloriousEggroll/proton-ge-custom/issues/787#issuecomment-5981272833
+
+The output-layout regression is established by the trace and existing Wine
+tests; confirmation that this resolves the in-game black preview is pending.
+---
+
+diff --git a/dlls/winedmo/unix_transform.c b/dlls/winedmo/unix_transform.c
+--- a/dlls/winedmo/unix_transform.c
++++ b/dlls/winedmo/unix_transform.c
+@@ -311,10 +311,11 @@
+             && t->avctx->coded_height > height)
+         return false;
+ 
+-    /* H.264 NV12 output must announce the coded size even when the caller
++    /* H.264 NV12 and YUY2 output must announce the coded size even when the caller
+      * selected a smaller placeholder before decoding the first frame. Both
+      * the format change and the copied planes must use the same padded size. */
+-    if (t->avctx->codec_id == AV_CODEC_ID_H264 && t->out_pix_fmt == AV_PIX_FMT_NV12)
++    if (t->avctx->codec_id == AV_CODEC_ID_H264
++            && (t->out_pix_fmt == AV_PIX_FMT_NV12 || t->out_pix_fmt == AV_PIX_FMT_YUYV422))
+         return true;
+ 
+     if (t->out_width > 0 && t->out_height > 0
+@@ -677,20 +678,45 @@
+         /* Pixel-format conversion and scaling via SwsContext. */
+         uint8_t *dst_data[4];
+         int dst_linesize[4];
+-        int sws_flags = (out_width == src_width && out_height == src_height) ? SWS_POINT : SWS_BILINEAR;
++        int convert_width = out_width, convert_height = out_height;
++        bool pad_yuy2 = out_fmt == AV_PIX_FMT_YUYV422 && t->avctx
++                && t->avctx->codec_id == AV_CODEC_ID_H264
++                && out_width == t->avctx->coded_width && out_height == t->avctx->coded_height
++                && out_width >= src_width && out_height >= src_height
++                && out_width - src_width < 16 && out_height - src_height < 16;
++        int sws_flags, ret, x, y;
++
++        /* Coded-size padding is outside the display aperture, not a resize. */
++        if (pad_yuy2)
++        {
++            convert_width = src_width;
++            convert_height = src_height;
++        }
++        sws_flags = (convert_width == src_width && convert_height == src_height) ? SWS_POINT : SWS_BILINEAR;
+ 
+         t->sws = sws_getCachedContext( t->sws,
+                                        src_width, src_height, frame->format,
+-                                       out_width, out_height, out_fmt,
++                                       convert_width, convert_height, out_fmt,
+                                        sws_flags, NULL, NULL, NULL );
+         if (!t->sws) return STATUS_UNSUCCESSFUL;
+ 
+         if (fill_output_image_arrays( t, dst_data, dst_linesize, dst, out_fmt, out_width, out_height ) < 0)
+             return STATUS_UNSUCCESSFUL;
+ 
+-        sws_scale( t->sws,
++        ret = sws_scale( t->sws,
+                    (const uint8_t *const *)frame->data, frame->linesize,
+                    0, src_height, dst_data, dst_linesize );
++        if (ret != convert_height) return STATUS_UNSUCCESSFUL;
++
++        if (pad_yuy2)
++        {
++            for (y = 0; y < out_height; ++y)
++                for (x = y < src_height ? src_width : 0; x < out_width; ++x)
++                {
++                    dst_data[0][y * dst_linesize[0] + 2 * x] = 16;
++                    dst_data[0][y * dst_linesize[0] + 2 * x + 1] = 128;
++                }
++        }
+     }
+     else if (t->out_bottom_up && is_packed_rgb_format( out_fmt ))
+     {
+diff --git a/dlls/mf/tests/transform.c b/dlls/mf/tests/transform.c
+--- a/dlls/mf/tests/transform.c
++++ b/dlls/mf/tests/transform.c
+@@ -5735,7 +5735,7 @@
+     CoUninitialize();
+ }
+ 
+-static void test_h264_decoder_alignment(BOOL input_frame_size)
++static void test_h264_decoder_alignment(BOOL input_frame_size, const GUID *subtype)
+ {
+     static const DWORD actual_width = 82, actual_height = 84;
+     static const DWORD aligned_width = 96, aligned_height = 96;
+@@ -5754,6 +5754,7 @@
+     IMFMediaType *input_type, *output_type;
+     IMFTransform *transform;
+     DWORD output_status, length, output_count = 0;
++    UINT32 sample_size, stride;
+     MFVideoArea aperture;
+     UINT64 frame_size;
+     HRESULT hr;
+@@ -5761,7 +5762,10 @@
+     hr = CoInitialize(NULL);
+     ok(hr == S_OK, "Failed to initialize, hr %#lx.\n", hr);
+ 
+-    winetest_push_context("h264dec alignment, input frame size %u", input_frame_size);
++    winetest_push_context("h264dec alignment, input frame size %u, subtype %s", input_frame_size, debugstr_guid(subtype));
++
++    hr = MFCalculateImageSize(subtype, aligned_width, aligned_height, &sample_size);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+ 
+     if (FAILED(hr = CoCreateInstance(&CLSID_MSH264DecoderMFT, NULL, CLSCTX_INPROC_SERVER,
+             &IID_IMFTransform, (void **)&transform)))
+@@ -5776,7 +5780,7 @@
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+     IMFMediaType_Release(input_type);
+ 
+-    output_type = transform_find_available_output_type(transform, &MFVideoFormat_NV12);
++    output_type = transform_find_available_output_type(transform, subtype);
+     hr = IMFMediaType_GetUINT64(output_type, &MF_MT_FRAME_SIZE, &frame_size);
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+     ok(frame_size == (input_frame_size ? (((UINT64)actual_width << 32) | actual_height)
+@@ -5789,7 +5793,7 @@
+     hr = IMFTransform_ProcessMessage(transform, MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+ 
+-    output_sample = create_sample(NULL, aligned_width * aligned_height * 3 / 2);
++    output_sample = create_sample(NULL, sample_size);
+     output_type = NULL;
+     do
+     {
+@@ -5804,10 +5808,10 @@
+             ok(!!output_type, "Stream change not received.\n");
+             hr = IMFSample_GetTotalLength(output_sample, &length);
+             ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+-            ok(length == aligned_width * aligned_height * 3 / 2, "Unexpected sample length %lu.\n", length);
++            ok(length == sample_size, "Unexpected sample length %lu.\n", length);
+             ++output_count;
+             IMFSample_Release(output_sample);
+-            output_sample = create_sample(NULL, aligned_width * aligned_height * 3 / 2);
++            output_sample = create_sample(NULL, sample_size);
+         }
+         else if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT && h264_encoded_data_len > 4)
+         {
+@@ -5819,11 +5823,16 @@
+         else if (hr == MF_E_TRANSFORM_STREAM_CHANGE)
+         {
+             /* The H.264 decoder sends a format change once the aligned frame size is known. */
+-            output_type = transform_find_available_output_type(transform, &MFVideoFormat_NV12);
++            output_type = transform_find_available_output_type(transform, subtype);
+             hr = IMFMediaType_GetUINT64(output_type, &MF_MT_FRAME_SIZE, &frame_size);
+             ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+             ok(frame_size == (((UINT64)aligned_width << 32) | aligned_height), "Unexpected frame size %#llx\n", frame_size);
+ 
++            hr = IMFMediaType_GetUINT32(output_type, &MF_MT_DEFAULT_STRIDE, &stride);
++            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++            ok(stride == aligned_width * (IsEqualGUID(subtype, &MFVideoFormat_YUY2) ? 2 : 1),
++                    "Unexpected stride %u.\n", stride);
++
+             hr = IMFMediaType_GetBlob(output_type, &MF_MT_MINIMUM_DISPLAY_APERTURE,
+                     (BYTE *)&aperture, sizeof(aperture), NULL);
+             ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+@@ -11704,8 +11713,10 @@
+     test_h264_decoder(FALSE);
+     test_h264_decoder(TRUE);
+     test_h264_decoder_timestamps();
+-    test_h264_decoder_alignment(FALSE);
+-    test_h264_decoder_alignment(TRUE);
++    test_h264_decoder_alignment(FALSE, &MFVideoFormat_NV12);
++    test_h264_decoder_alignment(TRUE, &MFVideoFormat_NV12);
++    test_h264_decoder_alignment(FALSE, &MFVideoFormat_YUY2);
++    test_h264_decoder_alignment(TRUE, &MFVideoFormat_YUY2);
+     test_wmv_encoder();
+     test_wmv_decoder(FALSE);
+     test_wmv_decoder(TRUE);
