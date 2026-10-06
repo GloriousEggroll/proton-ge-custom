@@ -1,0 +1,114 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] winedmo: Keep the selected output type until renegotiation.
+
+The RE4 Hunnigan comparison logs expose a missing source-reader format
+notification. Both decoders discover a coded NV12 size of 336x416 for
+the 328x408 video. Experimental returns the first sample with flags 0x20
+(MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED), while GE returns 0x4
+(NEWSTREAM) without the current-type change.
+
+handle_stream_type_change() was replacing output_type as well as
+stream_type before returning MF_E_TRANSFORM_STREAM_CHANGE. The source
+reader then obtained that already-updated current type and compared it
+with the same newly negotiated type. Its no-op suppression dropped the
+notification and left the reader's current media type unchanged.
+
+Keep the discovered format in stream_type, where GetOutputAvailableType
+can expose it, but retain output_type until SetOutputType accepts the new
+format. This restores the negotiation sequence used by winegstreamer
+without changing the coded dimensions, padding, or pixel conversion.
+
+An application retaining the 408-row layout for a 416-row NV12 buffer can
+read the bottom luma padding as the first chroma rows, consistent with
+the green band at the top of Hunnigan's video.
+
+Extend the H.264 alignment tests for NV12 and YUY2 to verify that the
+current frame size stays unchanged on discovery and changes only after
+SetOutputType. The existing H.264 test also expects the selected current
+type to survive a stream-change report.
+
+Reference: https://github.com/GloriousEggroll/proton-ge-custom/issues/775#issuecomment-6010028983
+Reference: https://learn.microsoft.com/en-us/windows/win32/medfound/handling-stream-changes
+---
+diff --git a/dlls/winedmo/video_decoder.c b/dlls/winedmo/video_decoder.c
+index f73a0508989..2c1234b912d 100644
+--- a/dlls/winedmo/video_decoder.c
++++ b/dlls/winedmo/video_decoder.c
+@@ -1463,11 +1463,10 @@ static HRESULT handle_stream_type_change(struct video_decoder *decoder, BOOL *ch
+     if (decoder->stream_type)
+         IMFMediaType_Release(decoder->stream_type);
+     decoder->stream_type = new_type;
+-    IMFMediaType_AddRef(new_type);
+ 
+-    if (decoder->output_type)
+-        IMFMediaType_Release(decoder->output_type);
+-    decoder->output_type = new_type;
++    /* Advertise the new format without replacing the type selected by the caller.
++     * The source reader compares that old type against the renegotiated type to
++     * decide whether to notify the application of changed frame dimensions. */
+ 
+     if (FAILED(hr = IMFMediaType_GetUINT64(decoder->stream_type, &MF_MT_FRAME_SIZE, &frame_size)))
+         return hr;
+diff --git a/dlls/mf/tests/transform.c b/dlls/mf/tests/transform.c
+index 9eb472a8f61..f551906ac54 100644
+--- a/dlls/mf/tests/transform.c
++++ b/dlls/mf/tests/transform.c
+@@ -5759,12 +5759,12 @@ static void test_h264_decoder_alignment(BOOL input_frame_size, const GUID *subty
+     IMFSample *input_sample, *output_sample;
+     const BYTE *h264_encoded_data;
+     ULONG h264_encoded_data_len;
+-    IMFMediaType *input_type, *output_type;
++    IMFMediaType *input_type, *output_type, *current_type;
+     IMFTransform *transform;
+     DWORD output_status, length, output_count = 0;
+     UINT32 sample_size, stride;
+     MFVideoArea aperture;
+-    UINT64 frame_size;
++    UINT64 frame_size, initial_frame_size;
+     HRESULT hr;
+ 
+     hr = CoInitialize(NULL);
+@@ -5800,6 +5800,7 @@ static void test_h264_decoder_alignment(BOOL input_frame_size, const GUID *subty
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+     ok(frame_size == (input_frame_size ? (((UINT64)actual_width << 32) | actual_height)
+             : (((UINT64)1920 << 32) | 1080)), "Unexpected frame size %#llx\n", frame_size);
++    initial_frame_size = frame_size;
+ 
+     hr = IMFTransform_SetOutputType(transform, 0, output_type, 0);
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+@@ -5837,6 +5838,17 @@ static void test_h264_decoder_alignment(BOOL input_frame_size, const GUID *subty
+         }
+         else if (hr == MF_E_TRANSFORM_STREAM_CHANGE)
+         {
++            /* Discovery updates the available types, not the type selected by the caller. */
++            hr = IMFTransform_GetOutputCurrentType(transform, 0, &current_type);
++            ok(hr == S_OK, "GetOutputCurrentType returned %#lx.\n", hr);
++            if (SUCCEEDED(hr))
++            {
++                hr = IMFMediaType_GetUINT64(current_type, &MF_MT_FRAME_SIZE, &frame_size);
++                ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++                ok(frame_size == initial_frame_size, "Current size changed before negotiation: %#llx.\n", frame_size);
++                IMFMediaType_Release(current_type);
++            }
++
+             /* The H.264 decoder sends a format change once the aligned frame size is known. */
+             output_type = transform_find_available_output_type(transform, subtype);
+             hr = IMFMediaType_GetUINT64(output_type, &MF_MT_FRAME_SIZE, &frame_size);
+@@ -5858,6 +5870,17 @@ static void test_h264_decoder_alignment(BOOL input_frame_size, const GUID *subty
+             hr = IMFTransform_SetOutputType(transform, 0, output_type, 0);
+             ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+             IMFMediaType_Release(output_type);
++
++            hr = IMFTransform_GetOutputCurrentType(transform, 0, &current_type);
++            ok(hr == S_OK, "GetOutputCurrentType returned %#lx.\n", hr);
++            if (SUCCEEDED(hr))
++            {
++                hr = IMFMediaType_GetUINT64(current_type, &MF_MT_FRAME_SIZE, &frame_size);
++                ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++                ok(frame_size == (((UINT64)aligned_width << 32) | aligned_height),
++                        "Current size was not updated by negotiation: %#llx.\n", frame_size);
++                IMFMediaType_Release(current_type);
++            }
+         }
+     } while (hr == S_OK);
+ 

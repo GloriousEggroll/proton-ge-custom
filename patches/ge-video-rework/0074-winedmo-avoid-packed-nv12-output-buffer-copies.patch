@@ -1,0 +1,195 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] winedmo: Avoid linearizing tightly packed NV12 output buffers.
+
+RE4's slow intro log shows the H.264 decoder returning correctly spaced
+29.97 fps timestamps, but delivering 4K frames well behind real time.
+ProcessOutput locks its caller's 2D NV12 buffer through IMFMediaBuffer,
+which copies the entire image into a temporary linear buffer and back.
+This also happens when the decoder only reports NEED_MORE_INPUT.
+
+Use a write-only IMF2DBuffer2 lock for NV12 when the pitch, first row,
+and complete allocation size match the packed image exactly. Otherwise
+keep the existing contiguous-buffer path. Checking the complete size
+also avoids treating a texture with extra rows as packed: its UV plane
+would start at a different offset. Leave negative strides, other pixel
+formats, and padded rows on the existing path.
+
+Release the old buffer reference before retrying with a decoder-owned
+sample when locking the caller's sample fails.
+
+Existing H.264 tests cover packed 1D and 128-pixel-wide 2D NV12 output.
+Extend the 96-pixel alignment tests to exercise the padded 2D fallback
+as well. This change does not alter timestamps, cropping, or the coded
+output dimensions; the reported Hunnigan green line needs separate
+comparison with the working decoder.
+
+Reference: https://github.com/GloriousEggroll/proton-ge-custom/issues/775#issuecomment-6002062772
+Reference: https://learn.microsoft.com/en-us/windows/win32/api/mfobjects/nf-mfobjects-imfmediabuffer-lock
+---
+diff --git a/dlls/winedmo/video_decoder.c b/dlls/winedmo/video_decoder.c
+index ffc176728cd..f73a0508989 100644
+--- a/dlls/winedmo/video_decoder.c
++++ b/dlls/winedmo/video_decoder.c
+@@ -1478,6 +1478,41 @@ static HRESULT handle_stream_type_change(struct video_decoder *decoder, BOOL *ch
+     return S_OK;
+ }
+ 
++static HRESULT lock_decoder_output_buffer(IMFMediaBuffer *buffer, const GUID *subtype, UINT64 frame_size,
++        UINT32 sample_size, BYTE **data, IMF2DBuffer2 **buffer_2d)
++{
++    UINT32 width = frame_size >> 32, height = frame_size;
++    BYTE *scanline, *start;
++    IMF2DBuffer2 *buffer2;
++    DWORD length;
++    LONG pitch;
++    HRESULT hr;
++
++    *buffer_2d = NULL;
++
++    /* Lock() copies the whole 2D image both in and out, even when the decoder
++     * has no frame ready. Write directly only if the NV12 planes match the
++     * packed layout expected by the Unix decoder, including the UV offset. */
++    if (IsEqualGUID(subtype, &MFVideoFormat_NV12) && !(width & 1) && !(height & 1)
++            && SUCCEEDED(IMFMediaBuffer_QueryInterface(buffer, &IID_IMF2DBuffer2, (void **)&buffer2)))
++    {
++        hr = IMF2DBuffer2_Lock2DSize(buffer2, MF2DBuffer_LockFlags_Write, &scanline, &pitch, &start, &length);
++        if (SUCCEEDED(hr))
++        {
++            if (pitch > 0 && pitch == width && scanline == start && length == sample_size)
++            {
++                *data = start;
++                *buffer_2d = buffer2;
++                return S_OK;
++            }
++            IMF2DBuffer2_Unlock2D(buffer2);
++        }
++        IMF2DBuffer2_Release(buffer2);
++    }
++
++    return IMFMediaBuffer_Lock(buffer, data, NULL, NULL);
++}
++
+ static HRESULT WINAPI transform_ProcessOutput(IMFTransform *iface, DWORD flags, DWORD count,
+         MFT_OUTPUT_DATA_BUFFER *samples, DWORD *status)
+ {
+@@ -1486,6 +1521,7 @@ static HRESULT WINAPI transform_ProcessOutput(IMFTransform *iface, DWORD flags,
+     LONGLONG duration, sample_duration;
+     IMFSample *sample, *provided_sample = NULL, *decode_sample = NULL;
+     IMFMediaBuffer *buffer = NULL;
++    IMF2DBuffer2 *buffer_2d;
+     UINT64 frame_size, frame_rate;
+     GUID subtype;
+     BYTE *data;
+@@ -1524,14 +1560,16 @@ static HRESULT WINAPI transform_ProcessOutput(IMFTransform *iface, DWORD flags,
+     }
+ 
+     if (FAILED(hr = IMFSample_ConvertToContiguousBuffer(sample, &buffer)) ||
+-            FAILED(hr = IMFMediaBuffer_Lock(buffer, &data, NULL, NULL)))
++            FAILED(hr = lock_decoder_output_buffer(buffer, &subtype, frame_size, sample_size, &data, &buffer_2d)))
+     {
+         if (decode_sample || FAILED(hr = create_decoder_output_sample(decoder, &subtype, frame_size, sample_size, &decode_sample)))
+             goto done;
+ 
++        if (buffer) IMFMediaBuffer_Release(buffer);
++        buffer = NULL;
+         sample = decode_sample;
+         if (FAILED(hr = IMFSample_ConvertToContiguousBuffer(sample, &buffer)) ||
+-                FAILED(hr = IMFMediaBuffer_Lock(buffer, &data, NULL, NULL)))
++                FAILED(hr = lock_decoder_output_buffer(buffer, &subtype, frame_size, sample_size, &data, &buffer_2d)))
+             goto done;
+     }
+ 
+@@ -1541,7 +1579,13 @@ static HRESULT WINAPI transform_ProcessOutput(IMFTransform *iface, DWORD flags,
+     if (!ntstatus && !(out_flags & WINEDMO_SAMPLE_FLAG_FORMAT_CHANGED)
+             && (IsEqualGUID(&subtype, &MFVideoFormat_RGB32) || IsEqualGUID(&subtype, &MFVideoFormat_ARGB32)))
+         fill_32bit_alpha_bytes(data, out_size);
+-    IMFMediaBuffer_Unlock(buffer);
++    if (buffer_2d)
++    {
++        IMF2DBuffer2_Unlock2D(buffer_2d);
++        IMF2DBuffer2_Release(buffer_2d);
++    }
++    else
++        IMFMediaBuffer_Unlock(buffer);
+ 
+     if (!ntstatus && (out_flags & WINEDMO_SAMPLE_FLAG_FORMAT_CHANGED))
+     {
+diff --git a/dlls/mf/tests/transform.c b/dlls/mf/tests/transform.c
+index e12250a131d..9eb472a8f61 100644
+--- a/dlls/mf/tests/transform.c
++++ b/dlls/mf/tests/transform.c
+@@ -5735,7 +5735,7 @@ failed:
+     CoUninitialize();
+ }
+ 
+-static void test_h264_decoder_alignment(BOOL input_frame_size, const GUID *subtype)
++static void test_h264_decoder_alignment(BOOL input_frame_size, const GUID *subtype, BOOL use_2d_buffer)
+ {
+     static const DWORD actual_width = 82, actual_height = 84;
+     static const DWORD aligned_width = 96, aligned_height = 96;
+@@ -5748,6 +5748,14 @@ static void test_h264_decoder_alignment(BOOL input_frame_size, const GUID *subty
+         {0},
+     };
+ 
++    const struct attribute_desc buffer_desc[] =
++    {
++        ATTR_GUID(MF_MT_MAJOR_TYPE, MFMediaType_Video),
++        ATTR_GUID(MF_MT_SUBTYPE, *subtype),
++        ATTR_RATIO(MF_MT_FRAME_SIZE, aligned_width, aligned_height),
++        {0},
++    };
++
+     IMFSample *input_sample, *output_sample;
+     const BYTE *h264_encoded_data;
+     ULONG h264_encoded_data_len;
+@@ -5762,7 +5770,14 @@ static void test_h264_decoder_alignment(BOOL input_frame_size, const GUID *subty
+     hr = CoInitialize(NULL);
+     ok(hr == S_OK, "Failed to initialize, hr %#lx.\n", hr);
+ 
+-    winetest_push_context("h264dec alignment, input frame size %u, subtype %s", input_frame_size, debugstr_guid(subtype));
++    winetest_push_context("h264dec alignment, input frame size %u, subtype %s, %s", input_frame_size,
++            debugstr_guid(subtype), use_2d_buffer ? "2d" : "1d");
++
++    if (use_2d_buffer && !pMFCreateMediaBufferFromMediaType)
++    {
++        win_skip("MFCreateMediaBufferFromMediaType is unavailable.\n");
++        goto failed;
++    }
+ 
+     hr = MFCalculateImageSize(subtype, aligned_width, aligned_height, &sample_size);
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+@@ -5793,7 +5808,7 @@ static void test_h264_decoder_alignment(BOOL input_frame_size, const GUID *subty
+     hr = IMFTransform_ProcessMessage(transform, MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+ 
+-    output_sample = create_sample(NULL, sample_size);
++    output_sample = create_sample_(NULL, sample_size, use_2d_buffer ? buffer_desc : NULL);
+     output_type = NULL;
+     do
+     {
+@@ -5811,7 +5826,7 @@ static void test_h264_decoder_alignment(BOOL input_frame_size, const GUID *subty
+             ok(length == sample_size, "Unexpected sample length %lu.\n", length);
+             ++output_count;
+             IMFSample_Release(output_sample);
+-            output_sample = create_sample(NULL, sample_size);
++            output_sample = create_sample_(NULL, sample_size, use_2d_buffer ? buffer_desc : NULL);
+         }
+         else if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT && h264_encoded_data_len > 4)
+         {
+@@ -11713,10 +11728,12 @@ START_TEST(transform)
+     test_h264_decoder(FALSE);
+     test_h264_decoder(TRUE);
+     test_h264_decoder_timestamps();
+-    test_h264_decoder_alignment(FALSE, &MFVideoFormat_NV12);
+-    test_h264_decoder_alignment(TRUE, &MFVideoFormat_NV12);
+-    test_h264_decoder_alignment(FALSE, &MFVideoFormat_YUY2);
+-    test_h264_decoder_alignment(TRUE, &MFVideoFormat_YUY2);
++    test_h264_decoder_alignment(FALSE, &MFVideoFormat_NV12, FALSE);
++    test_h264_decoder_alignment(TRUE, &MFVideoFormat_NV12, FALSE);
++    test_h264_decoder_alignment(FALSE, &MFVideoFormat_NV12, TRUE);
++    test_h264_decoder_alignment(TRUE, &MFVideoFormat_NV12, TRUE);
++    test_h264_decoder_alignment(FALSE, &MFVideoFormat_YUY2, FALSE);
++    test_h264_decoder_alignment(TRUE, &MFVideoFormat_YUY2, FALSE);
+     test_wmv_encoder();
+     test_wmv_decoder(FALSE);
+     test_wmv_decoder(TRUE);

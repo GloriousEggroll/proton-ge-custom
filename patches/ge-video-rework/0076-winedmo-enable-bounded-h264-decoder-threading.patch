@@ -1,0 +1,190 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] winedmo: Enable bounded H.264 decoder threading.
+
+The RE4 intro recordings in #775 still show slower frame delivery after
+removing the packed NV12 round-trip copies. In a moving one-second
+section of the 60 Hz recordings, GE advances through about 19 images
+while Experimental advances through 30. Matching the image content also
+shows GE falling progressively behind, rather than just starting late.
+
+The earlier Experimental trace configures avdec_h264 with max-threads=12.
+Our libavcodec context retains the default thread_count=1. Restore
+bounded H.264 decoding parallelism using the available CPU count, with
+the same 16-thread / 4-thread caps used by winegstreamer. This addresses
+a concrete performance difference; playback still needs runtime
+comparison on the reporter's system.
+
+Forward MF_LOW_LATENCY through the internal transform creation call.
+Allow frame and slice threading for normal MF playback, but only slice
+threading for low-latency callers. Preserve the exported creation API
+and its existing no-frame-threading latency for other callers. WMV and
+audio threading are unchanged.
+
+Drain the short H.264 alignment fixture before requiring output, since
+frame threading may buffer all its pictures until end-of-stream. The
+existing low-latency H.264 tests exercise the slice-threaded path.
+
+Leave the output-buffer fast path and current-type negotiation fixes
+from 0074/0075 unchanged.
+
+Reference: https://github.com/GloriousEggroll/proton-ge-custom/issues/775#issuecomment-6011041199
+---
+diff --git a/dlls/winedmo/main.c b/dlls/winedmo/main.c
+--- a/dlls/winedmo/main.c
++++ b/dlls/winedmo/main.c
+@@ -620,10 +620,10 @@
+  * winedmo_transform_* functions (from winedmo/main.c)
+  * ------------------------------------------------------------------------- */
+ 
+-NTSTATUS CDECL winedmo_transform_create( GUID major_type,
+-                                         const union winedmo_format *input_format,  UINT32 input_format_size,
+-                                         const union winedmo_format *output_format, UINT32 output_format_size,
+-                                         struct winedmo_transform *transform )
++NTSTATUS winedmo_transform_create_with_latency( GUID major_type,
++        const union winedmo_format *input_format, UINT32 input_format_size,
++        const union winedmo_format *output_format, UINT32 output_format_size,
++        BOOL low_latency, struct winedmo_transform *transform )
+ {
+     struct transform_create_params params =
+     {
+@@ -632,6 +632,7 @@
+         .input_format_size  = input_format_size,
+         .output_format      = (UINT_PTR)output_format,
+         .output_format_size = output_format_size,
++        .low_latency        = low_latency,
+     };
+     NTSTATUS status;
+ 
+@@ -650,6 +651,16 @@
+     return STATUS_SUCCESS;
+ }
+ 
++NTSTATUS CDECL winedmo_transform_create( GUID major_type,
++        const union winedmo_format *input_format, UINT32 input_format_size,
++        const union winedmo_format *output_format, UINT32 output_format_size,
++        struct winedmo_transform *transform )
++{
++    /* Keep the existing latency of callers which do not supply MF attributes. */
++    return winedmo_transform_create_with_latency( major_type, input_format, input_format_size,
++            output_format, output_format_size, TRUE, transform );
++}
++
+ NTSTATUS CDECL winedmo_transform_destroy( struct winedmo_transform transform )
+ {
+     struct transform_destroy_params params = {.transform = transform};
+diff --git a/dlls/winedmo/unix_transform.c b/dlls/winedmo/unix_transform.c
+--- a/dlls/winedmo/unix_transform.c
++++ b/dlls/winedmo/unix_transform.c
+@@ -31,6 +31,7 @@
+ 
+ #include <stdbool.h>
+ #include <inttypes.h>
++#include <libavutil/cpu.h>
+ #include <libavutil/imgutils.h>
+ #include <libavutil/samplefmt.h>
+ #include <libswscale/swscale.h>
+@@ -920,7 +921,16 @@
+             t->avctx->framerate.den = t->input_fps_den;
+         }
+ 
+-        if (is_wmv_video_codec( codec_id ))
++        if (codec_id == AV_CODEC_ID_H264)
++        {
++            int thread_count = av_cpu_count();
++
++            /* libavcodec defaults to one thread. Bound the worker count like
++             * winegstreamer, without adding frame latency to low-latency callers. */
++            t->avctx->thread_count = max( 1, min( thread_count, sizeof(void *) == 4 ? 4 : 16 ) );
++            t->avctx->thread_type = params->low_latency ? FF_THREAD_SLICE : FF_THREAD_SLICE | FF_THREAD_FRAME;
++        }
++        else if (is_wmv_video_codec( codec_id ))
+         {
+             t->avctx->thread_count = 1;
+             t->avctx->thread_type = 0;
+@@ -947,6 +957,9 @@
+         return STATUS_NOT_SUPPORTED;
+     }
+ 
++    TRACE( "opened %s decoder, threads %d, active thread type %#x, low latency %u\n",
++           codec->name, t->avctx->thread_count, t->avctx->active_thread_type, params->low_latency );
++
+     /* MF H.264 elementary streams may split one Annex-B access unit across
+      * multiple input samples.  Preserve those fragments until complete. */
+     if (!t->is_audio && (codec_id == AV_CODEC_ID_MPEG1VIDEO || codec_id == AV_CODEC_ID_MPEG2VIDEO
+diff --git a/dlls/winedmo/unixlib.h b/dlls/winedmo/unixlib.h
+--- a/dlls/winedmo/unixlib.h
++++ b/dlls/winedmo/unixlib.h
+@@ -160,6 +160,7 @@
+     UINT32 input_format_size;
+     UINT64 output_format;      /* pointer to union winedmo_format, or 0 */
+     UINT32 output_format_size;
++    UINT32 low_latency;
+     struct winedmo_transform transform;
+ };
+ 
+diff --git a/dlls/winedmo/video_decoder.c b/dlls/winedmo/video_decoder.c
+--- a/dlls/winedmo/video_decoder.c
++++ b/dlls/winedmo/video_decoder.c
+@@ -577,6 +577,7 @@
+ {
+     union winedmo_format *input_fmt = NULL, *output_fmt = NULL;
+     UINT32 input_size, output_size;
++    UINT32 low_latency = FALSE;
+     NTSTATUS status;
+     HRESULT hr;
+ 
+@@ -591,9 +592,10 @@
+     if (FAILED(hr = create_mfvideoformat(output_type, &output_fmt, &output_size)))
+         goto done;
+ 
+-    status = winedmo_transform_create(MFMediaType_Video,
++    IMFAttributes_GetUINT32(decoder->attributes, &MF_LOW_LATENCY, &low_latency);
++    status = winedmo_transform_create_with_latency(MFMediaType_Video,
+             input_fmt, input_size, output_fmt, output_size,
+-            &decoder->winedmo_transform);
++            low_latency, &decoder->winedmo_transform);
+     if (status) WARN("winedmo_transform_create failed, status %#lx\n", status);
+     hr = status ? E_FAIL : S_OK;
+ 
+diff --git a/dlls/winedmo/winedmo_private.h b/dlls/winedmo/winedmo_private.h
+--- a/dlls/winedmo/winedmo_private.h
++++ b/dlls/winedmo/winedmo_private.h
+@@ -41,6 +41,13 @@
+ 
+ bool array_reserve(void **elements, size_t *capacity, size_t count, size_t size);
+ 
++union winedmo_format;
++struct winedmo_transform;
++NTSTATUS winedmo_transform_create_with_latency(GUID major_type,
++        const union winedmo_format *input_format, UINT32 input_format_size,
++        const union winedmo_format *output_format, UINT32 output_format_size,
++        BOOL low_latency, struct winedmo_transform *transform);
++
+ #define MEDIATIME_FROM_BYTES(x) ((LONGLONG)(x) * 10000000)
+ 
+ static inline BOOL is_mf_video_area_empty(const MFVideoArea *area)
+diff --git a/dlls/mf/tests/transform.c b/dlls/mf/tests/transform.c
+--- a/dlls/mf/tests/transform.c
++++ b/dlls/mf/tests/transform.c
+@@ -5765,6 +5765,7 @@
+     UINT32 sample_size, stride;
+     MFVideoArea aperture;
+     UINT64 frame_size, initial_frame_size;
++    BOOL draining = FALSE;
+     HRESULT hr;
+ 
+     hr = CoInitialize(NULL);
+@@ -5836,6 +5837,13 @@
+             ok(hr == S_OK, "ProcessInput returned %#lx\n", hr);
+             IMFSample_Release(input_sample);
+         }
++        else if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT && !draining)
++        {
++            /* Frame-threaded decoders can retain the whole short test stream. */
++            hr = IMFTransform_ProcessMessage(transform, MFT_MESSAGE_COMMAND_DRAIN, 0);
++            ok(hr == S_OK, "ProcessMessage returned %#lx\n", hr);
++            draining = TRUE;
++        }
+         else if (hr == MF_E_TRANSFORM_STREAM_CHANGE)
+         {
+             /* Discovery updates the available types, not the type selected by the caller. */
