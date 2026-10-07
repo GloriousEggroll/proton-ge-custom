@@ -1,0 +1,115 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] winedmo: Preserve bitrate-based durations for seekable MPEG audio.
+
+The T4C Neerya log shows FFmpeg detecting sadness_new.mp3 as a finite
+320 kbit/s file with a duration of 279.353475 seconds. The media backend
+then rejects that duration solely because it was estimated from bitrate.
+
+The DirectShow splitter consequently returns E_NOTIMPL for GetDuration
+and GetStopPosition. The graph has a zero stop position, and its current
+position remains clamped to zero. The application repeatedly seeks back
+to zero and restarts the graph, interrupting the music.
+
+Accept the estimate for raw MPEG audio when the input is seekable, has
+a known positive size, and has a positive duration. MP3 files without a
+Xing/VBRI header need this estimate. Keep the existing ASF, raw video,
+and live-stream duration rules unchanged.
+
+Extend the existing constant-bitrate MP3 duration test to cover small
+files with and without ID3v2 padding, as well as the original large
+file. Check the default stop position and available range too.
+
+Reference: https://github.com/GloriousEggroll/proton-ge-custom/issues/681
+
+---
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+index 606e484..d16212c 100644
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -600,6 +600,13 @@ static INT64 get_context_duration( const AVFormatContext *ctx )
+ 
+     if (ctx->duration_estimation_method == AVFMT_DURATION_FROM_BITRATE)
+     {
++        /* MPEG audio without a Xing/VBRI header has no duration other than the
++         * bitrate estimate. Do not turn a finite, seekable file into a stream
++         * with no duration or stop position. */
++        if (ctx->iformat && !strcmp( ctx->iformat->name, "mp3" ) && ctx->pb &&
++                (ctx->pb->seekable & AVIO_SEEKABLE_NORMAL) && ctx->duration > 0 && avio_size( ctx->pb ) > 0)
++            return get_user_time( ctx->duration, AV_TIME_BASE_Q );
++
+         duration = get_asf_header_duration( (AVFormatContext *)ctx );
+         if (duration != AV_NOPTS_VALUE)
+             return duration;
+diff --git a/dlls/quartz/tests/mpegsplit.c b/dlls/quartz/tests/mpegsplit.c
+index 934a66d..910045c 100644
+--- a/dlls/quartz/tests/mpegsplit.c
++++ b/dlls/quartz/tests/mpegsplit.c
+@@ -1906,12 +1906,13 @@ static void test_streaming(void)
+     ok(ret, "Failed to delete file, error %lu.\n", GetLastError());
+ }
+ 
+-static void test_large_file(void)
++static void test_mp3_duration(unsigned int blocks, BOOL tagged)
+ {
+     static const BYTE frame[96] = {0xff, 0xfb, 0x14, 0xc4};
++    static const BYTE id3[2124] = {'I', 'D', '3', 2, 0, 0, 0, 0, 0x10, 0x42};
+     IBaseFilter *filter = create_mpeg_splitter();
+     static WCHAR path[MAX_PATH];
+-    REFERENCE_TIME duration;
++    REFERENCE_TIME duration, stop, earliest, latest;
+     IMediaSeeking *seeking;
+     IFilterGraph2 *graph;
+     unsigned int i;
+@@ -1923,14 +1924,18 @@ static void test_large_file(void)
+     FILE *f;
+ 
+     GetTempPathW(ARRAY_SIZE(path), path);
+-    wcscat(path, L"big_test.mp3");
++    wcscat(path, L"duration_test.mp3");
+ 
++    /* Constant-bitrate MPEG audio with no Xing/VBRI duration header. Each
++     * block contains 24 seconds at 32 kbit/s and 48 kHz. */
+     /* allocate a larger buffer so I/O is faster on the testbot */
+     buffer = malloc(1000 * sizeof(frame));
+     for (i = 0; i < 1000; ++i)
+         memcpy(buffer + i * 96, frame, sizeof(frame));
+-    f = _wfopen(path, L"w");
+-    for (i = 0; i < 100; ++i)
++    f = _wfopen(path, L"wb");
++    if (tagged)
++        fwrite(id3, sizeof(id3), 1, f);
++    for (i = 0; i < blocks; ++i)
+         fwrite(buffer, 1000 * sizeof(frame), 1, f);
+     fclose(f);
+     free(buffer);
+@@ -1942,7 +1947,18 @@ static void test_large_file(void)
+     duration = 0xdeadbeef;
+     hr = IMediaSeeking_GetDuration(seeking, &duration);
+     ok(hr == S_OK, "Got hr %#lx.\n", hr);
+-    ok(duration == 2400 * 10000000ull, "Got duration %I64d.\n", duration);
++    ok(duration == blocks * 24 * 10000000ull, "Got duration %I64d.\n", duration);
++
++    stop = 0xdeadbeef;
++    hr = IMediaSeeking_GetStopPosition(seeking, &stop);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    ok(stop == duration, "Expected stop %I64d, got %I64d.\n", duration, stop);
++
++    earliest = latest = 0xdeadbeef;
++    hr = IMediaSeeking_GetAvailable(seeking, &earliest, &latest);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    ok(!earliest, "Got earliest %I64d.\n", earliest);
++    ok(latest == duration, "Expected latest %I64d, got %I64d.\n", duration, latest);
+ 
+     IMediaSeeking_Release(seeking);
+     IPin_Release(source);
+@@ -2292,7 +2308,9 @@ START_TEST(mpegsplit)
+     test_connect_pin();
+     test_seeking();
+     test_streaming();
+-    test_large_file();
++    test_mp3_duration(1, FALSE);
++    test_mp3_duration(1, TRUE);
++    test_mp3_duration(100, FALSE);
+     test_video_file();
+     test_mpeg_audio_connection(L"test.mpg");
+     test_mpeg_audio_connection(L"test2.mpg");
