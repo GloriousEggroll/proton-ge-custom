@@ -339,6 +339,15 @@ apply_all_in_dir() {
     echo "WINE: -HOTFIX- Support SHA-256 certificate hash properties for MTA"
     apply_patch "../patches/wine-hotfixes/mta-certificate/0001-crypt32-support-sha256-certificate-properties.patch"
 
+    echo "WINE: -HOTFIX- Register Direct2D Tint effect properties for Le Mans Ultimate"
+    apply_patch "../patches/wine-hotfixes/pending/d2d1-register-tint-effect.patch"
+
+    echo "WINE: -HOTFIX- Render Direct2D sprites, Tint output and layers for Le Mans Ultimate"
+    apply_patch "../patches/wine-hotfixes/pending/d2d1-render-bitmap-sprites-tint-and-layers.patch"
+
+    echo "WINE: -HOTFIX- Isolate Direct2D target clips for Le Mans Ultimate text rendering"
+    apply_patch "../patches/wine-hotfixes/pending/d2d1-isolate-target-clip-stacks.patch"
+
     echo "WINE: -HOTFIX- Add GetFileVersionInfoByHandle version export stub"
     apply_patch "../patches/wine-hotfixes/pending/version-GetFileVersionInfoByHandle-stub.patch"
 

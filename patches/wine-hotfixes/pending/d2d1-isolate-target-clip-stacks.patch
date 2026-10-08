@@ -1,0 +1,369 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] d2d1: Isolate clipping across device context targets.
+
+Le Mans Ultimate switches from the HUD target to small text-cache bitmaps
+while axis-aligned clips and layers remain pushed on the HUD. Applying
+those screen-space clips to the offscreen bitmaps clips away the glyphs
+before they can be composited back. The log in #777 comment 6039633686
+shows these SetTarget / DrawTextLayout / SetTarget / DrawBitmap sequences.
+
+Restore the target-isolation behavior from Oleg Makarenko's
+<oleg@makarenk.ooo> JacKeTUs/wine commit
+299533217d17d10daace0c895aeebd642a889286 ("d2d1: Move clip stack to bitmap"),
+which was omitted from the earlier GE rendering adaptation.
+
+Keep ownership in the device context rather than sharing mutable clipping
+state through bitmap resources: associate each active clip with its target,
+retain that target until the clip is popped, intersect only matching clips,
+and restore the matching clip when switching back. Track layer clip depths
+per target as well, including error cleanup. Command-list clips remain
+recorded in the command list and do not affect bitmap rendering.
+
+Add pixel regression coverage for drawing to a small offscreen target
+under an existing HUD clip, switching back, independent pops, active
+layers, and unbalanced-layer cleanup after a target change.
+The tests still need runtime validation on Wine and native Windows.
+
+Requires d2d1-render-bitmap-sprites-tint-and-layers.patch first.
+
+Reference: https://github.com/GloriousEggroll/proton-ge-custom/issues/777#issuecomment-6039633686
+Based-on: https://github.com/JacKeTUs/wine/commit/299533217d17d10daace0c895aeebd642a889286
+
+---
+diff --git a/dlls/d2d1/d2d1_private.h b/dlls/d2d1/d2d1_private.h
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -64,7 +64,12 @@
+ 
+ struct d2d_clip_stack
+ {
+-    D2D1_RECT_F *stack;
++    struct d2d_clip_entry
++    {
++        ID2D1Image *target;
++        D2D1_RECT_F rect;
++        size_t depth;
++    } *stack;
+     size_t size;
+     size_t count;
+ };
+diff --git a/dlls/d2d1/device.c b/dlls/d2d1/device.c
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -95,29 +95,66 @@
+ 
+ static void d2d_clip_stack_cleanup(struct d2d_clip_stack *stack)
+ {
++    while (stack->count)
++        ID2D1Image_Release(stack->stack[--stack->count].target);
+     free(stack->stack);
+ }
+ 
+-static BOOL d2d_clip_stack_push(struct d2d_clip_stack *stack, const D2D1_RECT_F *rect)
++static const struct d2d_clip_entry *d2d_clip_stack_top(const struct d2d_clip_stack *stack, ID2D1Image *target)
+ {
+-    D2D1_RECT_F r;
++    size_t i = stack->count;
++
++    while (i--)
++        if (stack->stack[i].target == target)
++            return &stack->stack[i];
++    return NULL;
++}
++
++static size_t d2d_clip_stack_depth(const struct d2d_clip_stack *stack, ID2D1Image *target)
++{
++    const struct d2d_clip_entry *entry = d2d_clip_stack_top(stack, target);
++
++    return entry ? entry->depth : 0;
++}
++
++static BOOL d2d_clip_stack_push(struct d2d_clip_stack *stack, ID2D1Image *target, const D2D1_RECT_F *rect)
++{
++    const struct d2d_clip_entry *prev;
++    struct d2d_clip_entry *entry;
+ 
+     if (!d2d_array_reserve((void **)&stack->stack, &stack->size, stack->count + 1, sizeof(*stack->stack)))
+         return FALSE;
+ 
+-    r = *rect;
+-    if (stack->count)
+-        d2d_rect_intersect(&r, &stack->stack[stack->count - 1]);
+-    stack->stack[stack->count++] = r;
++    /* SetTarget suspends the old target's clips; it must not clip offscreen draws. */
++    prev = d2d_clip_stack_top(stack, target);
++    entry = &stack->stack[stack->count++];
++    entry->target = target;
++    ID2D1Image_AddRef(target);
++    entry->rect = *rect;
++    entry->depth = prev ? prev->depth + 1 : 1;
++    if (prev)
++        d2d_rect_intersect(&entry->rect, &prev->rect);
+ 
+     return TRUE;
+ }
+ 
+-static void d2d_clip_stack_pop(struct d2d_clip_stack *stack)
++static void d2d_clip_stack_pop(struct d2d_clip_stack *stack, ID2D1Image *target)
+ {
+-    if (!stack->count)
++    const struct d2d_clip_entry *entry = d2d_clip_stack_top(stack, target);
++    size_t i;
++
++    if (!entry)
+         return;
++    i = entry - stack->stack;
++    ID2D1Image_Release(entry->target);
+     --stack->count;
++    memmove(&stack->stack[i], &stack->stack[i + 1], (stack->count - i) * sizeof(*stack->stack));
++}
++
++static void d2d_clip_stack_restore(struct d2d_clip_stack *stack, ID2D1Image *target, size_t depth)
++{
++    while (d2d_clip_stack_depth(stack, target) > depth)
++        d2d_clip_stack_pop(stack, target);
+ }
+ 
+ static void d2d_layer_state_release(struct d2d_layer_state *state)
+@@ -160,6 +197,7 @@
+     ID3D11DeviceContext1 *context;
+     ID3D11Buffer *vs_cb = render_target->vs_cb, *ps_cb = render_target->ps_cb;
+     D3D11_RECT scissor_rect;
++    const struct d2d_clip_entry *clip;
+     unsigned int offset;
+     D3D11_VIEWPORT vp;
+     struct d2d_bitmap *target = d2d_device_context_get_draw_bitmap(render_target);
+@@ -187,11 +225,11 @@
+     ID3D11DeviceContext1_PSSetConstantBuffers(context, 0, 1, &ps_cb);
+     ID3D11DeviceContext1_PSSetShader(context, render_target->ps, NULL, 0);
+     ID3D11DeviceContext1_RSSetViewports(context, 1, &vp);
+-    if (render_target->clip_stack.count)
++    if ((clip = d2d_clip_stack_top(&render_target->clip_stack, render_target->target.object)))
+     {
+         const D2D1_RECT_F *clip_rect;
+ 
+-        clip_rect = &render_target->clip_stack.stack[render_target->clip_stack.count - 1];
++        clip_rect = &clip->rect;
+         scissor_rect.left = ceilf(clip_rect->left - 0.5f);
+         scissor_rect.top = ceilf(clip_rect->top - 0.5f);
+         scissor_rect.right = ceilf(clip_rect->right - 0.5f);
+@@ -1928,8 +1966,8 @@
+     bounds.top = max(0.0f, min(bounds.top, context->pixel_size.height));
+     bounds.right = max(bounds.left, min(bounds.right, context->pixel_size.width));
+     bounds.bottom = max(bounds.top, min(bounds.bottom, context->pixel_size.height));
+-    state->clip_depth = context->clip_stack.count;
+-    if (!d2d_clip_stack_push(&context->clip_stack, &bounds))
++    state->clip_depth = d2d_clip_stack_depth(&context->clip_stack, context->target.object);
++    if (!d2d_clip_stack_push(&context->clip_stack, context->target.object, &bounds))
+     {
+         d2d_device_context_set_error(context, E_OUTOFMEMORY);
+         return;
+@@ -1941,7 +1979,7 @@
+ 
+         if (InterlockedCompareExchange(&layer->in_use, 1, 0))
+         {
+-            context->clip_stack.count = state->clip_depth;
++            d2d_clip_stack_restore(&context->clip_stack, context->target.object, state->clip_depth);
+             d2d_device_context_set_error(context, D2DERR_LAYER_ALREADY_IN_USE);
+             return;
+         }
+@@ -2021,7 +2059,8 @@
+     }
+ 
+     state = &context->layers[--context->layers_count];
+-    if (state->target != context->target.object || context->clip_stack.count != state->clip_depth + 1)
++    if (state->target != context->target.object
++            || d2d_clip_stack_depth(&context->clip_stack, state->target) != state->clip_depth + 1)
+         d2d_device_context_set_error(context, D2DERR_PUSH_POP_UNBALANCED);
+     if (FAILED(context->error.code))
+         goto done;
+@@ -2085,7 +2124,7 @@
+     ID2D1Geometry_Release(geometry);
+ 
+ done:
+-    context->clip_stack.count = state->clip_depth;
++    d2d_clip_stack_restore(&context->clip_stack, state->target, state->clip_depth);
+     d2d_layer_state_release(state);
+ }
+ 
+@@ -2160,7 +2199,15 @@
+     TRACE("iface %p, clip_rect %s, antialias_mode %#x.\n", iface, debug_d2d_rect_f(clip_rect), antialias_mode);
+ 
+     if (context->target.type == D2D_TARGET_COMMAND_LIST)
++    {
+         d2d_command_list_push_clip(context->target.command_list, clip_rect, antialias_mode);
++        return;
++    }
++    if (context->target.type != D2D_TARGET_BITMAP)
++    {
++        d2d_device_context_set_error(context, D2DERR_WRONG_STATE);
++        return;
++    }
+ 
+     if (antialias_mode != D2D1_ANTIALIAS_MODE_ALIASED)
+         FIXME("Ignoring antialias_mode %#x.\n", antialias_mode);
+@@ -2180,7 +2227,7 @@
+             clip_rect->right * x_scale, clip_rect->bottom * y_scale);
+     d2d_rect_expand(&transformed_rect, &point);
+ 
+-    if (!d2d_clip_stack_push(&context->clip_stack, &transformed_rect))
++    if (!d2d_clip_stack_push(&context->clip_stack, context->target.object, &transformed_rect))
+         WARN("Failed to push clip rect.\n");
+ }
+ 
+@@ -2191,9 +2238,12 @@
+     TRACE("iface %p.\n", iface);
+ 
+     if (context->target.type == D2D_TARGET_COMMAND_LIST)
++    {
+         d2d_command_list_pop_clip(context->target.command_list);
++        return;
++    }
+ 
+-    d2d_clip_stack_pop(&context->clip_stack);
++    d2d_clip_stack_pop(&context->clip_stack, context->target.object);
+ }
+ 
+ static void STDMETHODCALLTYPE d2d_device_context_Clear(ID2D1DeviceContext6 *iface, const D2D1_COLOR_F *colour)
+@@ -2315,7 +2365,7 @@
+         {
+             struct d2d_layer_state *state = &context->layers[--context->layers_count];
+ 
+-            context->clip_stack.count = state->clip_depth;
++            d2d_clip_stack_restore(&context->clip_stack, state->target, state->clip_depth);
+             d2d_layer_state_release(state);
+         }
+     }
+diff --git a/dlls/d2d1/tests/d2d1.c b/dlls/d2d1/tests/d2d1.c
+--- a/dlls/d2d1/tests/d2d1.c
++++ b/dlls/d2d1/tests/d2d1.c
+@@ -17991,6 +17991,121 @@
+     release_test_context(&ctx);
+ }
+ 
++static void test_target_clipping(BOOL d3d11)
++{
++    static const D2D1_COLOR_F black = {0.0f, 0.0f, 0.0f, 1.0f};
++    static const D2D1_COLOR_F white = {1.0f, 1.0f, 1.0f, 1.0f};
++    static const D2D1_COLOR_F red = {1.0f, 0.0f, 0.0f, 1.0f};
++    static const D2D1_RECT_F main_clip = {40.0f, 40.0f, 64.0f, 64.0f};
++    static const D2D1_RECT_F offscreen_clip = {4.0f, 4.0f, 16.0f, 16.0f};
++    static const D2D1_RECT_F full_rect = {0.0f, 0.0f, 32.0f, 32.0f};
++    static const D2D1_RECT_F dest = {32.0f, 32.0f, 64.0f, 64.0f};
++    static const D2D1_RECT_F unclipped_dest = {80.0f, 0.0f, 112.0f, 32.0f};
++    static const struct {unsigned int x, y; DWORD colour;} pixels[] =
++    {
++        {44, 44, 0xffffffff}, {50, 50, 0xff000000}, {38, 38, 0xff000000},
++        {100, 20, 0xffff0000},
++    };
++    D2D1_BITMAP_PROPERTIES1 desc = {{DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED},
++            96.0f, 96.0f, D2D1_BITMAP_OPTIONS_TARGET};
++    D2D1_LAYER_PARAMETERS1 parameters = {0};
++    D2D1_SIZE_U size = {32, 32};
++    struct d2d1_test_context ctx;
++    struct resource_readback rb;
++    ID2D1DeviceContext *context;
++    ID2D1SolidColorBrush *brush;
++    ID2D1Bitmap1 *bitmap;
++    ID2D1Image *target;
++    unsigned int i, j;
++    DWORD colour;
++    HRESULT hr;
++
++    if (!init_test_context(&ctx, d3d11))
++        return;
++    if (!(context = ctx.context))
++    {
++        win_skip("ID2D1DeviceContext is not supported.\n");
++        release_test_context(&ctx);
++        return;
++    }
++
++    hr = ID2D1DeviceContext_CreateBitmap(context, size, NULL, 0, &desc, &bitmap);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++    hr = ID2D1DeviceContext_CreateSolidColorBrush(context, &white, NULL, &brush);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    if (FAILED(hr)) goto release_bitmap;
++    ID2D1DeviceContext_GetTarget(context, &target);
++    ID2D1DeviceContext_SetDpi(context, 96.0f, 96.0f);
++    ID2D1DeviceContext_SetAntialiasMode(context, D2D1_ANTIALIAS_MODE_ALIASED);
++    parameters.contentBounds = main_clip;
++    parameters.maskAntialiasMode = D2D1_ANTIALIAS_MODE_ALIASED;
++    set_matrix_identity(&parameters.maskTransform);
++    parameters.opacity = 1.0f;
++
++    for (i = 0; i < 2; ++i)
++    {
++        winetest_push_context("layer %u", i);
++        ID2D1DeviceContext_BeginDraw(context);
++        ID2D1DeviceContext_Clear(context, &black);
++        ID2D1DeviceContext_PushAxisAlignedClip(context, &main_clip, D2D1_ANTIALIAS_MODE_ALIASED);
++        if (i) ID2D1DeviceContext_PushLayer(context, &parameters, NULL);
++
++        /* Build an offscreen image without inheriting the main target's HUD clip. */
++        ID2D1DeviceContext_SetTarget(context, (ID2D1Image *)bitmap);
++        ID2D1DeviceContext_Clear(context, &black);
++        ID2D1DeviceContext_PushAxisAlignedClip(context, &offscreen_clip, D2D1_ANTIALIAS_MODE_ALIASED);
++        ID2D1DeviceContext_FillRectangle(context, &full_rect, (ID2D1Brush *)brush);
++        ID2D1DeviceContext_SetTarget(context, target);
++        ID2D1DeviceContext_DrawBitmap(context, (ID2D1Bitmap *)bitmap, &dest, 1.0f,
++                D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, NULL, NULL);
++        if (i) ID2D1DeviceContext_PopLayer(context);
++        ID2D1DeviceContext_PopAxisAlignedClip(context);
++
++        /* Pop each target's own clip, even when another target has a newer one. */
++        ID2D1DeviceContext_SetTarget(context, (ID2D1Image *)bitmap);
++        ID2D1DeviceContext_PopAxisAlignedClip(context);
++        ID2D1DeviceContext_Clear(context, &red);
++        ID2D1DeviceContext_SetTarget(context, target);
++        ID2D1DeviceContext_DrawBitmap(context, (ID2D1Bitmap *)bitmap, &unclipped_dest, 1.0f,
++                D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, NULL, NULL);
++        hr = ID2D1DeviceContext_EndDraw(context, NULL, NULL);
++        ok(hr == S_OK, "Got hr %#lx.\n", hr);
++        get_surface_readback(&ctx, &rb);
++        for (j = 0; j < ARRAY_SIZE(pixels); ++j)
++        {
++            colour = get_readback_colour(&rb, pixels[j].x, pixels[j].y);
++            ok(colour == pixels[j].colour, "Pixel %u: %#lx, expected %#lx.\n",
++                    j, colour, pixels[j].colour);
++        }
++        release_resource_readback(&rb);
++        winetest_pop_context();
++    }
++
++    /* An unbalanced layer must unwind its own target even if another is selected. */
++    ID2D1DeviceContext_BeginDraw(context);
++    ID2D1DeviceContext_PushLayer(context, &parameters, NULL);
++    ID2D1DeviceContext_SetTarget(context, (ID2D1Image *)bitmap);
++    hr = ID2D1DeviceContext_EndDraw(context, NULL, NULL);
++    ok(hr == D2DERR_PUSH_POP_UNBALANCED, "Got hr %#lx.\n", hr);
++    ID2D1DeviceContext_SetTarget(context, target);
++    ID2D1DeviceContext_BeginDraw(context);
++    ID2D1DeviceContext_Clear(context, &white);
++    hr = ID2D1DeviceContext_EndDraw(context, NULL, NULL);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    get_surface_readback(&ctx, &rb);
++    colour = get_readback_colour(&rb, 100, 100);
++    ok(colour == 0xffffffff, "Unbalanced layer left a stale target clip: %#lx.\n", colour);
++    release_resource_readback(&rb);
++
++    ID2D1Image_Release(target);
++    ID2D1SolidColorBrush_Release(brush);
++release_bitmap:
++    ID2D1Bitmap1_Release(bitmap);
++done:
++    release_test_context(&ctx);
++}
++
+ static void test_hud_rendering(BOOL d3d11)
+ {
+     static const DWORD pixels[] = {0xffffffff, 0xffff0000, 0xff00ff00, 0xff0000ff};
+@@ -18284,6 +18399,7 @@
+     queue_test(test_wic_gdi_interop);
+     queue_test(test_layer);
+     queue_test(test_hud_rendering);
++    queue_test(test_target_clipping);
+     queue_test(test_bezier_intersect);
+     queue_test(test_create_device);
+     queue_test(test_create_device_context);
