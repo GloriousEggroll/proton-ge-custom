@@ -1,0 +1,341 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Sun, 4 Oct 2026 00:30:00 -0600
+Subject: [PATCH] quartz/vmr7: Allocate surfaces for a late clipping window.
+
+SHUFFLE! Essence+ configures a windowless VMR7, connects its MPEG-1
+video graph, then supplies the clipping window. Both GE-Proton11-5 crash
+logs in #668 show allocate_surfaces() skipping allocation without a
+window, followed by SetVideoClippingWindow() rejecting the connected
+input with VFW_E_WRONG_STATE. The first decoded frame then takes a
+modulo by surface_count == 0 in vmr_render().
+
+Accept a clipping window after connection and finish the deferred surface
+allocation using the negotiated media type. Do not change the stream
+count after connection. Forward subsequent window changes to the
+presenter instead of discarding the existing surfaces. Serialize window
+and surface updates with sample delivery.
+
+Reject rendering without surfaces instead of dividing by zero. Publish
+the surface array/count only after initialization succeeds and clean up
+failed allocations, so an allocation failure cannot leave a connected
+renderer with stale surfaces. Clear the array on disconnection as well.
+
+Add regression coverage for both window-before-connection and
+connection-before-window ordering, frame delivery, repeated window
+assignment, rejection of an invalid window, and replacement during
+playback. Tests and game playback still require runtime validation.
+This fixes the builtin Quartz failure; the later black-screen-only log
+does not contain enough Quartz tracing to establish its renderer path.
+
+Reported by Sohryuu948 (formerly silver-saint), with crash logs from two
+systems. Uses Wine's existing VMR7 allocator-presenter implementation by
+Zebediah Figura; no third-party implementation is imported.
+
+Bug: https://github.com/GloriousEggroll/proton-ge-custom/issues/668
+Reference: https://learn.microsoft.com/en-us/windows/win32/api/strmif/nf-strmif-ivmrwindowlesscontrol-setvideoclippingwindow
+---
+diff --git a/dlls/quartz/vmr7.c b/dlls/quartz/vmr7.c
+--- a/dlls/quartz/vmr7.c
++++ b/dlls/quartz/vmr7.c
+@@ -256,6 +256,12 @@
+         return S_FALSE;
+     }
+ 
++    if (!filter->surfaces || !filter->surface_count)
++    {
++        WARN("No rendering surfaces.\n");
++        return VFW_E_WRONG_STATE;
++    }
++
+     info.dwFlags = VMR9Sample_SrcDstRectsValid;
+ 
+     if (SUCCEEDED(hr = IMediaSample_GetTime(sample, &start_time, &end_time)))
+@@ -406,7 +412,8 @@
+ 
+ static HRESULT initialize_device(struct vmr7 *filter, VMRALLOCATIONINFO *info, DWORD count)
+ {
+-    IDirectDrawSurface7 *frontbuffer, *prev;
++    IDirectDrawSurface7 *frontbuffer = NULL, *prev;
++    IDirectDrawSurface7 **surfaces;
+     IVMRWindowlessControl *control;
+     HRESULT hr;
+ 
+@@ -417,34 +424,53 @@
+         return hr;
+     }
+ 
++    if (!count || !frontbuffer)
++    {
++        WARN("Allocator returned no surfaces.\n");
++        hr = E_FAIL;
++        goto failed;
++    }
++
+     if (filter->mode != VMRMode_Renderless)
+     {
+-        IVMRSurfaceAllocator_QueryInterface(filter->allocator, &IID_IVMRWindowlessControl, (void **)&control);
+-        IVMRWindowlessControl_SetVideoClippingWindow(control,
++        if (FAILED(hr = IVMRSurfaceAllocator_QueryInterface(filter->allocator,
++                &IID_IVMRWindowlessControl, (void **)&control)))
++            goto failed;
++        hr = IVMRWindowlessControl_SetVideoClippingWindow(control,
+                 filter->mode == VMRMode_Windowed ? filter->window.hwnd : filter->clipping_window);
+         IVMRWindowlessControl_Release(control);
++        if (FAILED(hr))
++            goto failed;
+     }
+ 
+-    if (!(filter->surfaces = calloc(count, sizeof(IDirectDrawSurface7 *))))
+-        return E_OUTOFMEMORY;
+-    filter->surface_count = count;
+-    filter->surface_index = 0;
++    if (!(surfaces = calloc(count, sizeof(*surfaces))))
++    {
++        hr = E_OUTOFMEMORY;
++        goto failed;
++    }
+ 
+     prev = frontbuffer;
+     for (DWORD i = 0; i < count; ++i)
+     {
+         DDSCAPS2 caps = {.dwCaps = DDSCAPS_FLIP};
+ 
+-        if (FAILED(hr = IDirectDrawSurface7_GetAttachedSurface(prev, &caps, &filter->surfaces[i])))
++        if (FAILED(hr = IDirectDrawSurface7_GetAttachedSurface(prev, &caps, &surfaces[i])))
+         {
+             ERR("Failed to get surface %lu, hr %#lx.\n", i, hr);
+             while (i--)
+-                IDirectDrawSurface7_Release(filter->surfaces[i]);
+-            IVMRSurfaceAllocator_FreeSurface(filter->allocator, filter->cookie);
+-            return hr;
++                IDirectDrawSurface7_Release(surfaces[i]);
++            free(surfaces);
++            goto failed;
+         }
+     }
+ 
++    filter->surfaces = surfaces;
++    filter->surface_count = count;
++    filter->surface_index = 0;
++    return hr;
++
++failed:
++    IVMRSurfaceAllocator_FreeSurface(filter->allocator, filter->cookie);
+     return hr;
+ }
+ 
+@@ -452,7 +478,6 @@
+ {
+     BITMAPINFOHEADER bitmap_header = *get_bitmap_header(mt);
+     VMRALLOCATIONINFO info = {0};
+-    HRESULT hr = E_FAIL;
+     DWORD count = 1;
+ 
+     TRACE("Initializing in mode %u, our window %p, clipping window %p.\n",
+@@ -467,9 +492,7 @@
+     info.szAspectRatio.cx = info.szNativeSize.cx = bitmap_header.biWidth;
+     info.szAspectRatio.cy = info.szNativeSize.cy = bitmap_header.biHeight;
+ 
+-    if (FAILED(hr = initialize_device(filter, &info, count)))
+-        free(filter->surfaces);
+-    return hr;
++    return initialize_device(filter, &info, count);
+ }
+ 
+ static void vmr_init_stream(struct strmbase_renderer *iface)
+@@ -526,6 +549,7 @@
+         for (DWORD i = 0; i < filter->surface_count; ++i)
+             IDirectDrawSurface7_Release(filter->surfaces[i]);
+         free(filter->surfaces);
++        filter->surfaces = NULL;
+ 
+         IVMRSurfaceAllocator_FreeSurface(filter->allocator, filter->cookie);
+         filter->surface_count = 0;
+@@ -1214,7 +1238,9 @@
+ static HRESULT WINAPI windowless_control_SetVideoClippingWindow(IVMRWindowlessControl *iface, HWND window)
+ {
+     struct vmr7 *filter = impl_from_IVMRWindowlessControl(iface);
+-    HRESULT hr;
++    IVMRWindowlessControl *control;
++    HWND previous_window;
++    HRESULT hr = S_OK;
+ 
+     TRACE("filter %p, window %p.\n", filter, window);
+ 
+@@ -1225,18 +1251,31 @@
+     }
+ 
+     EnterCriticalSection(&filter->renderer.filter.filter_cs);
++    EnterCriticalSection(&filter->renderer.filter.stream_cs);
++
++    previous_window = filter->clipping_window;
++    filter->clipping_window = window;
+ 
+     if (filter->renderer.sink.pin.peer)
+     {
+-        LeaveCriticalSection(&filter->renderer.filter.filter_cs);
+-        WARN("Attempt to set the clipping window while connected; returning VFW_E_WRONG_STATE.\n");
+-        return VFW_E_WRONG_STATE;
++        /* Connection can precede the first clipping window. Complete the
++         * deferred allocation without changing the connected stream count. */
++        if (!filter->surface_count)
++            hr = allocate_surfaces(filter, &filter->renderer.sink.pin.mt);
++        else if (SUCCEEDED(hr = IVMRSurfaceAllocator_QueryInterface(filter->allocator,
++                &IID_IVMRWindowlessControl, (void **)&control)))
++        {
++            hr = IVMRWindowlessControl_SetVideoClippingWindow(control, window);
++            IVMRWindowlessControl_Release(control);
++        }
+     }
++    else if (!filter->stream_count)
++        hr = IVMRFilterConfig_SetNumberOfStreams(&filter->IVMRFilterConfig_iface, 4);
+ 
+-    filter->clipping_window = window;
+-
+-    hr = IVMRFilterConfig_SetNumberOfStreams(&filter->IVMRFilterConfig_iface, 4);
++    if (FAILED(hr))
++        filter->clipping_window = previous_window;
+ 
++    LeaveCriticalSection(&filter->renderer.filter.stream_cs);
+     LeaveCriticalSection(&filter->renderer.filter.filter_cs);
+     return hr;
+ }
+diff --git a/dlls/quartz/tests/vmr7.c b/dlls/quartz/tests/vmr7.c
+--- a/dlls/quartz/tests/vmr7.c
++++ b/dlls/quartz/tests/vmr7.c
+@@ -3143,6 +3143,126 @@
+     DestroyWindow(window);
+ }
+ 
++static void test_windowless_connection(BOOL late_window)
++{
++    ALLOCATOR_PROPERTIES req_props = {1, 32 * 16 * 4, 1, 0}, ret_props;
++    VIDEOINFOHEADER vih =
++    {
++        .bmiHeader.biSize = sizeof(BITMAPINFOHEADER),
++        .bmiHeader.biWidth = 32,
++        .bmiHeader.biHeight = 16,
++        .bmiHeader.biBitCount = 32,
++        .bmiHeader.biPlanes = 1,
++    };
++    AM_MEDIA_TYPE mt =
++    {
++        .majortype = MEDIATYPE_Video,
++        .subtype = MEDIASUBTYPE_RGB32,
++        .formattype = FORMAT_VideoInfo,
++        .cbFormat = sizeof(vih),
++        .pbFormat = (BYTE *)&vih,
++    };
++    IBaseFilter *filter = create_vmr7(VMRMode_Windowless);
++    IVMRWindowlessControl *windowless_control;
++    IFilterGraph2 *graph = create_graph();
++    IMemAllocator *allocator = NULL;
++    struct testfilter source;
++    IMediaControl *control;
++    IMemInputPin *input;
++    HWND window, other;
++    HRESULT hr;
++    ULONG ref;
++    RECT rect;
++    IPin *pin;
++
++    winetest_push_context("Late clipping window %u", late_window);
++    IBaseFilter_QueryInterface(filter, &IID_IVMRWindowlessControl, (void **)&windowless_control);
++    IBaseFilter_FindPin(filter, L"VMR Input0", &pin);
++    IPin_QueryInterface(pin, &IID_IMemInputPin, (void **)&input);
++    IFilterGraph2_QueryInterface(graph, &IID_IMediaControl, (void **)&control);
++    testfilter_init(&source);
++    IFilterGraph2_AddFilter(graph, &source.filter.IBaseFilter_iface, L"source");
++    IFilterGraph2_AddFilter(graph, filter, L"vmr7");
++    window = CreateWindowA("static", "quartz_test", WS_OVERLAPPEDWINDOW, 0, 0, 640, 480, 0, 0, 0, 0);
++    other = CreateWindowA("static", "quartz_test", WS_OVERLAPPEDWINDOW, 0, 0, 640, 480, 0, 0, 0, 0);
++
++    if (!late_window)
++    {
++        hr = IVMRWindowlessControl_SetVideoClippingWindow(windowless_control, window);
++        ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    }
++
++    hr = IFilterGraph2_ConnectDirect(graph, &source.source.pin.IPin_iface, pin, &mt);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    if (FAILED(hr))
++        goto out;
++
++    /* SHUFFLE! supplies its first window only after connecting the graph. */
++    hr = IVMRWindowlessControl_SetVideoClippingWindow(windowless_control, window);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    if (FAILED(hr))
++        goto out;
++
++    hr = IMemInputPin_GetAllocator(input, &allocator);
++    todo_wine ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    if (FAILED(hr))
++    {
++        test_allocator(input);
++        hr = IMemInputPin_GetAllocator(input, &allocator);
++        ok(hr == S_OK, "Got hr %#lx.\n", hr);
++        if (FAILED(hr))
++            goto out;
++    }
++    hr = IMemAllocator_SetProperties(allocator, &req_props, &ret_props);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    if (FAILED(hr))
++        goto out;
++    hr = IMemAllocator_Commit(allocator);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    if (FAILED(hr))
++        goto out;
++
++    GetClientRect(window, &rect);
++    hr = IVMRWindowlessControl_SetVideoPosition(windowless_control, NULL, &rect);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    hr = IMediaControl_Run(control);
++    ok(SUCCEEDED(hr), "Got hr %#lx.\n", hr);
++    hr = join_thread(send_frame(input));
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++
++    hr = IVMRWindowlessControl_SetVideoClippingWindow(windowless_control, NULL);
++    ok(hr == E_INVALIDARG, "Got hr %#lx.\n", hr);
++    hr = join_thread(send_frame(input));
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++
++    hr = IVMRWindowlessControl_SetVideoClippingWindow(windowless_control, other);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    hr = join_thread(send_frame(input));
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++
++out:
++    hr = IMediaControl_Stop(control);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    if (allocator)
++    {
++        IMemAllocator_Decommit(allocator);
++        IMemAllocator_Release(allocator);
++    }
++    IMediaControl_Release(control);
++    ref = IFilterGraph2_Release(graph);
++    ok(!ref, "Got outstanding refcount %ld.\n", ref);
++    IMemInputPin_Release(input);
++    IPin_Release(pin);
++    IVMRWindowlessControl_Release(windowless_control);
++    ref = IBaseFilter_Release(filter);
++    ok(!ref, "Got outstanding refcount %ld.\n", ref);
++    ref = IBaseFilter_Release(&source.filter.IBaseFilter_iface);
++    ok(!ref, "Got outstanding refcount %ld.\n", ref);
++    DestroyWindow(other);
++    DestroyWindow(window);
++    winetest_pop_context();
++}
++
+ static void test_unconnected_eos(void)
+ {
+     IFilterGraph2 *graph = create_graph();
+@@ -4032,6 +4152,8 @@
+     test_video_window();
+     test_basic_video();
+     test_windowless_size();
++    test_windowless_connection(FALSE);
++    test_windowless_connection(TRUE);
+     test_unconnected_eos();
+     test_default_presenter_allocate();
+     test_default_presenter_window();
