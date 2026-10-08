@@ -1,0 +1,233 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Alexandre Derumier <aderumier@gmail.com>
+Date: Mon, 05 Oct 2026 14:34:15 +0200
+Subject: [PATCH] ddraw: Emulate one visible overlay.
+
+Wine keeps track of overlay surfaces and UpdateOverlay() positions, but
+never draws them and does not report DDCAPS_OVERLAY. CRI Sofdec movie
+players check that cap and play their movies through a YUY2 overlay flip
+chain on the primary: The King of Fighters Maximum Impact Regulation A
+(Taito Type X2) gave up on its movies (black screen, audio only).
+
+Report one overlay (DDCAPS_OVERLAY, OVERLAYFOURCC, OVERLAYSTRETCH), and
+emulate it: the visible overlay set by UpdateOverlay(DDOVER_SHOW) is drawn
+(wined3d blit, YUY2 converted by the blitter) over its destination when
+that is presented, and its destination area is refreshed when the overlay
+chain is flipped. The primary surface contents are not modified, as with
+hardware overlays.
+
+Without a clipper, a non-exclusive primary is drawn into ddraw's hidden
+window (or through GDI to the desktop, under the application windows). For
+an overlay to be seen, bind the swapchain to the application window (the
+cooperative level window, else the topmost visible top-level window of the
+process), as a clipper would; the hidden window is restored on
+DDOVER_HIDE.
+
+Tested with KOF Maximum Impact Regulation A: the opening movie plays.
+---
+diff --git a/dlls/ddraw/ddraw.c b/dlls/ddraw/ddraw.c
+--- a/dlls/ddraw/ddraw.c
++++ b/dlls/ddraw/ddraw.c
+@@ -1586,6 +1586,15 @@
+     caps.dwCaps |= DDCAPS_ALIGNSTRIDE;
+     caps.dwAlignStrideAlign = DDRAW_STRIDE_ALIGNMENT;
+ 
++    /* One emulated overlay, drawn over its destination when that is
++     * presented. Some games (e.g. CRI Sofdec movie players) only play their
++     * movies through a YUY2 overlay and check this cap first. */
++    caps.dwCaps |= DDCAPS_OVERLAY | DDCAPS_OVERLAYFOURCC | DDCAPS_OVERLAYSTRETCH;
++    caps.ddsCaps.dwCaps |= DDSCAPS_OVERLAY;
++    caps.dwMaxVisibleOverlays = 1;
++    caps.dwMinOverlayStretch = 1;
++    caps.dwMaxOverlayStretch = 20000;
++
+     caps.ddsOldCaps.dwCaps = caps.ddsCaps.dwCaps;
+ 
+     if(DriverCaps)
+diff --git a/dlls/ddraw/ddraw_private.h b/dlls/ddraw/ddraw_private.h
+--- a/dlls/ddraw/ddraw_private.h
++++ b/dlls/ddraw/ddraw_private.h
+@@ -107,6 +107,10 @@
+ 
+     struct ddraw_surface *primary;
+     RECT primary_lock;
++    /* The visible overlay, composited over its destination when the
++     * destination is presented. */
++    struct ddraw_surface *overlay, *overlay_dst;
++    RECT overlay_src_rect, overlay_dst_rect;
+     struct wined3d_texture *gdi_surface;
+     struct wined3d_swapchain *wined3d_swapchain;
+     struct wined3d_swapchain_state_parent state_parent;
+diff --git a/dlls/ddraw/surface.c b/dlls/ddraw/surface.c
+--- a/dlls/ddraw/surface.c
++++ b/dlls/ddraw/surface.c
+@@ -157,9 +157,24 @@
+         else
+             dst_texture = wined3d_swapchain_get_front_buffer(ddraw->wined3d_swapchain);
+ 
+-        if (SUCCEEDED(hr = wined3d_device_context_blt(ddraw->immediate_context, dst_texture, 0, rect,
++        hr = wined3d_device_context_blt(ddraw->immediate_context, dst_texture, 0, rect,
+                 ddraw_surface_get_any_texture(surface, DDRAW_SURFACE_READ), surface->sub_resource_idx, rect, 0,
+-                NULL, WINED3D_TEXF_POINT)) && swap_interval)
++                NULL, WINED3D_TEXF_POINT);
++
++        /* Overlays are not part of the destination surface: draw the
++         * visible one over it, like the hardware scan-out would. */
++        if (SUCCEEDED(hr) && ddraw->overlay && ddraw->overlay_dst == surface)
++        {
++            struct ddraw_surface *overlay = ddraw->overlay;
++            HRESULT overlay_hr;
++
++            if (FAILED(overlay_hr = wined3d_device_context_blt(ddraw->immediate_context, dst_texture, 0,
++                    &ddraw->overlay_dst_rect, ddraw_surface_get_any_texture(overlay, DDRAW_SURFACE_READ),
++                    overlay->sub_resource_idx, &ddraw->overlay_src_rect, 0, NULL, WINED3D_TEXF_LINEAR)))
++                WARN("Failed to draw overlay %p, hr %#lx.\n", overlay, overlay_hr);
++        }
++
++        if (SUCCEEDED(hr) && swap_interval)
+         {
+             hr = wined3d_swapchain_present(ddraw->wined3d_swapchain, rect, rect, NULL, swap_interval, 0);
+             ddraw->flags |= DDRAW_SWAPPED;
+@@ -206,6 +221,17 @@
+     return DD_OK;
+ }
+ 
++/* Show the visible overlay: refresh its destination area on the screen. */
++static HRESULT ddraw_surface_update_overlay_dst(struct ddraw *ddraw)
++{
++    struct ddraw_surface *dst = ddraw->overlay_dst;
++
++    if (!ddraw->overlay || !dst || !(dst->surface_desc.ddsCaps.dwCaps & DDSCAPS_PRIMARYSURFACE))
++        return DD_OK;
++
++    return ddraw_surface_update_frontbuffer(dst, &ddraw->overlay_dst_rect, FALSE, 0);
++}
++
+ /*****************************************************************************
+  * IUnknown parts follow
+  *****************************************************************************/
+@@ -1515,6 +1541,8 @@
+ 
+     if (dst_impl->surface_desc.ddsCaps.dwCaps & DDSCAPS_PRIMARYSURFACE)
+         hr = ddraw_surface_update_frontbuffer(dst_impl, NULL, FALSE, ddraw_swap_interval_from_flags(flags));
++    else if (impl_from_IDirectDrawSurface(iface) == dst_impl->ddraw->overlay)
++        hr = ddraw_surface_update_overlay_dst(dst_impl->ddraw);
+     else
+         hr = DD_OK;
+ 
+@@ -4109,6 +4137,93 @@
+     return ddraw_surface7_SetOverlayPosition(&surface->IDirectDrawSurface7_iface, x, y);
+ }
+ 
++static BOOL CALLBACK find_overlay_window_proc(HWND window, LPARAM param)
++{
++    HWND *ret = (HWND *)param;
++    DWORD pid;
++
++    GetWindowThreadProcessId(window, &pid);
++    if (pid != GetCurrentProcessId() || !IsWindowVisible(window))
++        return TRUE;
++    *ret = window;
++    return FALSE;
++}
++
++/* The window an overlay on the screen shows in: the cooperative level
++ * window, else the application's topmost visible top-level window. */
++static HWND ddraw_find_overlay_window(struct ddraw *ddraw)
++{
++    HWND window = ddraw->dest_window;
++
++    if (!window)
++        EnumWindows(find_overlay_window_proc, (LPARAM)&window);
++    return window;
++}
++
++/* Wine has no hardware overlays: the visible overlay is drawn over its
++ * destination when that is presented (see ddraw_surface_update_frontbuffer()).
++ * Only one overlay is shown at a time. */
++static void ddraw_surface_set_visible_overlay(struct ddraw_surface *overlay, const RECT *src_rect,
++        struct ddraw_surface *dst, const RECT *dst_rect, DWORD flags)
++{
++    struct ddraw *ddraw = overlay->ddraw;
++    struct ddraw_surface *old_dst;
++    BOOL bind_window;
++    RECT old_dst_rect;
++    HWND window;
++
++    if (flags & DDOVER_HIDE)
++    {
++        if (ddraw->overlay != overlay)
++            return;
++        old_dst = ddraw->overlay_dst;
++        old_dst_rect = ddraw->overlay_dst_rect;
++        ddraw->overlay = ddraw->overlay_dst = NULL;
++        /* Uncover the destination. */
++        if (old_dst->surface_desc.ddsCaps.dwCaps & DDSCAPS_PRIMARYSURFACE)
++        {
++            ddraw_surface_update_frontbuffer(old_dst, &old_dst_rect, FALSE, 0);
++            if (!old_dst->clipper && ddraw->wined3d_swapchain && !(ddraw->cooperative_level & DDSCL_EXCLUSIVE))
++            {
++                wined3d_swapchain_set_window(ddraw->wined3d_swapchain, ddraw->d3d_window);
++                ddraw_set_swapchain_window(ddraw, ddraw->dest_window);
++            }
++        }
++        return;
++    }
++
++    if (!(flags & DDOVER_SHOW) && ddraw->overlay != overlay)
++        return;
++    if (!dst)
++        return;
++
++    /* Without a clipper, a non-exclusive primary is drawn to ddraw's hidden
++     * window, or through GDI to the desktop, under the application's windows.
++     * An overlay is shown on top of everything: draw it in the application
++     * window, as with a clipper on that window. */
++    window = ddraw_find_overlay_window(ddraw);
++    bind_window = (dst->surface_desc.ddsCaps.dwCaps & DDSCAPS_PRIMARYSURFACE) && !dst->clipper
++            && ddraw->wined3d_swapchain && window && !(ddraw->cooperative_level & DDSCL_EXCLUSIVE);
++    if (bind_window)
++    {
++        wined3d_swapchain_set_window(ddraw->wined3d_swapchain, window);
++        ddraw_set_swapchain_window(ddraw, window);
++    }
++
++    ddraw->overlay = overlay;
++    ddraw->overlay_dst = dst;
++    if (src_rect)
++        ddraw->overlay_src_rect = *src_rect;
++    else
++        SetRect(&ddraw->overlay_src_rect, 0, 0, overlay->surface_desc.dwWidth, overlay->surface_desc.dwHeight);
++    if (dst_rect)
++        ddraw->overlay_dst_rect = *dst_rect;
++    else
++        SetRect(&ddraw->overlay_dst_rect, 0, 0, dst->surface_desc.dwWidth, dst->surface_desc.dwHeight);
++
++    ddraw_surface_update_overlay_dst(ddraw);
++}
++
+ /*****************************************************************************
+  * IDirectDrawSurface7::UpdateOverlay
+  *
+@@ -4147,6 +4262,8 @@
+     }
+     hr = wined3d_texture_update_overlay(src_impl->wined3d_texture, src_impl->sub_resource_idx,
+             src_rect, dst_wined3d_texture, dst_sub_resource_idx, dst_rect, flags);
++    if (SUCCEEDED(hr))
++        ddraw_surface_set_visible_overlay(src_impl, src_rect, dst_impl, dst_rect, flags);
+     wined3d_mutex_unlock();
+ 
+     return hr_ddraw_from_wined3d(hr);
+@@ -6218,6 +6335,9 @@
+         surface->ddraw->gdi_surface = NULL;
+     }
+ 
++    if (surface == surface->ddraw->overlay || surface == surface->ddraw->overlay_dst)
++        surface->ddraw->overlay = surface->ddraw->overlay_dst = NULL;
++
+     wined3d_private_store_cleanup(&surface->private_store);
+ 
+     if (surface->draw_texture)
+-- 
+2.55.0
+

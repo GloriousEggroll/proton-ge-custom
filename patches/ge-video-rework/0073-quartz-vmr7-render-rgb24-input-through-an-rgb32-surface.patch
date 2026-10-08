@@ -1,0 +1,183 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Alexandre Derumier <aderumier@gmail.com>
+Date: Mon, 05 Oct 2026 14:18:29 +0200
+Subject: [PATCH] quartz: Render RGB24 input through an RGB32 surface in the VMR7.
+
+The VMR7 accepts RGB24 input, but its default allocator-presenter only
+allocates RGB surfaces at the depth of the primary (as on Windows, see
+test_default_presenter_allocate()). On a 32 bpp desktop allocate_surfaces()
+then fails with E_FAIL and the connection is refused.
+
+Gouketsuji Ichizoku (Taito Type X2) plays its MPEG-1 opening through
+MPEG Video Decoder (RGB24) -> Sample Grabber -> Video Renderer; the
+refused connection makes the game drop the movie.
+
+When the presenter refuses an RGB24 surface, ask for an RGB32 one and
+expand the pixels (flipping bottom-up frames) in vmr_render(), like the
+existing NV12/YV12 to RGB32 paths.
+---
+diff --git a/dlls/quartz/vmr7.c b/dlls/quartz/vmr7.c
+--- a/dlls/quartz/vmr7.c
++++ b/dlls/quartz/vmr7.c
+@@ -236,6 +236,22 @@
+     }
+ }
+ 
++/* A positive height means a bottom-up source; the surface is top-down. */
++static void convert_rgb24_to_rgb32(BYTE *dst, unsigned int dst_pitch,
++        const BYTE *src, unsigned int src_pitch, unsigned int width, int height)
++{
++    unsigned int x, y, rows = abs(height);
++
++    for (y = 0; y < rows; ++y)
++    {
++        const BYTE *src_row = src + src_pitch * (height > 0 ? rows - 1 - y : y);
++        DWORD *dst_row = (DWORD *)(dst + dst_pitch * y);
++
++        for (x = 0; x < width; ++x)
++            dst_row[x] = src_row[3 * x] | (src_row[3 * x + 1] << 8) | (src_row[3 * x + 2] << 16);
++    }
++}
++
+ static HRESULT vmr_render(struct strmbase_renderer *iface, IMediaSample *sample)
+ {
+     struct vmr7 *filter = impl_from_IBaseFilter(&iface->filter.IBaseFilter_iface);
+@@ -344,6 +360,12 @@
+             copy_plane(&dst, surface_desc.lPitch / 2, surface_desc.dwHeight / 2, &src, src_pitch / 2, height / 2);
+         }
+     }
++    else if (bitmap_header->biCompression == BI_RGB && depth == 24
++            && (surface_desc.ddpfPixelFormat.dwFlags & DDPF_RGB)
++            && surface_desc.ddpfPixelFormat.dwRGBBitCount == 32)
++    {
++        convert_rgb24_to_rgb32(surface_desc.lpSurface, surface_desc.lPitch, data, src_pitch, width, height);
++    }
+     else if (height > 0 && (bitmap_header->biCompression == BI_RGB || bitmap_header->biCompression == BI_BITFIELDS))
+     {
+         BYTE *dst = surface_desc.lpSurface;
+@@ -467,7 +489,17 @@
+     info.szAspectRatio.cx = info.szNativeSize.cx = bitmap_header.biWidth;
+     info.szAspectRatio.cy = info.szNativeSize.cy = bitmap_header.biHeight;
+ 
+-    if (FAILED(hr = initialize_device(filter, &info, count)))
++    hr = initialize_device(filter, &info, count);
++    if (FAILED(hr) && bitmap_header.biCompression == BI_RGB && bitmap_header.biBitCount == 24)
++    {
++        /* The default presenter does not take RGB24 surfaces, but the VMR
++         * accepts RGB24 input: expand it to RGB32 in vmr_render(). */
++        TRACE("Failed to allocate an RGB24 surface, hr %#lx; trying RGB32.\n", hr);
++        bitmap_header.biBitCount = 32;
++        bitmap_header.biSizeImage = bitmap_header.biWidth * abs(bitmap_header.biHeight) * 4;
++        hr = initialize_device(filter, &info, count);
++    }
++    if (FAILED(hr))
+         free(filter->surfaces);
+     return hr;
+ }
+diff --git a/dlls/quartz/tests/vmr7.c b/dlls/quartz/tests/vmr7.c
+--- a/dlls/quartz/tests/vmr7.c
++++ b/dlls/quartz/tests/vmr7.c
+@@ -1623,6 +1623,92 @@
+     ok(!ref, "Got outstanding refcount %ld.\n", ref);
+ }
+ 
++static void test_connect_rgb24(void)
++{
++    VIDEOINFOHEADER vih =
++    {
++        .bmiHeader.biSize = sizeof(BITMAPINFOHEADER),
++        .bmiHeader.biWidth = 32,
++        .bmiHeader.biHeight = 16,
++        .bmiHeader.biPlanes = 1,
++        .bmiHeader.biBitCount = 24,
++        .bmiHeader.biCompression = BI_RGB,
++        .bmiHeader.biSizeImage = 32 * 16 * 3,
++    };
++    AM_MEDIA_TYPE req_mt =
++    {
++        .majortype = MEDIATYPE_Video,
++        .subtype = MEDIASUBTYPE_RGB24,
++        .formattype = FORMAT_VideoInfo,
++        .cbFormat = sizeof(vih),
++        .pbFormat = (BYTE *)&vih,
++    };
++    ALLOCATOR_PROPERTIES req_props = {1, 32 * 16 * 3, 1, 0}, ret_props;
++    IBaseFilter *filter = create_vmr7(VMRMode_Windowed);
++    IFilterGraph2 *graph = create_graph();
++    struct testfilter source;
++    IMemAllocator *allocator;
++    IMediaControl *control;
++    OAFilterState state;
++    IMemInputPin *input;
++    HANDLE thread;
++    IPin *pin;
++    HRESULT hr;
++    ULONG ref;
++
++    testfilter_init(&source);
++    IFilterGraph2_AddFilter(graph, &source.filter.IBaseFilter_iface, NULL);
++    IFilterGraph2_AddFilter(graph, filter, NULL);
++    IFilterGraph2_QueryInterface(graph, &IID_IMediaControl, (void **)&control);
++    IBaseFilter_FindPin(filter, L"VMR Input0", &pin);
++
++    /* The default presenter does not allocate RGB24 surfaces, but the VMR
++     * accepts and renders RGB24 input. */
++    hr = IFilterGraph2_ConnectDirect(graph, &source.source.pin.IPin_iface, pin, &req_mt);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    if (hr != S_OK)
++        goto out;
++
++    IPin_QueryInterface(pin, &IID_IMemInputPin, (void **)&input);
++    if (IMemInputPin_GetAllocator(input, &allocator) != S_OK)
++    {
++        /* Wine's VMR7 has no allocator of its own. */
++        CoCreateInstance(&CLSID_MemoryAllocator, NULL, CLSCTX_INPROC_SERVER,
++                &IID_IMemAllocator, (void **)&allocator);
++        hr = IMemInputPin_NotifyAllocator(input, allocator, TRUE);
++        ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    }
++    hr = IMemAllocator_SetProperties(allocator, &req_props, &ret_props);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    hr = IMemAllocator_Commit(allocator);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    IMemAllocator_Release(allocator);
++
++    hr = IMediaControl_Pause(control);
++    ok(SUCCEEDED(hr), "Got hr %#lx.\n", hr);
++    thread = send_frame(input);
++    hr = IMediaControl_GetState(control, 1000, &state);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    hr = IMediaControl_Stop(control);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    hr = join_thread(thread);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++
++    IMemInputPin_Release(input);
++    IFilterGraph2_Disconnect(graph, pin);
++    IFilterGraph2_Disconnect(graph, &source.source.pin.IPin_iface);
++
++out:
++    IPin_Release(pin);
++    IMediaControl_Release(control);
++    ref = IFilterGraph2_Release(graph);
++    ok(!ref, "Got outstanding refcount %ld.\n", ref);
++    ref = IBaseFilter_Release(filter);
++    ok(!ref, "Got outstanding refcount %ld.\n", ref);
++    ref = IBaseFilter_Release(&source.filter.IBaseFilter_iface);
++    ok(!ref, "Got outstanding refcount %ld.\n", ref);
++}
++
+ static void test_overlay(void)
+ {
+     IBaseFilter *filter = create_vmr7(0);
+@@ -4028,6 +4114,7 @@
+     test_enum_media_types();
+     test_unconnected_filter_state();
+     test_connect_pin();
++    test_connect_rgb24();
+     test_overlay();
+     test_video_window();
+     test_basic_video();
+-- 
+2.55.0
+
