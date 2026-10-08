@@ -1,5 +1,42 @@
 # EM-11 patch import
 
+## Component refresh (2026-10-19)
+
+Validated bases:
+
+- Wine: `c53678ab22a` (`experimental-wine-bleeding-edge-11.0-453226-20261016`).
+- DXVK: `2cb40186c43d617b5bd349a3756721aa4bd24b6d`.
+- D7VK: `bcd66d0c95e7530e3b24bdab1ee5e7aae7131059`.
+- VKD3D-Proton: `0bb64c56c8f0dcc11ecc0f6c56e00e4f7bd8d506`.
+
+Wine now contains EM's Syscall User Dispatch rework, so these imports were
+removed (git history keeps them):
+
+- 0257, 0258, 0259, 0260, 0265: identical to `9f00f2a60e6` (plus the separate
+  fixup revert `6eb78e124f1`), `f909ced378b`, `679feeaac90`, `cb8a1857536` and
+  `79ab44b2d67`.
+- 0102 and its revert 0256: they cancel out, and 0102 targets the seccomp
+  filter that upstream no longer has.
+
+Wine also gained its own EAC native-syscall hack (`2f445676483`,
+`WINE_HACK_NATIVE_SYSCALLS`). It runs before 0271's handler for the same EOS
+bootstrapper and `start_protected_game.exe` launchers, so 0271's sigsys path is
+now effectively unused. 0271 is only refreshed here; removing it also needs
+em-fixups 0008 reworked.
+
+Other resolutions:
+
+- Refresh 0271, `ntdll-remove-redundant-packed-split-lock`, and ds5-haptic 0197
+  and 0208 for new context (`hack_native_syscalls`, and Witcher 3 joining the
+  get_state rescan hack in `eb674084226`). Their changed lines are unchanged.
+- DXVK now contains the clang AVX change (`2cb40186`); drop our copy. D7VK
+  still needs it.
+
+Validation: isolated replay of the whole prep script in a scratch worktree at
+the bases above: 864 patch applications at `--fuzz=0` with no failures,
+skipped patches, or rejects, plus automatic staging, `autoreconf` and
+`tools/make_requests`. No build or runtime test.
+
 ## Component refresh (2026-10-10)
 
 Validated bases:

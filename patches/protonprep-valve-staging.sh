@@ -39,8 +39,6 @@ apply_all_in_dir() {
     apply_patch "../patches/dxvk/dxgi-auto-detect-hdr.patch"
     # StarCraft II: avoid GPU hangs with D3D9 constant buffer streaming (#790).
     apply_patch "../patches/dxvk/starcraft2-disable-constant-buffer-streaming.patch"
-    # Clang realigns the stack for 32-byte spills, so AVX is fine with it.
-    apply_patch "../patches/dxvk/dxvk-allow-avx-with-clang.patch"
     popd
 
     pushd d7vk
@@ -102,6 +100,7 @@ apply_all_in_dir() {
         lsteamclient/steam_input_manual.c \
         lsteamclient/steamclient_main.c \
         lsteamclient/steamclient_private.h \
+        lsteamclient/unix_private.h \
         lsteamclient/unixlib.cpp \
         lsteamclient/winISteamController.c \
         lsteamclient/winISteamInput.c
@@ -111,6 +110,13 @@ apply_all_in_dir() {
 
     echo "LSTEAMCLIENT: apply Steam Input and initialization fixes"
     apply_all_in_dir "patches/lsteamclient"
+
+    git checkout -- \
+        vrclient_x64/json_converter.cpp \
+        vrclient_x64/unix_private.h
+
+    echo "VRCLIENT: apply build fixes"
+    apply_all_in_dir "patches/vrclient"
 
 ### (2) WINE PATCHING ###
 
