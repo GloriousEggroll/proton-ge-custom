@@ -1,0 +1,50 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] winedmo: Use track durations to identify finite HTTP MP4 files.
+
+avformat_open_input() initializes AVFormatContext.duration to AV_NOPTS_VALUE.
+The MOV demuxer fills AVStream.duration from the MP4 track headers; the
+aggregate duration is not populated until avformat_find_stream_info().
+
+The progressive HTTP path checked the aggregate duration immediately after
+opening and latched nonseekable for ordinary finite MP4 files. This then
+discarded the valid result of get_context_duration(), omitted MF_PD_DURATION
+and MFMEDIASOURCE_CAN_SEEK, and made later seek requests silently succeed
+without moving the demuxer.
+
+The VRChat reproducer resolves to an HTTP 206 MP4 with Content-Length
+7847298, H.264/AAC tracks and approximately 183 seconds of media. The log
+shows decoder negotiation followed by a query for the missing MF_PD_DURATION
+and release of the source reader without reading a sample.
+
+Use the existing track-aware duration helper for the progressive source
+classification too. Retain the non-seekable transport check and require
+a known resource length as well as a positive duration, so an unbounded
+fragmented stream cannot be mistaken for a finite file based on the first
+fragment's duration. Keep this decision before stream probing, which can
+otherwise produce a misleading duration for live inputs.
+
+Header-only reproduction with the existing fixture (no download needed):
+  ffprobe -v error -nofind_stream_info -show_entries \
+    format=duration:stream=duration -of json dlls/mfreadwrite/tests/test.mp4
+The tracks report 1 second while format.duration is absent. With normal
+stream probing, format.duration is also 1 second.
+
+Reference: https://ffmpeg.org/doxygen/trunk/structAVFormatContext.html
+
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -903,9 +903,12 @@ NTSTATUS demuxer_create( void *arg )
+             ERR( "Failed to open remote URL, error %s.\n", debugstr_averr(ret) );
+             goto failed;
+         }
++        /* MP4 track durations are available at open, but the aggregate duration
++         * is only populated by avformat_find_stream_info(). Do not discard the
++         * track durations of finite files, or trust a live fragment's duration. */
+         if (progressive && (!demuxer->ctx->pb ||
+                 !(demuxer->ctx->pb->seekable & AVIO_SEEKABLE_NORMAL) ||
+-                demuxer->ctx->duration == AV_NOPTS_VALUE))
++                avio_size( demuxer->ctx->pb ) < 0 || get_context_duration( demuxer->ctx ) <= 0))
+             demuxer->nonseekable = TRUE;
+         else if (!hls && get_context_duration( demuxer->ctx ) == AV_NOPTS_VALUE && (rtsp ||
+                 (demuxer->ctx->pb && !(demuxer->ctx->pb->seekable & AVIO_SEEKABLE_NORMAL)

@@ -1,0 +1,65 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] winedmo: Avoid Wine thread-local logging from FFmpeg workers.
+
+FFmpeg can invoke its log callback on native pthreads, including the H.264
+frame workers enabled by 0076. These threads have no Wine TEB. Calling
+wine_dbg_log() there faults in __wine_dbg_header() when it accesses the
+per-thread output buffer. Wine's signal handler then faults too while
+trying to save the exception context of the native thread.
+
+The VRChat core from 2026-10-08 shows:
+  save_context -> segv_handler -> __wine_dbg_header -> wine_dbg_log
+  -> winedmo vlog -> av_log -> libavcodec -> start_thread
+The first fault resolves to ntdll/unix/debug.c's info->out_pos access.
+The media log reports 16 active H.264 frame workers. Restoring the finite
+MP4 duration in 0081 lets this video reach decoding and expose this crash.
+
+Keep Wine's dmo channel filtering, which does not need a TEB, but format
+into a local buffer and write through libc stderr rather than Wine's
+thread-local logger. This also avoids formatting disabled messages. Use
+else-if for the severity mapping so errors are not overwritten as warnings.
+Do not disable decoder threading or remove the MP4 duration correction.
+
+Reference: https://ffmpeg.org/doxygen/trunk/group__lavu__log.html
+
+diff --git a/dlls/winedmo/unixlib.c b/dlls/winedmo/unixlib.c
+--- a/dlls/winedmo/unixlib.c
++++ b/dlls/winedmo/unixlib.c
+@@ -24,6 +24,8 @@
+ 
+ #ifdef HAVE_FFMPEG
+ 
++#include <stdio.h>
++
+ #include "unix_private.h"
+ #include "wine/debug.h"
+ 
+@@ -108,6 +110,7 @@ int unix_read_callback( void *opaque, uint8_t *buffer, int size )
+ 
+ static void vlog( void *ctx, int level, const char *fmt, va_list va_args )
+ {
++    static const char * const classes[] = {"fixme", "err", "warn", "trace"};
+     enum __wine_debug_class dbcl = __WINE_DBCL_TRACE;
+     char buffer[512];
+     char *p;
+@@ -115,14 +118,18 @@ static void vlog( void *ctx, int level, const char *fmt, va_list va_args )
+     int prefix = 1;
+ 
+     if (level <= AV_LOG_ERROR) dbcl = __WINE_DBCL_ERR;
+-    if (level <= AV_LOG_WARNING) dbcl = __WINE_DBCL_WARN;
++    else if (level <= AV_LOG_WARNING) dbcl = __WINE_DBCL_WARN;
++
++    if (!(__wine_dbg_get_channel_flags( __wine_dbch___default ) & (1 << dbcl))) return;
+ 
+     av_log_format_line( ctx, level, fmt, va_args, buffer, sizeof(buffer), &prefix );
+     for (p = buffer; *p; ++p)
+     {
+         if (*p == '\r' || *p == '\n') *p = ' ';
+     }
+-    wine_dbg_log( dbcl, __wine_dbch___default, __func__, "%.160s\n", buffer );
++    /* FFmpeg workers are native pthreads without a TEB. Channel lookup is safe,
++     * but Wine's log header and output buffer require Wine thread-local state. */
++    fprintf( stderr, "%s:dmo:vlog %.160s\n", classes[dbcl], buffer );
+ }
+ 
+ static const char *debugstr_version( UINT version )
