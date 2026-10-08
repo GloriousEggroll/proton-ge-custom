@@ -1,0 +1,163 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] winedmo: Finalize ASF timestamp normalization on the first sample.
+
+The ASF normalizer only recorded its decision when the first timestamp
+exceeded 200 ms. A normal clip starting near zero therefore kept checking
+each subsequent packet until playback crossed that threshold, then
+incorrectly rebased the stream to zero in the middle of decoding.
+
+Both WMV3 intros in the OPPW4 trace hit this at 234 ms. The resulting
+backward timestamp makes the video decoder flush its reference frames.
+The next compressed packet is not a keyframe, producing the reported
+block corruption.
+
+Latch the base on the first available timestamp even when no rebasing is
+needed. Retain rebasing for genuinely late first samples, continue waiting
+when both timestamps are unavailable, and leave timestamps unchanged when
+the selected base is zero, including any negative timestamps.
+
+Add a source-reader regression test using the existing wmvcore ASF fixture.
+Read compressed video samples across 200 ms both initially and after a
+seek to zero, checking their original timestamps without requiring a
+decoder or game assets.
+
+Reported-by: marco-calautti
+Link: https://github.com/GloriousEggroll/proton-ge-custom/issues/826#issuecomment-6035964615
+
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -191,14 +191,16 @@
+          * timestamp even though the clip itself starts at zero. Preserve normal
+          * small startup offsets, but rebase obviously late first samples so MF does
+          * not hold video for the first second or more of the clip. */
+-        if (base != INT64_MIN && base > 2000000)
++        if (base != INT64_MIN)
+         {
+-            stream->timestamp_base = base;
++            /* A small first timestamp also finalizes the base. Do not rebase
++             * later when normal playback crosses the startup threshold. */
++            stream->timestamp_base = base > 2000000 ? base : 0;
+             stream->timestamp_base_set = TRUE;
+         }
+     }
+ 
+-    if (!stream->timestamp_base_set)
++    if (!stream->timestamp_base_set || !stream->timestamp_base)
+         return;
+ 
+     if (sample->pts != AV_NOPTS_VALUE)
+diff --git a/dlls/mfreadwrite/tests/mfplat.c b/dlls/mfreadwrite/tests/mfplat.c
+--- a/dlls/mfreadwrite/tests/mfplat.c
++++ b/dlls/mfreadwrite/tests/mfplat.c
+@@ -1154,6 +1154,92 @@
+     winetest_pop_context();
+ }
+ 
++static void test_source_reader_asf_timestamps(void)
++{
++    IMFMediaType *media_type;
++    IMFSourceReader *reader;
++    IMFByteStream *stream;
++    LONGLONG timestamp, sample_time, expected;
++    PROPVARIANT position;
++    IMFSample *sample;
++    unsigned int pass, i;
++    DWORD flags;
++    HRESULT hr;
++
++    if (!pMFCreateMFByteStreamOnStream)
++    {
++        win_skip("MFCreateMFByteStreamOnStream() not found\n");
++        return;
++    }
++
++    stream = get_resource_stream("test.wmv");
++    hr = MFCreateSourceReaderFromByteStream(stream, NULL, &reader);
++    IMFByteStream_Release(stream);
++    if (FAILED(hr))
++    {
++        skip("Failed to create ASF source reader, hr %#lx.\n", hr);
++        return;
++    }
++
++    hr = IMFSourceReader_SetStreamSelection(reader, MF_SOURCE_READER_ALL_STREAMS, FALSE);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++    hr = IMFSourceReader_SetStreamSelection(reader, MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++
++    /* Read compressed samples to check demuxer timestamps without a decoder. */
++    hr = IMFSourceReader_GetNativeMediaType(reader, MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &media_type);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++    hr = IMFSourceReader_SetCurrentMediaType(reader, MF_SOURCE_READER_FIRST_VIDEO_STREAM, NULL, media_type);
++    IMFMediaType_Release(media_type);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    if (FAILED(hr)) goto done;
++
++    for (pass = 0; pass < 2; ++pass)
++    {
++        if (pass)
++        {
++            position.vt = VT_I8;
++            position.hVal.QuadPart = 0;
++            hr = IMFSourceReader_SetCurrentPosition(reader, &GUID_NULL, &position);
++            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++            if (FAILED(hr)) break;
++        }
++
++        /* The first video sample is at 46 ms, then 25 fps. Cross 200 ms on
++         * both initial playback and replay without resetting the timeline. */
++        for (i = 0; i < 16; ++i)
++        {
++            winetest_push_context("pass %u, sample %u", pass, i);
++            sample = NULL;
++            flags = 0;
++            timestamp = -1;
++            hr = IMFSourceReader_ReadSample(reader, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
++                    0, NULL, &flags, &timestamp, &sample);
++            ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++            ok(!flags, "Unexpected stream flags %#lx.\n", flags);
++            ok(!!sample, "Expected sample object.\n");
++            if (SUCCEEDED(hr) && sample)
++            {
++                expected = 460000 + i * 400000;
++                ok(timestamp == expected, "Got timestamp %I64d, expected %I64d.\n", timestamp, expected);
++                sample_time = -1;
++                hr = IMFSample_GetSampleTime(sample, &sample_time);
++                ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++                ok(sample_time == expected, "Got sample time %I64d, expected %I64d.\n", sample_time, expected);
++            }
++            if (sample) IMFSample_Release(sample);
++            winetest_pop_context();
++            if (FAILED(hr) || !sample || flags & MF_SOURCE_READERF_ENDOFSTREAM) break;
++        }
++    }
++
++done:
++    IMFSourceReader_Release(reader);
++}
++
+ static void check_source_reader_sample_lifetime(IMFSourceReader *reader, DWORD stream_index)
+ {
+     IMFSample *first_sample = NULL, *sample;
+@@ -3936,6 +4022,7 @@
+     test_interfaces();
+     test_source_reader("test.wav", false);
+     test_source_reader("test.mp4", true);
++    test_source_reader_asf_timestamps();
+     test_source_reader_from_media_source();
+     test_source_reader_transforms(FALSE, FALSE);
+     test_source_reader_transforms(TRUE, FALSE);
+diff --git a/dlls/mfreadwrite/tests/resource.rc b/dlls/mfreadwrite/tests/resource.rc
+--- a/dlls/mfreadwrite/tests/resource.rc
++++ b/dlls/mfreadwrite/tests/resource.rc
+@@ -25,3 +25,6 @@
+ /* ffmpeg -f lavfi -i smptebars -f lavfi -i "sine=frequency=1000" -t 1.0 -r 25 -f mp4 -vcodec h264 -vf scale=160x120 -acodec aac test.mp4 */
+ /* @makedep: test.mp4 */
+ test.mp4 RCDATA test.mp4
++
++/* @makedep: ../../wmvcore/tests/test.wmv */
++test.wmv RCDATA ../../wmvcore/tests/test.wmv

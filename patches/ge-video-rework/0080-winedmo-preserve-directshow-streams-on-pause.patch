@@ -1,0 +1,179 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] winedmo: Preserve DirectShow streams across pause and resume.
+
+strmbase calls filter_stop_stream for both Run -> Pause and Run -> Stop.
+Our parser used this callback to begin a downstream flush and advance
+read_flush_generation. On resume, EndFlush reset the DMO decoder while
+the stream threads discarded all queued packets from the old generation.
+The demuxer then continued from its read-ahead position, without seeking
+back to a keyframe.
+
+The Nioh logs in #826 show a WMV3 keyframe decoded at timestamp zero,
+followed by a DMO Flush roughly 66 ms later and a non-keyframe at 1.401 s.
+FFmpeg reports "first frame is no keyframe". The previous log shows the
+same sequence with a 1.434 s post-flush packet. These logs do not include
+quartz state tracing, but the destructive pause hook explains both the
+decoder reset and the read-ahead-sized gap.
+
+Remove the stop_stream hook from the shared AVI, MPEG and ASF parser.
+Non-live DirectShow sources must keep delivering while paused, allowing
+the renderer to provide backpressure without losing data. Leave real
+stop flushing and thread teardown in cleanup_stream, and retain the
+explicit seek flush path.
+
+Extend the AVI splitter tests to check that Run -> Pause -> Run sends
+neither BeginFlush nor EndFlush downstream. Perform the transition at
+EOS so the assertion does not depend on streaming-thread timing; the
+old hook flushes at EOS too.
+
+Reported-by: g89vito
+Link: https://github.com/GloriousEggroll/proton-ge-custom/issues/826#issuecomment-6042842433
+Reference: https://learn.microsoft.com/en-us/windows/win32/directshow/filter-states
+
+diff --git a/dlls/winedmo/winedmo_quartz_parser.c b/dlls/winedmo/winedmo_quartz_parser.c
+--- a/dlls/winedmo/winedmo_quartz_parser.c
++++ b/dlls/winedmo/winedmo_quartz_parser.c
+@@ -1639,43 +1639,8 @@
+     return S_OK;
+ }
+ 
+-static HRESULT dmo_parser_stop_stream(struct strmbase_filter *iface)
+-{
+-    struct dmo_parser *filter = dmo_impl_from_strmbase_filter(iface);
+-    unsigned int i;
+-
+-    if (!filter->sink_connected)
+-        return S_OK;
+-
+-    EnterCriticalSection(&filter->streaming_cs);
+-    filter->flushing = true;
+-    filter->read_flushing = TRUE;
+-    ++filter->read_flush_generation;
+-    LeaveCriticalSection(&filter->streaming_cs);
+-    dmo_parser_wake_demux_thread(filter);
+-
+-    dmo_parser_begin_downstream_flush(filter);
+-    WakeAllConditionVariable(&filter->flushing_cv);
+-
+-    for (i = 0; i < filter->source_count; ++i)
+-    {
+-        WakeConditionVariable(&filter->sources[i]->queue_cv);
+-        WakeConditionVariable(&filter->sources[i]->eos_cv);
+-    }
+-
+-    for (i = 0; i < filter->source_count; ++i)
+-    {
+-        struct dmo_parser_source *pin = filter->sources[i];
+-
+-        if (!dmo_parser_source_is_active(pin))
+-            continue;
+-        EnterCriticalSection(&pin->flushing_cs);
+-        LeaveCriticalSection(&pin->flushing_cs);
+-    }
+-
+-    return S_OK;
+-}
+-
++/* filter_stop_stream is also called for Run -> Pause. Keep delivering there;
++ * perform teardown flushing only on a real Stop. */
+ static HRESULT dmo_parser_cleanup_stream(struct strmbase_filter *iface)
+ {
+     struct dmo_parser *filter = dmo_impl_from_strmbase_filter(iface);
+@@ -1867,7 +1832,6 @@
+     .filter_destroy = dmo_parser_destroy,
+     .filter_init_stream = dmo_parser_init_stream,
+     .filter_start_stream = dmo_parser_start_stream,
+-    .filter_stop_stream = dmo_parser_stop_stream,
+     .filter_cleanup_stream = dmo_parser_cleanup_stream,
+ };
+ 
+@@ -2157,7 +2121,6 @@
+     .filter_destroy = dmo_parser_destroy,
+     .filter_init_stream = dmo_parser_init_stream,
+     .filter_start_stream = dmo_parser_start_stream,
+-    .filter_stop_stream = dmo_parser_stop_stream,
+     .filter_cleanup_stream = dmo_parser_cleanup_stream,
+ };
+ 
+@@ -2311,7 +2274,6 @@
+     .filter_destroy = dmo_parser_destroy,
+     .filter_init_stream = dmo_parser_init_stream,
+     .filter_start_stream = dmo_parser_start_stream,
+-    .filter_stop_stream = dmo_parser_stop_stream,
+     .filter_cleanup_stream = dmo_parser_cleanup_stream,
+ };
+ 
+diff --git a/dlls/quartz/tests/avisplit.c b/dlls/quartz/tests/avisplit.c
+--- a/dlls/quartz/tests/avisplit.c
++++ b/dlls/quartz/tests/avisplit.c
+@@ -809,6 +809,7 @@
+     const AM_MEDIA_TYPE *mt;
+     HANDLE eos_event;
+     unsigned int sample_count, eos_count, new_segment_count;
++    unsigned int begin_flush_count, end_flush_count;
+     REFERENCE_TIME segment_start, segment_end, seek_start, seek_end;
+ };
+ 
+@@ -843,6 +844,7 @@
+     filter->new_segment_count = 0;
+     filter->eos_count = 0;
+     filter->sample_count = 0;
++    filter->begin_flush_count = filter->end_flush_count = 0;
+     return S_OK;
+ }
+ 
+@@ -1002,6 +1004,22 @@
+     return S_OK;
+ }
+ 
++static HRESULT testsink_begin_flush(struct strmbase_sink *iface)
++{
++    struct testfilter *filter = impl_from_strmbase_filter(iface->pin.filter);
++
++    ++filter->begin_flush_count;
++    return S_OK;
++}
++
++static HRESULT testsink_end_flush(struct strmbase_sink *iface)
++{
++    struct testfilter *filter = impl_from_strmbase_filter(iface->pin.filter);
++
++    ++filter->end_flush_count;
++    return S_OK;
++}
++
+ static const struct strmbase_sink_ops testsink_ops =
+ {
+     .base.pin_query_interface = testsink_query_interface,
+@@ -1010,6 +1028,8 @@
+     .pfnReceive = testsink_Receive,
+     .sink_eos = testsink_eos,
+     .sink_new_segment = testsink_new_segment,
++    .sink_begin_flush = testsink_begin_flush,
++    .sink_end_flush = testsink_end_flush,
+ };
+ 
+ static struct testfilter *impl_from_IAsyncReader(IAsyncReader *iface)
+@@ -1711,6 +1731,22 @@
+     ok(WaitForSingleObject(testsink.eos_event, 100) == WAIT_TIMEOUT, "Got more than one EOS.\n");
+     ok(testsink.sample_count, "Expected at least one sample.\n");
+ 
++    /* Pause and resume must not flush the downstream decoder, even at EOS. */
++    hr = IMediaControl_Run(control);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    ok(!testsink.begin_flush_count, "Got %u BeginFlush calls.\n", testsink.begin_flush_count);
++    ok(!testsink.end_flush_count, "Got %u EndFlush calls.\n", testsink.end_flush_count);
++
++    hr = IMediaControl_Pause(control);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    ok(!testsink.begin_flush_count, "Got %u BeginFlush calls on Pause.\n", testsink.begin_flush_count);
++    ok(!testsink.end_flush_count, "Got %u EndFlush calls on Pause.\n", testsink.end_flush_count);
++
++    hr = IMediaControl_Run(control);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    ok(!testsink.begin_flush_count, "Got %u BeginFlush calls on Run.\n", testsink.begin_flush_count);
++    ok(!testsink.end_flush_count, "Got %u EndFlush calls on Run.\n", testsink.end_flush_count);
++
+     hr = IMediaControl_Stop(control);
+     ok(hr == S_OK, "Got hr %#lx.\n", hr);
+     hr = IMediaControl_Pause(control);
