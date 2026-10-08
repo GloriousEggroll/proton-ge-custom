@@ -464,6 +464,18 @@ make redist &> log
 
 The build will be placed within the build directory as SOME-BUILD-NAME-HERE.tar.gz.
 
+### Debian helper script
+
+On Debian (written for Debian 14 "forky"), `build-debian.sh` runs all of the steps above: it installs the host packages and a container engine (rootless podman by default), fetches submodules, applies the patches and stops on any failure, runs `configure.sh` and `make redist` in `./build`, and extracts the result into Steam's `compatibilitytools.d`:
+
+```sh
+git clone --recurse-submodules https://github.com/gloriouseggroll/proton-ge-custom
+cd proton-ge-custom
+./build-debian.sh            # see ./build-debian.sh --help for options
+```
+
+Run it as your normal user (it uses `sudo` for `apt`). A full build takes several hours and needs about 80 GB of free disk space.
+
 ## Enabling
 
 1. Right click any game in Steam and click `Properties`.
