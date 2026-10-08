@@ -1,0 +1,517 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] winedmo: Open HTTP and RTSP media asynchronously by URL.
+
+The MPEG-TS log in #748 stops at scheme_handler_BeginCreateObject before
+any demuxer is created. Non-MP4 HTTP sources still use
+URLOpenBlockingStreamW there, which waits for the download to finish.
+An endless transport stream cannot finish, and even finite downloads
+block the caller before the asynchronous resolver work is queued.
+
+Use the existing IO work item to open all HTTP(S) media through FFmpeg,
+including TS, MKV and extensionless URLs. Preserve the existing HLS and
+progressive MP4 options. Bound non-HLS network IO waits, identify live
+nonseekable inputs without discarding known finite durations, and share
+the existing common timestamp offset across their audio/video streams.
+Only interpret AVIO opaque data as a Wine stream_context when using
+Wine's own read callback; direct network inputs have FFmpeg-owned IO.
+
+The RTSPT trace reaches the demuxer but reads the empty placeholder
+bytestream. Open RTSP URLs directly as well, translating rtspt:// and
+rtspu:// to rtsp:// with explicit TCP and UDP transports respectively.
+Normalize only the scheme's case, leaving paths and query data intact.
+Register both explicit-transport aliases with Media Foundation.
+
+The alias registrations follow Torge Matthies
+<openglfreak@googlemail.com>'s winegstreamer change, commit
+67bfe239bba3755fced37ed0f1283f32713e8a75 (CW-Bug-Id: #21644), carried
+by SpookySkeletons/proton-rtsp. The FFmpeg implementation here is new;
+it does not import the GStreamer backend or claim its other aliases.
+
+Add loopback resolver tests for HTTP, extensionless and common media
+paths, RTSP, RTSPT, RTSPU, and mixed-case schemes. Hold the server reply
+until BeginCreateObjectFromURL returns to detect synchronous network IO.
+These cover routing and asynchronous failure completion, not successful
+media playback or RTSP SETUP transport negotiation.
+
+Reference: https://github.com/GloriousEggroll/proton-ge-custom/issues/748
+Reference: https://learn.microsoft.com/en-us/windows/win32/medfound/supported-protocols
+Reference: https://ffmpeg.org/ffmpeg-protocols.html#rtsp
+Reference: https://github.com/SpookySkeletons/proton-rtsp/blob/rtsp/10-33-24/patches/wine-gst/0005-winegstreamer-Add-more-RTSP-based-URI-schemes-to-GSt.patch
+---
+diff --git a/dlls/winedmo/media_source.c b/dlls/winedmo/media_source.c
+--- a/dlls/winedmo/media_source.c
++++ b/dlls/winedmo/media_source.c
+@@ -26,7 +26,6 @@
+ 
+ #include "mfapi.h"
+ #include "mferror.h"
+-#include "urlmon.h"
+ 
+ #include "wine/list.h"
+ 
+@@ -2801,22 +2800,9 @@
+     if (cancel_cookie)
+         *cancel_cookie = NULL;
+ 
+-    if ((!wcsnicmp(url, L"http://", 7) || !wcsnicmp(url, L"https://", 8))
+-            && (wcsstr(url, L".googlevideo.com/videoplayback") || wcsstr(url, L".mp4")))
+-    {
+-        /* The demuxer opens progressive HTTP media directly through FFmpeg. */
+-        if (FAILED(hr = CreateStreamOnHGlobal(0, TRUE, &stream)))
+-            return hr;
+-    }
+-    else if (!wcsnicmp(url, L"http://", 7) || !wcsnicmp(url, L"https://", 8))
+-    {
+-        if (FAILED(hr = URLOpenBlockingStreamW(NULL, url, &stream, 0, NULL)))
+-        {
+-            WARN("Failed to open url %s, hr %#lx\n", debugstr_w(url), hr);
+-            return hr;
+-        }
+-    }
+-    else if (FAILED(hr = CreateStreamOnHGlobal(0, TRUE, &stream)))
++    /* The IO work item opens the URL through FFmpeg. Downloading here would
++     * block BeginCreateObject indefinitely for an unbounded HTTP stream. */
++    if (FAILED(hr = CreateStreamOnHGlobal(0, TRUE, &stream)))
+         return hr;
+ 
+     hr = MFCreateMFByteStreamOnStream(stream, &bytestream);
+@@ -2825,8 +2811,13 @@
+         return hr;
+ 
+     if (FAILED(hr = MFCreateAsyncResult(NULL, callback, state, &result)))
++    {
++        IMFByteStream_Release(bytestream);
+         return hr;
+-    if (FAILED(hr = object_context_create(flags, bytestream, url, -1, 0, result, &context)))
++    }
++    hr = object_context_create(flags, bytestream, url, -1, 0, result, &context);
++    IMFByteStream_Release(bytestream);
++    if (FAILED(hr))
+     {
+         IMFAsyncResult_Release(result);
+         return hr;
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -27,6 +27,8 @@
+ 
+ #ifdef HAVE_FFMPEG
+ 
++#include <libavutil/avstring.h>
++
+ WINE_DEFAULT_DEBUG_CHANNEL(dmo);
+ 
+ static inline const char *debugstr_averr( int err )
+@@ -120,7 +122,7 @@
+         0xa1, 0xdc, 0xab, 0x8c, 0x47, 0xa9, 0xcf, 0x11,
+         0x8e, 0xe4, 0x00, 0xc0, 0x0c, 0x20, 0x53, 0x65
+     };
+-    struct stream_context *context = ctx->pb ? ctx->pb->opaque : NULL;
++    struct stream_context *context = ctx->pb && ctx->pb->read_packet == unix_read_callback ? ctx->pb->opaque : NULL;
+     BYTE header[30], object[104];
+     UINT64 header_size, offset;
+     UINT32 object_count, i;
+@@ -205,7 +207,7 @@
+         sample->dts = max( 0, sample->dts - stream->timestamp_base );
+ }
+ 
+-static void normalize_live_hls_timestamps( const struct demuxer *demuxer, struct sample *sample )
++static void normalize_live_timestamps( const struct demuxer *demuxer, struct sample *sample )
+ {
+     if (demuxer->live_timestamp_base == AV_NOPTS_VALUE)
+         return;
+@@ -428,7 +430,7 @@
+ 
+ static INT64 get_raw_mpegvideo_duration( const AVFormatContext *ctx )
+ {
+-    struct stream_context *context = ctx->pb ? ctx->pb->opaque : NULL;
++    struct stream_context *context = ctx->pb && ctx->pb->read_packet == unix_read_callback ? ctx->pb->opaque : NULL;
+     const UINT32 buffer_size = 64 * 1024;
+     UINT64 offset, length;
+     AVStream *video = NULL;
+@@ -802,20 +804,30 @@
+     unix_seek_callback( context, pos, SEEK_SET );
+ }
+ 
+-static BOOL is_http_hls_url( const char *url )
++static BOOL is_http_url( const char *url )
+ {
+-    if (!url || (strncmp( url, "http://", 7 ) && strncmp( url, "https://", 8 ))) return FALSE;
++    return url && (av_stristart( url, "http://", NULL ) || av_stristart( url, "https://", NULL ));
++}
+ 
++static BOOL is_http_hls_url( const char *url )
++{
++    if (!is_http_url( url )) return FALSE;
+     return !!strstr( url, ".m3u8" ) || !!strstr( url, "/hls_playlist/" );
+ }
+ 
+ static BOOL is_http_progressive_url( const char *url )
+ {
+-    if (!url || (strncmp( url, "http://", 7 ) && strncmp( url, "https://", 8 ))) return FALSE;
++    if (!is_http_url( url )) return FALSE;
+ 
+     return !!strstr( url, ".googlevideo.com/videoplayback" ) || !!strstr( url, ".mp4" );
+ }
+ 
++static BOOL is_rtsp_url( const char *url )
++{
++    return url && (av_stristart( url, "rtsp://", NULL ) || av_stristart( url, "rtspt://", NULL )
++            || av_stristart( url, "rtspu://", NULL ));
++}
++
+ static void demuxer_free_context( struct demuxer *demuxer )
+ {
+     if (!demuxer->ctx) return;
+@@ -851,16 +863,27 @@
+     demuxer->live_timestamp_base = AV_NOPTS_VALUE;
+ 
+     if (!(demuxer->ctx = avformat_alloc_context())) goto failed;
+-    if (is_http_hls_url( params->url ) || is_http_progressive_url( params->url ))
++    if (is_http_url( params->url ) || is_rtsp_url( params->url ))
+     {
++        BOOL hls = is_http_hls_url( params->url ), rtsp = is_rtsp_url( params->url );
+         BOOL progressive = is_http_progressive_url( params->url );
+         AVDictionary *options = NULL;
+-        const AVInputFormat *format = progressive ? NULL : av_find_input_format( "hls" );
++        const AVInputFormat *input_format = hls ? av_find_input_format( "hls" ) : NULL;
++        char *url, *p;
+ 
+-        /* HLS playlists need the source URL as their base URI, while URLMon
+-         * can expose progressive streams as non-seekable or incomplete streams.
+-         * Let FFmpeg handle both remote source forms directly. */
++        /* Keep the URL as the base for playlists and let FFmpeg probe HTTP
++         * media regardless of its extension, without waiting for HTTP EOF. */
+         demuxer->direct_url = TRUE;
++        if (!(url = strdup( params->url ))) goto failed;
++        for (p = url; *p && *p != ':'; ++p) *p = av_tolower( *p );
++        if (!strncmp( url, "rtspt://", 8 ) || !strncmp( url, "rtspu://", 8 ))
++        {
++            av_dict_set( &options, "rtsp_transport", url[4] == 't' ? "tcp" : "udp", 0 );
++            /* FFmpeg accepts rtsp:// plus an explicit transport option. */
++            memmove( url + 4, url + 5, strlen( url + 5 ) + 1 );
++        }
++        if (rtsp) av_dict_set( &options, "timeout", "15000000", 0 );
++        else if (!hls) av_dict_set( &options, "rw_timeout", "15000000", 0 );
+         if (progressive)
+         {
+             /* Replayed byte-range requests can be reset before media EOF. */
+@@ -870,7 +893,8 @@
+             av_dict_set( &options, "reconnect_delay_max", "5", 0 );
+         }
+ 
+-        ret = avformat_open_input( &demuxer->ctx, params->url, format, &options );
++        ret = avformat_open_input( &demuxer->ctx, url, input_format, &options );
++        free( url );
+         av_dict_free( &options );
+         if (ret < 0)
+         {
+@@ -881,6 +905,10 @@
+                 !(demuxer->ctx->pb->seekable & AVIO_SEEKABLE_NORMAL) ||
+                 demuxer->ctx->duration == AV_NOPTS_VALUE))
+             demuxer->nonseekable = TRUE;
++        else if (!hls && get_context_duration( demuxer->ctx ) == AV_NOPTS_VALUE && (rtsp ||
++                (demuxer->ctx->pb && !(demuxer->ctx->pb->seekable & AVIO_SEEKABLE_NORMAL)
++                && avio_size( demuxer->ctx->pb ) < 0)))
++            demuxer->nonseekable = TRUE;
+     }
+     else
+     {
+@@ -911,7 +939,7 @@
+     if (demuxer->nonseekable) params->duration = AV_NOPTS_VALUE;
+     demuxer->duration = params->duration;
+     if (demuxer->duration == AV_NOPTS_VALUE && demuxer->ctx->start_time != AV_NOPTS_VALUE &&
+-        strstr( format->name, "hls" ))
++        (strstr( format->name, "hls" ) || demuxer->nonseekable))
+     {
+         demuxer->live_timestamp_base = get_user_time( demuxer->ctx->start_time, AV_TIME_BASE_Q );
+     }
+@@ -1077,7 +1105,7 @@
+     sample->pts = get_stream_time( stream, packet->pts );
+     sample->dts = get_stream_time( stream, packet->dts );
+     sample->duration = get_stream_time( stream, packet->duration );
+-    normalize_live_hls_timestamps( demuxer, sample );
++    normalize_live_timestamps( demuxer, sample );
+     fixup_asf_mpeg4_timestamps( demuxer->ctx, stream, demuxer_stream, sample );
+     if (demuxer->ctx->iformat && strstr( demuxer->ctx->iformat->name, "asf" ))
+         normalize_stream_timestamps( demuxer_stream, sample );
+diff --git a/dlls/winedmo/winedmo.rgs b/dlls/winedmo/winedmo.rgs
+--- a/dlls/winedmo/winedmo.rgs
++++ b/dlls/winedmo/winedmo.rgs
+@@ -62,6 +62,14 @@
+                     {
+                         val '{587eeb6a-7336-4ebd-a4f2-91c948de622c}' = s 'winedmo Scheme Handler'
+                     }
++                    'rtspt:'
++                    {
++                        val '{587eeb6a-7336-4ebd-a4f2-91c948de622c}' = s 'winedmo Scheme Handler'
++                    }
++                    'rtspu:'
++                    {
++                        val '{587eeb6a-7336-4ebd-a4f2-91c948de622c}' = s 'winedmo Scheme Handler'
++                    }
+                 }
+             }
+         }
+diff --git a/dlls/mfplat/tests/Makefile.in b/dlls/mfplat/tests/Makefile.in
+--- a/dlls/mfplat/tests/Makefile.in
++++ b/dlls/mfplat/tests/Makefile.in
+@@ -1,6 +1,7 @@
+ TESTDLL   = mfplat.dll
+-IMPORTS   = ole32 mfplat user32 d3d9 dxva2 mfuuid propsys uuid strmiids kernelbase
++IMPORTS   = ole32 mfplat user32 d3d9 dxva2 mfuuid propsys uuid strmiids kernelbase ws2_32
+ 
+ SOURCES = \
+ 	mfplat.c \
++	network.c \
+ 	resource.rc
+diff --git a/dlls/mfplat/tests/network.c b/dlls/mfplat/tests/network.c
+--- /dev/null
++++ b/dlls/mfplat/tests/network.c
+@@ -0,0 +1,246 @@
++/*
++ * Media Foundation network source resolver tests
++ *
++ * Copyright 2026 GloriousEggroll
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ */
++
++#define COBJMACROS
++#include <stdarg.h>
++#include <stdio.h>
++#include <string.h>
++#include "winsock2.h"
++#include "mfapi.h"
++#include "mfidl.h"
++#include "wine/test.h"
++
++struct network_test
++{
++    IMFAsyncCallback IMFAsyncCallback_iface;
++    LONG refcount;
++    IMFSourceResolver *resolver;
++    HANDLE reply, complete;
++    SOCKET listener;
++    BOOL rtsp, blocked_begin;
++    char request[2048];
++};
++
++static struct network_test *impl_from_IMFAsyncCallback(IMFAsyncCallback *iface)
++{
++    return CONTAINING_RECORD(iface, struct network_test, IMFAsyncCallback_iface);
++}
++
++static HRESULT WINAPI callback_QueryInterface(IMFAsyncCallback *iface, REFIID iid, void **out)
++{
++    *out = NULL;
++    if (!IsEqualIID(iid, &IID_IUnknown) && !IsEqualIID(iid, &IID_IMFAsyncCallback))
++        return E_NOINTERFACE;
++    *out = iface;
++    IMFAsyncCallback_AddRef(iface);
++    return S_OK;
++}
++
++static ULONG WINAPI callback_AddRef(IMFAsyncCallback *iface)
++{
++    return InterlockedIncrement(&impl_from_IMFAsyncCallback(iface)->refcount);
++}
++
++static ULONG WINAPI callback_Release(IMFAsyncCallback *iface)
++{
++    struct network_test *test = impl_from_IMFAsyncCallback(iface);
++    ULONG refcount = InterlockedDecrement(&test->refcount);
++
++    if (!refcount)
++    {
++        IMFSourceResolver_Release(test->resolver);
++        closesocket(test->listener);
++        CloseHandle(test->reply);
++        CloseHandle(test->complete);
++        free(test);
++    }
++    return refcount;
++}
++
++static HRESULT WINAPI callback_GetParameters(IMFAsyncCallback *iface, DWORD *flags, DWORD *queue)
++{
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI callback_Invoke(IMFAsyncCallback *iface, IMFAsyncResult *result)
++{
++    struct network_test *test = impl_from_IMFAsyncCallback(iface);
++    IUnknown *object = NULL;
++    MF_OBJECT_TYPE type;
++    HRESULT hr;
++
++    hr = IMFSourceResolver_EndCreateObjectFromURL(test->resolver, result, &type, &object);
++    ok(FAILED(hr), "Expected a failed network request, got %#lx.\n", hr);
++    if (object) IUnknown_Release(object);
++    SetEvent(test->complete);
++    return S_OK;
++}
++
++static const IMFAsyncCallbackVtbl callback_vtbl =
++{
++    callback_QueryInterface,
++    callback_AddRef,
++    callback_Release,
++    callback_GetParameters,
++    callback_Invoke,
++};
++
++static DWORD WINAPI server_thread(void *arg)
++{
++    static const char http_reply[] = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
++    static const char rtsp_reply[] = "RTSP/1.0 404 Not Found\r\nCSeq: 1\r\nContent-Length: 0\r\n\r\n";
++    struct network_test *test = arg;
++    struct timeval timeout = {5, 0};
++    DWORD receive_timeout = 3000;
++    SOCKET client;
++    fd_set sockets;
++    int size = 0, ret;
++
++    FD_ZERO(&sockets);
++    FD_SET(test->listener, &sockets);
++    if (select(0, &sockets, NULL, NULL, &timeout) != 1) goto done;
++    if ((client = accept(test->listener, NULL, NULL)) == INVALID_SOCKET) goto done;
++    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, (char *)&receive_timeout, sizeof(receive_timeout));
++    while (size < sizeof(test->request) - 1)
++    {
++        if ((ret = recv(client, test->request + size, sizeof(test->request) - 1 - size, 0)) <= 0) break;
++        size += ret;
++        test->request[size] = 0;
++        if (strstr(test->request, "\r\n\r\n")) break;
++    }
++
++    /* Do not answer until BeginCreateObjectFromURL has returned. The timeout
++     * also lets a broken synchronous implementation finish instead of hanging. */
++    test->blocked_begin = WaitForSingleObject(test->reply, 2000) != WAIT_OBJECT_0;
++    if (test->rtsp) send(client, rtsp_reply, sizeof(rtsp_reply) - 1, 0);
++    else send(client, http_reply, sizeof(http_reply) - 1, 0);
++    shutdown(client, SD_BOTH);
++    closesocket(client);
++done:
++    IMFAsyncCallback_Release(&test->IMFAsyncCallback_iface);
++    return 0;
++}
++
++static void test_network_url(const WCHAR *scheme, const WCHAR *path, BOOL rtsp)
++{
++    struct sockaddr_in address = {0};
++    struct network_test *test;
++    int size = sizeof(address), ret;
++    WCHAR url[256];
++    HANDLE thread;
++    DWORD wait;
++    HRESULT hr;
++
++    winetest_push_context("%s%s", wine_dbgstr_w(scheme), wine_dbgstr_w(path));
++    test = calloc(1, sizeof(*test));
++    test->IMFAsyncCallback_iface.lpVtbl = &callback_vtbl;
++    test->refcount = 1;
++    test->rtsp = rtsp;
++    test->listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
++    ok(test->listener != INVALID_SOCKET, "Failed to create socket, error %d.\n", WSAGetLastError());
++    if (test->listener == INVALID_SOCKET)
++    {
++        free(test);
++        goto done;
++    }
++    test->reply = CreateEventW(NULL, TRUE, FALSE, NULL);
++    test->complete = CreateEventW(NULL, TRUE, FALSE, NULL);
++    hr = MFCreateSourceResolver(&test->resolver);
++    ok(hr == S_OK, "Failed to create resolver, hr %#lx.\n", hr);
++    if (FAILED(hr))
++    {
++        closesocket(test->listener);
++        CloseHandle(test->reply);
++        CloseHandle(test->complete);
++        free(test);
++        goto done;
++    }
++
++    address.sin_family = AF_INET;
++    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++    ret = bind(test->listener, (struct sockaddr *)&address, sizeof(address));
++    ok(!ret, "Failed to bind, error %d.\n", WSAGetLastError());
++    if (ret) goto release;
++    ret = getsockname(test->listener, (struct sockaddr *)&address, &size);
++    ok(!ret, "Failed to get socket address, error %d.\n", WSAGetLastError());
++    if (ret) goto release;
++    ret = listen(test->listener, 1);
++    ok(!ret, "Failed to listen, error %d.\n", WSAGetLastError());
++    if (ret) goto release;
++
++    swprintf(url, ARRAY_SIZE(url), L"%s://127.0.0.1:%u%s", scheme, ntohs(address.sin_port), path);
++    IMFAsyncCallback_AddRef(&test->IMFAsyncCallback_iface);
++    thread = CreateThread(NULL, 0, server_thread, test, 0, NULL);
++    ok(!!thread, "Failed to create server thread.\n");
++    if (!thread)
++    {
++        IMFAsyncCallback_Release(&test->IMFAsyncCallback_iface);
++        goto release;
++    }
++    hr = IMFSourceResolver_BeginCreateObjectFromURL(test->resolver, url, MF_RESOLUTION_MEDIASOURCE,
++            NULL, NULL, &test->IMFAsyncCallback_iface, NULL);
++    SetEvent(test->reply);
++    ok(hr == S_OK, "BeginCreateObjectFromURL failed, hr %#lx.\n", hr);
++    wait = WaitForSingleObject(thread, 10000);
++    ok(wait == WAIT_OBJECT_0, "Server thread did not finish, wait %#lx.\n", wait);
++    if (wait == WAIT_OBJECT_0)
++    {
++        ok(!test->blocked_begin, "BeginCreateObjectFromURL waited for a network response.\n");
++        ok(!!test->request[0], "No request reached the server.\n");
++        if (rtsp)
++            ok(!!strstr(test->request, " rtsp://127.0.0.1:"), "Unexpected RTSP request %s.\n", test->request);
++        else
++            ok(!!strstr(test->request, "HTTP/1."), "Unexpected HTTP request %s.\n", test->request);
++    }
++    CloseHandle(thread);
++    if (SUCCEEDED(hr))
++    {
++        wait = WaitForSingleObject(test->complete, 10000);
++        ok(wait == WAIT_OBJECT_0, "Missing completion callback, wait %#lx.\n", wait);
++    }
++release:
++    IMFAsyncCallback_Release(&test->IMFAsyncCallback_iface);
++done:
++    winetest_pop_context();
++}
++
++START_TEST(network)
++{
++    WSADATA data;
++    HRESULT hr;
++    int ret;
++
++    CoInitializeEx(NULL, COINIT_MULTITHREADED);
++    ret = WSAStartup(MAKEWORD(2, 2), &data);
++    ok(!ret, "WSAStartup failed, error %d.\n", ret);
++    hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
++    ok(hr == S_OK, "MFStartup failed, hr %#lx.\n", hr);
++    if (!ret && SUCCEEDED(hr))
++    {
++        test_network_url(L"http", L"/live.ts", FALSE);
++        test_network_url(L"HTTP", L"/live", FALSE);
++        test_network_url(L"http", L"/movie.mkv", FALSE);
++        test_network_url(L"http", L"/movie.mp4", FALSE);
++        test_network_url(L"http", L"/live.m3u8", FALSE);
++        test_network_url(L"rtsp", L"/live", TRUE);
++        test_network_url(L"rtspt", L"/live", TRUE);
++        test_network_url(L"RTSPT", L"/live", TRUE);
++        test_network_url(L"rtspu", L"/live", TRUE);
++    }
++    if (SUCCEEDED(hr)) MFShutdown();
++    if (!ret) WSACleanup();
++    CoUninitialize();
++}
