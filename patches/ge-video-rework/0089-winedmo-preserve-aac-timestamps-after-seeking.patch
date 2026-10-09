@@ -1,0 +1,215 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] winedmo: Preserve AAC presentation timestamps after seeking.
+
+Seeking a finite HTTP MP4 in VRChat starts the demuxer at the requested
+keyframe, but the AAC transform resets its first decoded timestamp to
+zero. The session drops the resulting audio as pre-seek preroll; video
+only advances a few frames and the application keeps requesting new
+seeks to recover its clock.
+
+In the capture, the seek target is 1218.9382324 seconds. The first AAC
+packet has PTS 1215.1234467, while the decoder's output is stamped 0.0.
+No audio reaches the renderer after that seek.
+
+The timestamp reset was gated on split_aac_output, which selects AAC
+packet batching from the input WAVEFORMATEX fields. Streaming AAC was
+already exempt, but MP4-style AAC with block alignment and sample bits
+was not. Packet batching must not change the presentation timeline.
+
+Extend the PCM timestamp-preservation policy to all AAC input, including
+negative preroll. Exclude AAC from the legacy ASF/WMA frame-anchor and
+negative-offset corrections as well. Preserve the other compressed-codec
+behavior, packet batching, and network read-ahead.
+
+Add AAC MFT tests using the existing encoded sample fixture, with and
+without block alignment, for nonzero startup, forward/backward seeks,
+discontinuity, negative preroll, and a return to zero after flushing.
+
+Fixes: https://github.com/GloriousEggroll/proton-ge-custom/issues/738#issuecomment-6082461588
+---
+diff --git a/dlls/winedmo/unix_transform.c b/dlls/winedmo/unix_transform.c
+--- a/dlls/winedmo/unix_transform.c
++++ b/dlls/winedmo/unix_transform.c
+@@ -60,7 +60,7 @@
+     AVPacket       *parsed_packet; /* reusable packet for parser output */
+ 
+     bool is_audio;
+-    bool is_raw_audio;
++    bool preserve_audio_timestamps;
+     bool is_raw_video;
+     bool draining;       /* NULL packet sent — flushing decoder */
+     bool frame_pending;  /* frame holds undispatched output */
+@@ -780,9 +780,9 @@
+         const WAVEFORMATEX *wfx = &in_fmt->audio;
+ 
+         t->is_audio = true;
+-        t->is_raw_audio = format_tag_from_wfx( wfx ) == WAVE_FORMAT_PCM ||
+-                format_tag_from_wfx( wfx ) == WAVE_FORMAT_IEEE_FLOAT;
+         codec_id    = codec_id_from_audio_format( wfx );
++        t->preserve_audio_timestamps = format_tag_from_wfx( wfx ) == WAVE_FORMAT_PCM ||
++                format_tag_from_wfx( wfx ) == WAVE_FORMAT_IEEE_FLOAT || codec_id == AV_CODEC_ID_AAC;
+ 
+         if (wfx->cbSize && params->input_format_size >= sizeof(*wfx) + wfx->cbSize)
+         {
+@@ -1476,7 +1476,7 @@
+          * clip starts at a non-zero packet timestamp. Rebase those frame-relative
+          * timestamps onto the current input packet anchor so audio and video start
+          * on the same timeline for clip transitions. */
+-        if (t->is_audio && !t->is_raw_audio && t->avctx->codec_id != AV_CODEC_ID_WMAPRO
++        if (t->is_audio && !t->preserve_audio_timestamps && t->avctx->codec_id != AV_CODEC_ID_WMAPRO
+                 && t->last_input_pts > 0 && params->pts >= 0 && params->pts < t->last_input_pts)
+             params->pts += t->last_input_pts;
+     }
+@@ -1496,7 +1496,7 @@
+         INT64 base_pts = params->pts;
+         NTSTATUS st;
+ 
+-        if (!t->is_raw_audio && base_pts != INT64_MIN && t->audio_pts_offset)
++        if (!t->preserve_audio_timestamps && base_pts != INT64_MIN && t->audio_pts_offset)
+         {
+             base_pts -= t->audio_pts_offset;
+             params->pts = base_pts;
+@@ -1553,10 +1553,9 @@
+          * (legacy PROVIDES_SAMPLES query) get STATUS_BUFFER_TOO_SMALL with the full
+          * size; all other callers receive up to capacity bytes with INCOMPLETE set when
+          * more data remains. */
+-        /* PCM conversion must preserve the decoder's presentation timeline,
+-         * including a nonzero start position after a seek. */
+-        if (!t->is_raw_audio && !t->audio_started && base_pts != INT64_MIN
+-                && (t->avctx->codec_id != AV_CODEC_ID_AAC || !t->split_aac_output))
++        /* PCM conversion and AAC decoding must preserve the presentation
++         * timeline, including after a seek, independently of packet batching. */
++        if (!t->preserve_audio_timestamps && !t->audio_started && base_pts != INT64_MIN)
+             t->audio_output_pts_adjust = base_pts;
+         if (base_pts != INT64_MIN && t->audio_output_pts_adjust != INT64_MIN)
+         {
+diff --git a/dlls/mf/tests/transform.c b/dlls/mf/tests/transform.c
+--- a/dlls/mf/tests/transform.c
++++ b/dlls/mf/tests/transform.c
+@@ -3104,6 +3104,118 @@
+     test_aac_decoder_channels(raw_aac_input_type_desc);
+ }
+ 
++static void test_aac_decoder_timestamps(void)
++{
++    static const struct attribute_desc input_desc[] =
++    {
++        ATTR_GUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio),
++        ATTR_GUID(MF_MT_SUBTYPE, MFAudioFormat_AAC),
++        ATTR_UINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, 44100),
++        ATTR_UINT32(MF_MT_AUDIO_NUM_CHANNELS, 1),
++        ATTR_UINT32(MF_MT_AAC_PAYLOAD_TYPE, 0),
++        ATTR_BLOB(MF_MT_USER_DATA, test_aac_codec_data, sizeof(test_aac_codec_data)),
++        {0},
++    };
++    static const struct attribute_desc output_desc[] =
++    {
++        ATTR_GUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio),
++        ATTR_GUID(MF_MT_SUBTYPE, MFAudioFormat_PCM),
++        ATTR_UINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, 44100),
++        ATTR_UINT32(MF_MT_AUDIO_NUM_CHANNELS, 1),
++        ATTR_UINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16),
++        ATTR_UINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, 2),
++        ATTR_UINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 88200),
++        {0},
++    };
++    static const struct
++    {
++        LONGLONG time;
++        BOOL discontinuity;
++    }
++    tests[] = {{12500000, FALSE}, {12151234467, FALSE}, {50000000, TRUE}, {-232200, FALSE}, {0, FALSE}};
++    const BYTE *data;
++    ULONG data_size;
++    DWORD packet_size, status, length;
++    IMFSample *input_sample, *output_sample;
++    IMFTransform *transform;
++    IMFMediaType *type;
++    LONGLONG time;
++    unsigned int i, j;
++    HRESULT hr;
++
++    hr = CoInitialize(NULL);
++    ok(hr == S_OK, "CoInitialize returned %#lx.\n", hr);
++    load_resource(L"aacencdata.bin", &data, &data_size);
++    if (data_size < sizeof(packet_size)) goto done;
++    memcpy(&packet_size, data, sizeof(packet_size));
++    ok(packet_size <= data_size - sizeof(packet_size), "Invalid packet size %lu.\n", packet_size);
++    if (packet_size > data_size - sizeof(packet_size)) goto done;
++
++    /* Both zero-alignment streaming types and MP4-style types with explicit
++     * block alignment must preserve the sample's presentation timestamp. */
++    for (i = 0; i < 2; ++i)
++    {
++        winetest_push_context("AAC block alignment %u", i ? 2 : 0);
++        hr = CoCreateInstance(&CLSID_MSAACDecMFT, NULL, CLSCTX_INPROC_SERVER,
++                &IID_IMFTransform, (void **)&transform);
++        if (FAILED(hr))
++        {
++            win_skip("AAC decoder unavailable, hr %#lx.\n", hr);
++            winetest_pop_context();
++            break;
++        }
++        hr = MFCreateMediaType(&type);
++        ok(hr == S_OK, "MFCreateMediaType returned %#lx.\n", hr);
++        init_media_type(type, input_desc, -1);
++        IMFMediaType_SetUINT32(type, &MF_MT_AUDIO_BLOCK_ALIGNMENT, i ? 2 : 0);
++        IMFMediaType_SetUINT32(type, &MF_MT_AUDIO_BITS_PER_SAMPLE, i ? 16 : 0);
++        hr = IMFTransform_SetInputType(transform, 0, type, 0);
++        ok(hr == S_OK, "SetInputType returned %#lx.\n", hr);
++        IMFMediaType_Release(type);
++        hr = MFCreateMediaType(&type);
++        ok(hr == S_OK, "MFCreateMediaType returned %#lx.\n", hr);
++        init_media_type(type, output_desc, -1);
++        hr = IMFTransform_SetOutputType(transform, 0, type, 0);
++        ok(hr == S_OK, "SetOutputType returned %#lx.\n", hr);
++        IMFMediaType_Release(type);
++
++        for (j = 0; j < ARRAY_SIZE(tests); ++j)
++        {
++            winetest_push_context("timestamp %s", wine_dbgstr_longlong(tests[j].time));
++            hr = IMFTransform_ProcessMessage(transform, MFT_MESSAGE_COMMAND_FLUSH, 0);
++            ok(hr == S_OK, "Flush returned %#lx.\n", hr);
++            input_sample = create_sample(data + sizeof(packet_size), packet_size);
++            hr = IMFSample_SetSampleTime(input_sample, tests[j].time);
++            ok(hr == S_OK, "SetSampleTime returned %#lx.\n", hr);
++            if (tests[j].discontinuity)
++                IMFSample_SetUINT32(input_sample, &MFSampleExtension_Discontinuity, TRUE);
++            hr = IMFTransform_ProcessInput(transform, 0, input_sample, 0);
++            ok(hr == S_OK, "ProcessInput returned %#lx.\n", hr);
++            IMFSample_Release(input_sample);
++            hr = IMFTransform_ProcessMessage(transform, MFT_MESSAGE_COMMAND_DRAIN, 0);
++            ok(hr == S_OK, "Drain returned %#lx.\n", hr);
++
++            output_sample = create_sample(NULL, 0xc000);
++            hr = check_mft_process_output(transform, output_sample, &status);
++            ok(hr == S_OK, "ProcessOutput returned %#lx.\n", hr);
++            length = 0;
++            hr = IMFSample_GetTotalLength(output_sample, &length);
++            ok(hr == S_OK && length, "No decoded audio, hr %#lx, length %lu.\n", hr, length);
++            time = 0;
++            hr = IMFSample_GetSampleTime(output_sample, &time);
++            ok(hr == S_OK, "GetSampleTime returned %#lx.\n", hr);
++            ok(time == tests[j].time, "Got timestamp %s, expected %s.\n",
++                    wine_dbgstr_longlong(time), wine_dbgstr_longlong(tests[j].time));
++            IMFSample_Release(output_sample);
++            winetest_pop_context();
++        }
++        IMFTransform_Release(transform);
++        winetest_pop_context();
++    }
++done:
++    CoUninitialize();
++}
++
+ static const BYTE wma_codec_data[10] = {0, 0x44, 0, 0, 0x17, 0, 0, 0, 0, 0};
+ static const ULONG wmaenc_block_size = 1487;
+ static const ULONG wmadec_block_size = 0x2000;
+@@ -11840,6 +11952,7 @@
+     test_aac_encoder();
+     test_aac_decoder();
+     test_aac_decoder_user_data();
++    test_aac_decoder_timestamps();
+     test_wma_encoder();
+     test_wma_decoder();
+     test_wma_decoder_dmo_input_type();
