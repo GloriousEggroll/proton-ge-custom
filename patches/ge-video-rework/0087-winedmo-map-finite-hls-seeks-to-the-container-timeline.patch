@@ -1,0 +1,104 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] winedmo: Map finite HLS samples and seeks onto one presentation timeline.
+
+Finite HLS can start at a nonzero MPEG-TS timestamp just like live HLS.
+Normalizing only live streams leaves finite playback starting at clock
+zero but seeking before the beginning of the container.
+
+The current reproduction starts at 1.4 seconds. With the built Proton
+FFmpeg libraries, avformat_seek_file at zero returns -1, while seeking to
+1.4 seconds and to the offset-adjusted resume position succeeds. A failed
+initial seek leaves the source's read-ahead position in use after its
+queued samples are discarded.
+
+Use the common container start timestamp for both finite and live HLS,
+retaining the relative audio/video offsets. Add the same offset back when
+translating presentation seeks into FFmpeg timestamps. Keep the existing
+nonseekable-stream behavior and leave other container timelines alone.
+
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -56,7 +56,7 @@
+     struct stream_context *stream_context;
+     struct stream *streams;
+     INT64 duration;
+-    INT64 live_timestamp_base;
++    INT64 timestamp_base;
+     BOOL direct_url;
+     BOOL nonseekable;
+ 
+@@ -209,15 +209,15 @@
+         sample->dts = max( 0, sample->dts - stream->timestamp_base );
+ }
+ 
+-static void normalize_live_timestamps( const struct demuxer *demuxer, struct sample *sample )
++static void normalize_demuxer_timestamps( const struct demuxer *demuxer, struct sample *sample )
+ {
+-    if (demuxer->live_timestamp_base == AV_NOPTS_VALUE)
++    if (demuxer->timestamp_base == AV_NOPTS_VALUE)
+         return;
+ 
+     if (sample->pts != AV_NOPTS_VALUE)
+-        sample->pts = max( 0, sample->pts - demuxer->live_timestamp_base );
++        sample->pts = max( 0, sample->pts - demuxer->timestamp_base );
+     if (sample->dts != AV_NOPTS_VALUE)
+-        sample->dts = max( 0, sample->dts - demuxer->live_timestamp_base );
++        sample->dts = max( 0, sample->dts - demuxer->timestamp_base );
+ }
+ 
+ static void fixup_asf_mpeg4_timestamps( const AVFormatContext *ctx, AVStream *avstream,
+@@ -862,7 +862,7 @@
+ 
+     if (!(demuxer = calloc( 1, sizeof(*demuxer) ))) return STATUS_NO_MEMORY;
+     demuxer->stream_context = params->context;
+-    demuxer->live_timestamp_base = AV_NOPTS_VALUE;
++    demuxer->timestamp_base = AV_NOPTS_VALUE;
+ 
+     if (!(demuxer->ctx = avformat_alloc_context())) goto failed;
+     if (is_http_url( params->url ) || is_rtsp_url( params->url ))
+@@ -958,10 +958,12 @@
+     }
+     if (demuxer->nonseekable) params->duration = AV_NOPTS_VALUE;
+     demuxer->duration = params->duration;
+-    if (demuxer->duration == AV_NOPTS_VALUE && demuxer->ctx->start_time != AV_NOPTS_VALUE &&
++    if (demuxer->ctx->start_time != AV_NOPTS_VALUE &&
+         (strstr( format->name, "hls" ) || demuxer->nonseekable))
+     {
+-        demuxer->live_timestamp_base = get_user_time( demuxer->ctx->start_time, AV_TIME_BASE_Q );
++        /* Finite HLS has the same transport timestamp origin as live HLS.
++         * Use one origin for all streams to retain their relative offsets. */
++        demuxer->timestamp_base = get_user_time( demuxer->ctx->start_time, AV_TIME_BASE_Q );
+     }
+     if (!(demuxer->streams = calloc( demuxer->ctx->nb_streams, sizeof(*demuxer->streams) ))) goto failed;
+     if (demuxer_create_streams( demuxer )) goto failed;
+@@ -1125,7 +1127,7 @@
+     sample->pts = get_stream_time( stream, packet->pts );
+     sample->dts = get_stream_time( stream, packet->dts );
+     sample->duration = get_stream_time( stream, packet->duration );
+-    normalize_live_timestamps( demuxer, sample );
++    normalize_demuxer_timestamps( demuxer, sample );
+     fixup_asf_mpeg4_timestamps( demuxer->ctx, stream, demuxer_stream, sample );
+     if (demuxer->ctx->iformat && strstr( demuxer->ctx->iformat->name, "asf" ))
+         normalize_stream_timestamps( demuxer_stream, sample );
+@@ -1158,7 +1160,7 @@
+ {
+     struct demuxer_seek_params *params = arg;
+     struct demuxer *demuxer = get_demuxer( params->demuxer );
+-    int64_t timestamp = params->timestamp * AV_TIME_BASE / 10000000;
++    int64_t timestamp = params->timestamp;
+     NTSTATUS status;
+     int i, ret;
+ 
+@@ -1175,6 +1177,11 @@
+     if (status != STATUS_NOT_SUPPORTED)
+         return status;
+ 
++    /* Convert the presentation position back to the container's timeline. */
++    if (demuxer->timestamp_base != AV_NOPTS_VALUE)
++        timestamp += demuxer->timestamp_base;
++    timestamp = av_rescale_q( timestamp, (AVRational){1, 10000000}, AV_TIME_BASE_Q );
++
+     if ((ret = avformat_seek_file( demuxer->ctx, -1, INT64_MIN, timestamp, timestamp, AVSEEK_FLAG_BACKWARD )) < 0)
+     {
+         ERR( "Failed to seek demuxer %p, error %s.\n", demuxer, debugstr_averr(ret) );

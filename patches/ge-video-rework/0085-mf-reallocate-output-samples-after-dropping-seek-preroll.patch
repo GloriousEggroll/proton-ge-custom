@@ -1,0 +1,175 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] mf: Reallocate transform output samples after dropping seek preroll.
+
+When mark-in discards a sample preceding a seek target, it releases the
+sample and clears pSample. Retrying ProcessOutput with the same descriptors
+violates the contract of transforms requiring caller-allocated output.
+
+In the VRChat HLS reproduction, resuming seeks to 209.8437652 seconds. The
+AAC decoder produces earlier preroll, which mark-in drops. The following
+call has no output buffer, returns E_FAIL, and stops audio sample requests;
+the audio-driven presentation clock then stops as well.
+
+Release and reset all output descriptors, allocate replacement samples,
+and reset the status before retrying. Keep stream-change handling and
+transform-provided sample allocation unchanged. Extend the session seek
+test to require fresh samples while discarding two preroll outputs.
+
+diff --git a/dlls/mf/session.c b/dlls/mf/session.c
+--- a/dlls/mf/session.c
++++ b/dlls/mf/session.c
+@@ -3839,10 +3839,9 @@
+     if (FAILED(hr = allocate_output_samples(session, node, buffers)))
+         goto done;
+ 
+-    status = 0;
+-
+-    do
++    for (;;)
+     {
++        status = 0;
+         hr = IMFTransform_ProcessOutput(node->object.transform, 0, node->u.transform.output_count, buffers, &status);
+         if (hr == MF_E_TRANSFORM_STREAM_CHANGE && SUCCEEDED(hr = transform_node_format_changed(node, buffers)))
+         {
+@@ -3854,8 +3853,17 @@
+ 
+             hr = IMFTransform_ProcessOutput(node->object.transform, 0, node->u.transform.output_count, buffers, &status);
+         }
++
++        if (hr != S_OK || !transform_node_markin_need_more_input(session, node, buffers))
++            break;
++
++        /* Mark-in releases preroll samples. Caller-allocated transforms still
++         * need an output sample on the next attempt to drain the decoder. */
++        release_output_samples(node, buffers);
++        memset(buffers, 0, node->u.transform.output_count * sizeof(*buffers));
++        if (FAILED(hr = allocate_output_samples(session, node, buffers)))
++            goto done;
+     }
+-    while (hr == S_OK && transform_node_markin_need_more_input(session, node, buffers));
+ 
+     if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT)
+         node->flags |= TOPO_NODE_TRANSFORM_NEEDS_INPUT;
+diff --git a/dlls/mf/tests/mf.c b/dlls/mf/tests/mf.c
+--- a/dlls/mf/tests/mf.c
++++ b/dlls/mf/tests/mf.c
+@@ -995,6 +995,7 @@
+ 
+     IMFMediaEventQueue *event_queue;
+     BOOL hold_markers;
++    HANDLE sample_event;
+ };
+ 
+ static struct test_stream_sink *impl_from_IMFStreamSink(IMFStreamSink *iface)
+@@ -1140,6 +1141,7 @@
+ 
+ static HRESULT WINAPI test_stream_sink_ProcessSample(IMFStreamSink *iface, IMFSample *sample)
+ {
++    struct test_stream_sink *sink = impl_from_IMFStreamSink(iface);
+     HRESULT hr;
+ 
+     if (expect_test_stream_sink_ProcessSample)
+@@ -1149,6 +1151,8 @@
+ 
+     CHECK_EXPECT(test_stream_sink_ProcessSample);
+     add_object_state(&actual_object_state_record, SINK_PROCESS_SAMPLE);
++    if (sink->sample_event)
++        SetEvent(sink->sample_event);
+ 
+     return hr;
+ }
+@@ -7915,6 +7919,7 @@
+     IMFMediaType *output_type;
+ 
+     IMFSample *output;
++    unsigned int preroll_samples;
+ 
+     IMFAttributes *attributes;
+     IMFMediaEventQueue *event_queue;
+@@ -8317,7 +8322,21 @@
+ 
+     if (expect_test_transform_ProcessOutput)
+     {
+-        if (transform->output)
++        if (transform->preroll_samples)
++        {
++            ok(count == 1, "Unexpected output count %lu.\n", count);
++            ok(!!data->pSample, "Missing caller-allocated sample while draining preroll.\n");
++            if (!data->pSample)
++                return E_INVALIDARG;
++            ok(!data->dwStatus, "Unexpected output status %#lx.\n", data->dwStatus);
++            *status = 0;
++            hr = IMFSample_SetSampleTime(data->pSample, 15000000 - transform->preroll_samples * 5000000);
++            ok(hr == S_OK, "SetSampleTime returned %#lx.\n", hr);
++            hr = IMFSample_SetSampleDuration(data->pSample, 5000000);
++            ok(hr == S_OK, "SetSampleDuration returned %#lx.\n", hr);
++            --transform->preroll_samples;
++        }
++        else if (transform->output)
+         {
+             *status = 0;
+             data->pSample = transform->output;
+@@ -8544,6 +8563,8 @@
+ 
+     IMFClockStateSink test_seek_clock_sink = {&test_seek_clock_sink_vtbl};
+     MFT_OUTPUT_STREAM_INFO output_stream_info = {0};
++    IMFTopologyNode *transform_node;
++    struct test_stream_sink *stream_sink;
+     IMFPresentationClock *presentation_clock;
+     struct test_callback *test_callback;
+     struct test_media_sink *media_sink;
+@@ -8558,6 +8579,7 @@
+     IMFTransform *mft;
+     IMFClock *clock;
+     UINT32 status;
++    DWORD wait_result;
+     HRESULT hr;
+     INT i;
+ 
+@@ -8584,6 +8606,8 @@
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+     hr = IMFMediaType_SetUINT64(type, &MF_MT_FRAME_SIZE, (UINT64)640 << 32 | 480);
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = IMFMediaType_SetUINT32(type, &MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+     mft = NULL;
+     hr = test_transform_create(1, &type, 1, &type, FALSE, FALSE, &mft);
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+@@ -8592,6 +8616,11 @@
+ 
+     SET_EXPECT(test_transform_ProcessMessage_BEGIN_STREAMING);
+     topology = create_test_topology_unk(source, (IUnknown*)media_sink->stream, (IUnknown*) mft, NULL);
++    hr = IMFTopology_GetNode(topology, 2, &transform_node);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    hr = IMFTopologyNode_SetUINT32(transform_node, &MF_TOPONODE_MARKIN_HERE, TRUE);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    IMFTopologyNode_Release(transform_node);
+     hr = IMFMediaSession_SetTopology(session, 0, topology);
+     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+     IMFTopology_Release(topology);
+@@ -8722,6 +8751,25 @@
+     flaky
+     compare_object_states(&actual_object_state_record, &expected_seek_start_no_pending_request_records);
+ 
++    /* Drop two preroll frames before the seek target. Each retry must receive
++     * a fresh caller-allocated output sample, even without another input. */
++    stream_sink = impl_from_IMFStreamSink(media_sink->stream);
++    stream_sink->sample_event = CreateEventW(NULL, FALSE, FALSE, NULL);
++    ok(!!stream_sink->sample_event, "CreateEventW failed, error %lu.\n", GetLastError());
++    test_transform_from_IMFTransform(mft)->preroll_samples = 3;
++    SET_EXPECT(test_transform_ProcessOutput);
++    SET_EXPECT(test_stream_sink_ProcessSample);
++    hr = IMFStreamSink_QueueEvent(media_sink->stream, MEStreamSinkRequestSample, &GUID_NULL, S_OK, &propvar);
++    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
++    wait_result = WaitForSingleObject(stream_sink->sample_event, 1000);
++    ok(wait_result == WAIT_OBJECT_0, "Preroll delivery timed out, result %lu.\n", wait_result);
++    CloseHandle(stream_sink->sample_event);
++    stream_sink->sample_event = NULL;
++    CHECK_CALLED(test_transform_ProcessOutput);
++    CHECK_CALLED(test_stream_sink_ProcessSample);
++    ok(!test_transform_from_IMFTransform(mft)->preroll_samples, "Preroll output stalled.\n");
++    test_transform_from_IMFTransform(mft)->preroll_samples = 0;
++
+     /* Test a sample request only (i.e. with no sample delivery), then pause and then start with a seek */
+     for (i = 0; i < media_source->stream_count; i++)
+         media_source->streams[i]->delay_sample = TRUE;

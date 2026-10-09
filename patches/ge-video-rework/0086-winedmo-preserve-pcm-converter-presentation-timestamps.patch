@@ -1,0 +1,173 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] winedmo: Preserve presentation timestamps through PCM conversion.
+
+Raw PCM/float conversion shares the FFmpeg audio transform with compressed
+decoders. It must not apply their legacy timestamp rebasing or independently
+reset the first output timestamp to zero.
+
+The VRChat HLS trace has decoded audio starting at 2.1253333 seconds. The
+following PCM converter subtracts that origin while video retains its own
+timestamps, causing A/V desynchronization. Resetting to zero again after
+a seek also makes valid audio look like preroll to the media session.
+
+Identify raw audio input, including WAVEFORMATEXTENSIBLE, and exclude it
+from compressed-decoder timestamp corrections. Preserve the existing
+compressed-codec behavior. Add resampler tests for PCM and float input,
+nonzero and negative timestamps, and flushing to a new playback position.
+
+diff --git a/dlls/winedmo/unix_transform.c b/dlls/winedmo/unix_transform.c
+--- a/dlls/winedmo/unix_transform.c
++++ b/dlls/winedmo/unix_transform.c
+@@ -60,6 +60,7 @@
+     AVPacket       *parsed_packet; /* reusable packet for parser output */
+ 
+     bool is_audio;
++    bool is_raw_audio;
+     bool is_raw_video;
+     bool draining;       /* NULL packet sent — flushing decoder */
+     bool frame_pending;  /* frame holds undispatched output */
+@@ -779,6 +780,8 @@
+         const WAVEFORMATEX *wfx = &in_fmt->audio;
+ 
+         t->is_audio = true;
++        t->is_raw_audio = format_tag_from_wfx( wfx ) == WAVE_FORMAT_PCM ||
++                format_tag_from_wfx( wfx ) == WAVE_FORMAT_IEEE_FLOAT;
+         codec_id    = codec_id_from_audio_format( wfx );
+ 
+         if (wfx->cbSize && params->input_format_size >= sizeof(*wfx) + wfx->cbSize)
+@@ -1473,7 +1476,7 @@
+          * clip starts at a non-zero packet timestamp. Rebase those frame-relative
+          * timestamps onto the current input packet anchor so audio and video start
+          * on the same timeline for clip transitions. */
+-        if (t->is_audio && t->avctx->codec_id != AV_CODEC_ID_WMAPRO
++        if (t->is_audio && !t->is_raw_audio && t->avctx->codec_id != AV_CODEC_ID_WMAPRO
+                 && t->last_input_pts > 0 && params->pts >= 0 && params->pts < t->last_input_pts)
+             params->pts += t->last_input_pts;
+     }
+@@ -1493,7 +1496,7 @@
+         INT64 base_pts = params->pts;
+         NTSTATUS st;
+ 
+-        if (base_pts != INT64_MIN && t->audio_pts_offset)
++        if (!t->is_raw_audio && base_pts != INT64_MIN && t->audio_pts_offset)
+         {
+             base_pts -= t->audio_pts_offset;
+             params->pts = base_pts;
+@@ -1550,7 +1553,9 @@
+          * (legacy PROVIDES_SAMPLES query) get STATUS_BUFFER_TOO_SMALL with the full
+          * size; all other callers receive up to capacity bytes with INCOMPLETE set when
+          * more data remains. */
+-        if (!t->audio_started && base_pts != INT64_MIN
++        /* PCM conversion must preserve the decoder's presentation timeline,
++         * including a nonzero start position after a seek. */
++        if (!t->is_raw_audio && !t->audio_started && base_pts != INT64_MIN
+                 && (t->avctx->codec_id != AV_CODEC_ID_AAC || !t->split_aac_output))
+             t->audio_output_pts_adjust = base_pts;
+         if (base_pts != INT64_MIN && t->audio_output_pts_adjust != INT64_MIN)
+diff --git a/dlls/mf/tests/transform.c b/dlls/mf/tests/transform.c
+--- a/dlls/mf/tests/transform.c
++++ b/dlls/mf/tests/transform.c
+@@ -6449,6 +6449,95 @@
+     CoUninitialize();
+ }
+ 
++static void test_audio_convert_timestamps(void)
++{
++    static const LONGLONG timestamps[] = {12500000, 2098437652, -100000};
++    static const WORD formats[] = {WAVE_FORMAT_PCM, WAVE_FORMAT_IEEE_FLOAT};
++    BYTE data[8192] = {0};
++    IMFSample *input_sample, *output_sample;
++    WAVEFORMATEX format = {0};
++    IMFMediaType *type;
++    IMFTransform *transform;
++    LONGLONG time;
++    DWORD status;
++    unsigned int i, j;
++    HRESULT hr;
++
++    hr = CoInitialize(NULL);
++    ok(hr == S_OK, "CoInitialize returned %#lx.\n", hr);
++
++    for (i = 0; i < ARRAY_SIZE(formats); ++i)
++    {
++        winetest_push_context("format %#x", formats[i]);
++        hr = CoCreateInstance(&CLSID_CResamplerMediaObject, NULL, CLSCTX_INPROC_SERVER,
++                &IID_IMFTransform, (void **)&transform);
++        if (FAILED(hr))
++        {
++            win_skip("Resampler unavailable, hr %#lx.\n", hr);
++            winetest_pop_context();
++            continue;
++        }
++
++        format.wFormatTag = formats[i];
++        format.nChannels = 2;
++        format.nSamplesPerSec = 22050;
++        format.wBitsPerSample = formats[i] == WAVE_FORMAT_PCM ? 16 : 32;
++        format.nBlockAlign = format.nChannels * format.wBitsPerSample / 8;
++        format.nAvgBytesPerSec = format.nBlockAlign * format.nSamplesPerSec;
++        hr = MFCreateMediaType(&type);
++        ok(hr == S_OK, "MFCreateMediaType returned %#lx.\n", hr);
++        hr = MFInitMediaTypeFromWaveFormatEx(type, &format, sizeof(format));
++        ok(hr == S_OK, "MFInitMediaTypeFromWaveFormatEx returned %#lx.\n", hr);
++        hr = IMFTransform_SetInputType(transform, 0, type, 0);
++        ok(hr == S_OK, "SetInputType returned %#lx.\n", hr);
++        IMFMediaType_Release(type);
++
++        format.wFormatTag = WAVE_FORMAT_PCM;
++        format.nSamplesPerSec = 44100;
++        format.wBitsPerSample = 16;
++        format.nBlockAlign = 4;
++        format.nAvgBytesPerSec = format.nBlockAlign * format.nSamplesPerSec;
++        hr = MFCreateMediaType(&type);
++        ok(hr == S_OK, "MFCreateMediaType returned %#lx.\n", hr);
++        hr = MFInitMediaTypeFromWaveFormatEx(type, &format, sizeof(format));
++        ok(hr == S_OK, "MFInitMediaTypeFromWaveFormatEx returned %#lx.\n", hr);
++        hr = IMFTransform_SetOutputType(transform, 0, type, 0);
++        ok(hr == S_OK, "SetOutputType returned %#lx.\n", hr);
++        IMFMediaType_Release(type);
++
++        for (j = 0; j < ARRAY_SIZE(timestamps); ++j)
++        {
++            winetest_push_context("timestamp %s", wine_dbgstr_longlong(timestamps[j]));
++            hr = IMFTransform_ProcessMessage(transform, MFT_MESSAGE_COMMAND_FLUSH, 0);
++            ok(hr == S_OK, "Flush returned %#lx.\n", hr);
++            input_sample = create_sample(data, sizeof(data));
++            hr = IMFSample_SetSampleTime(input_sample, timestamps[j]);
++            ok(hr == S_OK, "SetSampleTime returned %#lx.\n", hr);
++            hr = IMFTransform_ProcessInput(transform, 0, input_sample, 0);
++            ok(hr == S_OK, "ProcessInput returned %#lx.\n", hr);
++            IMFSample_Release(input_sample);
++            hr = IMFTransform_ProcessMessage(transform, MFT_MESSAGE_COMMAND_DRAIN, 0);
++            ok(hr == S_OK, "Drain returned %#lx.\n", hr);
++
++            output_sample = create_sample(NULL, 16384);
++            hr = check_mft_process_output(transform, output_sample, &status);
++            ok(hr == S_OK, "ProcessOutput returned %#lx.\n", hr);
++            time = 0;
++            hr = IMFSample_GetSampleTime(output_sample, &time);
++            ok(hr == S_OK, "GetSampleTime returned %#lx.\n", hr);
++            ok(time == timestamps[j], "Got timestamp %s, expected %s.\n",
++                    wine_dbgstr_longlong(time), wine_dbgstr_longlong(timestamps[j]));
++            IMFSample_Release(output_sample);
++            winetest_pop_context();
++        }
++
++        IMFTransform_Release(transform);
++        winetest_pop_context();
++    }
++
++    CoUninitialize();
++}
++
+ static void test_mp43_decoder(void)
+ {
+     const GUID *subtypes[] = {&MFVideoFormat_MP43, &MFVideoFormat_mp43};
+@@ -11775,6 +11864,7 @@
+     test_wmv_decoder_media_object();
+     test_mp43_decoder();
+     test_audio_convert();
++    test_audio_convert_timestamps();
+     test_color_convert(FALSE);
+     test_color_convert(TRUE);
+     test_video_processor(FALSE);

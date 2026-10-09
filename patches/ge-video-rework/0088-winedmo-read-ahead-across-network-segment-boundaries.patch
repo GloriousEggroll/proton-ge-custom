@@ -1,0 +1,112 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] winedmo: Read ahead across network media segment boundaries.
+
+The MF source throttles its demux thread once any selected stream has
+eight packets queued. At 60 fps this is only 133 ms of video, too little
+to hide a playlist refresh or an HTTP segment request. In the VRChat
+capture, HLS audio and video delivery repeatedly stop at two-second
+segment boundaries, and the audio presentation clock freezes until the
+next read completes. The packet timestamps remain continuous.
+
+Use a two-second compressed-packet duration budget for HTTP(S) and RTSP
+sources, with a 256-packet fallback for missing or invalid durations.
+Keep the existing 8 MiB payload backpressure and the exception allowing
+read-ahead for an empty selected stream. Local sources retain their
+eight-packet limit. No initial fill delay is imposed: this lets the
+existing demux thread fetch available data earlier, without changing
+presentation timestamps, the clock, or decoder threading.
+
+Account durations on enqueue, dequeue and flush under the existing queue
+lock. Clamp individual durations to the budget so invalid or unusually
+large values cannot corrupt the accounting. Do not derive the budget
+from PTS differences, which can jump at live-stream discontinuities.
+---
+diff --git a/dlls/winedmo/media_source.c b/dlls/winedmo/media_source.c
+--- a/dlls/winedmo/media_source.c
++++ b/dlls/winedmo/media_source.c
+@@ -239,6 +239,16 @@
+ 
+ #define MEDIA_SOURCE_MAX_QUEUED_PACKETS 8
+ #define MEDIA_SOURCE_MAX_QUEUED_BYTES   (8 * 1024 * 1024)
++#define MEDIA_SOURCE_NETWORK_MAX_QUEUED_PACKETS 256
++#define MEDIA_SOURCE_NETWORK_READAHEAD (2 * 10000000)
++
++static UINT64 media_packet_buffered_duration(const struct media_packet *pkt)
++{
++    /* Invalid durations must not wrap the counter, and one long packet is
++     * already enough to fill the read-ahead budget. */
++    if (pkt->duration <= 0) return 0;
++    return min(pkt->duration, MEDIA_SOURCE_NETWORK_READAHEAD);
++}
+ 
+ struct media_stream;
+ 
+@@ -272,6 +282,7 @@
+     BOOL eos;
+     UINT queued_packets;
+     UINT64 queued_bytes;
++    UINT64 queued_duration;
+ };
+ 
+ static void media_packet_queue_flush(struct media_stream *stream)
+@@ -284,6 +295,7 @@
+     }
+     stream->queued_packets = 0;
+     stream->queued_bytes = 0;
++    stream->queued_duration = 0;
+ }
+ 
+ enum source_async_op
+@@ -337,6 +349,7 @@
+     UINT64 stream_offset;
+     UINT64 duration;
+     bool has_duration;
++    bool is_network;
+ 
+     struct winedmo_demuxer demuxer;
+     struct
+@@ -430,8 +443,12 @@
+ 
+         EnterCriticalSection(&stream->queue_cs);
+         empty = !stream->queued_packets;
+-        full = stream->queued_packets >= MEDIA_SOURCE_MAX_QUEUED_PACKETS
+-                || stream->queued_bytes >= MEDIA_SOURCE_MAX_QUEUED_BYTES;
++        if (source->is_network)
++            full = stream->queued_duration >= MEDIA_SOURCE_NETWORK_READAHEAD
++                    || stream->queued_packets >= MEDIA_SOURCE_NETWORK_MAX_QUEUED_PACKETS;
++        else
++            full = stream->queued_packets >= MEDIA_SOURCE_MAX_QUEUED_PACKETS;
++        full |= stream->queued_bytes >= MEDIA_SOURCE_MAX_QUEUED_BYTES;
+         LeaveCriticalSection(&stream->queue_cs);
+ 
+         if (empty)
+@@ -1114,6 +1131,7 @@
+         list_remove(&pkt->entry);
+         --stream->queued_packets;
+         stream->queued_bytes -= pkt->size;
++        stream->queued_duration -= media_packet_buffered_duration(pkt);
+     }
+     LeaveCriticalSection(&stream->queue_cs);
+     return pkt;
+@@ -1264,6 +1282,7 @@
+             list_add_tail(&stream->packet_queue, &pkt->entry);
+             ++stream->queued_packets;
+             stream->queued_bytes += pkt->size;
++            stream->queued_duration += media_packet_buffered_duration(pkt);
+             LeaveCriticalSection(&stream->queue_cs);
+             WakeConditionVariable(&stream->queue_cv);
+         }
+@@ -2218,6 +2237,13 @@
+     object->stream_offset = context->stream_offset;
+     object->file_size = context->file_size > context->stream_offset
+             ? context->file_size - context->stream_offset : (UINT64)-1;
++    /* Fetch the next network segment while the previous one is playing.
++     * Eight packets only cover about 130 ms of 60 fps video. */
++    object->is_network = context->url && (!wcsnicmp(context->url, L"http://", 7)
++            || !wcsnicmp(context->url, L"https://", 8)
++            || !wcsnicmp(context->url, L"rtsp://", 7)
++            || !wcsnicmp(context->url, L"rtspt://", 8)
++            || !wcsnicmp(context->url, L"rtspu://", 8));
+     object->rate = 1.0f;
+     InitializeCriticalSectionEx(&object->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+     object->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": cs");
