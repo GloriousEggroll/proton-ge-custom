@@ -935,8 +935,7 @@ static void collapse_path( WCHAR *path, UINT mark )
 static char *get_unix_file_name( const WCHAR *path )
 {
     NTSTATUS status;
-    ULONG size = 256;
-    char *buffer;
+    char *buffer = NULL;
 
     status = ntdll_get_unix_file_name( path, &buffer, FILE_OPEN_IF );
 
@@ -960,21 +959,31 @@ static void url_unescape( WCHAR *s )
 {
     unsigned int i, len;
     unsigned char c, d1, d2;
+    char *tmp, *d;
 
     len = wcslen( s );
     if (len < 3) return;
+    tmp = (char *)malloc( len + 1 );
+    d = tmp;
     for (i = 0; i < len - 3; ++i)
     {
-        if (s[i] != '%') continue;
-        if ((d1 = hexdigit( s[i + 1] )) == 0xff || (d2 = hexdigit( s[i + 2] )) == 0xff)
+        if (s[i] != '%')
         {
-            ERR( "Invalid escape %s.\n", debugstr_wn( s, 3 ) );
+            *d++ = s[i];
             continue;
         }
-        s[i] = d1 * 0x10 + d2;
-        len -= 2;
-        memmove( &s[i + 1], &s[i + 3], (len - i) * sizeof(*s) );
+        if ((d1 = hexdigit( s[i + 1] )) == 0xff || (d2 = hexdigit( s[i + 2] )) == 0xff)
+        {
+            ERR( "Invalid escape %s.\n", debugstr_wn( s, 3 ));
+            continue;
+        }
+        *d++ = d1 * 0x10 + d2;
+        i += 2;
     }
+    for (    ; i <= len; ++i) *d++ = s[i];
+    RtlUTF8ToUnicodeN( s, (len + 1) * sizeof(*s), &len, tmp, strlen( tmp ) + 1 );
+    free( tmp );
+    TRACE( "-> %s.\n", debugstr_w( s ));
 }
 
 char *steamclient_dos_to_unix_path( const char *src, int is_url )
