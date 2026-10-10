@@ -1,8 +1,65 @@
 # EM-11 patch import
 
+## Component refresh (2026-10-10)
+
+Validated bases:
+
+- Wine: `981e2f0b9007fd70a6e0ed6119cb18f4164e26f9`.
+- DXVK: `71ec7b5be6c517db39bcca4d38f38a63f6ddbc56`.
+- VKD3D-Proton: `2230755878b01993b4b82d0ac0c0624f3ab4d333`.
+- lsteamclient update: root commit `06be8505af167aea52e5dce20ac9c663d802ff95`.
+- WineOpenXR update: root commit `afcee17be30bea965c041fec420745f1433d99e2`.
+- Root checkout: `fb7978fc`. The EM import snapshot below is unchanged.
+
+Twenty-six ntoskrnl imports are now upstream and moved to `../disabled/`
+without altering their original author headers. See that directory's README
+for the replacement commit for each patch. The remaining ntoskrnl imports
+retain upstream's process layout and use the result of the debug-port query
+itself when checking for failure.
+
+Other rebase resolutions:
+
+- Refresh server-protocol, native-DLL heuristic, and Vulkan generator context.
+  Keep upstream's new thread-affinity fields, Unix-library loader declaration,
+  and D3D12 timeline-semaphore support. The managed-swapchain validity helper
+  remains beside the swapchain helpers, not inside the new semaphore code.
+- Preserve upstream CPUID emulation when removing seccomp and initializing
+  EM's signal-restorer-based syscall dispatch.
+- Keep Return to Krondor's restricted bitmap-readback exception alongside
+  upstream's display-DC and 8-bit-display validation changes.
+- Apply GE-rebased `winedevice-Default_Drivers` staging copies manually after
+  automatic staging. Only the test context changed; the staging submodule
+  remains untouched, and Michael Mueller's original authorship is retained.
+- Refresh the GStreamer transform deletion against upstream's new padding
+  logic. The FFmpeg backend remains active. Video patch 0070 is now upstream
+  (`c8df1a2d652`) and retained under `ge-video-rework/disabled/`.
+- DXVK already contains the swapchain-colorspace instance-extension fix
+  (`3c40ca1b946b`, GloriousEggroll). Keep the old patch in `dxvk/disabled/`;
+  the separate output-HDR-state fallback patch still applies.
+- Rebase external-VR support onto WineOpenXR's new shared function lookup,
+  checked Unix calls, session mapping, and WoW64 Vulkan callbacks. The cached
+  native Vulkan function pointer uses a fixed-width field so Unix64 does not
+  overwrite a PE32 pointer-sized field. Keep the new upstream callback thunks.
+- VKD3D-Proton's patch and all 14 lsteamclient patches need no changes.
+  Existing overlay, child-process rendering, SNI, controller, media, and HDR
+  behavior remains part of the active patch stack.
+
+Validation: isolated replay in prep order of 809 GE/manual Wine patches,
+173 automatic Wine-staging patches, and 24 component patches (DXVK,
+VKD3D-Proton, WineOpenXR, lsteamclient), with no failures, skipped patches,
+or rejects. GE/manual patches apply with `--fuzz=0`; automatic staging uses
+its normal `git apply` backend. `bash -n`, patch whitespace checks, and Python
+syntax checks for the patched Vulkan/lsteamclient generators pass. Server
+protocol regeneration with `tools/make_requests` also succeeds in the scratch
+tree. All 28 retired patches retain their original author headers and diffs.
+
+No build, autoconf, runtime test, or real-worktree reset was performed. The
+user must rerun the prep script before their normal build. Unrelated local
+changes and the component source worktrees were left untouched.
+
 ## Bleeding-edge refresh (2026-09-22)
 
-Current validated Wine base: `1c78596625336a73dbfc035dbbcf0dbdd95b06eb`.
+Wine base validated at this refresh: `1c78596625336a73dbfc035dbbcf0dbdd95b06eb`.
 The EM import snapshot below is unchanged. Imports 0295 and 0296 now live in
 `../disabled/`, because Wine includes Remi Bernon's fixes as `a16c7d16e5b`
 and `15b9d161776`. Preserve the base's constructor/alias signature and avoid
@@ -28,8 +85,8 @@ generators, builds, or runtime tests were run.
 - Upstream: https://github.com/Etaash-mathamsetty/wine-valve/tree/em-11
 - Wine-staging snapshot: `6cc805ea57132eeaf44764e9213823c9b8d0d300`.
 
-Existing patch numbers are retained for review. There are 285 active patches
-in this directory; gaps are intentional. Unused imports are kept under
+Existing patch numbers are retained for review. This snapshot had 285 active
+patches in this directory; gaps are intentional. Unused imports are kept under
 `../disabled/` with their original author headers.
 
 ## New commits

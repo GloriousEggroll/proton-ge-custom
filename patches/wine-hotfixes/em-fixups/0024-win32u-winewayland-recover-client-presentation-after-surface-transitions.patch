@@ -24,62 +24,23 @@ Source: https://github.com/nanomatters/wine-wineland/commit/88b19ffdd44b3126d4e9
 Source: https://github.com/nanomatters/wine-wineland/commit/a9ce7e02fe509bd5ee77daf65798f26106f8ba3e
 Source: https://github.com/nanomatters/wine-wineland/commit/48bf29c49f2b979dd620e3bddd9d20b1dae8e51e
 ---
- dlls/win32u/vulkan.c                    | 76 +++++++++++++++++++++++++++++---
- dlls/win32u/window.c                    |  8 +++
- dlls/winewayland.drv/wayland_surface.c | 13 ++++-
- include/wine/gdi_driver.h               |  2 +
- 4 files changed, 89 insertions(+), 10 deletions(-)
 
-diff --git a/include/wine/gdi_driver.h b/include/wine/gdi_driver.h
---- a/include/wine/gdi_driver.h
-+++ b/include/wine/gdi_driver.h
-@@ -267,11 +267,13 @@ struct client_surface
-     HWND                               hwnd;           /* window the surface was created for */
-     LONG                               updated;        /* has been moved / resized / reparented */
-     LONG                               offscreen;      /* client window is offscreen */
-+    LONG                               presentation_generation; /* invalidates stale presentation waits */
- };
- 
- W32KAPI void *client_surface_create( UINT size, const struct client_surface_funcs *funcs, HWND hwnd );
- W32KAPI void client_surface_add_ref( struct client_surface *surface );
- W32KAPI void client_surface_release( struct client_surface *surface );
-+W32KAPI void client_surface_invalidate_presentation( struct client_surface *surface );
- W32KAPI void client_surface_present( struct client_surface *surface );
- W32KAPI void client_surface_update( struct client_surface *surface );
- W32KAPI void update_client_surfaces( HWND hwnd );
-diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
---- a/dlls/win32u/window.c
-+++ b/dlls/win32u/window.c
-@@ -353,6 +353,14 @@ void client_surface_release( struct client_surface *surface )
-     pthread_mutex_unlock( &surfaces_lock );
- }
- 
-+void client_surface_invalidate_presentation( struct client_surface *surface )
-+{
-+    LONG generation = InterlockedIncrement( &surface->presentation_generation );
-+
-+    TRACE( "%s advanced presentation generation to %d\n",
-+           debugstr_client_surface( surface ), generation );
-+}
-+
- void client_surface_present( struct client_surface *surface )
- {
-     HDC hdc = 0;
 diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+index 31a03a4..a4d58e2 100644
 --- a/dlls/win32u/vulkan.c
 +++ b/dlls/win32u/vulkan.c
-@@ -344,6 +344,7 @@ struct swapchain
+@@ -319,6 +319,7 @@ struct swapchain
  {
      struct vulkan_swapchain obj;
      struct surface *surface;
 +    LONG presentation_generation;
      VkExtent2D extents;
      struct wine_managed_swapchain *managed; /* non-NULL => wine-managed cross-process producer */
- 
-@@ -371,6 +372,13 @@ static struct swapchain *swapchain_from_handle( VkSwapchainKHR handle )
+
+@@ -342,6 +343,13 @@ static struct swapchain *swapchain_from_handle( VkSwapchainKHR handle )
      return CONTAINING_RECORD( obj, struct swapchain, obj );
  }
- 
+
 +static BOOL swapchain_is_out_of_date( const struct swapchain *swapchain )
 +{
 +    if (!swapchain || swapchain->managed || !swapchain->surface) return FALSE;
@@ -87,11 +48,11 @@ diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
 +           ReadAcquire( &swapchain->surface->client->presentation_generation );
 +}
 +
- struct semaphore
+ struct d3d12_fence_timeline
  {
-     struct vulkan_semaphore obj;
-@@ -4220,6 +4228,8 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
- 
+     pthread_mutex_t mutex;
+@@ -4489,6 +4497,8 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
+
      vulkan_object_init( &swapchain->obj.obj, host_swapchain );
      swapchain->surface = surface;
 +    swapchain->presentation_generation =
@@ -99,28 +60,28 @@ diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
      surface->swapchain = swapchain;
      swapchain->extents = create_info->imageExtent;
      instance->p_insert_object( instance, &swapchain->obj.obj );
-@@ -4319,7 +4329,7 @@ static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkA
+@@ -4586,7 +4596,7 @@ static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkA
      RECT client_rect;
      VkResult res;
- 
+
 -    if (!swapchain) return VK_ERROR_OUT_OF_DATE_KHR;
 +    if (!swapchain || swapchain_is_out_of_date( swapchain )) return VK_ERROR_OUT_OF_DATE_KHR;
- 
+
      surface = swapchain->surface;
- 
-@@ -4360,7 +4370,7 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
+
+@@ -4627,7 +4637,7 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
      RECT client_rect;
      VkResult res;
- 
+
 -    if (!swapchain) return VK_ERROR_OUT_OF_DATE_KHR;
 +    if (!swapchain || swapchain_is_out_of_date( swapchain )) return VK_ERROR_OUT_OF_DATE_KHR;
- 
+
      surface = swapchain->surface;
- 
-@@ -4400,13 +4410,66 @@ static BOOL should_skip_wait( HWND hwnd )
+
+@@ -4667,13 +4677,66 @@ static BOOL should_skip_wait( HWND hwnd )
      return FALSE;
  }
- 
+
 +/* Keep host waits interruptible across presentation-target changes and
 + * recover infinite waits when the compositor stops reporting completion. */
 +#define WINE_VK_PRESENT_WAIT_SLICE_NS (100 * 1000000ull)
@@ -179,72 +140,92 @@ diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
  {
      struct vulkan_device *device = vulkan_device_from_handle( client_device );
      struct swapchain *swapchain = swapchain_from_handle( client_swapchain );
- 
+
 -    if (!swapchain) return VK_ERROR_OUT_OF_DATE_KHR;
 +    if (!swapchain || swapchain_is_out_of_date( swapchain )) return VK_ERROR_OUT_OF_DATE_KHR;
- 
+
      /* Managed swapchains have no host swapchain to wait on. Wine paces the present
       * itself. Report presentation as proceeding. */
-@@ -4415,7 +4478,7 @@ static VkResult win32u_vkWaitForPresentKHR( VkDevice client_device, VkSwapchainK
+@@ -4682,7 +4745,7 @@ static VkResult win32u_vkWaitForPresentKHR( VkDevice client_device, VkSwapchainK
      if (swapchain->surface && should_skip_wait( swapchain->surface->hwnd ))
          return VK_SUCCESS;
- 
+
 -    return device->p_vkWaitForPresentKHR( device->host.device, swapchain->obj.host.swapchain, presentId, timeout );
 +    return swapchain_wait_for_present( device, swapchain, presentId, timeout, NULL );
  }
- 
+
  static VkResult win32u_vkWaitForPresent2KHR( VkDevice client_device, VkSwapchainKHR client_swapchain,
-@@ -4424,14 +4487,15 @@ static VkResult win32u_vkWaitForPresent2KHR( VkDevice client_device, VkSwapchain
+@@ -4691,14 +4754,15 @@ static VkResult win32u_vkWaitForPresent2KHR( VkDevice client_device, VkSwapchain
      struct vulkan_device *device = vulkan_device_from_handle( client_device );
      struct swapchain *swapchain = swapchain_from_handle( client_swapchain );
- 
+
 -    if (!swapchain) return VK_ERROR_OUT_OF_DATE_KHR;
 +    if (!swapchain || swapchain_is_out_of_date( swapchain )) return VK_ERROR_OUT_OF_DATE_KHR;
- 
+
      if (swapchain->managed) return VK_SUCCESS;
- 
+
      if (swapchain->surface && should_skip_wait( swapchain->surface->hwnd ))
          return VK_SUCCESS;
- 
+
 -    return device->p_vkWaitForPresent2KHR( device->host.device, swapchain->obj.host.swapchain, info );
 +    return swapchain_wait_for_present( device, swapchain, info->presentId,
 +                                       info->timeout, info );
  }
- 
+
  static VkResult win32u_vkGetSwapchainImagesKHR( VkDevice client_device, VkSwapchainKHR client_swapchain,
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index 5d92439..1cf0002 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -353,6 +353,14 @@ void client_surface_release( struct client_surface *surface )
+     pthread_mutex_unlock( &surfaces_lock );
+ }
+
++void client_surface_invalidate_presentation( struct client_surface *surface )
++{
++    LONG generation = InterlockedIncrement( &surface->presentation_generation );
++
++    TRACE( "%s advanced presentation generation to %d\n",
++           debugstr_client_surface( surface ), generation );
++}
++
+ void client_surface_present( struct client_surface *surface )
+ {
+     HDC hdc = 0;
 diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 9ce23e0..760df7e 100644
 --- a/dlls/winewayland.drv/wayland_surface.c
 +++ b/dlls/winewayland.drv/wayland_surface.c
-@@ -2517,7 +2517,7 @@ static void wayland_client_surface_stack(struct wayland_surface *surface,
+@@ -2584,7 +2584,7 @@ static void wayland_client_surface_stack(struct wayland_surface *surface,
      client->stack_above_parent = stack_above_parent;
  }
- 
+
 -static void wayland_surface_reconfigure_client(struct wayland_surface *surface,
 +static BOOL wayland_surface_reconfigure_client(struct wayland_surface *surface,
                                                 struct wayland_client_surface *client,
                                                 const RECT *client_rect,
                                                 BOOL stack_above_parent)
-@@ -2555,6 +2555,8 @@ static void wayland_surface_reconfigure_client(struct wayland_surface *surface,
+@@ -2622,6 +2622,8 @@ static void wayland_surface_reconfigure_client(struct wayland_surface *surface,
                  wp_viewport_set_destination(client->wp_viewport, 1, 1);
          }
      }
 +
 +    return rect_changed || stack_changed;
  }
- 
+
  static struct wayland_hwnd_dmabuf_surface *wayland_hwnd_dmabuf_surface_get(struct wayland_surface *parent,
-@@ -4850,6 +4852,7 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
- 
+@@ -4878,6 +4880,7 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
+
          if (client->wl_subsurface)
          {
 +            client_surface_invalidate_presentation(&client->client);
              wl_subsurface_destroy(client->wl_subsurface);
              client->wl_subsurface = NULL;
              client->toplevel_wl_surface = NULL;
-@@ -4937,9 +4940,11 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
+@@ -4965,9 +4968,11 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
      wayland_surface_classify_child_visibility(surface, &dst, &visibility);
      wayland_surface_update_child_visibility(&dst, &visibility, &client->visual_constraint);
- 
+
 -    wayland_surface_reconfigure_client(surface, client, &client_rect, stack_above_parent);
 -    /* Commit to apply subsurface positioning. */
 -    wl_surface_commit(surface->wl_surface);
@@ -253,8 +234,24 @@ diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayla
 +    if (wayland_surface_reconfigure_client(surface, client, &client_rect,
 +                                           stack_above_parent))
 +        wl_surface_commit(surface->wl_surface);
- 
+
      if (!toplevel_data->window_contents)
      {
--- 
-2.53.0
+diff --git a/include/wine/gdi_driver.h b/include/wine/gdi_driver.h
+index 38aa5a0..0cbc6e8 100644
+--- a/include/wine/gdi_driver.h
++++ b/include/wine/gdi_driver.h
+@@ -267,11 +267,13 @@ struct client_surface
+     HWND                               hwnd;           /* window the surface was created for */
+     LONG                               updated;        /* has been moved / resized / reparented */
+     LONG                               offscreen;      /* client window is offscreen */
++    LONG                               presentation_generation; /* invalidates stale presentation waits */
+ };
+
+ W32KAPI void *client_surface_create( UINT size, const struct client_surface_funcs *funcs, HWND hwnd );
+ W32KAPI void client_surface_add_ref( struct client_surface *surface );
+ W32KAPI void client_surface_release( struct client_surface *surface );
++W32KAPI void client_surface_invalidate_presentation( struct client_surface *surface );
+ W32KAPI void client_surface_present( struct client_surface *surface );
+ W32KAPI void client_surface_update( struct client_surface *surface );
+ W32KAPI void update_client_surfaces( HWND hwnd );
