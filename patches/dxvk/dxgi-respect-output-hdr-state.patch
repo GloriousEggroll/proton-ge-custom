@@ -1,0 +1,201 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] dxgi: Require an HDR-enabled output before advertising HDR.
+
+DXVK_HDR=1 currently makes GetDesc1 report HDR even when Wine detects an
+SDR output. DXVK-NVAPI derives ST2084 support from that colorspace, so the
+incorrect capability also reaches native Vulkan games such as Saints Row.
+
+Match the HMONITOR's GDI source to the active display-config targets and
+query their advanced-color state. Report SDR when the target is disabled,
+missing, or cannot be queried. Require all targets of a cloned source to
+be HDR-enabled; unrelated monitors do not affect a successful query.
+
+Use this check for GetDesc1 and HDR10 swapchain support. Keep the existing
+HDR opt-in and Vulkan surface-support check. Preserve scRGB presentation
+on SDR displays and the existing policy for non-Win32 WSI backends. Query
+the window's current monitor for windowed swapchains rather than a stale
+fullscreen monitor. Do not issue extra display queries for SDR GetDesc1.
+
+Requires the Wine Wayland fixup 0066 to stop DXVK_HDR from overriding the
+compositor's SDR result. X11/gamescope retains Wine's existing HDR opt-in.
+
+Bug: https://github.com/GloriousEggroll/proton-ge-custom/issues/541
+API: https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_6/nf-dxgi1_6-idxgioutput6-getdesc1
+
+Manual validation needed after rebuilding:
+- HDR opt-in on an SDR Wayland output: SDR in GetDesc1 and NVAPI.
+- HDR opt-in on an HDR-enabled Wayland output: HDR remains available.
+- Mixed SDR/HDR outputs, window moves, and explicit HDR disable.
+- X11/gamescope HDR and scRGB-to-SDR presentation remain functional.
+---
+
+diff --git a/src/dxgi/dxgi_output.cpp b/src/dxgi/dxgi_output.cpp
+--- a/src/dxgi/dxgi_output.cpp
++++ b/src/dxgi/dxgi_output.cpp
+@@ -236,16 +236,11 @@
+     pDesc->Rotation              = DXGI_MODE_ROTATION_UNSPECIFIED;
+     pDesc->Monitor               = m_monitor;
+     pDesc->BitsPerColor          = 10;
+-    // This should only return DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+-    // (HDR) if the user has the HDR setting enabled in Windows.
+-    // Games can still punt into HDR mode by using CheckColorSpaceSupport
+-    // and SetColorSpace1.
+-    //
+-    // We have no way of checking the actual Windows colorspace as the
+-    // only public method for this *is* DXGI which we are re-implementing.
+-    // So we just pick our color space based on the DXVK_HDR env var
+-    // and the punting from SetColorSpace1.
++    // DXVK_HDR permits HDR but must not override the output's SDR state.
++    // This also supplies the HDR capability reported through DXVK-NVAPI.
+     pDesc->ColorSpace            = m_monitorInfo->CurrentColorSpace();
++    if (pDesc->ColorSpace != DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709 && !wsi::isHdrEnabled(m_monitor))
++      pDesc->ColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+     pDesc->RedPrimary[0]         = m_metadata.redPrimary[0];
+     pDesc->RedPrimary[1]         = m_metadata.redPrimary[1];
+     pDesc->GreenPrimary[0]       = m_metadata.greenPrimary[0];
+
+diff --git a/src/dxgi/dxgi_swapchain.cpp b/src/dxgi/dxgi_swapchain.cpp
+--- a/src/dxgi/dxgi_swapchain.cpp
++++ b/src/dxgi/dxgi_swapchain.cpp
+@@ -1116,9 +1116,11 @@
+     if (ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709)
+       return true;
+ 
+-    // Only expose HDR10 color space if HDR option is enabled
++    // HDR10 requires both the opt-in and an HDR-enabled output.
+     if (ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
+-      return m_factory->GetOptions()->enableHDR && m_presenter->CheckColorSpaceSupport(ColorSpace);
++      return m_factory->GetOptions()->enableHDR
++          && wsi::isHdrEnabled(m_descFs.Windowed ? wsi::getWindowMonitor(m_window) : m_monitor)
++          && m_presenter->CheckColorSpaceSupport(ColorSpace);
+ 
+     return false;
+   }
+
+diff --git a/src/wsi/win32/wsi_monitor_win32.cpp b/src/wsi/win32/wsi_monitor_win32.cpp
+--- a/src/wsi/win32/wsi_monitor_win32.cpp
++++ b/src/wsi/win32/wsi_monitor_win32.cpp
+@@ -7,6 +7,7 @@
+ #include "../../util/util_string.h"
+ 
+ #include <cstring>
++#include <cwchar>
+ #include <set>
+ 
+ #include <setupapi.h>
+@@ -223,6 +224,59 @@
+     return retrieveDisplayMode(hMonitor, ENUM_REGISTRY_SETTINGS, pMode);
+   }
+ 
++  bool Win32WsiDriver::isHdrEnabled(HMONITOR hMonitor) {
++    WCHAR displayName[32];
++    if (!getDisplayName(hMonitor, displayName))
++      return false;
++
++    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
++    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
++    UINT32 pathCount = 0, modeCount = 0;
++    LONG result;
++
++    do {
++      if (::GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS)
++        return false;
++
++      paths.resize(pathCount);
++      modes.resize(modeCount);
++      result = ::QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS,
++        &pathCount, paths.data(), &modeCount, modes.data(), nullptr);
++    } while (result == ERROR_INSUFFICIENT_BUFFER);
++
++    if (result != ERROR_SUCCESS)
++      return false;
++
++    bool found = false;
++    for (UINT32 i = 0; i < pathCount; i++) {
++      const auto& path = paths[i];
++      DISPLAYCONFIG_SOURCE_DEVICE_NAME source = { };
++      source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
++      source.header.size = sizeof(source);
++      source.header.adapterId = path.sourceInfo.adapterId;
++      source.header.id = path.sourceInfo.id;
++      if (::DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS)
++        return false;
++      if (std::wcscmp(source.viewGdiDeviceName, displayName))
++        continue;
++
++      DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO color = { };
++      color.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
++      color.header.size = sizeof(color);
++      color.header.adapterId = path.targetInfo.adapterId;
++      color.header.id = path.targetInfo.id;
++      if (::DisplayConfigGetDeviceInfo(&color.header) != ERROR_SUCCESS)
++        return false;
++
++      // A cloned output must be HDR-enabled on every matching target.
++      if (!color.advancedColorSupported || !color.advancedColorEnabled || color.advancedColorForceDisabled)
++        return false;
++      found = true;
++    }
++
++    return found;
++  }
++
+   static std::wstring getMonitorDevicePath(HMONITOR hMonitor) {
+     // Get the device name of the monitor.
+     MONITORINFOEXW monInfo;
+
+diff --git a/src/wsi/win32/wsi_platform_win32.h b/src/wsi/win32/wsi_platform_win32.h
+--- a/src/wsi/win32/wsi_platform_win32.h
++++ b/src/wsi/win32/wsi_platform_win32.h
+@@ -44,6 +44,8 @@
+ 
+     virtual WsiEdidData getMonitorEdid(HMONITOR hMonitor);
+ 
++    bool isHdrEnabled(HMONITOR hMonitor) override;
++
+     // Window
+ 
+     virtual void getWindowSize(
+
+diff --git a/src/wsi/wsi_monitor.h b/src/wsi/wsi_monitor.h
+--- a/src/wsi/wsi_monitor.h
++++ b/src/wsi/wsi_monitor.h
+@@ -149,4 +149,12 @@
+     */
+   WsiEdidData getMonitorEdid(HMONITOR hMonitor);
+ 
++  /**
++    * \brief Whether HDR is enabled on the monitor
++    *
++    * Win32 queries the active output, falling back to SDR on failure.
++    * Backends without an output HDR query retain their existing opt-in.
++    */
++  bool isHdrEnabled(HMONITOR hMonitor);
++
+ }
+
+diff --git a/src/wsi/wsi_platform.cpp b/src/wsi/wsi_platform.cpp
+--- a/src/wsi/wsi_platform.cpp
++++ b/src/wsi/wsi_platform.cpp
+@@ -199,4 +199,8 @@
+     return s_driver->getMonitorEdid(hMonitor);
+   }
+ 
++  bool isHdrEnabled(HMONITOR hMonitor) {
++    return s_driver->isHdrEnabled(hMonitor);
++  }
++
+ }
+
+diff --git a/src/wsi/wsi_platform.h b/src/wsi/wsi_platform.h
+--- a/src/wsi/wsi_platform.h
++++ b/src/wsi/wsi_platform.h
+@@ -44,6 +44,8 @@
+ 
+     virtual WsiEdidData getMonitorEdid(HMONITOR hMonitor) = 0;
+ 
++    virtual bool isHdrEnabled(HMONITOR) { return true; }
++
+     // Window
+ 
+     virtual void getWindowSize(

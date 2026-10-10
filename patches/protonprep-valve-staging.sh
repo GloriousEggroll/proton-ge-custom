@@ -34,6 +34,8 @@ apply_all_in_dir() {
     apply_patch "../patches/dxvk/assassins-creed-keep-fullscreen-on-focus-loss.patch"
     # HDR colorspaces require an instance extension, not a device extension.
     apply_patch "../patches/dxvk/dxvk-enable-swapchain-colorspace-on-instance.patch"
+    # Do not advertise HDR when Wine reports an SDR output, even with DXVK_HDR=1.
+    apply_patch "../patches/dxvk/dxgi-respect-output-hdr-state.patch"
     popd
 
     pushd vkd3d-proton
