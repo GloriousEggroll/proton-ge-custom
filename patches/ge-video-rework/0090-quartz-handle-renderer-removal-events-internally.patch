@@ -1,0 +1,230 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] quartz: Handle renderer removal events internally by default.
+
+Way of the Samurai 4 registers a WM_APP + 1 notification with its movie
+object as the instance pointer. On skipping S4_OP_Movie_eu.wmv it releases
+the graph, whose destruction detaches the game's PROPHET MOVIE renderer.
+The renderer sends EC_WINDOW_DESTROYED from JoinFilterGraph(NULL).
+
+Wine queues this internal notification for the application and posts the
+registered window message. The game has already freed its movie object
+when the message arrives, and dereferences the freed 0xfeeefeee vtable.
+
+EC_WINDOW_DESTROYED is a resource-manager notification which the graph
+must not forward to the application by default. Consume it without
+posting a message or signaling the application's event handle. Keep the
+normal event path when default handling is explicitly cancelled, and
+support restoring default handling.
+
+The graph does not implement IResourceManager yet; this change only fixes
+event routing, not resource focus management. Other event codes and the
+playback/decoder teardown order are unchanged.
+
+Cover renderer removal, cancellation/restoration, unrelated application
+events, and destruction of a graph with a renderer still attached.
+
+Reference: https://learn.microsoft.com/en-us/windows/win32/directshow/ec-window-destroyed
+---
+diff --git a/dlls/quartz/filtergraph.c b/dlls/quartz/filtergraph.c
+--- a/dlls/quartz/filtergraph.c
++++ b/dlls/quartz/filtergraph.c
+@@ -162,6 +162,7 @@
+     int HandleEcComplete;
+     int HandleEcRepaint;
+     int HandleEcClockChanged;
++    int HandleEcWindowDestroyed;
+     unsigned int media_events_disabled : 1;
+ 
+     CRITICAL_SECTION cs;
+@@ -5587,6 +5588,8 @@
+ 	This->HandleEcRepaint = FALSE;
+     else if (lEvCode == EC_CLOCK_CHANGED)
+         This->HandleEcClockChanged = FALSE;
++    else if (lEvCode == EC_WINDOW_DESTROYED)
++        This->HandleEcWindowDestroyed = FALSE;
+     else
+ 	return S_FALSE;
+ 
+@@ -5605,6 +5608,8 @@
+ 	This->HandleEcRepaint = TRUE;
+     else if (lEvCode == EC_CLOCK_CHANGED)
+         This->HandleEcClockChanged = TRUE;
++    else if (lEvCode == EC_WINDOW_DESTROYED)
++        This->HandleEcWindowDestroyed = TRUE;
+     else
+ 	return S_FALSE;
+ 
+@@ -6080,6 +6085,11 @@
+     {
+         FIXME("EC_REPAINT is not handled.\n");
+     }
++    else if (code == EC_WINDOW_DESTROYED && graph->HandleEcWindowDestroyed)
++    {
++        /* Resource-manager notification, not an application event. */
++        TRACE("Renderer %p left the graph.\n", (void *)param1);
++    }
+     else if (!graph->media_events_disabled)
+     {
+         queue_media_event(graph, code, param1, param2);
+@@ -6401,6 +6411,7 @@
+     object->HandleEcClockChanged = TRUE;
+     object->HandleEcComplete = TRUE;
+     object->HandleEcRepaint = TRUE;
++    object->HandleEcWindowDestroyed = TRUE;
+     object->hEventCompletion = CreateEventW(0, TRUE, FALSE, 0);
+ 
+     object->name_index = 1;
+diff --git a/dlls/quartz/tests/filtergraph.c b/dlls/quartz/tests/filtergraph.c
+--- a/dlls/quartz/tests/filtergraph.c
++++ b/dlls/quartz/tests/filtergraph.c
+@@ -899,6 +899,7 @@
+ 
+     IAMFilterMiscFlags IAMFilterMiscFlags_iface;
+     ULONG misc_flags;
++    BOOL notify_window_destroyed;
+ 
+     IMediaSeeking IMediaSeeking_iface;
+     IMediaPosition IMediaPosition_iface;
+@@ -1574,8 +1575,23 @@
+ static HRESULT WINAPI testfilter_JoinFilterGraph(IBaseFilter *iface, IFilterGraph *graph, const WCHAR *name)
+ {
+     struct testfilter *filter = impl_from_IBaseFilter(iface);
++    IMediaEventSink *sink;
++    HRESULT hr;
++
+     if (winetest_debug > 1) trace("%p->JoinFilterGraph(%p, %s)\n", filter, graph, wine_dbgstr_w(name));
+ 
++    if (!graph && filter->graph && filter->notify_window_destroyed)
++    {
++        hr = IFilterGraph_QueryInterface(filter->graph, &IID_IMediaEventSink, (void **)&sink);
++        ok(hr == S_OK, "Got hr %#lx.\n", hr);
++        if (SUCCEEDED(hr))
++        {
++            hr = IMediaEventSink_Notify(sink, EC_WINDOW_DESTROYED, (LONG_PTR)iface, 0);
++            ok(hr == S_OK, "Got hr %#lx.\n", hr);
++            IMediaEventSink_Release(sink);
++        }
++    }
++
+     filter->graph = graph;
+     free(filter->name);
+     filter->name = wcsdup(name);
+@@ -5713,6 +5729,110 @@
+     ok(source_pin.ref == 1, "Got outstanding refcount %ld.\n", source_pin.ref);
+ }
+ 
++static void test_ec_window_destroyed(void)
++{
++    IFilterGraph2 *graph = create_graph();
++    IMediaEventSink *sink;
++    IMediaEventEx *events;
++    struct testfilter filter;
++    LONG_PTR param1, param2;
++    unsigned int i;
++    HANDLE event;
++    HWND window;
++    HRESULT hr;
++    ULONG ref;
++    LONG code;
++    MSG msg;
++
++    window = CreateWindowA("static", NULL, WS_OVERLAPPEDWINDOW,
++            50, 50, 150, 150, NULL, NULL, NULL, NULL);
++    ok(!!window, "Failed to create window.\n");
++
++    hr = IFilterGraph2_QueryInterface(graph, &IID_IMediaEventEx, (void **)&events);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    hr = IFilterGraph2_QueryInterface(graph, &IID_IMediaEventSink, (void **)&sink);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    hr = IMediaEventEx_GetEventHandle(events, (OAEVENT *)&event);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    hr = IMediaEventEx_SetNotifyWindow(events, (OAHWND)window, WM_APP + 1, 0x1234);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++
++    testfilter_init(&filter, NULL, 0);
++    filter.notify_window_destroyed = TRUE;
++
++    for (i = 0; i < 3; ++i)
++    {
++        winetest_push_context("handling %u", i);
++        if (i == 1)
++        {
++            hr = IMediaEventEx_CancelDefaultHandling(events, EC_WINDOW_DESTROYED);
++            ok(hr == S_OK, "Got hr %#lx.\n", hr);
++        }
++        else if (i == 2)
++        {
++            hr = IMediaEventEx_RestoreDefaultHandling(events, EC_WINDOW_DESTROYED);
++            ok(hr == S_OK, "Got hr %#lx.\n", hr);
++        }
++
++        hr = IFilterGraph2_AddFilter(graph, &filter.IBaseFilter_iface, L"renderer");
++        ok(hr == S_OK, "Got hr %#lx.\n", hr);
++        hr = IFilterGraph2_RemoveFilter(graph, &filter.IBaseFilter_iface);
++        ok(hr == S_OK, "Got hr %#lx.\n", hr);
++        ok(WaitForSingleObject(event, 0) == (i == 1 ? WAIT_OBJECT_0 : WAIT_TIMEOUT),
++                "Unexpected event signal state.\n");
++        ok(!!PeekMessageA(&msg, window, WM_APP + 1, WM_APP + 1, PM_REMOVE) == (i == 1),
++                "Unexpected window notification.\n");
++
++        hr = IMediaEventEx_GetEvent(events, &code, &param1, &param2, 0);
++        ok(hr == (i == 1 ? S_OK : E_ABORT), "Got hr %#lx.\n", hr);
++        if (hr == S_OK)
++        {
++            ok(code == EC_WINDOW_DESTROYED, "Got code %#lx.\n", code);
++            ok(param1 == (LONG_PTR)&filter.IBaseFilter_iface, "Got param1 %#Ix.\n", param1);
++            ok(!param2, "Got param2 %#Ix.\n", param2);
++            hr = IMediaEventEx_FreeEventParams(events, code, param1, param2);
++            ok(hr == S_OK, "Got hr %#lx.\n", hr);
++        }
++        hr = IMediaEventEx_GetEvent(events, &code, &param1, &param2, 0);
++        ok(hr == E_ABORT, "Got hr %#lx.\n", hr);
++
++        /* Suppressing renderer removal must not suppress application events. */
++        hr = IMediaEventSink_Notify(sink, EC_USER, 123, 456);
++        ok(hr == S_OK, "Got hr %#lx.\n", hr);
++        ok(WaitForSingleObject(event, 0) == WAIT_OBJECT_0, "Event should be signaled.\n");
++        if (PeekMessageA(&msg, window, WM_APP + 1, WM_APP + 1, PM_REMOVE))
++        {
++            ok(!msg.wParam, "Got wparam %#Ix.\n", msg.wParam);
++            ok(msg.lParam == 0x1234, "Got lparam %#Ix.\n", msg.lParam);
++        }
++        else
++            ok(0, "Missing window notification.\n");
++        hr = IMediaEventEx_GetEvent(events, &code, &param1, &param2, 0);
++        ok(hr == S_OK, "Got hr %#lx.\n", hr);
++        ok(code == EC_USER, "Got code %#lx.\n", code);
++        ok(param1 == 123, "Got param1 %#Ix.\n", param1);
++        ok(param2 == 456, "Got param2 %#Ix.\n", param2);
++        hr = IMediaEventEx_FreeEventParams(events, code, param1, param2);
++        ok(hr == S_OK, "Got hr %#lx.\n", hr);
++        hr = IMediaEventEx_GetEvent(events, &code, &param1, &param2, 0);
++        ok(hr == E_ABORT, "Got hr %#lx.\n", hr);
++        winetest_pop_context();
++    }
++
++    /* Graph destruction also detaches renderers, after the application releases
++     * its event interface. No stale callback may be posted at this point. */
++    hr = IFilterGraph2_AddFilter(graph, &filter.IBaseFilter_iface, L"renderer");
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    IMediaEventSink_Release(sink);
++    IMediaEventEx_Release(events);
++    ref = IFilterGraph2_Release(graph);
++    ok(!ref, "Got outstanding refcount %ld.\n", ref);
++    ok(filter.ref == 1, "Got outstanding refcount %ld.\n", filter.ref);
++    ok(!PeekMessageA(&msg, window, WM_APP + 1, WM_APP + 1, PM_REMOVE),
++            "Renderer removal posted a callback after graph destruction.\n");
++    DestroyWindow(window);
++}
++
+ static void test_set_notify_flags(void)
+ {
+     IFilterGraph2 *graph = create_graph();
+@@ -7471,6 +7591,7 @@
+     test_add_source_filter();
+     test_window_threading();
+     test_autoplug_uyvy();
++    test_ec_window_destroyed();
+     test_set_notify_flags();
+     test_events();
+     test_event_dispatch();
