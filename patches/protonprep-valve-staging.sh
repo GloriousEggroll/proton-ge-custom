@@ -458,6 +458,10 @@ apply_all_in_dir() {
     echo "WINE: -PENDING- unity crash hotfix"
     apply_patch "../patches/wine-hotfixes/pending/unity_crash_hotfix.patch"
 
+    # llvm-libc: kernel thread ID and no _r_debug warning, neither changes glibc builds
+    echo "WINE: llvm-libc support"
+    apply_all_in_dir "../patches/wine-hotfixes/llvm-libc"
+
     # https://bugs.winehq.org/show_bug.cgi?id=58476
     echo "WINE: -PENDING- RegGetValueW dwFlags hotfix (R.E.A.L VR mod)"
     apply_patch "../patches/wine-hotfixes/pending/registry_RRF_RT_REG_SZ-RRF_RT_REG_EXPAND_SZ.patch"
