@@ -49,6 +49,12 @@ apply_all_in_dir() {
     apply_patch "../patches/d7vk/d7vk-allow-avx-with-clang.patch"
     popd
 
+    pushd openvr
+    git reset --hard HEAD
+    git clean -xdf
+    apply_patch "../patches/openvr/openvr-no-msvc-assumption.patch"
+    popd
+
     pushd vkd3d-proton
     git reset --hard HEAD
     git clean -xdf
