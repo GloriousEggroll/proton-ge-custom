@@ -39,6 +39,14 @@ apply_all_in_dir() {
     apply_patch "../patches/dxvk/dxgi-auto-detect-hdr.patch"
     # StarCraft II: avoid GPU hangs with D3D9 constant buffer streaming (#790).
     apply_patch "../patches/dxvk/starcraft2-disable-constant-buffer-streaming.patch"
+    # Clang realigns the stack for 32-byte spills, so AVX is fine with it.
+    apply_patch "../patches/dxvk/dxvk-allow-avx-with-clang.patch"
+    popd
+
+    pushd d7vk
+    git reset --hard HEAD
+    git clean -xdf
+    apply_patch "../patches/d7vk/d7vk-allow-avx-with-clang.patch"
     popd
 
     pushd vkd3d-proton
