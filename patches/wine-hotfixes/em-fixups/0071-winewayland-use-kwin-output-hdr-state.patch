@@ -1,0 +1,1242 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] winewayland: Use KWin's explicit per-output HDR state.
+
+In #838 KWin reports max_lum=500 and ref_lum=500 for the HDR-enabled
+primary monitor, while the secondary SDR monitor reports 200/200.
+Lowering Plasma's SDR brightness below 500 restores HDR detection. The
+luminance-headroom heuristic confuses enabled HDR at its reference peak
+with SDR. Changing > to >= would incorrectly enable HDR on SDR outputs.
+
+Read the optional KDE output-device protocol's high_dynamic_range state,
+matched to wl_output by connector name. Require an enabled, HDR-capable
+output and commit properties atomically on done. Re-evaluate on both KDE
+and wl_output updates so registry ordering, HDR toggles and hotplug do not
+leave stale state. Other compositors keep the existing headroom check.
+
+Support both legacy per-device globals (bind v3) and the newer registry
+(bind v21, its minimum legal version). Listen to every event at the
+negotiated versions and clean up device/mode proxies on removal. This is
+read-only: no output configuration is changed. The KDE protocol is an
+implementation detail, so restrict the versions used and keep the
+standard color-management fallback when it is unavailable.
+
+Retain the color-management requirement, Vulkan surface-format checks,
+per-output SDR fallback and existing explicit HDR opt-outs. Do not restore
+the optional Windows image-description gate removed by patch 0070.
+
+Import kde-output-device-v2.xml unchanged from KDE plasma-wayland-protocols
+commit 344524df9ec212f5043ffc32e223b9a5bc07c1f4, with its original author
+credits and MIT-CMU license. Protocol source:
+https://github.com/KDE/plasma-wayland-protocols/blob/344524df9ec212f5043ffc32e223b9a5bc07c1f4/src/protocols/kde-output-device-v2.xml
+
+Bug: https://github.com/GloriousEggroll/proton-ge-custom/issues/838
+
+Static validation: Wayland scanner header/private-code generation; C
+parsing and all 44 v21 listener signatures checked against protocol XML;
+forward/reverse patch checks. No Proton build or game test performed.
+
+Runtime validation needed after rebuilding:
+- HDR remains available with Plasma SDR brightness at the 500-nit peak.
+- HDR toggles and mixed HDR/SDR monitors report their individual states.
+- Legacy KWin globals and non-KDE color-management paths still work.
+- DXVK_NO_HDR=1 and DXVK_HDR=0 still disable HDR reporting.
+---
+
+diff --git a/dlls/winewayland.drv/Makefile.in b/dlls/winewayland.drv/Makefile.in
+index d591d28ae78..70badd60742 100644
+--- a/dlls/winewayland.drv/Makefile.in
++++ b/dlls/winewayland.drv/Makefile.in
+@@ -14,6 +14,7 @@ SOURCES = \
+ 	dllmain.c \
+ 	fractional-scale-v1.xml \
+ 	ext-data-control-v1.xml \
++	kde-output-device-v2.xml \
+ 	keyboard-shortcuts-inhibit-unstable-v1.xml \
+ 	opengl.c \
+ 	pointer-constraints-unstable-v1.xml \
+@@ -28,6 +29,7 @@ SOURCES = \
+ 	wayland_data_device.c \
+ 	wayland_keyboard.c \
+ 	wayland_output.c \
++	wayland_output_kde.c \
+ 	wayland_pointer.c \
+ 	wayland_surface.c \
+ 	wayland_text_input.c \
+diff --git a/dlls/winewayland.drv/kde-output-device-v2.xml b/dlls/winewayland.drv/kde-output-device-v2.xml
+new file mode 100644
+index 00000000000..bb5609083e0
+--- /dev/null
++++ b/dlls/winewayland.drv/kde-output-device-v2.xml
+@@ -0,0 +1,664 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<protocol name="kde_output_device_v2">
++  <copyright><![CDATA[
++    SPDX-FileCopyrightText: 2008-2011 Kristian Høgsberg
++    SPDX-FileCopyrightText: 2010-2011 Intel Corporation
++    SPDX-FileCopyrightText: 2012-2013 Collabora, Ltd.
++    SPDX-FileCopyrightText: 2015 Sebastian Kügler <sebas@kde.org>
++    SPDX-FileCopyrightText: 2021 Méven Car <meven.car@enioka.com>
++
++    SPDX-License-Identifier: MIT-CMU
++    ]]></copyright>
++
++  <interface name="kde_output_device_registry_v2" version="26">
++    <description summary="output devices">
++      This interface can be used to list output devices.
++
++      If this global is bound with a version less than 21, the unsupported_version
++      protocol error will be posted.
++    </description>
++
++    <enum name="error">
++      <description summary="kde_output_device_registry_v2 error values">
++        These errors can be emitted in response to some requests.
++      </description>
++      <entry name="unsupported_version" value="0"
++             summary="the registry was bound with an unsupported version"/>
++    </enum>
++
++    <event name="finished" type="destructor" since="21">
++      <description summary="no new output announcements">
++        This event is sent in response to the stop request. The compositor will
++        immediately destroy the object after sending this event.
++      </description>
++    </event>
++
++    <request name="stop" since="21">
++      <description summary="stop receiving updates">
++        This request indicates that the client no longer wants to receive new
++        output announcements. The compositor will send the
++        kde_output_device_registry_v2.finished event in response to this request.
++        The compositor may still send new output announcements after calling this
++        request until the kde_output_device_registry_v2.finished event is sent.
++      </description>
++    </request>
++
++    <event name="output" since="21">
++      <description summary="new available output">
++        This event is sent when a new output is connected or after binding this
++        global to list all available outputs.
++      </description>
++      <arg name="output" type="new_id" interface="kde_output_device_v2"/>
++    </event>
++  </interface>
++
++  <interface name="kde_output_device_v2" version="26">
++    <description summary="output configuration representation">
++      An output device describes a display device available to the compositor.
++      output_device is similar to wl_output, but focuses on output
++      configuration management.
++
++      A client can query all global output_device objects to enlist all
++      available display devices, even those that may currently not be
++      represented by the compositor as a wl_output.
++
++      The client sends configuration changes to the server through the
++      outputconfiguration interface, and the server applies the configuration
++      changes to the hardware and signals changes to the output devices
++      accordingly.
++
++      This object is published as global during start up for every available
++      display devices, or when one later becomes available, for example by
++      being hotplugged via a physical connector.
++
++      Warning! The protocol described in this file is a desktop environment
++      implementation detail. Regular clients must not use this protocol.
++      Backward incompatible changes may be added without bumping the major
++      version of the extension.
++    </description>
++
++    <enum name="subpixel">
++      <description summary="subpixel geometry information">
++        This enumeration describes how the physical pixels on an output are
++        laid out.
++      </description>
++      <entry name="unknown" value="0"/>
++      <entry name="none" value="1"/>
++      <entry name="horizontal_rgb" value="2"/>
++      <entry name="horizontal_bgr" value="3"/>
++      <entry name="vertical_rgb" value="4"/>
++      <entry name="vertical_bgr" value="5"/>
++    </enum>
++
++    <enum name="transform">
++      <description summary="transform from framebuffer to output">
++        This describes the transform, that a compositor will apply to a
++        surface to compensate for the rotation or mirroring of an
++        output device.
++
++        The flipped values correspond to an initial flip around a
++        vertical axis followed by rotation.
++
++        The purpose is mainly to allow clients to render accordingly and
++        tell the compositor, so that for fullscreen surfaces, the
++        compositor is still able to scan out directly client surfaces.
++      </description>
++
++      <entry name="normal" value="0"/>
++      <entry name="90" value="1"/>
++      <entry name="180" value="2"/>
++      <entry name="270" value="3"/>
++      <entry name="flipped" value="4"/>
++      <entry name="flipped_90" value="5"/>
++      <entry name="flipped_180" value="6"/>
++      <entry name="flipped_270" value="7"/>
++    </enum>
++
++    <event name="geometry">
++      <description summary="geometric properties of the output">
++        The geometry event describes geometric properties of the output.
++        The event is sent when binding to the output object and whenever
++        any of the properties change.
++      </description>
++      <arg name="x" type="int"
++         summary="x position within the global compositor space"/>
++      <arg name="y" type="int"
++         summary="y position within the global compositor space"/>
++      <arg name="physical_width" type="int"
++         summary="width in millimeters of the output"/>
++      <arg name="physical_height" type="int"
++         summary="height in millimeters of the output"/>
++      <arg name="subpixel" type="int"
++         summary="subpixel orientation of the output"/>
++      <arg name="make" type="string"
++         summary="textual description of the manufacturer"/>
++      <arg name="model" type="string"
++         summary="textual description of the model"/>
++      <arg name="transform" type="int"
++         summary="transform that maps framebuffer to output"/>
++    </event>
++
++    <event name="current_mode">
++      <description summary="current mode">
++        This event describes the mode currently in use for this head. It is only
++        sent if the output is enabled.
++      </description>
++      <arg name="mode" type="object" interface="kde_output_device_mode_v2"/>
++    </event>
++
++    <event name="mode">
++      <description summary="advertise available output modes and current one">
++        The mode event describes an available mode for the output.
++
++        When the client binds to the output_device object, the server sends this
++        event once for every available mode the output_device can be operated by.
++
++        There will always be at least one event sent out on initial binding,
++        which represents the current mode.
++
++        Later if an output changes, its mode event is sent again for the
++        eventual added modes and lastly the current mode. In other words, the
++        current mode is always represented by the latest event sent with the current
++        flag set.
++
++        The size of a mode is given in physical hardware units of the output device.
++        This is not necessarily the same as the output size in the global compositor
++        space. For instance, the output may be scaled, as described in
++        kde_output_device_v2.scale, or transformed, as described in
++        kde_output_device_v2.transform.
++      </description>
++      <arg name="mode" type="new_id" interface="kde_output_device_mode_v2"/>
++    </event>
++
++    <event name="done">
++      <description summary="sent all information about output">
++        This event is sent after all other properties have been
++        sent on binding to the output object as well as after any
++        other output property change have been applied later on.
++        This allows to see changes to the output properties as atomic,
++        even if multiple events successively announce them.
++      </description>
++    </event>
++
++    <event name="scale">
++      <description summary="output scaling properties">
++        This event contains scaling geometry information
++        that is not in the geometry event. It may be sent after
++        binding the output object or if the output scale changes
++        later. If it is not sent, the client should assume a
++        scale of 1.
++
++        A scale larger than 1 means that the compositor will
++        automatically scale surface buffers by this amount
++        when rendering. This is used for high resolution
++        displays where applications rendering at the native
++        resolution would be too small to be legible.
++
++        It is intended that scaling aware clients track the
++        current output of a surface, and if it is on a scaled
++        output it should use wl_surface.set_buffer_scale with
++        the scale of the output. That way the compositor can
++        avoid scaling the surface, and the client can supply
++        a higher detail image.
++      </description>
++      <arg name="factor" type="fixed" summary="scaling factor of output"/>
++    </event>
++
++    <event name="edid">
++      <description summary="advertise EDID data for the output">
++        The edid event encapsulates the EDID data for the outputdevice.
++
++        The event is sent when binding to the output object. The EDID
++        data may be empty, in which case this event is sent anyway.
++        If the EDID information is empty, you can fall back to the name
++        et al. properties of the outputdevice.
++      </description>
++      <arg name="raw" type="string" summary="base64-encoded EDID string"/>
++    </event>
++
++    <event name="enabled">
++      <description summary="output is enabled or disabled">
++        The enabled event notifies whether this output is currently
++        enabled and used for displaying content by the server.
++        The event is sent when binding to the output object and
++        whenever later on an output changes its state by becoming
++        enabled or disabled.
++      </description>
++      <arg name="enabled" type="int" summary="output enabled state"/>
++    </event>
++
++    <event name="uuid">
++      <description summary="A unique id for this outputdevice">
++        The uuid can be used to identify the output. It's controlled by
++        the server entirely. The server should make sure the uuid is
++        persistent across restarts. An empty uuid is considered invalid.
++      </description>
++      <arg name="uuid" type="string" summary="output devices ID"/>
++    </event>
++
++    <event name="serial_number">
++      <description summary="Serial Number">
++        Serial ID of the monitor, sent on startup before the first done event.
++      </description>
++      <arg name="serialNumber" type="string"
++          summary="textual representation of serial number"/>
++    </event>
++    <event name="eisa_id">
++      <description summary="EISA ID">
++        EISA ID of the monitor, sent on startup before the first done event.
++      </description>
++      <arg name="eisaId" type="string"
++         summary="textual representation of EISA identifier"/>
++    </event>
++
++    <enum name="capability" bitfield="true">
++      <description summary="describes capabilities of the outputdevice">
++        Describes what capabilities this device has.
++      </description>
++      <entry name="overscan" value="0x1"
++           summary="if this output_device can use overscan"/>
++      <entry name="vrr" value="0x2"
++           summary="if this outputdevice supports variable refresh rate"/>
++      <entry name="rgb_range" value="0x4"
++             summary="if setting the rgb range is possible"/>
++      <entry name="high_dynamic_range" value="0x8" since="3"
++             summary="if this outputdevice supports high dynamic range"/>
++      <entry name="wide_color_gamut" value="0x10" since="3"
++             summary="if this outputdevice supports a wide color gamut"/>
++      <entry name="auto_rotate" value="0x20" since="4"
++             summary="if this outputdevice supports autorotation"/>
++      <entry name="icc_profile" value="0x40" since="5"
++             summary="if this outputdevice supports icc profiles"/>
++      <entry name="brightness" value="0x80" since="9"
++             summary="if this outputdevice supports the brightness setting"/>
++      <entry name="built_in_color" value="0x100" since="12"
++             summary="if this outputdevice supports the built-in color profile"/>
++      <entry name="ddc_ci" value="0x200" since="14"
++             summary="if this outputdevice supports DDC/CI"/>
++      <entry name="max_bits_per_color" value="0x400" since="15"
++             summary="if this outputdevice supports setting max bpc"/>
++      <entry name="edr" value="0x800" since="16"
++             summary="if this outputdevice supports EDR"/>
++      <entry name="sharpness" value="0x1000" since="17"
++             summary="if this outputdevice supports the sharpness setting"/>
++      <entry name="custom_modes" value="0x2000" since="18"
++             summary="if this outputdevice supports custom modes"/>
++      <entry name="auto_brightness" value = "0x4000" since="19"/>
++      <entry name="hdr_icc_profile" value="0x8000" since="22"
++             summary="if this outputdevice supports HDR ICC profiles"/>
++      <entry name="abm_level" value="0x10000" since="23"
++             summary="if this outputdevice supports the abm level setting"/>
++      <entry name="disable" value="0x20000" since="25"
++             summary="if this outputdevice supports being enabled/disabled"/>
++    </enum>
++
++    <event name="capabilities">
++      <description summary="capability flags">
++        What capabilities this device has, sent on startup before the first
++        done event.
++      </description>
++      <arg name="flags" type="uint" enum="capability"/>
++    </event>
++
++    <event name="overscan">
++      <description summary="overscan">
++        Overscan value of the monitor in percent, sent on startup before the
++        first done event.
++      </description>
++      <arg name="overscan" type="uint"
++         summary="amount of overscan of the monitor"/>
++    </event>
++
++    <enum name="vrr_policy">
++      <description summary="describes vrr policy">
++        Describes when the compositor may employ variable refresh rate
++      </description>
++      <entry name="never" value="0"/>
++      <entry name="always" value="1"/>
++      <entry name="automatic" value="2"/>
++    </enum>
++
++    <event name="vrr_policy">
++      <description summary="Variable Refresh Rate Policy">
++        What policy the compositor will employ regarding its use of variable
++        refresh rate.
++      </description>
++      <arg name="vrr_policy" type="uint" enum="vrr_policy"/>
++    </event>
++
++    <enum name="rgb_range">
++      <description summary="describes RGB range policy">
++        Whether full or limited color range should be used
++      </description>
++      <entry name="automatic" value="0"/>
++      <entry name="full" value="1"/>
++      <entry name="limited" value="2"/>
++    </enum>
++
++    <event name="rgb_range">
++      <description summary="RGB range">
++        What rgb range the compositor is using for this output
++      </description>
++      <arg name="rgb_range" type="uint" enum="rgb_range"/>
++    </event>
++
++    <event name="name" since="2">
++      <description summary="Output's name">
++        Name of the output, it's useful to cross-reference to an zxdg_output_v1 and ultimately QScreen
++      </description>
++      <arg name="name" type="string"/>
++    </event>
++
++    <event name="high_dynamic_range" since="3">
++      <description summary="if HDR is enabled">
++        Whether or not high dynamic range is enabled for this output
++      </description>
++      <arg name="hdr_enabled" type="uint" summary="1 if enabled, 0 if disabled"/>
++    </event>
++
++    <event name="sdr_brightness" since="3">
++      <description summary="the brightness of sdr if hdr is enabled">
++        If high dynamic range is used, this value defines the brightness in nits for content
++        that's in standard dynamic range format. Note that while the value is in nits, that
++        doesn't necessarily translate to the same brightness on the screen.
++      </description>
++      <arg name="sdr_brightness" type="uint"/>
++    </event>
++
++    <event name="wide_color_gamut" since="3">
++      <description summary="if WCG is enabled">
++        Whether or not the use of a wide color gamut is enabled for this output
++      </description>
++      <arg name="wcg_enabled" type="uint" summary="1 if enabled, 0 if disabled"/>
++    </event>
++
++    <enum name="auto_rotate_policy">
++      <description summary="describes when auto rotate should be used"/>
++      <entry name="never" value="0"/>
++      <entry name="in_tablet_mode" value="1"/>
++      <entry name="always" value="2"/>
++    </enum>
++
++    <event name="auto_rotate_policy" since="4">
++      <description summary="describes when auto rotate is used"/>
++      <arg name="policy" type="uint" enum="auto_rotate_policy"/>
++    </event>
++
++    <event name="icc_profile_path" since="5">
++      <description summary="describes the path to the ICC profile used in SDR mode"/>
++      <arg name="profile_path" type="string"/>
++    </event>
++
++    <event name="brightness_metadata" since="6">
++      <description summary="metadata about the screen's brightness limits"/>
++      <arg name="max_peak_brightness" type="uint" summary="in nits"/>
++      <arg name="max_frame_average_brightness" type="uint" summary="in nits"/>
++      <arg name="min_brightness" type="uint" summary="in 0.0001 nits"/>
++    </event>
++
++    <event name="brightness_overrides" since="6">
++      <description summary="overrides for the screen's brightness limits"/>
++      <arg name="max_peak_brightness" type="int" summary="-1 for no override, positive values are the brightness in nits"/>
++      <arg name="max_average_brightness" type="int" summary="-1 for no override, positive values are the brightness in nits"/>
++      <arg name="min_brightness" type="int" summary="-1 for no override, positive values are the brightness in 0.0001 nits"/>
++    </event>
++
++    <event name="sdr_gamut_wideness" since="6">
++      <description summary="describes which gamut is assumed for sRGB applications">
++          This can be used to provide the colors users assume sRGB applications should have based on the
++          default experience on many modern sRGB screens.
++      </description>
++      <arg name="gamut_wideness" type="uint" summary="0 means rec.709 primaries, 10000 means native primaries"/>
++    </event>
++
++    <enum name="color_profile_source" since="7">
++      <description summary="which source the compositor should use for the color profile on an output"/>
++      <entry name="sRGB" value="0"/>
++      <entry name="ICC" value="1"/>
++      <entry name="EDID" value="2"/>
++    </enum>
++
++    <event name="color_profile_source" since="7">
++      <description summary="describes which source the compositor uses for the color profile on an output in SDR mode"/>
++      <arg name="source" type="uint" enum="color_profile_source"/>
++    </event>
++
++    <event name="brightness" since="8">
++      <description summary="brightness multiplier">
++        This is the brightness modifier of the output. It doesn't specify
++        any absolute values, but is merely a multiplier on top of other
++        brightness values, like sdr_brightness and brightness_metadata.
++        0 is the minimum brightness (not completely dark) and 10000 is
++        the maximum brightness.
++        This is currently only supported / meaningful while HDR is active.
++      </description>
++      <arg name="brightness" type="uint" summary="brightness in 0-10000"/>
++    </event>
++
++    <enum name="color_power_tradeoff">
++      <description summary="tradeoff between power and accuracy">
++        The compositor can do a lot of things that trade between
++        performance, power and color accuracy. This setting describes
++        a high level preference from the user about in which direction
++        that tradeoff should be made.
++      </description>
++      <entry name="efficiency" value="0" summary="prefer efficiency and performance"/>
++      <entry name="accuracy" value="1" summary="prefer accuracy"/>
++    </enum>
++
++    <event name="color_power_tradeoff" since="10">
++      <description summary="the preferred color/power tradeoff"/>
++      <arg name="preference" type="uint" enum="color_power_tradeoff"/>
++    </event>
++
++    <event name="dimming" since="11">
++      <description summary="dimming multiplier">
++        This is the dimming multiplier of the output. This is similar to
++        the brightness setting, except it's meant to be a temporary setting
++        only, not persistent and may be implemented differently depending
++        on the display.
++        0 is the minimum dimming factor (not completely dark) and 10000
++        means the output is not dimmed.
++      </description>
++      <arg name="multiplier" type="uint" summary="multiplier in 0-10000"/>
++    </event>
++
++    <event name="replication_source" since="13">
++      <description summary="source output for mirroring"/>
++      <arg name="source" type="string" summary="uuid of the source output"/>
++    </event>
++
++    <event name="ddc_ci_allowed" since="14">
++      <description summary="if DDC/CI should be used to control brightness etc.">
++        If the ddc_ci capability is present, this determines if settings
++        such as brightness, contrast or others should be set using DDC/CI.
++      </description>
++      <arg name="allowed" type="uint" summary="1 if allowed, 0 if disabled"/>
++    </event>
++
++    <event name="max_bits_per_color" since="15">
++      <description summary="override max bpc">
++        This limits the amount of bits per color that are sent to the display.
++      </description>
++      <arg name="max_bpc" type="uint" summary="0 for the default / automatic"/>
++    </event>
++
++    <event name="max_bits_per_color_range" since="15">
++      <description summary="range of max bits per color value"/>
++      <arg name="min_value" type="uint" summary="the minimum supported by the driver"/>
++      <arg name="max_value" type="uint" summary="the maximum supported by the driver"/>
++    </event>
++
++    <event name="automatic_max_bits_per_color_limit" since="15">
++      <description summary="if and to what value automatic max bpc is limited"/>
++      <arg name="max_bpc_limit" type="uint"
++           summary="which value automatic bpc gets limited to. 0 if not limited"/>
++    </event>
++
++    <enum name="edr_policy" since="16">
++      <description summary="when the compositor may make use of EDR"/>
++      <entry name="never" value="0"/>
++      <entry name="always" value="1"/>
++    </enum>
++
++    <event name="edr_policy" since="16">
++      <description summary="when the compositor may apply EDR">
++        When EDR is enabled, the compositor may increase the backlight beyond
++        the user-specified setting, in order to present HDR content on displays
++        without native HDR support.
++        This will usually result in better visuals, but also increases battery
++        usage.
++      </description>
++      <arg name="policy" type="uint" enum="edr_policy"/>
++    </event>
++
++    <event name="sharpness" since="17">
++      <description summary="sharpness strength">
++        This is the sharpness modifier of the output.
++        0 is sharpness disabled and 10000 is the maximum sharpness
++      </description>
++      <arg name="sharpness" type="uint" summary="sharpness in 0-10000"/>
++    </event>
++
++    <event name="priority" since="18">
++      <description summary="output priority">
++        Describes the position of the output in the output order list,
++        with lower values being earlier in the list. There's no specific
++        value the list has to start at, this value is only used in sorting
++        outputs.
++
++        Note that the output order protocol is not sufficient for this,
++        as an output may not be in the output order if it's disabled or
++        mirroring another screen.
++      </description>
++      <arg name="priority" type="uint" summary="priority"/>
++    </event>
++
++    <event name="auto_brightness" since="20">
++      <description summary="whether or not automatic brightness is enabled"/>
++      <arg name="enabled" type="uint" summary="1 for enabled, 0 for disabled"/>
++    </event>
++
++    <request name="release" type="destructor" since="21">
++      <description summary="destroy the output device">
++        This notifies the compositor that the client no longer wishes to use
++        the kde_output_device_v2 object.
++      </description>
++    </request>
++
++    <event name="removed" since="21">
++      <description summary="the output has been removed">
++        This event is sent when the output device is disconnected and no new
++        updates will be sent. The client should call the kde_output_device_v2.release
++        request after receiving this event.
++      </description>
++    </event>
++
++    <event name="hdr_icc_profile_path" since="22">
++      <description summary="describes the path to the ICC profile used in HDR mode"/>
++      <arg name="profile_path" type="string"/>
++    </event>
++
++    <event name="hdr_color_profile_source" since="22">
++      <description summary="describes which source the compositor uses for the color profile on an output in HDR mode"/>
++      <arg name="source" type="uint" enum="color_profile_source"/>
++    </event>
++
++    <event name="abm_level" since="23">
++      <description summary="allowed level of adaptive backlight modulation">
++        Adaptive backlight modulation is a feature that reduces the backlight
++        and increases contrast of colors on the screen to improve power usage.
++      </description>
++      <arg name="level" type="uint" summary="0 is off, 4 is the maximum level"/>
++    </event>
++  </interface>
++
++  <interface name="kde_output_device_mode_v2" version="26">
++    <description summary="output mode">
++      This object describes an output mode.
++
++      Some heads don't support output modes, in which case modes won't be
++      advertised.
++
++      Properties sent via this interface are applied atomically via the
++      kde_output_device.done event. No guarantees are made regarding the order
++      in which properties are sent.
++    </description>
++
++    <event name="size">
++      <description summary="mode size">
++        This event describes the mode size. The size is given in physical
++        hardware units of the output device. This is not necessarily the same as
++        the output size in the global compositor space. For instance, the output
++        may be scaled or transformed.
++      </description>
++      <arg name="width" type="int" summary="width of the mode in hardware units"/>
++      <arg name="height" type="int" summary="height of the mode in hardware units"/>
++    </event>
++
++    <event name="refresh">
++      <description summary="mode refresh rate">
++        This event describes the mode's fixed vertical refresh rate. It is only
++        sent if the mode has a fixed refresh rate.
++      </description>
++      <arg name="refresh" type="int" summary="vertical refresh rate in mHz"/>
++    </event>
++
++    <event name="preferred">
++      <description summary="mode is preferred">
++        This event advertises this mode as preferred.
++      </description>
++    </event>
++
++    <event name="removed">
++      <description summary="the mode has been destroyed">
++        The compositor will destroy the object immediately after sending this
++        event, so it will become invalid and the client should release any
++        resources associated with it.
++
++        The client should call the kde_output_device_mode_v2.release request
++        after receiving this event.
++      </description>
++    </event>
++
++    <enum name="flags">
++      <description summary="mode flags"/>
++      <entry name="custom" value="0x1"/>
++      <entry name="reduced_blanking" value="0x2" deprecated-since="24"/>
++    </enum>
++
++    <event name="flags" since="19">
++      <description summary="mode flags">
++        This event describes the mode's flags.
++      </description>
++      <arg name="flags" type="uint" enum="flags"/>
++    </event>
++
++    <event name="cvt" since="24">
++      <description summary="cvt timings">
++        This event describes the CVT timings associated with the mode.
++
++        If an output mode has no CVT timings, this event will not be sent.
++      </description>
++      <arg name="dot_clock" type="uint" summary="pixel clock in kHz"/>
++      <arg name="hdisplay" type="uint" summary="horizontal display size"/>
++      <arg name="hsync_start" type="uint" summary="horizontal sync start"/>
++      <arg name="hsync_end" type="uint" summary="horizontal sync end"/>
++      <arg name="htotal" type="uint" summary="horizontal total size"/>
++      <arg name="hskew" type="uint" summary="horizontal skew"/>
++      <arg name="vdisplay" type="uint" summary="vertical display size"/>
++      <arg name="vsync_start" type="uint" summary="vertical sync start"/>
++      <arg name="vsync_end" type="uint" summary="vertical sync end"/>
++      <arg name="vtotal" type="uint" summary="vertical total size"/>
++      <arg name="vscan" type="uint" summary="vertical scan"/>
++      <arg name="flags" type="uint" summary="flags, see DRM_MODE_FLAG_*"/>
++    </event>
++
++    <request name="release" type="destructor" since="26">
++      <description summary="destroy mode">
++        Notifies the compositor that this mode will not be used anymore.
++      </description>
++    </request>
++  </interface>
++
++</protocol>
+diff --git a/dlls/winewayland.drv/wayland.c b/dlls/winewayland.drv/wayland.c
+index 0ba14a6e0df..ac210781c04 100644
+--- a/dlls/winewayland.drv/wayland.c
++++ b/dlls/winewayland.drv/wayland.c
+@@ -395,6 +395,8 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
+ {
+     TRACE("interface=%s version=%u id=%u\n", interface, version, id);
+ 
++    if (wayland_kde_output_bind(registry, id, interface, version)) return;
++
+     if (strcmp(interface, "wl_output") == 0)
+     {
+         if (!wayland_output_create(id, version))
+@@ -601,6 +603,7 @@ static void registry_handle_global_remove(void *data, struct wl_registry *regist
+ #endif
+ 
+     if (wayland_output_remove(id)) return;
++    if (wayland_kde_output_remove(id)) return;
+ 
+     seat = &process_wayland.seat;
+     if (seat->wl_seat && seat->global_id == id)
+diff --git a/dlls/winewayland.drv/wayland_output.c b/dlls/winewayland.drv/wayland_output.c
+index 203a41501ca..8dfb790ec76 100644
+--- a/dlls/winewayland.drv/wayland_output.c
++++ b/dlls/winewayland.drv/wayland_output.c
+@@ -124,6 +124,41 @@ static void wayland_output_mode_free_rb(struct rb_entry *entry, void *ctx)
+     free(RB_ENTRY_VALUE(entry, struct wayland_output_mode, entry));
+ }
+ 
++/* Called with output_mutex held. */
++static BOOL wayland_output_supports_hdr(struct wayland_output *output)
++{
++    BOOL enabled;
++
++    /* KWin's SDR reference brightness can equal the HDR peak. Its explicit
++     * per-output state avoids confusing this with a genuinely SDR output. */
++    if (process_wayland.wp_color_manager_v1 &&
++        wayland_kde_output_get_hdr_state(output->current.name, &enabled))
++        return enabled;
++
++    /* Other compositors expose HDR through the output's luminance headroom,
++     * independently of the optional Windows image descriptions. */
++    return output->current.max_lum > output->current.ref_lum;
++}
++
++void wayland_output_refresh_hdr_state(void)
++{
++    struct wayland_output **output;
++    BOOL changed = FALSE, enabled;
++
++    pthread_mutex_lock(&process_wayland.output_mutex);
++    wl_array_for_each(output, &process_wayland.output_array)
++    {
++        enabled = wayland_output_supports_hdr(*output);
++        if ((*output)->current.supports_hdr == enabled) continue;
++        (*output)->current.supports_hdr = enabled;
++        TRACE("name=%s hdr=%u\n", (*output)->current.name, enabled);
++        changed = TRUE;
++    }
++    pthread_mutex_unlock(&process_wayland.output_mutex);
++
++    if (changed) maybe_init_display_devices();
++}
++
+ static void wayland_output_done(struct wayland_output *output)
+ {
+     struct wayland_output_mode *mode;
+@@ -196,9 +231,7 @@ static void wayland_output_done(struct wayland_output *output)
+         output->current.ref_lum = output->pending.ref_lum;
+     }
+ 
+-    /* Output HDR state is independent of the optional Windows image descriptions.
+-     * Vulkan WSI can handle HDR colorspaces through standard color management. */
+-    output->current.supports_hdr = output->current.max_lum > output->current.ref_lum;
++    output->current.supports_hdr = wayland_output_supports_hdr(output);
+ 
+     output->current.flags |= output->pending.flags;
+     output->pending.flags = 0;
+diff --git a/dlls/winewayland.drv/wayland_output_kde.c b/dlls/winewayland.drv/wayland_output_kde.c
+new file mode 100644
+index 00000000000..988af56813f
+--- /dev/null
++++ b/dlls/winewayland.drv/wayland_output_kde.c
+@@ -0,0 +1,408 @@
++/*
++ * KWin output HDR state
++ *
++ * Copyright 2026 GloriousEggroll
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#include "config.h"
++#include "waylanddrv.h"
++#include "kde-output-device-v2-client-protocol.h"
++#include "wine/debug.h"
++
++#include <stdlib.h>
++#include <string.h>
++
++WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
++
++struct kde_output_registry
++{
++    struct list entry;
++    struct kde_output_device_registry_v2 *proxy;
++    uint32_t global_id;
++    BOOL stopped;
++};
++
++struct kde_output
++{
++    struct list entry, modes;
++    struct kde_output_device_v2 *proxy;
++    struct kde_output_registry *registry;
++    uint32_t global_id;
++    char *name, *pending_name;
++    BOOL ready, hdr, have_hdr, pending_hdr, pending_enabled;
++    uint32_t pending_capabilities;
++};
++
++struct kde_output_mode
++{
++    struct list entry;
++    struct kde_output_device_mode_v2 *proxy;
++};
++
++static struct list registries = LIST_INIT(registries);
++/* Membership and committed state are protected by output_mutex. Pending state
++ * and protocol object lifetimes are managed only by the Wayland event queue. */
++static struct list outputs = LIST_INIT(outputs);
++
++static void output_proxy_destroy(struct kde_output_device_v2 *proxy)
++{
++    if (kde_output_device_v2_get_version(proxy) >= KDE_OUTPUT_DEVICE_V2_RELEASE_SINCE_VERSION)
++        kde_output_device_v2_release(proxy);
++    else
++        kde_output_device_v2_destroy(proxy);
++}
++
++static void mode_destroy(struct kde_output_mode *mode)
++{
++    /* We bind at most version 21; modes have no release request before v26. */
++    kde_output_device_mode_v2_destroy(mode->proxy);
++    list_remove(&mode->entry);
++    free(mode);
++}
++
++/* Called with output_mutex held. */
++static void output_destroy(struct kde_output *output)
++{
++    struct kde_output_mode *mode, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE(mode, next, &output->modes, struct kde_output_mode, entry)
++        mode_destroy(mode);
++    output_proxy_destroy(output->proxy);
++    list_remove(&output->entry);
++    free(output->name);
++    free(output->pending_name);
++    free(output);
++}
++
++static void mode_handle_size(void *data, struct kde_output_device_mode_v2 *proxy,
++                             int32_t width, int32_t height)
++{
++}
++
++static void mode_handle_refresh(void *data, struct kde_output_device_mode_v2 *proxy, int32_t refresh)
++{
++}
++
++static void mode_handle_preferred(void *data, struct kde_output_device_mode_v2 *proxy)
++{
++}
++
++static void mode_handle_removed(void *data, struct kde_output_device_mode_v2 *proxy)
++{
++    mode_destroy(data);
++}
++
++static void mode_handle_flags(void *data, struct kde_output_device_mode_v2 *proxy, uint32_t flags)
++{
++}
++
++static const struct kde_output_device_mode_v2_listener mode_listener =
++{
++    .size = mode_handle_size,
++    .refresh = mode_handle_refresh,
++    .preferred = mode_handle_preferred,
++    .removed = mode_handle_removed,
++    .flags = mode_handle_flags,
++};
++
++static void output_handle_mode(void *data, struct kde_output_device_v2 *proxy,
++                               struct kde_output_device_mode_v2 *mode_proxy)
++{
++    struct kde_output *output = data;
++    struct kde_output_mode *mode = calloc(1, sizeof(*mode));
++
++    if (!mode)
++    {
++        kde_output_device_mode_v2_destroy(mode_proxy);
++        return;
++    }
++    mode->proxy = mode_proxy;
++    list_add_tail(&output->modes, &mode->entry);
++    kde_output_device_mode_v2_add_listener(mode_proxy, &mode_listener, mode);
++}
++
++static void output_handle_name(void *data, struct kde_output_device_v2 *proxy, const char *name)
++{
++    struct kde_output *output = data;
++
++    free(output->pending_name);
++    output->pending_name = strdup(name);
++}
++
++static void output_handle_hdr(void *data, struct kde_output_device_v2 *proxy, uint32_t enabled)
++{
++    struct kde_output *output = data;
++
++    output->pending_hdr = !!enabled;
++    output->have_hdr = TRUE;
++}
++
++static void output_handle_enabled(void *data, struct kde_output_device_v2 *proxy, int32_t enabled)
++{
++    struct kde_output *output = data;
++
++    output->pending_enabled = !!enabled;
++}
++
++static void output_handle_capabilities(void *data, struct kde_output_device_v2 *proxy, uint32_t flags)
++{
++    struct kde_output *output = data;
++
++    output->pending_capabilities = flags;
++}
++
++static void output_handle_done(void *data, struct kde_output_device_v2 *proxy)
++{
++    struct kde_output *output = data;
++
++    pthread_mutex_lock(&process_wayland.output_mutex);
++    if (output->pending_name)
++    {
++        free(output->name);
++        output->name = output->pending_name;
++        output->pending_name = NULL;
++    }
++    output->ready = output->name && output->have_hdr;
++    output->hdr = output->pending_enabled && output->pending_hdr &&
++                  (output->pending_capabilities & KDE_OUTPUT_DEVICE_V2_CAPABILITY_HIGH_DYNAMIC_RANGE);
++    TRACE("KDE output %s ready=%u hdr=%u\n", debugstr_a(output->name), output->ready, output->hdr);
++    pthread_mutex_unlock(&process_wayland.output_mutex);
++
++    /* KDE properties may arrive before or after wl_output's done event. */
++    wayland_output_refresh_hdr_state();
++}
++
++static void output_handle_removed(void *data, struct kde_output_device_v2 *proxy)
++{
++    pthread_mutex_lock(&process_wayland.output_mutex);
++    output_destroy(data);
++    pthread_mutex_unlock(&process_wayland.output_mutex);
++    wayland_output_refresh_hdr_state();
++}
++
++static void output_handle_geometry(void *data, struct kde_output_device_v2 *proxy,
++                                   int32_t x, int32_t y, int32_t physical_width,
++                                   int32_t physical_height, int32_t subpixel,
++                                   const char *make, const char *model, int32_t transform)
++{
++}
++
++static void output_handle_current_mode(void *data, struct kde_output_device_v2 *proxy,
++                                       struct kde_output_device_mode_v2 *mode)
++{
++}
++
++static void output_handle_scale(void *data, struct kde_output_device_v2 *proxy, wl_fixed_t scale)
++{
++}
++
++static void output_ignore_string(void *data, struct kde_output_device_v2 *proxy, const char *value)
++{
++}
++
++static void output_ignore_uint(void *data, struct kde_output_device_v2 *proxy, uint32_t value)
++{
++}
++
++static void output_handle_brightness_metadata(void *data, struct kde_output_device_v2 *proxy,
++                                              uint32_t peak, uint32_t average, uint32_t minimum)
++{
++}
++
++static void output_handle_brightness_overrides(void *data, struct kde_output_device_v2 *proxy,
++                                               int32_t peak, int32_t average, int32_t minimum)
++{
++}
++
++static void output_handle_bpc_range(void *data, struct kde_output_device_v2 *proxy,
++                                    uint32_t minimum, uint32_t maximum)
++{
++}
++
++/* Only events through v21 can be sent at our negotiated versions. */
++static const struct kde_output_device_v2_listener output_listener =
++{
++    .geometry = output_handle_geometry,
++    .current_mode = output_handle_current_mode,
++    .mode = output_handle_mode,
++    .done = output_handle_done,
++    .scale = output_handle_scale,
++    .edid = output_ignore_string,
++    .enabled = output_handle_enabled,
++    .uuid = output_ignore_string,
++    .serial_number = output_ignore_string,
++    .eisa_id = output_ignore_string,
++    .capabilities = output_handle_capabilities,
++    .overscan = output_ignore_uint,
++    .vrr_policy = output_ignore_uint,
++    .rgb_range = output_ignore_uint,
++    .name = output_handle_name,
++    .high_dynamic_range = output_handle_hdr,
++    .sdr_brightness = output_ignore_uint,
++    .wide_color_gamut = output_ignore_uint,
++    .auto_rotate_policy = output_ignore_uint,
++    .icc_profile_path = output_ignore_string,
++    .brightness_metadata = output_handle_brightness_metadata,
++    .brightness_overrides = output_handle_brightness_overrides,
++    .sdr_gamut_wideness = output_ignore_uint,
++    .color_profile_source = output_ignore_uint,
++    .brightness = output_ignore_uint,
++    .color_power_tradeoff = output_ignore_uint,
++    .dimming = output_ignore_uint,
++    .replication_source = output_ignore_string,
++    .ddc_ci_allowed = output_ignore_uint,
++    .max_bits_per_color = output_ignore_uint,
++    .max_bits_per_color_range = output_handle_bpc_range,
++    .automatic_max_bits_per_color_limit = output_ignore_uint,
++    .edr_policy = output_ignore_uint,
++    .sharpness = output_ignore_uint,
++    .priority = output_ignore_uint,
++    .auto_brightness = output_ignore_uint,
++    .removed = output_handle_removed,
++};
++
++static void output_create(struct kde_output_device_v2 *proxy, struct kde_output_registry *registry,
++                           uint32_t global_id)
++{
++    struct kde_output *output;
++
++    if (!proxy) return;
++    if (!(output = calloc(1, sizeof(*output))))
++    {
++        output_proxy_destroy(proxy);
++        return;
++    }
++    output->proxy = proxy;
++    output->registry = registry;
++    output->global_id = global_id;
++    list_init(&output->modes);
++    pthread_mutex_lock(&process_wayland.output_mutex);
++    list_add_tail(&outputs, &output->entry);
++    pthread_mutex_unlock(&process_wayland.output_mutex);
++    kde_output_device_v2_add_listener(proxy, &output_listener, output);
++}
++
++static void registry_handle_output(void *data, struct kde_output_device_registry_v2 *proxy,
++                                   struct kde_output_device_v2 *output)
++{
++    struct kde_output_registry *registry = data;
++
++    if (registry->stopped) output_proxy_destroy(output);
++    else output_create(output, registry, 0);
++}
++
++static void registry_handle_finished(void *data, struct kde_output_device_registry_v2 *proxy)
++{
++    struct kde_output_registry *registry = data;
++    struct kde_output *output, *next;
++
++    pthread_mutex_lock(&process_wayland.output_mutex);
++    LIST_FOR_EACH_ENTRY_SAFE(output, next, &outputs, struct kde_output, entry)
++        if (output->registry == registry) output_destroy(output);
++    pthread_mutex_unlock(&process_wayland.output_mutex);
++    kde_output_device_registry_v2_destroy(proxy);
++    list_remove(&registry->entry);
++    free(registry);
++    wayland_output_refresh_hdr_state();
++}
++
++static const struct kde_output_device_registry_v2_listener registry_listener =
++{
++    .finished = registry_handle_finished,
++    .output = registry_handle_output,
++};
++
++BOOL wayland_kde_output_bind(struct wl_registry *wl_registry, uint32_t id,
++                             const char *interface, uint32_t version)
++{
++    struct kde_output_registry *registry;
++
++    if (!strcmp(interface, "kde_output_device_registry_v2"))
++    {
++        /* This global rejects versions below 21 with a fatal protocol error. */
++        if (version < 21) return TRUE;
++        if (!(registry = calloc(1, sizeof(*registry)))) return TRUE;
++        registry->proxy = wl_registry_bind(wl_registry, id, &kde_output_device_registry_v2_interface, 21);
++        if (!registry->proxy)
++        {
++            free(registry);
++            return TRUE;
++        }
++        registry->global_id = id;
++        list_add_tail(&registries, &registry->entry);
++        kde_output_device_registry_v2_add_listener(registry->proxy, &registry_listener, registry);
++        return TRUE;
++    }
++    if (!strcmp(interface, "kde_output_device_v2"))
++    {
++        /* Older KWin versions advertise each device directly. v3 adds HDR. */
++        if (version >= 3)
++            output_create(wl_registry_bind(wl_registry, id, &kde_output_device_v2_interface, 3), NULL, id);
++        return TRUE;
++    }
++    return FALSE;
++}
++
++BOOL wayland_kde_output_remove(uint32_t id)
++{
++    struct kde_output_registry *registry;
++    struct kde_output *output;
++
++    LIST_FOR_EACH_ENTRY(registry, &registries, struct kde_output_registry, entry)
++    {
++        if (registry->global_id != id) continue;
++        pthread_mutex_lock(&process_wayland.output_mutex);
++        registry->stopped = TRUE;
++        pthread_mutex_unlock(&process_wayland.output_mutex);
++        kde_output_device_registry_v2_stop(registry->proxy);
++        wayland_output_refresh_hdr_state();
++        return TRUE;
++    }
++
++    pthread_mutex_lock(&process_wayland.output_mutex);
++    LIST_FOR_EACH_ENTRY(output, &outputs, struct kde_output, entry)
++    {
++        if (output->registry || output->global_id != id) continue;
++        output_destroy(output);
++        pthread_mutex_unlock(&process_wayland.output_mutex);
++        wayland_output_refresh_hdr_state();
++        return TRUE;
++    }
++    pthread_mutex_unlock(&process_wayland.output_mutex);
++    return FALSE;
++}
++
++/* Called with output_mutex held. Match only connector names, not position or
++ * model: mixed HDR/SDR desktops must retain per-output state. */
++BOOL wayland_kde_output_get_hdr_state(const char *name, BOOL *enabled)
++{
++    struct kde_output *output;
++
++    if (!name) return FALSE;
++    LIST_FOR_EACH_ENTRY(output, &outputs, struct kde_output, entry)
++    {
++        if (!output->ready || (output->registry && output->registry->stopped)) continue;
++        if (strcmp(name, output->name)) continue;
++        *enabled = output->hdr;
++        return TRUE;
++    }
++    return FALSE;
++}
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index 3b2d407793c..c99d7631853 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -575,6 +575,11 @@ void wayland_output_use_xdg_extension(struct wayland_output *output);
+ void wayland_output_use_image_description(struct wayland_output *output);
+ struct wayland_output *wayland_output_for_rect(const RECT *rect);
+ void wayland_output_array_arrange_physical_coords(void);
++void wayland_output_refresh_hdr_state(void);
++BOOL wayland_kde_output_bind(struct wl_registry *registry, uint32_t id,
++                             const char *interface, uint32_t version);
++BOOL wayland_kde_output_remove(uint32_t id);
++BOOL wayland_kde_output_get_hdr_state(const char *name, BOOL *enabled);
+ 
+ /**********************************************************************
+  *          Wayland surface
