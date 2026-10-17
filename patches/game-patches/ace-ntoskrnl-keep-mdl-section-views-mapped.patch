@@ -1,0 +1,144 @@
+From e7942574f689db3accfdd35fed08a00bd706b81d Mon Sep 17 00:00:00 2001
+From: NelloKudo <marshnelloosu@gmail.com>
+Date: Thu, 15 Oct 2026 21:25:34 +0200
+Subject: [PATCH] HACK: ntoskrnl.exe: Keep section views mapped while a locked
+ MDL uses them.
+
+---
+ dlls/ntoskrnl.exe/ntoskrnl.c        | 86 +++++++++++++++++++++++++++++
+ dlls/ntoskrnl.exe/ntoskrnl.exe.spec |  2 +-
+ 2 files changed, 87 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/ntoskrnl.exe/ntoskrnl.c b/dlls/ntoskrnl.exe/ntoskrnl.c
+index 604554724ab..c01a3a9d5fd 100644
+--- a/dlls/ntoskrnl.exe/ntoskrnl.c
++++ b/dlls/ntoskrnl.exe/ntoskrnl.c
+@@ -1204,6 +1204,87 @@ PVOID WINAPI IoAllocateErrorLogEntry( PVOID IoObject, UCHAR EntrySize )
+ }
+ 
+ 
++/* dirty way to postpone drivers from unmapping sections while a locked MDL still uses it */
++struct mapped_view
++{
++    struct list entry;
++    MDL *mdl;
++    void *pending_unmap;
++};
++
++/* i dont really know other ways to do this.. */
++static struct list mapped_views = LIST_INIT( mapped_views );
++DECLARE_CRITICAL_SECTION(mapped_views_cs);
++static struct mapped_view *find_mapped_view( const void *addr )
++{
++    struct mapped_view *view;
++
++    LIST_FOR_EACH_ENTRY( view, &mapped_views, struct mapped_view, entry )
++        if ((const char *)addr >= (char *)view->mdl->MappedSystemVa &&
++            (const char *)addr < (char *)view->mdl->MappedSystemVa + view->mdl->ByteCount)
++            return view;
++    return NULL;
++}
++
++static void add_mapped_view( MDL *mdl )
++{
++    struct mapped_view *view;
++
++    if (!(mdl->MdlFlags & MDL_PAGES_LOCKED) || !(view = malloc( sizeof(*view) ))) return;
++    view->mdl = mdl;
++    view->pending_unmap = NULL;
++
++    EnterCriticalSection( &mapped_views_cs );
++    list_add_tail( &mapped_views, &view->entry );
++    LeaveCriticalSection( &mapped_views_cs );
++}
++
++static void remove_mapped_view( MDL *mdl )
++{
++    struct mapped_view *view, *other;
++    void *unmap = NULL;
++
++    EnterCriticalSection( &mapped_views_cs );
++    LIST_FOR_EACH_ENTRY( view, &mapped_views, struct mapped_view, entry )
++    {
++        if (view->mdl != mdl) continue;
++        unmap = view->pending_unmap;
++        list_remove( &view->entry );
++        free( view );
++        /* another MDL may still map the same view */
++        if (unmap && (other = find_mapped_view( unmap )))
++        {
++            other->pending_unmap = unmap;
++            unmap = NULL;
++        }
++        break;
++    }
++    LeaveCriticalSection( &mapped_views_cs );
++
++    if (unmap) NtUnmapViewOfSection( GetCurrentProcess(), unmap );
++}
++
++/***********************************************************************
++ *           ZwUnmapViewOfSection  (NTOSKRNL.EXE.@)
++ */
++NTSTATUS WINAPI ZwUnmapViewOfSection( HANDLE process, void *addr )
++{
++    /* surely upstreamable........... */
++    struct mapped_view *view = NULL;
++
++    TRACE( "process %p, addr %p\n", process, addr );
++
++    if (process == GetCurrentProcess())
++    {
++        EnterCriticalSection( &mapped_views_cs );
++        if ((view = find_mapped_view( addr ))) view->pending_unmap = addr;
++        LeaveCriticalSection( &mapped_views_cs );
++    }
++    if (view) return STATUS_SUCCESS;
++
++    return NtUnmapViewOfSection( process, addr );
++}
++
+ /***********************************************************************
+  *           IoAllocateMdl  (NTOSKRNL.EXE.@)
+  */
+@@ -1247,6 +1328,7 @@ PMDL WINAPI IoAllocateMdl( PVOID va, ULONG length, BOOLEAN secondary, BOOLEAN ch
+ void WINAPI IoFreeMdl(PMDL mdl)
+ {
+     TRACE("%p\n", mdl);
++    remove_mapped_view( mdl );
+     HeapFree(GetProcessHeap(), 0, mdl);
+ }
+ 
+@@ -3191,8 +3273,11 @@ PVOID WINAPI MmMapLockedPages( MDL *mdl, KPROCESSOR_MODE mode )
+ {
+     TRACE( "%p %u\n", mdl, mode );
+ 
++    if (mdl->MdlFlags & MDL_MAPPED_TO_SYSTEM_VA) return mdl->MappedSystemVa;
++
+     mdl->MdlFlags |= MDL_MAPPED_TO_SYSTEM_VA;
+     mdl->MappedSystemVa = (char *)mdl->StartVa + mdl->ByteOffset;
++    add_mapped_view( mdl );
+     return mdl->MappedSystemVa;
+ }
+ 
+@@ -3217,6 +3302,7 @@ void WINAPI MmUnmapLockedPages( void *base, MDL *mdl )
+ {
+     TRACE( "%p %p\n", base, mdl );
+ 
++    remove_mapped_view( mdl );
+     mdl->MdlFlags &= ~MDL_MAPPED_TO_SYSTEM_VA;
+ }
+ 
+diff --git a/dlls/ntoskrnl.exe/ntoskrnl.exe.spec b/dlls/ntoskrnl.exe/ntoskrnl.exe.spec
+index 9126dc903cf..cd57ab88ad8 100644
+--- a/dlls/ntoskrnl.exe/ntoskrnl.exe.spec
++++ b/dlls/ntoskrnl.exe/ntoskrnl.exe.spec
+@@ -1556,7 +1556,7 @@
+ @ stdcall -private ZwUnloadKey(ptr) NtUnloadKey
+ @ stdcall -private ZwUnlockFile(long ptr ptr ptr ptr) NtUnlockFile
+ @ stdcall -private ZwUnlockVirtualMemory(long ptr ptr long) NtUnlockVirtualMemory
+-@ stdcall ZwUnmapViewOfSection(long ptr) NtUnmapViewOfSection
++@ stdcall ZwUnmapViewOfSection(long ptr)
+ @ stdcall -private ZwWaitForMultipleObjects(long ptr long long ptr) NtWaitForMultipleObjects
+ @ stdcall ZwWaitForSingleObject(long long ptr) NtWaitForSingleObject
+ @ stdcall ZwWriteFile(long long ptr ptr ptr ptr long ptr ptr) NtWriteFile

@@ -327,6 +327,15 @@ apply_all_in_dir() {
     echo "WINE: -GAME FIXES- call DriverEntry with a kernel-mode return address for ACE anti-cheat"
     apply_patch "../patches/game-patches/ace-driverentry-kernel-return-address.patch"
 
+    # https://github.com/GloriousEggroll/proton-ge-custom/issues/847
+    # ACE-CORE driver fixes by NelloKudo in dawn-winery/wine-dwproton
+    # (4ef68081d5, 6a06ad015f, e7942574f6, 532d18e79a)
+    echo "WINE: -GAME FIXES- add ntoskrnl MmCopyMemory, ServiceKeyName, MDL view and PsGetContextThread fixes for ACE anti-cheat"
+    apply_patch "../patches/game-patches/ace-ntoskrnl-mmcopymemory-stub.patch"
+    apply_patch "../patches/game-patches/ace-ntoskrnl-service-key-name.patch"
+    apply_patch "../patches/game-patches/ace-ntoskrnl-keep-mdl-section-views-mapped.patch"
+    apply_patch "../patches/game-patches/ace-ntoskrnl-psgetcontextthread-thunk.patch"
+
 ### END GAME PATCH SECTION ###
 
 ### (2-5) WINE HOTFIX/BACKPORT SECTION ###
