@@ -872,7 +872,7 @@ static void collapse_path( WCHAR *path, UINT mark )
     for (p = path; *p; p++) if (*p == '/') *p = '\\';
 
     /* collapse duplicate backslashes */
-    next = path + std::max( 1u, mark );
+    next = path + (std::max)( 1u, mark );
     for (p = next; *p; p++) if (*p != '\\' || next[-1] != '\\') *next++ = *p;
     *next = 0;
 
