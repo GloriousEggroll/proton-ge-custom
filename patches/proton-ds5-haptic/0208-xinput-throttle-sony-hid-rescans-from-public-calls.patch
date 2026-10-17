@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Subject: [PATCH] xinput: Throttle automatic Sony HID rescans from public calls.
+
+XInputGetState, XInputSetState and XInputGetCapabilities rescan devices
+whenever the queried slot is empty. With automatic Sony fallback enabled by
+default, every one of those rescans also walks the whole HID class under
+xinput_cs. Games that poll all four slots continuously, directly or through
+GameInput's XInput provider, then spend their time in HID enumeration. The
+cost grows with the number of HID collections, so devices such as racing
+wheels make it much worse.
+
+Le Mans Ultimate with a Moza R12 connected and Steam Input disabled ran its
+physics in slow motion on GE-Proton11-9; its physics thread timed out
+waiting for a critical section held by the main thread. Disconnecting the
+wheel avoided the slowdown.
+
+The update thread already adds Sony controllers on HID arrival notifications
+and rescans every two seconds. Keep the WINEXINPUT pass on every public call,
+as upstream does, but limit the synchronous Sony HID pass to once every
+500 ms, so queries from a game's own device-arrival handler can still find a
+controller the update thread has not processed yet.
+
+Bug: https://github.com/GloriousEggroll/proton-ge-custom/issues/777
+---
+--- a/dlls/xinput1_3/main.c
++++ b/dlls/xinput1_3/main.c
+@@ -796,11 +796,14 @@
+     return NULL;
+ }
+ 
+-static void update_controller_list(void)
++/* synchronous is set for rescans from public XInput calls on missing slots */
++static void update_controller_list(BOOL synchronous)
+ {
++    static ULONGLONG last_sony_scan;
+     GUID guid = GUID_DEVINTERFACE_WINEXINPUT;
+     WCHAR *paths, *path;
+     BOOL native_present = FALSE;
++    ULONGLONG now;
+ 
+     EnterCriticalSection(&xinput_cs);
+ 
+@@ -820,6 +823,13 @@
+ 
+     if (auto_sony_xinput && !steam_virtual_present)
+     {
++        /* Games polling empty slots would walk the whole HID class on every
++         * call. The update thread handles Sony hotplug, so only rescan here
++         * occasionally, for queries made from a device-arrival handler. */
++        now = GetTickCount64();
++        if (synchronous && now - last_sony_scan < 500) goto done;
++        last_sony_scan = now;
++
+         HidD_GetHidGuid(&guid);
+         if (!(paths = get_device_interfaces(&guid))) goto done;
+         for (path = paths; *path; path += wcslen(path) + 1)
+@@ -1030,7 +1040,7 @@
+         if (wparam == DBT_DEVICEREMOVECOMPLETE)
+         {
+             try_remove_device(iface->dbcc_name);
+-            update_controller_list();
++            update_controller_list(FALSE);
+         }
+         LeaveCriticalSection(&xinput_cs);
+     }
+@@ -1072,13 +1082,13 @@
+         hid_notif = RegisterDeviceNotificationW(hwnd, &filter, DEVICE_NOTIFY_WINDOW_HANDLE);
+     }
+ 
+-    update_controller_list();
++    update_controller_list(FALSE);
+     SetEvent(start_event);
+ 
+     do
+     {
+         if (ret == count) while (PeekMessageW(&msg, hwnd, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+-        if (ret == WAIT_TIMEOUT) update_controller_list();
++        if (ret == WAIT_TIMEOUT) update_controller_list(FALSE);
+ 
+         EnterCriticalSection(&xinput_cs);
+         if (ret < count - 1 && devices[ret]->device) read_controller_state(devices[ret]);
+@@ -1200,7 +1210,7 @@
+     if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
+ 
+     EnterCriticalSection(&xinput_cs);
+-    if (!controllers[index].device) update_controller_list();
++    if (!controllers[index].device) update_controller_list(TRUE);
+     if (!controller_available(&controllers[index]))
+         ret = is_persistent_player1(index) ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
+     else if (WaitForSingleObject(steam_overlay_event, 0) == WAIT_OBJECT_0)
+@@ -1231,7 +1241,7 @@
+     if (sgi && !strcmp(sgi, "298110")) goto done;
+ 
+     EnterCriticalSection(&xinput_cs);
+-    if (!controllers[index].device) update_controller_list();
++    if (!controllers[index].device) update_controller_list(TRUE);
+     ret = get_current_state(index, state) ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
+     LeaveCriticalSection(&xinput_cs);
+ 
+@@ -1612,7 +1622,7 @@
+     if (index >= XUSER_MAX_COUNT) return ERROR_BAD_ARGUMENTS;
+ 
+     EnterCriticalSection(&xinput_cs);
+-    if (!controllers[index].device) update_controller_list();
++    if (!controllers[index].device) update_controller_list(TRUE);
+     if (!controllers[index].device && is_persistent_player1(index))
+     {
+         memset(&attr, 0, sizeof(attr));
