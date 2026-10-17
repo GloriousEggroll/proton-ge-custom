@@ -322,6 +322,11 @@ apply_all_in_dir() {
     echo "WINE: -GAME FIXES- repair NASCAR 25 protected loader state"
     apply_patch "../patches/game-patches/nascar25-protector.patch"
 
+    # https://github.com/GloriousEggroll/proton-ge-custom/issues/847
+    # Original fix by mkrsym1 in dawn-winery/wine-dwproton (ecedc3e2d6d2)
+    echo "WINE: -GAME FIXES- call DriverEntry with a kernel-mode return address for ACE anti-cheat"
+    apply_patch "../patches/game-patches/ace-driverentry-kernel-return-address.patch"
+
 ### END GAME PATCH SECTION ###
 
 ### (2-5) WINE HOTFIX/BACKPORT SECTION ###

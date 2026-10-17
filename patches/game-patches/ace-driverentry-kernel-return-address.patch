@@ -1,0 +1,122 @@
+From: mkrsym1 <mkrsym1@gmail.com>
+Subject: [PATCH] ntoskrnl.exe: Call DriverInit with bits 48-64 of return address set.
+
+Anti-Cheat Expert (ACE) 29.6 drivers bugcheck (0x65636157, "Wace") in
+DriverEntry when the caller is not a kernel-space address. Tag the
+return address with the kernel-space bits and strip them again in the
+vectored handler when the driver returns.
+
+Original commit ecedc3e2d6d2 from dawn-winery/wine-dwproton (App:
+Goddess of Victory: NIKKE). GE-Proton additionally handles Intel CPUs,
+which report the general protection fault at the ret instruction
+rather than at the non-canonical target, and only strips returns into
+ntoskrnl.exe.
+
+https://github.com/GloriousEggroll/proton-ge-custom/issues/847
+---
+--- a/dlls/ntoskrnl.exe/instr.c
++++ b/dlls/ntoskrnl.exe/instr.c
+@@ -29,6 +29,7 @@
+ #define WIN32_NO_STATUS
+ #include "ddk/wdm.h"
+ #include "excpt.h"
++#include "rtlsupportapi.h"
+ #include "wine/debug.h"
+ 
+ #define KSHARED_USER_DATA_PAGE_SIZE 0x1000
+@@ -947,6 +948,49 @@
+ }
+ 
+ 
++#define KERNEL_RETURN_TAG 0xffff800000000000ull
++
++/* strip the tag added by call_driver_init(), only for returns into ntoskrnl */
++static BOOL strip_kernel_return( ULONG_PTR *addr )
++{
++    void *self, *target;
++
++    if ((*addr & KERNEL_RETURN_TAG) != KERNEL_RETURN_TAG) return FALSE;
++    RtlPcToFileHeader( (void *)strip_kernel_return, &self );
++    if (!RtlPcToFileHeader( (void *)(*addr & ~KERNEL_RETURN_TAG), &target ) || target != self)
++        return FALSE;
++    *addr &= ~KERNEL_RETURN_TAG;
++    return TRUE;
++}
++
++/* handle a driver returning to a tagged kernel-space address */
++static BOOL emulate_kernel_return( EXCEPTION_RECORD *record, CONTEXT *context )
++{
++    const BYTE *instr = (const BYTE *)context->Rip;
++    ULONG_PTR addr = context->Rip;
++    unsigned int pop = 0;
++
++    /* AMD reports the fault at the non-canonical target */
++    if (strip_kernel_return( &addr ))
++    {
++        context->Rip = addr;
++        return TRUE;
++    }
++
++    /* Intel reports a general protection fault at the ret instruction itself */
++    if (record->NumberParameters < 2 || record->ExceptionInformation[1] != ~(ULONG_PTR)0) return FALSE;
++    if (*instr == 0xf2 || *instr == 0xf3) instr++;  /* bnd / rep */
++    if (*instr == 0xc2) pop = *(const WORD *)(instr + 1);
++    else if (*instr != 0xc3) return FALSE;
++
++    addr = *(const ULONG_PTR *)context->Rsp;
++    if (!strip_kernel_return( &addr )) return FALSE;
++    context->Rip = addr;
++    context->Rsp += sizeof(ULONG_PTR) + pop;
++    return TRUE;
++}
++
++
+ /***********************************************************************
+  *           vectored_handler
+  *
+@@ -958,6 +1002,12 @@
+     EXCEPTION_RECORD *record = ptrs->ExceptionRecord;
+     CONTEXT *context = ptrs->ContextRecord;
+ 
++    if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && emulate_kernel_return( record, context ))
++    {
++        TRACE( "returning from kernel-mode call to rip=%Ix\n", context->Rip );
++        return EXCEPTION_CONTINUE_EXECUTION;
++    }
++
+     if (record->ExceptionCode == EXCEPTION_PRIV_INSTRUCTION ||
+         (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+          record->ExceptionInformation[0] == EXCEPTION_READ_FAULT))
+--- a/dlls/ntoskrnl.exe/ntoskrnl.c
++++ b/dlls/ntoskrnl.exe/ntoskrnl.c
+@@ -4417,6 +4417,18 @@
+     return module;
+ }
+ 
++#if defined(__x86_64__) && !defined(__arm64ec__)
++/* Windows calls DriverEntry from kernel space, and some anti-cheat drivers
++ * verify that. Tag the return address with the kernel-space bits; the
++ * vectored handler strips them again when the driver returns. */
++static NTSTATUS __attribute__((naked)) call_driver_init( DRIVER_OBJECT *driver, UNICODE_STRING *keyname, void *init )
++{
++    asm( "movq $0xffff800000000000,%r9\n\t"
++         "orq %r9,(%rsp)\n\t"
++         "jmpq *%r8\n\t" );
++}
++#endif
++
+ /* call the driver init entry point */
+ static NTSTATUS WINAPI init_driver( DRIVER_OBJECT *driver_object, UNICODE_STRING *keyname )
+ {
+@@ -4445,7 +4457,11 @@
+     TRACE_(relay)( "\1Call driver init %p (obj=%p,str=%s)\n",
+                    driver_object->DriverInit, driver_object, wine_dbgstr_w(keyname->Buffer) );
+ 
++#if defined(__x86_64__) && !defined(__arm64ec__)
++    status = call_driver_init( driver_object, keyname, driver_object->DriverInit );
++#else
+     status = driver_object->DriverInit( driver_object, keyname );
++#endif
+ 
+     TRACE_(relay)( "\1Ret  driver init %p (obj=%p,str=%s) retval=%08lx\n",
+                    driver_object->DriverInit, driver_object, wine_dbgstr_w(keyname->Buffer), status );
