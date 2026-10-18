@@ -336,6 +336,13 @@ apply_all_in_dir() {
     apply_patch "../patches/game-patches/ace-ntoskrnl-keep-mdl-section-views-mapped.patch"
     apply_patch "../patches/game-patches/ace-ntoskrnl-psgetcontextthread-thunk.patch"
 
+    # https://github.com/GloriousEggroll/proton-ge-custom/issues/847
+    # ACE-CORE fails DriverEntry unless lsass.exe is running. Backported in
+    # CachyOS/wine-cachyos (3b0c6a64ba, b1fbd12dd0); drop with the Wine 12 rebase.
+    echo "WINE: -GAME FIXES- add and start an lsass.exe SamSs service stub for ACE anti-cheat"
+    apply_patch "../patches/game-patches/ace-lsass-samss-service-stub.patch"
+    apply_patch "../patches/game-patches/ace-wineboot-start-samss-service.patch"
+
 ### END GAME PATCH SECTION ###
 
 ### (2-5) WINE HOTFIX/BACKPORT SECTION ###
