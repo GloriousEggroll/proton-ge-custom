@@ -1,0 +1,121 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Mon, 19 Oct 2026 09:40:00 -0600
+Subject: [PATCH] winedmo: Follow per-sample row order requests in quartz
+ video transforms.
+
+amstream's DirectDraw stream connects with a bottom-up RGB type but hands
+out surface-backed samples whose media type asks for top-down rows. The
+winegstreamer transform this replaced handled that through
+IMediaSample_GetMediaType() as a dynamic format change; the winedmo
+version ignored it and wrote bottom-up rows into top-down surface memory,
+so MPEG-1 video played through AMStream was upside down (since
+GE-Proton11-1).
+
+When an output sample carries a media type with the same subtype and size
+but the other row order, switch the decoder's output orientation with
+winedmo_transform_set_output_format(), which keeps the decoder state.
+Other dynamic format changes are still ignored, as before.
+
+https://github.com/GloriousEggroll/proton-ge-custom/issues/863
+---
+diff --git a/dlls/winedmo/quartz_transform.c b/dlls/winedmo/quartz_transform.c
+--- a/dlls/winedmo/quartz_transform.c
++++ b/dlls/winedmo/quartz_transform.c
+@@ -53,6 +53,7 @@
+     bool have_next_output_time;
+     bool have_video_input;
+     bool have_decoded_output;
++    bool output_bottom_up;
+     REFERENCE_TIME next_output_time;
+ };
+ 
+@@ -225,7 +226,8 @@
+             output_fmt.guidFormat = source_mt->subtype;
+             output_fmt.videoInfo.dwWidth = vih->bmiHeader.biWidth;
+             output_fmt.videoInfo.dwHeight = abs(vih->bmiHeader.biHeight);
+-            if (vih->bmiHeader.biHeight > 0 && is_rgb_video_subtype(&source_mt->subtype))
++            filter->output_bottom_up = vih->bmiHeader.biHeight > 0 && is_rgb_video_subtype(&source_mt->subtype);
++            if (filter->output_bottom_up)
+                 output_fmt.videoInfo.VideoFlags |= MFVideoFlag_BottomUpLinearRep;
+             if (vih->AvgTimePerFrame)
+             {
+@@ -437,6 +439,68 @@
+     return S_OK;
+ }
+ 
++/* Allocators such as amstream's DirectDraw stream attach a media type to the
++ * sample to request top-down output into surface memory, while the connected
++ * type stays bottom-up. Follow the requested row order. */
++static void transform_update_output_orientation(struct transform *filter, IMediaSample *sample)
++{
++    const AM_MEDIA_TYPE *source_mt = &filter->source.pin.mt;
++    const VIDEOINFOHEADER *vih, *new_vih;
++    MFVIDEOFORMAT output_fmt = {0};
++    AM_MEDIA_TYPE *mt;
++    bool bottom_up;
++
++    if (IMediaSample_GetMediaType(sample, &mt) != S_OK)
++        return;
++
++    if (!IsEqualGUID(&mt->majortype, &MEDIATYPE_Video)
++            || !IsEqualGUID(&mt->formattype, &FORMAT_VideoInfo)
++            || mt->cbFormat < sizeof(VIDEOINFOHEADER)
++            || !IsEqualGUID(&source_mt->formattype, &FORMAT_VideoInfo)
++            || source_mt->cbFormat < sizeof(VIDEOINFOHEADER)
++            || !IsEqualGUID(&mt->subtype, &source_mt->subtype)
++            || !is_rgb_video_subtype(&mt->subtype))
++        goto done;
++
++    vih = (const VIDEOINFOHEADER *)source_mt->pbFormat;
++    new_vih = (const VIDEOINFOHEADER *)mt->pbFormat;
++    if (new_vih->bmiHeader.biWidth != vih->bmiHeader.biWidth
++            || abs(new_vih->bmiHeader.biHeight) != abs(vih->bmiHeader.biHeight))
++    {
++        FIXME("Ignoring dynamic format change to %ldx%ld.\n",
++                new_vih->bmiHeader.biWidth, new_vih->bmiHeader.biHeight);
++        goto done;
++    }
++
++    bottom_up = new_vih->bmiHeader.biHeight > 0;
++    if (bottom_up == filter->output_bottom_up)
++        goto done;
++
++    TRACE("Switching output to %s rows.\n", bottom_up ? "bottom-up" : "top-down");
++
++    output_fmt.dwSize = sizeof(output_fmt);
++    output_fmt.guidFormat = mt->subtype;
++    output_fmt.videoInfo.dwWidth = vih->bmiHeader.biWidth;
++    output_fmt.videoInfo.dwHeight = abs(vih->bmiHeader.biHeight);
++    if (bottom_up)
++        output_fmt.videoInfo.VideoFlags |= MFVideoFlag_BottomUpLinearRep;
++    if (vih->AvgTimePerFrame)
++    {
++        output_fmt.videoInfo.FramesPerSecond.Numerator = 10000000;
++        output_fmt.videoInfo.FramesPerSecond.Denominator = vih->AvgTimePerFrame;
++    }
++
++    EnterCriticalSection(&filter->filter.stream_cs);
++    if (filter->winedmo_transform.handle
++            && !winedmo_transform_set_output_format(filter->winedmo_transform,
++                    (union winedmo_format *)&output_fmt, sizeof(output_fmt)))
++        filter->output_bottom_up = bottom_up;
++    LeaveCriticalSection(&filter->filter.stream_cs);
++
++done:
++    DeleteMediaType(mt);
++}
++
+ static HRESULT transform_drain_output(struct transform *filter, BOOL *delivered, BOOL drain_all)
+ {
+     DWORD out_flags;
+@@ -456,6 +520,9 @@
+         if (FAILED(hr))
+             return hr;
+ 
++        if (IsEqualGUID(&filter->source.pin.mt.majortype, &MEDIATYPE_Video))
++            transform_update_output_orientation(filter, output_sample);
++
+         if (FAILED(hr = IMediaSample_GetPointer(output_sample, &out_data)))
+         {
+             IMediaSample_Release(output_sample);
