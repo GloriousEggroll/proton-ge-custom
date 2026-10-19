@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jason Eggleston <eggnet@gmail.com>
+Date: Tue, 29 Sep 2026 19:36:30 -0700
+Subject: [PATCH] ntdll: Take the in-flight alert when a RtlWaitOnAddress()
+ wait times out after being dequeued.
+
+RtlWakeAddressSingle() and RtlWakeAddressAll() dequeue a waiter under the
+queue lock and alert it after releasing the lock. A waiter whose wait
+times out in between finds itself dequeued but returns STATUS_TIMEOUT.
+Its alert then arrives with nobody waiting for it and stays pending, and
+the thread's next NtWaitForAlertByThreadId() returns at once, whatever it
+waits for: typically a SleepConditionVariableCS() or
+SleepConditionVariableSRW() with an infinite timeout on an unrelated
+condition variable, which wakes up spuriously.
+
+Windows doesn't leave that alert behind: a waiter that finds itself
+claimed by a waker after its timeout waits again for the wake before
+returning. Do the same. A dequeued waiter has been woken, so take the
+alert and report the wake.
+
+Warhammer 40,000: Space Marine 2 crashes under Wine because of this. Its tcmalloc spinlock back-off polls with zero-timeout
+WaitOnAddress() calls, whose timeouts race the releasing
+WakeByAddressSingle(), and the game's unlooped
+SleepConditionVariableCS(INFINITE) then returns early. On Windows 11 the
+same stress program shows no early return in 100,000 waits, against 13%
+under Wine.
+
+Backported from https://github.com/jegglest/wine/commit/dee180fa83 and refreshed for
+the ReadPointerAcquire() cast in Valve's b2a60dcd145.
+
+https://github.com/ValveSoftware/Proton/issues/8072
+---
+diff --git a/dlls/ntdll/sync.c b/dlls/ntdll/sync.c
+--- a/dlls/ntdll/sync.c
++++ b/dlls/ntdll/sync.c
+@@ -883,6 +883,7 @@
+ {
+     struct futex_queue *queue = get_futex_queue( addr );
+     struct futex_entry entry;
++    BOOL queued = FALSE;
+     NTSTATUS ret;
+ 
+     TRACE("addr %p cmp %p size %#Ix timeout %s\n", addr, cmp, size, debugstr_timeout( timeout ));
+@@ -915,11 +916,20 @@
+     if (ReadPointerAcquire( (void * volatile *)&entry.addr ))
+     {
+         spin_lock( &queue->lock );
+-        if (entry.addr)
++        if ((queued = entry.addr != NULL))
+             list_remove( &entry.entry );
+         spin_unlock( &queue->lock );
+     }
+ 
++    if (!queued && ret == STATUS_TIMEOUT)
++    {
++        /* A waker removed us as the wait timed out: we have been woken, and the waker alerts us right after
++         * releasing the queue lock. Take that alert, as Windows does, or it would end this thread's next wait
++         * early, whatever it waits for. */
++        NtWaitForAlertByThreadId( NULL, NULL );
++        ret = STATUS_SUCCESS;
++    }
++
+     TRACE("returning %#lx\n", ret);
+ 
+     if (ret == STATUS_ALERTED) ret = STATUS_SUCCESS;
