@@ -39,6 +39,20 @@ apply_all_in_dir() {
     apply_patch "../patches/dxvk/dxgi-auto-detect-hdr.patch"
     # StarCraft II: avoid GPU hangs with D3D9 constant buffer streaming (#790).
     apply_patch "../patches/dxvk/starcraft2-disable-constant-buffer-streaming.patch"
+    # Clang realigns the stack for 32-byte spills, so AVX is fine with it.
+    apply_patch "../patches/dxvk/dxvk-allow-avx-with-clang.patch"
+    popd
+
+    pushd d7vk
+    git reset --hard HEAD
+    git clean -xdf
+    apply_patch "../patches/d7vk/d7vk-allow-avx-with-clang.patch"
+    popd
+
+    pushd openvr
+    git reset --hard HEAD
+    git clean -xdf
+    apply_patch "../patches/openvr/openvr-no-msvc-assumption.patch"
     popd
 
     pushd vkd3d-proton
@@ -464,6 +478,10 @@ apply_all_in_dir() {
     # https://github.com/Frogging-Family/wine-tkg-git/commit/ca0daac62037be72ae5dd7bf87c705c989eba2cb
     echo "WINE: -PENDING- unity crash hotfix"
     apply_patch "../patches/wine-hotfixes/pending/unity_crash_hotfix.patch"
+
+    # llvm-libc: kernel thread ID and no _r_debug warning, neither changes glibc builds
+    echo "WINE: llvm-libc support"
+    apply_all_in_dir "../patches/wine-hotfixes/llvm-libc"
 
     # https://bugs.winehq.org/show_bug.cgi?id=58476
     echo "WINE: -PENDING- RegGetValueW dwFlags hotfix (R.E.A.L VR mod)"
