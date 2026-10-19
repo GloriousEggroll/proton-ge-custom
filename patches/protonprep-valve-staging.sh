@@ -57,6 +57,7 @@ apply_all_in_dir() {
     git reset --hard HEAD
     git clean -xdf
     echo "VKD3D-PROTON: prevent stalled present waits from deadlocking swapchain teardown"
+    echo "VKD3D-PROTON: don't map the parent process image for engine detection (EAC untrusted file, Star Citizen/Hunt)"
     apply_all_in_dir "../patches/vkd3d-proton/"
     popd
 
@@ -470,10 +471,6 @@ apply_all_in_dir() {
 
     echo "WINE: -HOTFIX- Keep builtin AMD AGS ahead of the native-version heuristic"
     apply_patch "../patches/wine-hotfixes/pending/ntdll-keep-builtin-amd-ags-ahead-of-version-heuristic.patch"
-
-    # https://github.com/GloriousEggroll/proton-ge-custom/issues/858
-    echo "WINE: -GAME FIXES- load Star Citizen's bundled AMD AGS to avoid an EAC file violation"
-    apply_patch "../patches/wine-hotfixes/pending/wine.inf-star-citizen-native-amd-ags.patch"
 
 ### END WINE HOTFIX/BACKPORT SECTION ###
 
