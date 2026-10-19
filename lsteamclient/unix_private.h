@@ -3,8 +3,6 @@
 
 #include <stdarg.h>
 #include <stddef.h>
-/* libc++ needs the C wide-character declarations before the Wine headers. */
-#include <wchar.h>
 
 #include <windef.h>
 #include <winbase.h>

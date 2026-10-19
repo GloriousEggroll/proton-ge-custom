@@ -1,7 +1,5 @@
 #include <stdarg.h>
 #include <stddef.h>
-/* libc++ needs the C wide-character declarations before the Wine headers. */
-#include <wchar.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
