@@ -1,0 +1,84 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] winewayland: Destroy owned popups before their parent's role.
+
+xdg-shell requires child popups to be destroyed before their parent
+surface. Windows hides and destroys owner and owned windows in any order,
+so the driver could destroy or rebuild a toplevel's xdg_surface while an
+xdg_popup parented to it was still alive. Mutter then disconnects the
+client with "destroyed popup not top most popup", and winewayland reports
+"Protocol error on xdg_wm_base with code 2".
+
+Seen with AION 2 during the splash screen to game window transition and
+with Battle.net when its auto-login window closes itself. KWin and labwc
+tolerate the order, so this only reproduced on GNOME.
+
+Before clearing the role of a surface with an xdg_surface, clear the roles
+of the popups it owns (recursively, so nested popups go first) and queue a
+window state update so they get their role back afterwards.
+
+https://github.com/GloriousEggroll/proton-ge-custom/issues/834
+---
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index cffb9a3..4226912 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -2109,6 +2109,9 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
+ {
+     TRACE("surface=%p\n", surface);
+ 
++    /* popups parented to this surface must go before its xdg_surface */
++    if (surface->xdg_surface) wayland_win_data_clear_owned_popups(surface->hwnd);
++
+     /* Keep input state across role churn; it follows wl_surface enter/leave. */
+     wayland_surface_clear_child_surfaces(surface);
+     wayland_surface_clear_carrier(surface);
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index c99d763..d34bde9 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -730,6 +730,7 @@ struct wayland_win_data
+ struct wayland_win_data *wayland_win_data_get_nolock(HWND hwnd);
+ struct wayland_win_data *wayland_win_data_get(HWND hwnd);
+ void wayland_win_data_release(struct wayland_win_data *data);
++void wayland_win_data_clear_owned_popups(HWND owner);
+ 
+ struct wayland_client_surface *get_client_surface(HWND hwnd);
+ void set_client_surface(HWND hwnd, struct wayland_client_surface *client);
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index e389972..7b2ffa6 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -168,6 +168,33 @@ void wayland_win_data_release(struct wayland_win_data *data)
+     pthread_mutex_unlock(&win_data_mutex);
+ }
+ 
++/***********************************************************************
++ *           wayland_win_data_clear_owned_popups
++ *
++ * Clear the role of the xdg_popups parented to the owner window surface.
++ * xdg-shell requires child popups to be destroyed before their parent, and
++ * mutter disconnects the client otherwise ("destroyed popup not top most
++ * popup"). The popups get their role back on their next window state update.
++ */
++void wayland_win_data_clear_owned_popups(HWND owner)
++{
++    struct wayland_win_data *data;
++    struct wayland_surface *surface;
++
++    /* the caller may or may not hold the (recursive) lock */
++    pthread_mutex_lock(&win_data_mutex);
++    RB_FOR_EACH_ENTRY(data, &win_data_rb, struct wayland_win_data, entry)
++    {
++        if (!(surface = data->wayland_surface)) continue;
++        if (surface->role != WAYLAND_SURFACE_ROLE_POPUP || surface->owner_hwnd != owner) continue;
++
++        TRACE("clearing popup hwnd=%p before owner hwnd=%p\n", data->hwnd, owner);
++        wayland_surface_clear_role(surface);
++        NtUserPostMessage(data->hwnd, WM_WINE_UPDATEWINDOWSTATE, 0, 0);
++    }
++    pthread_mutex_unlock(&win_data_mutex);
++}
++
+ static void wayland_win_data_queue_state_update(struct wayland_win_data *data,
+                                                 UINT state_cmd, const RECT *rect)
+ {
