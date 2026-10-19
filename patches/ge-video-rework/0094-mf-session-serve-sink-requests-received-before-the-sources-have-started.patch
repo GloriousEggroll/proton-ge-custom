@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Petru Mare <43178362+Petru101@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 00:20:00 +0100
+Subject: [PATCH] mf/session: Serve sink requests received before the sources
+ have started.
+
+MonoGame keeps one topology per song (source + audio renderer activate)
+and plays a song again by setting its topology again with
+MFSESSION_SETTOPOLOGY_IMMEDIATE. The renderer is then the same object as
+in the song's earlier presentation, and the session's subscription to its
+events from then is still pending. While the topology is resolved, the
+renderer prerolls and queues two MEStreamSinkRequestSample; the session
+received them through that old subscription before the new source had
+been started and sent MENewStream, and called
+IMFMediaStream_RequestSample on a NULL source stream (Picross for a Cause
+crashed after 10 minutes or more, when a song came back after another
+one).
+
+Count sink requests on the output node until the sinks are subscribed and
+serve them then, once the sources have started, which is when Windows
+reads the sinks' event queues. Subscribing a sink that is still
+subscribed from an earlier presentation fails with MF_E_MULTIPLE_BEGIN;
+its events already come to the session, so don't fail the start for it.
+---
+diff --git a/dlls/mf/session.c b/dlls/mf/session.c
+index 3ceb8d18..a1e285cc 100644
+--- a/dlls/mf/session.c
++++ b/dlls/mf/session.c
+@@ -216,6 +216,7 @@ struct topo_node
+         struct
+         {
+             unsigned int requests;
++            unsigned int early_requests;
+             IMFVideoSampleAllocatorNotify notify_cb;
+             IMFVideoSampleAllocator *allocator;
+             IMFVideoSampleAllocatorCallback *allocator_cb;
+@@ -1049,6 +1050,8 @@ static HRESULT session_subscribe_sources(struct media_session *session)
+     return hr;
+ }
+ 
++static void session_request_sample(struct media_session *session, IMFStreamSink *sink_stream);
++
+ static HRESULT session_subscribe_sinks(struct media_session *session)
+ {
+     struct topo_node *node;
+@@ -1062,8 +1065,9 @@ static HRESULT session_subscribe_sinks(struct media_session *session)
+         if (node->type != MF_TOPOLOGY_OUTPUT_NODE)
+             continue;
+ 
++        /* A sink reused from an earlier presentation is still subscribed. */
+         if (FAILED(hr = IMFStreamSink_BeginGetEvent(node->object.sink_stream, &session->events_callback,
+-                        node->object.object)))
++                        node->object.object)) && hr != MF_E_MULTIPLE_BEGIN)
+         {
+             WARN("Failed to subscribe to stream sink %p events, hr %#lx.\n", node->object.sink_stream, hr);
+             return hr;
+@@ -1071,6 +1075,17 @@ static HRESULT session_subscribe_sinks(struct media_session *session)
+     }
+ 
+     session->presentation.flags |= SESSION_FLAG_SINKS_SUBSCRIBED;
++
++    /* Requests received through a subscription left from a previous presentation of the same sink. */
++    LIST_FOR_EACH_ENTRY(node, &session->presentation.nodes, struct topo_node, entry)
++    {
++        if (node->type != MF_TOPOLOGY_OUTPUT_NODE)
++            continue;
++
++        for (; node->u.sink.early_requests; node->u.sink.early_requests--)
++            session_request_sample(session, node->object.sink_stream);
++    }
++
+     return S_OK;
+ }
+ 
+@@ -1108,7 +1123,6 @@ static void session_flush_transforms(struct media_session *session)
+     }
+ }
+ 
+-static void session_request_sample(struct media_session *session, IMFStreamSink *sink_stream);
+ static HRESULT session_get_stream_sink_type(IMFStreamSink *sink, IMFMediaType **media_type);
+ static HRESULT session_start_clock(struct media_session *session);
+ 
+@@ -4289,6 +4303,13 @@ static void session_request_sample(struct media_session *session, IMFStreamSink
+     if (!sink_node)
+         return;
+ 
++    /* Like Windows, serve sink requests only once the sources have started. */
++    if (!(session->presentation.flags & SESSION_FLAG_SINKS_SUBSCRIBED))
++    {
++        sink_node->u.sink.early_requests++;
++        return;
++    }
++
+     if (!(up_node = session_get_topo_node_input(session, sink_node, 0, &output)))
+     {
+         WARN("Failed to node %p/%u input\n", sink_node, 0);
