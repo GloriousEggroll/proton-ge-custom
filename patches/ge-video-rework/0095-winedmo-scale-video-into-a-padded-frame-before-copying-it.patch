@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Alexandre Derumier <aderumier@gmail.com>
+Date: Mon, 19 Oct 2026 11:00:00 +0200
+Subject: [PATCH] winedmo: Scale video into a padded frame before copying it
+ to the output buffer.
+
+copy_video_frame() ran sws_scale() straight into the caller's output
+buffer, laid out with av_image_fill_arrays(..., 1): rows packed with no
+padding and the buffer exactly the size of the image. swscale's SIMD
+output functions may store past the end of a row, which FFmpeg's own
+buffers allow for (av_frame_get_buffer() pads them). With a packed
+buffer the last row written runs past the end of the buffer (with a
+bottom-up RGB output, the image's first row, stored last).
+
+The WM reader decodes into exactly-sized heap blocks, so the overrun
+overwrites the header of the next heap block and the process crashes
+later in RtlFreeHeap, from wm_demux_thread. Target Bravo: Operation
+G.H.O.S.T. (Sega RingWide) crashed when entering its stage select: its
+WMV2 thumbnails (216x120, 214x118) and movies (1048x624, 1024x428) are
+converted to bottom-up RGB24 for its DirectShow renderer; 24 bytes were
+written past each 216x120 frame. Canary bytes after the WM reader's
+output buffers were overwritten after every decode of such frames.
+
+Scale into a padded AVFrame kept with the transform and copy only the
+image into the caller's buffer with av_image_copy().
+---
+ dlls/winedmo/unix_transform.c | 24 +++++++++++++++++++++++-
+ 1 file changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/winedmo/unix_transform.c b/dlls/winedmo/unix_transform.c
+--- a/dlls/winedmo/unix_transform.c
++++ b/dlls/winedmo/unix_transform.c
+@@ -86,6 +86,7 @@
+ 
+     /* Video output conversion */
+     SwsContext         *sws;
++    AVFrame            *sws_frame;       /* padded scaler output, copied to the caller's buffer */
+     enum AVPixelFormat  out_pix_fmt;     /* AV_PIX_FMT_NONE = native */
+     DWORD               out_video_fourcc;
+     enum AVPixelFormat  in_pix_fmt;
+@@ -705,10 +706,30 @@
+         if (fill_output_image_arrays( t, dst_data, dst_linesize, dst, out_fmt, out_width, out_height ) < 0)
+             return STATUS_UNSUCCESSFUL;
+ 
++        /* swscale's SIMD output may store past the end of a row: scale into a padded frame
++         * and copy only the image into the caller's exactly-sized buffer (an unpadded
++         * destination lets the last row overrun the buffer: heap corruption). */
++        if (!t->sws_frame || t->sws_frame->width != convert_width || t->sws_frame->height != convert_height
++                || t->sws_frame->format != out_fmt)
++        {
++            av_frame_free( &t->sws_frame );
++            if (!(t->sws_frame = av_frame_alloc())) return STATUS_NO_MEMORY;
++            t->sws_frame->width = convert_width;
++            t->sws_frame->height = convert_height;
++            t->sws_frame->format = out_fmt;
++            if (av_frame_get_buffer( t->sws_frame, 0 ) < 0)
++            {
++                av_frame_free( &t->sws_frame );
++                return STATUS_NO_MEMORY;
++            }
++        }
++
+         ret = sws_scale( t->sws,
+                    (const uint8_t *const *)frame->data, frame->linesize,
+-                   0, src_height, dst_data, dst_linesize );
++                   0, src_height, t->sws_frame->data, t->sws_frame->linesize );
+         if (ret != convert_height) return STATUS_UNSUCCESSFUL;
++        av_image_copy( dst_data, dst_linesize, (const uint8_t **)t->sws_frame->data,
++                       t->sws_frame->linesize, out_fmt, convert_width, convert_height );
+ 
+         if (pad_yuy2)
+         {
+@@ -1014,6 +1035,7 @@
+     av_packet_free( &t->parsed_packet );
+     if (t->swr) swr_free( &t->swr );
+     if (t->sws) sws_freeContext( t->sws );
++    av_frame_free( &t->sws_frame );
+     free( t->mpeg_es_buf );
+     free( t->audio_buf );
+     free( t->video_buf );
+-- 
+2.50.0
