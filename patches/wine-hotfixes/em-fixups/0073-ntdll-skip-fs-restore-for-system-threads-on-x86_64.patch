@@ -1,0 +1,45 @@
+From 501a6bb947f8720d3d503c3355cacce080b82b22 Mon Sep 17 00:00:00 2001
+From: Adam Lesperance <lespea@gmail.com>
+Date: Mon, 19 Oct 2026 18:56:40 -0500
+Subject: [PATCH] ntdll: Don't switch %fs to pthread_teb for system threads on
+ x86_64.
+
+System threads created by PsCreateSystemThread() never run
+signal_init_thread()/call_init_thunk(), so amd64_thread_data->pthread_teb
+is never initialized and stays NULL. In WoW64 processes (fs32_sel != 0)
+init_handler() then loads %fs with 0, and the first libc TLS access in the
+handler (NtCurrentTeb() -> pthread_getspecific()) faults at %fs:0x10.
+
+This makes every 32-bit process with winewayland's event dispatcher
+system thread crash with SIGSEGV on exit, when wineserver sends SIGQUIT
+and quit_handler() runs on that thread. SIGUSR1 (usr1_handler) is
+affected the same way.
+
+System threads never leave the Unix side, so %fs still holds the libc
+TLS base and there is nothing to restore. Upstream avoids this because
+init_handler() returns early for threads without amd64 thread data; this
+is the equivalent for the 11.0 backport, matching what 0031 does for gs
+on i386.
+---
+ dlls/ntdll/unix/signal_x86_64.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index cd6ba849cc6..8482cfe470f 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -928,7 +928,10 @@ static inline ucontext_t *init_handler( void *sigcontext )
+     {
+         struct amd64_thread_data *thread_data = (struct amd64_thread_data *)&get_current_teb()->GdiTebBatch;
+         thread_data->syscall_dispatch = 0; /* SYSCALL_DISPATCH_FILTER_ALLOW */
+-        if (fs32_sel) arch_prctl( ARCH_SET_FS, thread_data->pthread_teb );
++        /* system threads never run PE code, so %fs still holds the libc TLS base
++         * and pthread_teb is never initialized for them */
++        if (fs32_sel && !((struct ntdll_thread_data *)thread_data)->system_thread)
++            arch_prctl( ARCH_SET_FS, thread_data->pthread_teb );
+     }
+ #elif defined __APPLE__
+     {
+-- 
+2.56.0
+
