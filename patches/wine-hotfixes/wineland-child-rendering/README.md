@@ -166,6 +166,14 @@ frame-changed `SetWindowPos`. It only acts on a live, non-minimized,
 borderless window that remains in the true Wayland fullscreen state and whose
 live Win32 client dimensions do not match its live window dimensions.
 
+Patch 0086 is a second GE-Proton follow-up for 0021. Hyprland sends
+fullscreen configures with both fullscreen and maximized set. Once 0021 makes
+such a configure current directly, the next state update sent
+`unset_maximized()` for the Win32-fullscreen window, which Hyprland answers
+by leaving fullscreen with a tiled configure (GE issue 871: UT2004 viewport
+and UT4 fullscreen loss). 0086 keeps maximized while both the window and the
+current configure are fullscreen.
+
 `../em-fixups/0024` is a focused backport of Erhan Bilgili's presentation
 lifecycle work from `8878f044c1b0`, `88b19ffdd44b`, `a9ce7e02fe50`, and
 `48bf29c49f2b`. It tracks a minimal presentation generation, invalidates it
