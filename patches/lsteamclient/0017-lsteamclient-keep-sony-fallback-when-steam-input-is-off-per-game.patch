@@ -1,0 +1,170 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GE-Proton <git@localhost>
+Subject: [PATCH] lsteamclient: Keep Sony fallback when Steam Input is off per game.
+
+With per-game Steam Input disabled but Steam's global "Steam Input for
+PlayStation controllers" setting enabled, ISteamInput still enumerates the
+pad. Its handles then carry no input. A nonzero native controller count
+latched native mode for the process and signalled XInput to withdraw the
+automatic Sony slot, so games using the Sony fallback received no input at
+all. The same latch could also fire mid-session with the global setting off.
+
+Only treat Steam's virtual gamepad as proof of native ownership. A native
+controller count still selects native mode, but only while no automatic Sony
+slot is live; XInput only exposes those slots while Steam's virtual gamepad
+is absent. It no longer signals XInput, so the slot survives and the fallback
+can serve it. Remember native action handles while native mode is selected,
+so a later switch to the fallback still resolves the game's handles.
+---
+diff --git a/lsteamclient/steam_input_manual.c b/lsteamclient/steam_input_manual.c
+--- a/lsteamclient/steam_input_manual.c
++++ b/lsteamclient/steam_input_manual.c
+@@ -214,6 +214,7 @@
+ 
+ static LONG steaminput_xinput_fallback_mode;
+ static LONG steaminput_native_session_seen;
++static LONG steaminput_native_controllers_reported;
+ 
+ static BOOL steaminput_xinput_explicit_fallback(void)
+ {
+@@ -308,6 +309,33 @@
+     return FALSE;
+ }
+ 
++static WORD steaminput_xinput_sony_product_id(unsigned int index)
++{
++    static INIT_ONCE init_once = INIT_ONCE_STATIC_INIT;
++    WORD product_id = 0;
++
++    InitOnceExecuteOnce(&init_once, init_xinput_get_sony_product_id, NULL, NULL);
++    if (xinput_get_sony_product_id)
++        xinput_get_sony_product_id(index, &product_id);
++    return product_id;
++}
++
++/* XInput only exposes automatic Sony slots while Steam's virtual gamepad is
++ * absent, so a live one means Steam Input is not feeding this process. */
++static BOOL steaminput_xinput_sony_slot_live(void)
++{
++    XINPUT_STATE state;
++    unsigned int index;
++
++    for (index = 0; index < XUSER_MAX_COUNT; ++index)
++    {
++        if (!steaminput_xinput_sony_product_id(index)) continue;
++        if (XInputGetState(index, &state) == ERROR_SUCCESS) return TRUE;
++    }
++
++    return FALSE;
++}
++
+ static void steaminput_xinput_refresh_mode(const char *reason)
+ {
+     BOOL native_virtual_present;
+@@ -325,6 +353,12 @@
+ 
+     if (native_virtual_present)
+         steaminput_xinput_set_fallback_mode(STEAMINPUT_FALLBACK_NATIVE, reason);
++    /* Steam also enumerates controllers through ISteamInput when per-game Steam
++     * Input is disabled but a global controller family setting is enabled. Its
++     * handles then carry no input, so do not let them hide a live Sony slot. */
++    else if (InterlockedCompareExchange(&steaminput_native_controllers_reported, 0, 0) &&
++            !steaminput_xinput_sony_slot_live())
++        steaminput_xinput_set_fallback_mode(STEAMINPUT_FALLBACK_NATIVE, reason);
+     else
+         steaminput_xinput_set_fallback_mode(STEAMINPUT_FALLBACK_XINPUT, reason);
+ }
+@@ -333,21 +367,10 @@
+ {
+     TRACE("native Steam Input configuration mask %#x, controllers %d.\n",
+             native_configuration, native_count);
+-    if (native_count > 0) steaminput_xinput_native_detected();
++    if (native_count > 0) InterlockedExchange(&steaminput_native_controllers_reported, TRUE);
+     steaminput_xinput_refresh_mode("native Steam controller probe");
+ }
+ 
+-static WORD steaminput_xinput_sony_product_id(unsigned int index)
+-{
+-    static INIT_ONCE init_once = INIT_ONCE_STATIC_INIT;
+-    WORD product_id = 0;
+-
+-    InitOnceExecuteOnce(&init_once, init_xinput_get_sony_product_id, NULL, NULL);
+-    if (xinput_get_sony_product_id)
+-        xinput_get_sony_product_id(index, &product_id);
+-    return product_id;
+-}
+-
+ static BOOL steaminput_xinput_controller_available(unsigned int index, XINPUT_STATE *state)
+ {
+     if (!steaminput_xinput_fallback_active()) return FALSE;
+@@ -459,7 +482,7 @@
+ 
+     if (!steaminput_xinput_fallback_configured() || !handles) return native_count;
+ 
+-    if (native_count > 0) steaminput_xinput_native_detected();
++    if (native_count > 0) InterlockedExchange(&steaminput_native_controllers_reported, TRUE);
+     steaminput_xinput_refresh_mode("controller enumeration");
+     if (InterlockedCompareExchange(&steaminput_xinput_fallback_mode, 0, 0) ==
+             STEAMINPUT_FALLBACK_NATIVE)
+@@ -489,13 +512,14 @@
+ {
+     unsigned int i;
+ 
+-    if (!steaminput_xinput_fallback_active() || !name) return native_handle;
++    if (!steaminput_xinput_fallback_configured() || !name) return native_handle;
+ 
+     for (i = 0; i < ARRAY_SIZE(xinput_action_sets); ++i)
+     {
+         if (strcmp(name, xinput_action_sets[i].name)) continue;
+         if (native_handle) xinput_action_sets[i].handle = native_handle;
+-        else if (!xinput_action_sets[i].handle)
++        if (!steaminput_xinput_fallback_active()) return native_handle;
++        if (!xinput_action_sets[i].handle)
+             xinput_action_sets[i].handle = XINPUT_ACTION_SET_BASE + i;
+         return xinput_action_sets[i].handle;
+     }
+@@ -507,21 +531,23 @@
+ {
+     unsigned int i;
+ 
+-    if (!steaminput_xinput_fallback_active() || !name) return native_handle;
++    if (!steaminput_xinput_fallback_configured() || !name) return native_handle;
+ 
+     for (i = 0; i < ARRAY_SIZE(xinput_digital_actions); ++i)
+     {
+         if (strcmp(name, xinput_digital_actions[i].name)) continue;
+         if (native_handle) xinput_digital_actions[i].handle = native_handle;
+-        else if (!xinput_digital_actions[i].handle)
++        if (!steaminput_xinput_fallback_active()) return native_handle;
++        if (!xinput_digital_actions[i].handle)
+             xinput_digital_actions[i].handle = XINPUT_DIGITAL_ACTION_BASE + i;
+         TRACE("Steam Input XInput fallback mapped digital action '%s' to %#I64x.\n",
+                 name, xinput_digital_actions[i].handle);
+         return xinput_digital_actions[i].handle;
+     }
+ 
+-    TRACE("Steam Input XInput fallback has no mapping for digital action '%s' (native handle %#I64x).\n",
+-            name, native_handle);
++    if (steaminput_xinput_fallback_active())
++        TRACE("Steam Input XInput fallback has no mapping for digital action '%s' (native handle %#I64x).\n",
++                name, native_handle);
+     return native_handle;
+ }
+ 
+@@ -574,13 +600,14 @@
+ {
+     unsigned int i;
+ 
+-    if (!steaminput_xinput_fallback_active() || !name) return native_handle;
++    if (!steaminput_xinput_fallback_configured() || !name) return native_handle;
+ 
+     for (i = 0; i < ARRAY_SIZE(xinput_analog_actions); ++i)
+     {
+         if (strcmp(name, xinput_analog_actions[i].name)) continue;
+         if (native_handle) xinput_analog_actions[i].handle = native_handle;
+-        else if (!xinput_analog_actions[i].handle)
++        if (!steaminput_xinput_fallback_active()) return native_handle;
++        if (!xinput_analog_actions[i].handle)
+             xinput_analog_actions[i].handle = XINPUT_ANALOG_ACTION_BASE + i;
+         return xinput_analog_actions[i].handle;
+     }
