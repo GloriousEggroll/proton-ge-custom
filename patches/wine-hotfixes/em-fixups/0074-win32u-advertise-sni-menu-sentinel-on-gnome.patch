@@ -1,0 +1,105 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] win32u: Advertise the SNI Menu sentinel on GNOME.
+
+0058 stopped advertising Menu=/NO_DBUSMENU because Waybar imports any Menu
+path as a dbusmenu and never calls ContextMenu. GNOME Shell's AppIndicator
+extension, however, requires the Menu property. It reads it, receives
+UnknownProperty, retries, and drops the item after three attempts, so the
+tray icon never appears. This affects winewayland applications under GNOME,
+since winex11 applications under Mutter use the XEmbed tray instead.
+
+The extension treats /NO_DBUSMENU as no menu and calls ContextMenu, which is
+how GE-Proton11-7 worked there. Advertise the sentinel when
+XDG_CURRENT_DESKTOP contains GNOME, and keep omitting Menu elsewhere.
+
+Fixes: https://github.com/GloriousEggroll/proton-ge-custom/issues/872
+Related: https://github.com/GloriousEggroll/proton-ge-custom/issues/803
+References: https://github.com/ubuntu/gnome-shell-extension-appindicator/blob/master/appIndicator.js
+---
+
+diff --git a/dlls/win32u/sni.c b/dlls/win32u/sni.c
+--- a/dlls/win32u/sni.c
++++ b/dlls/win32u/sni.c
+@@ -483,6 +483,33 @@
+     p_dbus_message_iter_close_container( iter, &var );
+ }
+ 
++/* GNOME Shell's AppIndicator extension drops items whose Menu property cannot
++ * be read. It treats /NO_DBUSMENU as "no menu" and calls ContextMenu, so
++ * advertise that sentinel there. Other hosts such as Waybar try to import any
++ * Menu path, so keep omitting it elsewhere. */
++static BOOL sni_host_requires_menu(void)
++{
++    static int requires_menu = -1;
++
++    if (requires_menu == -1)
++    {
++        const char *env = getenv( "XDG_CURRENT_DESKTOP" ), *p = env;
++        size_t len;
++
++        requires_menu = 0;
++        while (p && *p)
++        {
++            len = strcspn( p, ":" );
++            if (len == 5 && !strncasecmp( p, "GNOME", 5 )) requires_menu = 1;
++            p += len;
++            if (*p) p++;
++        }
++        TRACE( "XDG_CURRENT_DESKTOP %s, Menu property %s\n", debugstr_a(env),
++               requires_menu ? "advertised" : "omitted" );
++    }
++    return requires_menu;
++}
++
+ /* write the value of a single named property into iter (already a variant slot) */
+ static void append_property( DBusMessageIter *iter, const struct sni_icon *icon, const char *name )
+ {
+@@ -516,6 +543,16 @@
+         }
+     }
+     else if (!strcmp( name, "ToolTip" )) append_variant_tooltip( iter, icon );
++    else if (!strcmp( name, "Menu" ))
++    {
++        DBusMessageIter var;
++        const char *path = "/NO_DBUSMENU";
++        if (p_dbus_message_iter_open_container( iter, DBUS_TYPE_VARIANT, "o", &var ))
++        {
++            p_dbus_message_iter_append_basic( &var, DBUS_TYPE_OBJECT_PATH, &path );
++            p_dbus_message_iter_close_container( iter, &var );
++        }
++    }
+     else append_variant_string( iter, empty );
+ }
+ 
+@@ -699,7 +736,7 @@
+                 !strcmp( piface, SNI_ITEM_IFACE ))
+             {
+                 p_dbus_message_iter_get_basic( &args, &pname );
+-                if (!strcmp( pname, "Menu" ))
++                if (!strcmp( pname, "Menu" ) && !sni_host_requires_menu())
+                     reply = p_dbus_message_new_error( msg, DBUS_ERROR_UNKNOWN_PROPERTY,
+                                                      "Tray menus are provided by ContextMenu" );
+                 else if ((reply = p_dbus_message_new_method_return( msg )))
+@@ -713,17 +750,18 @@
+     else if (!strcmp( iface, DBUS_PROPS_IFACE ) && !strcmp( member, "GetAll" ) && icon)
+     {
+         /* No D-Bus menu is exported. Omit Menu so hosts call ContextMenu;
+-         * /NO_DBUSMENU is a KDE convention which other hosts may try to import. */
++         * /NO_DBUSMENU is a KDE convention which other hosts may try to import.
++         * GNOME requires the property, see sni_host_requires_menu. Menu is last. */
+         static const char *props[] = { "Category", "Id", "Title", "Status", "IconName",
+-                                       "IconPixmap", "ToolTip", "ItemIsMenu", "WindowId" };
++                                       "IconPixmap", "ToolTip", "ItemIsMenu", "WindowId", "Menu" };
++        unsigned int i, count = ARRAY_SIZE(props) - !sni_host_requires_menu();
+         DBusMessageIter ret, dict;
+-        unsigned int i;
+         if ((reply = p_dbus_message_new_method_return( msg )))
+         {
+             p_dbus_message_iter_init_append( reply, &ret );
+             if (p_dbus_message_iter_open_container( &ret, DBUS_TYPE_ARRAY, "{sv}", &dict ))
+             {
+-                for (i = 0; i < ARRAY_SIZE(props); i++)
++                for (i = 0; i < count; i++)
+                 {
+                     DBusMessageIter e;
+                     if (!p_dbus_message_iter_open_container( &dict, DBUS_TYPE_DICT_ENTRY, NULL, &e ))
