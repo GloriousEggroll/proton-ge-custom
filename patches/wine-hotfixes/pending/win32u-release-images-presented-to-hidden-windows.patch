@@ -1,0 +1,174 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Tue, 20 Oct 2026 20:00:00 -0600
+Subject: [PATCH] win32u: Release swapchain images presented to hidden windows.
+
+A window that isn't visible is never shown, and on Windows the
+presentation engine simply discards what is presented to it. The host
+present is not as forgiving on Wayland: the client surface of a window
+whose toplevel was never mapped has no role, so the compositor never
+sends the frame callbacks a FIFO present waits for. NVIDIA's WSI then
+blocks in vkQueuePresentKHR forever (Mesa times out instead).
+
+RuneScape's Vulkan client renders its loading frames into a child window
+before it shows the main window. With MSAA enabled it recreates its
+swapchain during loading, and the second present after that never
+returns on winewayland with NVIDIA, so the game never appears.
+
+When swapchainMaintenance1 is available, enable it on the host device,
+and for host swapchains of windows that are not visible, skip the host
+present: consume the present waits, wait for the device, release the
+image with vkReleaseSwapchainImagesEXT() and signal any present fence.
+Visible windows and managed (cross-process) swapchains are unchanged.
+
+https://github.com/GloriousEggroll/proton-ge-custom/issues/837
+---
+diff --git a/include/wine/vulkan_driver.h b/include/wine/vulkan_driver.h
+--- a/include/wine/vulkan_driver.h
++++ b/include/wine/vulkan_driver.h
+@@ -233,6 +233,7 @@
+     struct vulkan_queue *queues;
+     VkQueueFamilyProperties *queue_props;
+     BOOL low_latency_enabled;
++    BOOL release_swapchain_images; /* swapchainMaintenance1 enabled for presents to hidden windows */
+ 
+     pthread_t signaller_thread;
+     pthread_mutex_t signaller_mutex;
+diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -1533,6 +1533,20 @@
+     return maintenance.swapchainMaintenance1;
+ }
+ 
++static BOOL host_supports_swapchain_maintenance1( struct vulkan_physical_device *physical_device )
++{
++    struct vulkan_instance *instance = physical_device->instance;
++    VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT maintenance =
++        {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT};
++    VkPhysicalDeviceFeatures2 features = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &maintenance};
++
++    if (!physical_device->extensions.has_VK_EXT_swapchain_maintenance1 || !instance->p_vkGetPhysicalDeviceFeatures2KHR)
++        return FALSE;
++
++    instance->p_vkGetPhysicalDeviceFeatures2KHR( physical_device->host.physical_device, &features );
++    return maintenance.swapchainMaintenance1;
++}
++
+ static VkResult convert_device_create_info( struct vulkan_physical_device *physical_device, VkDeviceCreateInfo *info,
+                                             struct mempool *pool, struct vulkan_device *device )
+ {
+@@ -1603,6 +1617,24 @@
+         maintenance->swapchainMaintenance1 = VK_TRUE;
+     }
+ 
++    /* Presents to hidden windows release their images instead of reaching the
++     * host compositor, see win32u_vkQueuePresentKHR. That needs the feature. */
++    if (device->extensions.has_VK_EXT_swapchain_maintenance1 && host_supports_swapchain_maintenance1( physical_device ))
++    {
++        VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT *maintenance;
++
++        if (!(maintenance = (void *)find_next_struct( info->pNext,
++                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT )))
++        {
++            if (!(maintenance = mem_alloc( pool, sizeof(*maintenance) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
++            maintenance->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT;
++            maintenance->pNext = (void *)info->pNext;
++            info->pNext = maintenance;
++        }
++        maintenance->swapchainMaintenance1 = VK_TRUE;
++        device->release_swapchain_images = TRUE;
++    }
++
+     /* Force-enable the extensions the cross-process producer needs so we can
+      * interpose a managed swapchain even when the app did not request them.
+      * Only meaningful for swapchain devices. */
+@@ -6207,10 +6239,11 @@
+     const VkSwapchainKHR *client_swapchains;
+     VkSwapchainKHR *swapchains;
+     uint32_t host_indices_buffer[16], *host_indices = host_indices_buffer;
++    uint32_t hidden_indices_buffer[16], *hidden_indices = hidden_indices_buffer;
+     VkSemaphore *host_wait_semaphores = NULL;
+     const VkSwapchainPresentFenceInfoKHR *present_fence_info = NULL;
+     struct wine_managed_swapchain *first_managed = NULL;
+-    uint32_t host_count = 0;
++    uint32_t host_count = 0, hidden_count = 0;
+     BOOL skip_managed = FALSE;
+     BOOL managed_present_waits_consumed = FALSE;
+     VkCommandBuffer *blit_cmds;
+@@ -6224,6 +6257,8 @@
+     if (!(blit_cmds = mem_alloc( &pool, present_info->swapchainCount * sizeof(blit_cmds) ))) goto failed;
+     if (present_info->swapchainCount > ARRAY_SIZE(host_indices_buffer) &&
+         !(host_indices = mem_alloc( &pool, present_info->swapchainCount * sizeof(*host_indices) ))) goto failed;
++    if (present_info->swapchainCount > ARRAY_SIZE(hidden_indices_buffer) &&
++        !(hidden_indices = mem_alloc( &pool, present_info->swapchainCount * sizeof(*hidden_indices) ))) goto failed;
+ 
+     for (uint32_t i = 0; i < present_info->swapchainCount; ++i)
+     {
+@@ -6274,6 +6309,16 @@
+             if (!first_managed) first_managed = swapchain->managed;
+             continue;
+         }
++        /* A hidden window is never shown, and on Wayland its client surface has no
++         * role, so the compositor never sends the frame callbacks a FIFO present
++         * waits for (NVIDIA blocks forever). Release the image instead, like the
++         * presentation engine discards it on Windows. */
++        if (device->release_swapchain_images && device->p_vkReleaseSwapchainImagesEXT &&
++            !is_window_visible( swapchain->surface->hwnd ))
++        {
++            hidden_indices[hidden_count++] = i;
++            continue;
++        }
+         swapchains[host_count] = swapchain->obj.host.swapchain;
+         host_indices[host_count] = i;
+         host_count++;
+@@ -6391,6 +6436,49 @@
+         else managed_present_waits_consumed = TRUE;
+     }
+ 
++    /* Release images presented to hidden windows once the GPU is done with them. */
++    if (hidden_count)
++    {
++        VkResult hidden_res = res < VK_SUCCESS ? res : VK_SUCCESS;
++
++        if (hidden_res == VK_SUCCESS)
++        {
++            pthread_mutex_lock( &producer_device_lock );
++            hidden_res = device->p_vkDeviceWaitIdle( device->host.device );
++            pthread_mutex_unlock( &producer_device_lock );
++        }
++
++        for (uint32_t k = 0; k < hidden_count; k++)
++        {
++            uint32_t i = hidden_indices[k];
++            struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
++            VkReleaseSwapchainImagesInfoKHR release =
++            {
++                .sType = VK_STRUCTURE_TYPE_RELEASE_SWAPCHAIN_IMAGES_INFO_KHR,
++                .swapchain = swapchain->obj.host.swapchain,
++                .imageIndexCount = 1,
++                .pImageIndices = &present_info->pImageIndices[i],
++            };
++            VkResult image_res = hidden_res;
++
++            TRACE( "window %p is hidden, releasing image %u of swapchain %p instead of presenting\n",
++                   swapchain->surface->hwnd, present_info->pImageIndices[i], swapchain );
++
++            if (image_res == VK_SUCCESS)
++            {
++                pthread_mutex_lock( &producer_device_lock );
++                image_res = device->p_vkReleaseSwapchainImagesEXT( device->host.device, &release );
++                /* No host present will signal this fence. */
++                if (present_fence_info && i < present_fence_info->swapchainCount && present_fence_info->pFences[i])
++                    device->p_vkQueueSubmit( queue->host.queue, 0, NULL, present_fence_info->pFences[i] );
++                pthread_mutex_unlock( &producer_device_lock );
++            }
++
++            if (present_info->pResults) present_info->pResults[i] = image_res;
++            if (image_res < VK_SUCCESS && res >= VK_SUCCESS) res = image_res;
++        }
++    }
++
+     /* Present each managed swapchain after the present waits are consumed. */
+     for (uint32_t i = 0; i < present_info->swapchainCount; i++)
+     {

@@ -587,6 +587,10 @@ apply_all_in_dir() {
     echo "WINE: -GAME FIXES- cmd: make CHOICE /T time out on console input (NCSOFT PURPLE post-update restart hang)"
     apply_patch "../patches/wine-hotfixes/pending/cmd-make-choice-timeout-work-on-console-input.patch"
 
+    # https://github.com/GloriousEggroll/proton-ge-custom/issues/837
+    echo "WINE: -GAME FIXES- win32u: release swapchain images presented to hidden windows instead of blocking the host present (RuneScape Vulkan on winewayland)"
+    apply_patch "../patches/wine-hotfixes/pending/win32u-release-images-presented-to-hidden-windows.patch"
+
     # Bluetooth LE GATT and WinRT BLE (Zwift, Rouvy trainers). winebth.sys stays disabled
     # unless PROTON_ENABLE_WINEBTH=1. https://github.com/GloriousEggroll/proton-ge-custom/issues/814
     # https://github.com/evanjt/wine
