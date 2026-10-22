@@ -1,0 +1,74 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Thu, 22 Oct 2026 15:00:00 -0600
+Subject: [PATCH] ntdll: Keep the address range the NVIDIA driver reserves for DLSS free.
+
+When a Vulkan device is created with VK_NVX_binary_import /
+VK_NVX_image_view_handle, which DLSS needs, the NVIDIA driver (libcuda)
+looks for free space in /proc/self/maps from 0x200000000 up to 1T (16T in
+one mode on newer drivers) and maps 4G + 2M at the first fit. With
+ntdll-ForceBottomUpAlloc, large allocations land right at 0x200000000, so a
+game that reserves enough memory early (Star Citizen allocates 1T) leaves
+no room, vkCreateDevice fails, DXVK and vkd3d-proton fall back to a device
+without those extensions and DLSS is unavailable.
+
+Measured 0x200000000-0x300200000 on RTX 5060, RTX 5070 Laptop, RTX 5080
+and RTX 3080 Ti with 595, 610 and 615 drivers and 30-62G of RAM. Keep
+0x200000000-0x400000000 out of the free areas on 64-bit so the driver
+always finds it, while bottom-up order is kept for everything else.
+Allocations at an explicit address are still allowed there.
+---
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -2285,6 +2285,34 @@
+     return try_map_free_area_range( area, base, end );
+ }
+ 
++#ifdef _WIN64
++/* The NVIDIA driver reserves 4G + 2M at the first free address from 0x200000000 when a
++ * Vulkan device uses the extensions DLSS needs, and device creation fails if 0x200000000
++ * up to its search limit is taken. Bottom-up allocation would fill exactly that range, so
++ * keep it out of the free areas (but unmapped, the driver looks for it in /proc/self/maps). */
++static char * const blocked_area_start = (char *)0x200000000;
++static char * const blocked_area_end   = (char *)0x400000000;
++#else
++static char * const blocked_area_start = NULL;
++static char * const blocked_area_end   = NULL;
++#endif
++
++static void *alloc_unblocked_area_in_range( struct alloc_area *area, char *base, char *end )
++{
++    char *result;
++
++    if (blocked_area_end <= base || blocked_area_start >= end)
++        return alloc_free_area_in_range( area, base, end );
++
++    if (area->top_down)
++    {
++        if ((result = alloc_free_area_in_range( area, max( base, blocked_area_end ), end ))) return result;
++        return alloc_free_area_in_range( area, base, min( end, blocked_area_start ));
++    }
++    if ((result = alloc_free_area_in_range( area, base, min( end, blocked_area_start )))) return result;
++    return alloc_free_area_in_range( area, max( base, blocked_area_end ), end );
++}
++
+ static void *alloc_free_area( char *limit_low, char *limit_high, size_t size, BOOL top_down, int unix_prot, UINT_PTR align_mask )
+ {
+     struct range_entry *range, *ranges_start, *ranges_end;
+@@ -2348,14 +2376,14 @@
+             else
+             {
+                 /* range is split in two by the preloader reservation, try first part. */
+-                if ((result = alloc_free_area_in_range( &area, base, reserve_start )))
++                if ((result = alloc_unblocked_area_in_range( &area, base, reserve_start )))
+                     break;
+                 /* then fall through to try second part. */
+                 base = reserve_end;
+             }
+         }
+ 
+-        if ((result = alloc_free_area_in_range( &area, base, end )))
++        if ((result = alloc_unblocked_area_in_range( &area, base, end )))
+             break;
+     }
+ 

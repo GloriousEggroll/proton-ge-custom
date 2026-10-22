@@ -454,10 +454,10 @@ apply_all_in_dir() {
     echo "WINE: -HOTFIX- Reserve top-down space for large-address-aware WoW64 applications"
     apply_patch "../patches/wine-hotfixes/pending/ntdll-reserve-top-down-space-for-large-address-aware-wow64.patch"
 
-    # Opt-out of ntdll-ForceBottomUpAlloc with WINE_DISABLE_BOTTOM_UP_ALLOC=1: large bottom-up allocations take the
-    # range libcuda reserves in (DLSS in Star Citizen, #460). Not global because some games need bottom-up order.
-    echo "WINE: -HOTFIX- Add opt-out of forced bottom-up allocation order on 64-bit"
-    apply_patch "../patches/wine-hotfixes/pending/ntdll-add-opt-out-of-forced-bottom-up-allocation.patch"
+    # The NVIDIA driver maps 4G + 2M at the first free address from 0x200000000 for the Vulkan extensions DLSS needs;
+    # bottom-up allocation (ntdll-ForceBottomUpAlloc) can fill that range (DLSS in Star Citizen, #460).
+    echo "WINE: -HOTFIX- Keep the address range the NVIDIA driver reserves for DLSS free"
+    apply_patch "../patches/wine-hotfixes/pending/ntdll-keep-nvidia-dlss-address-range-free.patch"
 
     echo "WINE: -HOTFIX- Remove redundant packed-code split locks"
     apply_patch "../patches/wine-hotfixes/pending/ntdll-remove-redundant-packed-split-lock.patch"
