@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Alexandre Derumier <aderumier@gmail.com>
+Date: Sun, 25 Oct 2026 16:30:00 +0100
+Subject: [PATCH] winedmo: Let the WM reader's seek read the file while
+ flushing.
+
+reinit_stream() sets read_flushing so that the demux thread's reads
+return no data, then seeks the demuxer to the new start time. The seek
+reads the file too, through the same callback, which returned no data
+either: FFmpeg searches an ASF file without index for its key frames
+(asf_read_pts), found nothing and the seek failed ("Failed to seek
+demuxer, error -1"). The demuxer then stayed at its end, every following
+read failed ("A non-NULL packet sent after an EOF") and the movie stopped
+(Yu-Gi-Oh! 5D's Duel Terminal 6 plays its mode previews as segments of
+one WMV file, IMediaSeeking::SetPositions() for each).
+
+demuxer_cs already keeps the demux thread out while the demuxer seeks:
+let the reads through for the seek's duration.
+---
+diff --git a/dlls/winedmo/wm_reader.c b/dlls/winedmo/wm_reader.c
+--- a/dlls/winedmo/wm_reader.c
++++ b/dlls/winedmo/wm_reader.c
+@@ -107,6 +107,7 @@
+     HANDLE demux_thread;
+     bool demux_shutdown;
+     bool read_flushing;
++    bool read_seeking;        /* reinit_stream's demuxer seek reads the file while flushing */
+     unsigned int read_flush_generation;
+     bool flushing;
+     CRITICAL_SECTION demuxer_cs;  /* serialises winedmo_demuxer_read vs winedmo_demuxer_seek */
+@@ -956,7 +957,7 @@
+     ULONG ret_size = 0;
+     HRESULT hr;
+ 
+-    if (reader->read_flushing || reader->demux_shutdown)
++    if ((reader->read_flushing && !reader->read_seeking) || reader->demux_shutdown)
+     {
+         *size = 0;
+         return STATUS_SUCCESS;
+@@ -2389,9 +2390,13 @@
+         wm_flush_stream_queue(&reader->streams[i]);
+ 
+     /* Seek demuxer back to start_time.  Hold demuxer_cs so the demux thread
+-     * cannot race us with a concurrent winedmo_demuxer_read call. */
++     * cannot race us with a concurrent winedmo_demuxer_read call.  The seek
++     * itself reads the file (an unindexed ASF file is searched for its key
++     * frames), let those reads through. */
+     EnterCriticalSection(&reader->demuxer_cs);
++    reader->read_seeking = true;
+     winedmo_demuxer_seek(reader->demuxer, reader->start_time);
++    reader->read_seeking = false;
+     LeaveCriticalSection(&reader->demuxer_cs);
+ 
+     /* Recreate decoders and reset EOS flags */
+-- 
+2.51.0
+
