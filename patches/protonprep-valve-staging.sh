@@ -545,9 +545,6 @@ apply_all_in_dir() {
     echo "WINE: --CUSTOM-- add WINE_HOSTBLOCK envvar to allow working around some problematic anticheats (notably eac)"
     apply_patch "../patches/proton/wine_host_block_envvar.patch"
 
-    echo "WINE: mutter -> cinnamon detection patch for winex11"
-    apply_patch "../patches/proton/winex11-mutter-cinnamon.patch"
-
     echo "WINE: add optiscaler patch"
     apply_patch "../patches/proton/0001-HACK-kernelbase-allow-overriding-dlls-for-DLSS-XeSS-.patch"
     apply_patch "../patches/proton/0002-HACK-ntdll-add-optiscaler-inection-hack.patch"
