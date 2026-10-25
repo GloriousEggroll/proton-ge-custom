@@ -64,7 +64,6 @@ Things it contains that Valve's Proton currently does not:
 - AMD FSR patches added directly to fullscreen hack that can be toggled with WINE_FULLSCREEN_FSR=1
 - FSR fake resolution patch details [here](https://github.com/GloriousEggroll/proton-ge-custom/pull/52)
 - NVIDIA CUDA support for PhysX and NVAPI
-- Raw input mouse support
 - 'protonfixes' system -- this is an automated system that applies per-game fixes (such as winetricks changes, environment variables, Easy Anti-Cheat workarounds, overrides, etc)
 - Various upstream Wine patches backported
 - Various wine-staging patches applied as they become needed
