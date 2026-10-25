@@ -69,8 +69,6 @@ apply_all_in_dir() {
     pushd protonfixes
     git reset --hard HEAD
     git clean -xdf
-    echo "PROTONFIXES: add optiscaler support"
-    apply_all_in_dir "../patches/protonfixes/"
     popd
 
     pushd wineopenxr
