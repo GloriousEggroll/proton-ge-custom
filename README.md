@@ -484,12 +484,13 @@ This covers DX11 through DXVK and DX12 through VKD3D-Proton: both use the
 DXVK-provided DXGI for output queries, with their respective Vulkan presenters
 checking HDR surface support.
 
-- Native Wine Wayland uses the compositor's per-output color-management state.
-  Select that driver with `PROTON_ENABLE_WAYLAND=1` when using a native Wayland
-  desktop outside Gamescope.
+- Detection is per monitor: the game sees HDR only on the monitor it is
+  displayed on, and other connected monitors (HDR or SDR) do not affect it.
+- Native Wine Wayland uses the compositor's color-management information for
+  each output. Select that driver with `PROTON_ENABLE_WAYLAND=1` when using a
+  native Wayland desktop outside Gamescope.
 - Gamescope's XWayland path uses its HDR output feedback. Ordinary X11/XWayland
   paths without HDR feedback default to SDR; this does not add HDR support to them.
-- SDR outputs remain SDR, including when other connected monitors use HDR.
 
 For native Wine Wayland without Gamescope, use:
 
@@ -504,13 +505,80 @@ default XWayland driver instead of adding the Wayland option above.
 
 Use `DXVK_NO_HDR=1 %command%` to disable HDR reporting. The old Proton HDR
 options are still accepted for compatibility; setting either to `0` disables
-HDR (if both are set, `PROTON_USE_HDR` takes precedence). Explicit HDR opt-in
-is retained for older X11 HDR WSI implementations without output feedback.
+HDR (if both are set, `PROTON_USE_HDR` takes precedence). Setting them to `1`
+no longer forces HDR on Wayland; use `PROTON_FORCE_HDR=1` for that. Explicit
+HDR opt-in is retained for older X11 HDR WSI implementations without output
+feedback.
 
 > [!NOTE]
 > Automatic detection does not change your desktop's HDR setting, select Wine
 > Wayland automatically, or force the game's own HDR setting on. Gamescope's
 > HDR mode and WSI support still need to be configured normally.
+
+###### How native Wayland decides whether a monitor is HDR
+
+Wayland has no "HDR on/off" flag that applications can read. Wine instead
+compares two luminance values the compositor reports for each output through
+the standard color-management protocol: the maximum luminance, and the
+reference luminance (the brightness of SDR white). The output is treated as HDR
+only when the maximum is above the reference, i.e. when there is headroom for
+highlights brighter than SDR white. This is the same check on every compositor.
+
+###### KDE Plasma: HDR enabled but the game only offers SDR
+
+If Plasma's SDR brightness is set to your monitor's peak brightness, KWin
+reports the same value for reference and maximum luminance. That has no HDR
+headroom, so Wine reports the monitor as SDR, even though Plasma's HDR toggle
+is on. This is common on monitors with a low peak (DisplayHDR 400/600 class,
+around 400-600 nits), where raising SDR brightness to the peak makes the
+desktop look as bright as it did in SDR mode.
+
+To get HDR in games, either:
+
+- Lower Plasma's SDR brightness below the monitor's peak brightness
+  (System Settings → Display & Monitor), then restart the game, or
+- Launch with `PROTON_FORCE_HDR=1` (see below).
+
+Why we don't simply read Plasma's HDR toggle: GE-Proton11-10 and 11-11 did
+this through KWin's `kde-output-device-v2` protocol
+([#838](https://github.com/GloriousEggroll/proton-ge-custom/issues/838)).
+KWin and Wayland color-management developers pointed out two problems:
+
+- That protocol is a private interface for Plasma's own display settings, not
+  meant for applications, and can change without notice.
+- With SDR brightness at the peak, there is genuinely no headroom: a game's
+  HDR mode cannot show highlights brighter than the desktop's white, and its
+  tone mapping may look flatter than SDR. Reporting SDR there is correct by
+  the Wayland definition of HDR.
+
+We agree on both points and removed it, so KDE now uses the same standard
+check as every other compositor. `PROTON_FORCE_HDR=1` remains for users who
+want HDR offered regardless (for example for its wider color gamut).
+
+###### Forcing HDR: `PROTON_FORCE_HDR=1`
+
+`PROTON_FORCE_HDR=1` reports every Wine Wayland output as HDR-enabled, whatever
+the compositor reports. Use it when:
+
+- KDE Plasma reports SDR because SDR brightness is at the monitor's peak (see
+  above).
+- Your compositor switches a monitor to HDR when a fullscreen game presents
+  HDR content, and you keep the desktop in SDR, e.g. Hyprland's
+  `render:cm_auto_hdr`. Without the override the game sees an SDR monitor,
+  never requests HDR, and the compositor never switches.
+
+```bash
+PROTON_ENABLE_WAYLAND=1 PROTON_FORCE_HDR=1 %command%
+```
+
+> [!WARNING]
+> Only use it per game, on monitors you know can display HDR. On a monitor
+> that is really SDR, games may show washed-out or faded colors, and some games
+> hang or fail to start (for example Saints Row on NVIDIA,
+> [#541](https://github.com/GloriousEggroll/proton-ge-custom/issues/541)).
+> That is why `PROTON_ENABLE_HDR=1` no longer forces HDR. `DXVK_NO_HDR=1`
+> still takes precedence. The override applies to native Wine Wayland only;
+> under Gamescope, Gamescope's own HDR state is used.
 
 ##### Enabling NTSync
 For NTSync to work, your kernel must be version 6.14 or newer and built with `CONFIG_NTSYNC=y` or `CONFIG_NTSYNC=m`. On non-systemd systems, you must also have a `ulimit -Hn` of 524288 or higher.
@@ -605,7 +673,8 @@ Without HIDRAW access, Wine retains its normal SDL fallback, which does not prov
 |                      | `PROTON_STEAMINPUT_LAYOUT_DS4` | Force the fallback controller to use the DualShock 4 profile instead of automatic layout detection. |
 |                      | `PROTON_STEAMINPUT_LAYOUT_DS5` | Force the fallback controller to use the DualSense profile instead of automatic layout detection. |
 | `wayland`            | `PROTON_USE_WAYLAND` or `PROTON_ENABLE_WAYLAND` | Enables the Wayland driver. |
-| `hdr`                | `PROTON_ENABLE_HDR` or `PROTON_USE_HDR` | Legacy HDR overrides; no longer required for automatic detection in DX11 or DX12. Set to `0` to disable HDR reporting. If both are set, `PROTON_USE_HDR` takes precedence. Does not select the Wayland driver. See [HDR](#hdr). |
+| `hdr`                | `PROTON_ENABLE_HDR` or `PROTON_USE_HDR` | Legacy HDR overrides; no longer required for automatic detection in DX11 or DX12, and `1` no longer forces HDR on Wayland (use `PROTON_FORCE_HDR`). Set to `0` to disable HDR reporting. If both are set, `PROTON_USE_HDR` takes precedence. Does not select the Wayland driver. See [HDR](#hdr). |
+| `forcehdr`           | `PROTON_FORCE_HDR` | Report HDR on every Wine Wayland output even when the compositor reports SDR, e.g. KDE Plasma with SDR brightness at the monitor's peak, or Hyprland's `render:cm_auto_hdr` switching. Can cause faded colors or hangs on real SDR monitors. `DXVK_NO_HDR=1` takes precedence. See [Forcing HDR](#forcing-hdr-proton_force_hdr1). |
 |                      | `DXVK_NO_HDR` | Set to `1` to disable HDR reporting on both Wine display drivers, including for DX12 through the shared DXGI implementation. Takes precedence over HDR opt-in flags. |
 |                      | `PROTON_USE_X11_EXCLUSIVE` | Under Wine-Wayland, use `winex11.drv` only for the executable specified by this value. Accepts an exact executable basename such as `Launcher.exe` or a case-insensitive Windows path fragment such as `Vendor\\Launcher.exe`; other processes remain on Wine-Wayland. |
 | `winebth`            | `PROTON_ENABLE_WINEBTH`        | Enables `winebth.sys`, Wine's Bluetooth driver, which is disabled by default. Needed for Bluetooth LE devices such as smart trainers and controllers in Zwift or Rouvy. Requires BlueZ. |
