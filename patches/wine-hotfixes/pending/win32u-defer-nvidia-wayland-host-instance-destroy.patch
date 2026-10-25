@@ -1,0 +1,204 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] win32u: Defer destroying NVIDIA Wayland host instances while
+ another one is alive.
+
+The NVIDIA proprietary driver creates its Wayland WSI state with the first
+Wayland surface of a VkInstance. That state dlopens libwayland-client and
+stores wl_display_* entry points in a process-global table. Destroying the
+VkInstance dlcloses the library and zeroes that table, even when other
+instances still use it. The next surface call on a surviving instance then
+calls a NULL wl_display_create_queue from inside the driver.
+
+This reproduces natively without Wine (driver 610.43.02): create instance A
+and a Wayland surface, create instance B and a Wayland surface, destroy B,
+then vkGetPhysicalDeviceSurfaceFormats2KHR on A's surface crashes. Instances
+that never created a Wayland surface do not trigger it, and destroying only
+the surface does not either.
+
+The EA app hits this on winewayland: DXVK creates and destroys several
+instances during startup while another one stays alive, and the next format
+query on a hidden helper window's surface faults, so UNIX_CALL_CHECKED exits
+the process with code 3.
+
+Keep the host instance of such an instance alive while another NVIDIA
+Wayland instance is alive, and destroy all deferred ones together with the
+last one. Creating the first surface of an instance and destroying host
+instances are serialized, so the table is never cleared while a live
+instance depends on it. A deferred instance costs about 240 kB.
+
+Set WINE_VK_NO_NVIDIA_WAYLAND_INSTANCE_DEFER=1 to disable the workaround.
+
+Fixes: https://github.com/GloriousEggroll/proton-ge-custom/issues/881
+---
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -148,6 +148,9 @@
+ 
+     struct rb_tree objects;
+     pthread_rwlock_t objects_lock;
++
++    BOOL nvidia_wayland;            /* host instance uses Wayland WSI with the NVIDIA proprietary driver */
++    BOOL nvidia_wayland_surface;    /* a host Wayland surface was created on this instance */
+ };
+ 
+ static struct instance *instance_from_handle( VkInstance handle )
+@@ -156,6 +159,104 @@
+     return CONTAINING_RECORD( object, struct instance, obj );
+ }
+ 
++/* The NVIDIA proprietary driver creates its Wayland WSI state with the first
++ * Wayland surface of a VkInstance. That state loads libwayland-client into a
++ * process-global function table, and destroying the VkInstance dlcloses the
++ * library and clears the table, even while other instances still use it.
++ * Their next surface call then jumps to a NULL wl_display_create_queue.
++ *
++ * Defer host destruction of such instances while another one is alive, and
++ * destroy them all once the last one goes away. Every host instance destroy
++ * and every first surface creation runs under nvidia_wayland_lock, so the
++ * table is never cleared while it is filled for a live instance. */
++struct deferred_host_instance
++{
++    struct list entry;
++    VkInstance host_instance;
++    PFN_vkDestroyInstance p_vkDestroyInstance;
++};
++
++static pthread_mutex_t nvidia_wayland_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct list nvidia_wayland_deferred = LIST_INIT( nvidia_wayland_deferred );
++static unsigned int nvidia_wayland_live;
++
++static BOOL instance_uses_nvidia_wayland( struct vulkan_instance *instance )
++{
++    PFN_vkGetPhysicalDeviceProperties2 get_properties2;
++    const char *env;
++    unsigned int i;
++
++    if (!instance->extensions.has_VK_KHR_wayland_surface) return FALSE;
++    if ((env = getenv( "WINE_VK_NO_NVIDIA_WAYLAND_INSTANCE_DEFER" )) && atoi( env )) return FALSE;
++
++    if (instance->extensions.has_VK_KHR_get_physical_device_properties2)
++        get_properties2 = instance->p_vkGetPhysicalDeviceProperties2KHR;
++    else if (instance->api_version >= VK_API_VERSION_1_1)
++        get_properties2 = instance->p_vkGetPhysicalDeviceProperties2;
++    else
++        get_properties2 = NULL;
++
++    for (i = 0; i < instance->physical_device_count; i++)
++    {
++        VkPhysicalDevice host_physical_device = instance->physical_devices[i].host.physical_device;
++        VkPhysicalDeviceDriverProperties driver_props = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
++        VkPhysicalDeviceProperties2 props = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &driver_props};
++
++        if (get_properties2 && instance->physical_devices[i].api_version >= VK_API_VERSION_1_2)
++        {
++            get_properties2( host_physical_device, &props );
++            if (driver_props.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY) return TRUE;
++        }
++        else
++        {
++            instance->p_vkGetPhysicalDeviceProperties( host_physical_device, &props.properties );
++            if (props.properties.vendorID == 0x10de) return TRUE;
++        }
++    }
++
++    return FALSE;
++}
++
++static void destroy_host_instance( struct instance *instance )
++{
++    struct deferred_host_instance *deferred, *next;
++
++    if (!instance->nvidia_wayland)
++    {
++        instance->obj.p_vkDestroyInstance( instance->obj.host.instance, NULL /* allocator */ );
++        return;
++    }
++
++    pthread_mutex_lock( &nvidia_wayland_lock );
++    if (instance->nvidia_wayland_surface && --nvidia_wayland_live)
++    {
++        if ((deferred = malloc( sizeof(*deferred) )))
++        {
++            TRACE( "Deferring destruction of host instance %p, %u NVIDIA Wayland instances alive.\n",
++                   instance->obj.host.instance, nvidia_wayland_live );
++            deferred->host_instance = instance->obj.host.instance;
++            deferred->p_vkDestroyInstance = instance->obj.p_vkDestroyInstance;
++            list_add_tail( &nvidia_wayland_deferred, &deferred->entry );
++            pthread_mutex_unlock( &nvidia_wayland_lock );
++            return;
++        }
++        ERR( "Failed to defer destruction of host instance %p.\n", instance->obj.host.instance );
++    }
++
++    instance->obj.p_vkDestroyInstance( instance->obj.host.instance, NULL /* allocator */ );
++    if (!nvidia_wayland_live)
++    {
++        LIST_FOR_EACH_ENTRY_SAFE( deferred, next, &nvidia_wayland_deferred, struct deferred_host_instance, entry )
++        {
++            TRACE( "Destroying deferred host instance %p.\n", deferred->host_instance );
++            list_remove( &deferred->entry );
++            deferred->p_vkDestroyInstance( deferred->host_instance, NULL /* allocator */ );
++            free( deferred );
++        }
++    }
++    pthread_mutex_unlock( &nvidia_wayland_lock );
++}
++
+ struct device_memory
+ {
+     struct vulkan_device_memory obj;
+@@ -1451,6 +1552,8 @@
+      */
+     if ((res = init_physical_devices( &instance->obj, physical_devices ))) goto failed;
+ 
++    instance->nvidia_wayland = instance_uses_nvidia_wayland( &instance->obj );
++
+     TRACE( "Created instance %p, host_instance %p.\n", instance, instance->obj.host.instance );
+     for (i = 0; i < instance->obj.physical_device_count; i++)
+     {
+@@ -1478,7 +1581,7 @@
+ 
+     if (!instance) return;
+ 
+-    instance->obj.p_vkDestroyInstance( instance->obj.host.instance, NULL /* allocator */ );
++    destroy_host_instance( instance );
+     for (int i = 0; i < instance->obj.physical_device_count; i++)
+         vulkan_instance_remove_object( &instance->obj, &instance->obj.physical_devices[i].obj );
+     vulkan_instance_remove_object( &instance->obj, &instance->obj.obj );
+@@ -2532,6 +2635,8 @@
+                                                 const VkAllocationCallbacks *allocator, VkSurfaceKHR *ret )
+ {
+     struct vulkan_instance *instance = vulkan_instance_from_handle( client_instance );
++    struct instance *win32u_instance = CONTAINING_RECORD( instance, struct instance, obj );
++    BOOL nvidia_wayland_locked = FALSE;
+     VkSurfaceKHR host_surface;
+     struct surface *surface;
+     HWND dummy = NULL;
+@@ -2553,13 +2658,27 @@
+         surface->hwnd = dummy;
+     }
+ 
++    if (win32u_instance->nvidia_wayland)
++    {
++        pthread_mutex_lock( &nvidia_wayland_lock );
++        if (win32u_instance->nvidia_wayland_surface) pthread_mutex_unlock( &nvidia_wayland_lock );
++        else nvidia_wayland_locked = TRUE;
++    }
++
+     if ((res = driver_funcs->p_vulkan_surface_create( surface->hwnd, fshack_enabled, instance,
+                                                       &host_surface, &surface->client )))
+     {
++        if (nvidia_wayland_locked) pthread_mutex_unlock( &nvidia_wayland_lock );
+         if (dummy) NtUserDestroyWindow( dummy );
+         free( surface );
+         return res;
+     }
++    if (nvidia_wayland_locked)
++    {
++        win32u_instance->nvidia_wayland_surface = TRUE;
++        nvidia_wayland_live++;
++        pthread_mutex_unlock( &nvidia_wayland_lock );
++    }
+     add_window_client_surface( surface->hwnd, surface->client );
+ 
+     vulkan_object_init( &surface->obj.obj, host_surface );
