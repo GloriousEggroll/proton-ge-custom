@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Alexandre Derumier <aderumier@gmail.com>
+Date: Mon, 26 Oct 2026 23:30:00 +0100
+Subject: [PATCH] mfreadwrite: Find the WMV decoder for MF RGB output types.
+
+The WMV video decoder registers its RGB outputs with the DMO subtypes
+(DMOVideoFormat_RGB32...: the D3D format with the DirectShow GUID base),
+as native does, not with the MFVideoFormat_RGB* subtypes. A source reader
+asked for MFVideoFormat_RGB32 on a WMV3 stream, without the video
+processor, enumerated the video decoders for WMV3 -> MFVideoFormat_RGB32,
+found none and SetCurrentMediaType() failed with MF_E_TOPO_CODEC_NOT_FOUND
+(Wangan Midnight Maximum Tune 5 then stops on its movies; the decoder
+itself accepts MFVideoFormat_RGB32 as its output type).
+
+Like the IYUV fixup, enumerate again with the DMO subtype when no decoder
+matches an MF RGB output subtype.
+---
+--- a/dlls/mfreadwrite/reader.c
++++ b/dlls/mfreadwrite/reader.c
+@@ -3033,6 +3033,24 @@
+     return hr;
+ }
+ 
++/* The DMO RGB subtypes (DMOVideoFormat_RGB32...) keep the D3D format of the MF subtype with the DirectShow GUID base. */
++static BOOL get_dmo_rgb_subtype(const GUID *category, MFT_REGISTER_TYPE_INFO *type)
++{
++    static const GUID dmo_base = {0, 0x524f, 0x11ce, {0x9f, 0x53, 0x00, 0x20, 0xaf, 0x0b, 0xa7, 0x70}};
++
++    if (!IsEqualGUID(category, &MFT_CATEGORY_VIDEO_DECODER) || !IsEqualGUID(&type->guidMajorType, &MFMediaType_Video))
++        return FALSE;
++    if (!IsEqualGUID(&type->guidSubtype, &MFVideoFormat_RGB32) && !IsEqualGUID(&type->guidSubtype, &MFVideoFormat_RGB24)
++            && !IsEqualGUID(&type->guidSubtype, &MFVideoFormat_RGB565) && !IsEqualGUID(&type->guidSubtype, &MFVideoFormat_RGB555)
++            && !IsEqualGUID(&type->guidSubtype, &MFVideoFormat_RGB8))
++        return FALSE;
++
++    type->guidSubtype.Data2 = dmo_base.Data2;
++    type->guidSubtype.Data3 = dmo_base.Data3;
++    memcpy(type->guidSubtype.Data4, dmo_base.Data4, sizeof(dmo_base.Data4));
++    return TRUE;
++}
++
+ static HRESULT source_reader_create_transform(struct source_reader *reader, BOOL decoder, BOOL allow_processor,
+         IMFMediaType *input_type, IMFMediaType *output_type, struct transform_entry **out)
+ {
+@@ -3102,7 +3120,18 @@
+     }
+ 
+     count = 0;
+-    if (SUCCEEDED(hr = MFTEnumEx(category, 0, &in_type, allow_processor ? NULL : &out_type, &activates, &count)))
++    hr = MFTEnumEx(category, 0, &in_type, allow_processor ? NULL : &out_type, &activates, &count);
++    if (SUCCEEDED(hr) && !count && !allow_processor && get_dmo_rgb_subtype(&category, &out_type))
++    {
++        /* The WMV video decoder registers its RGB outputs with the DMO subtypes (as native does), but selecting
++         * the matching MF RGB format as an output format still succeeds, so fixup the subtype for MFTEnumEx.
++         */
++        WARN("Fixing up %s subtype for the video decoder\n", debugstr_guid(&out_type.guidSubtype));
++        CoTaskMemFree(activates);
++        count = 0;
++        hr = MFTEnumEx(category, 0, &in_type, &out_type, &activates, &count);
++    }
++    if (SUCCEEDED(hr))
+     {
+         if (!count)
+         {
