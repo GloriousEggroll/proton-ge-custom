@@ -561,6 +561,10 @@ apply_all_in_dir() {
     echo "WINE: -PERF- read QueryPerformanceCounter from the TSC in user mode (DCS World: 39 -> 62 FPS)"
     apply_patch "../patches/proton/0001-ntdll-Read-QueryPerformanceCounter-from-the-TSC-in-us.patch"
 
+    # https://github.com/GloriousEggroll/proton-ge-custom/issues/873
+    echo "WINE: only check the kernel clocksource for QPC at start-up (P5R Reloaded-II mods crash)"
+    apply_patch "../patches/proton/0002-ntdll-Only-read-the-kernel-clocksource-for-QPC-at-start-up.patch"
+
     echo "WINE: implement IOCTL_SERIAL_GET_DTRRTS (Qt serial device tools, e.g. MOZA Cockpit)"
     apply_patch "../patches/proton/0001-ntdll-Implement-IOCTL_SERIAL_GET_DTRRTS-for-serial-dev.patch"
 

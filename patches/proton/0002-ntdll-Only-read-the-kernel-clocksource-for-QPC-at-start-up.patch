@@ -1,0 +1,141 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Mon, 26 Oct 2026 12:00:00 -0600
+Subject: [PATCH] ntdll: Only read the kernel clocksource for QPC at start-up.
+
+The user-mode QueryPerformanceCounter path read current_clocksource again
+on the first call made more than a second after the last check, through
+NtOpenFile/NtReadFile from inside RtlQueryPerformanceCounter. Programs
+hook those functions: Reloaded-II's File Emulation Framework, which most
+Persona 5 Royal mods depend on, hooks file I/O with managed code. A timer
+call from a thread that cannot run managed code then re-enters the .NET
+runtime through the hook, and the runtime aborts the process
+(RaiseFailFastException, 0x80131506) shortly after the mods load.
+
+Keep the start-up read, which happens while the process is starting and
+before such hooks are installed, and drop the periodic one. A TSC that
+the kernel demotes after start-up is no longer followed; a TSC read
+below the calibrated base still takes the syscall path for that call.
+
+WINE_ENABLE_QPC_TSC=1, which skips both reads, was confirmed by a user to
+fix the crash. This change on its own has not been runtime-tested.
+
+Fixes https://github.com/GloriousEggroll/proton-ge-custom/issues/873
+---
+--- a/dlls/ntdll/time.c
++++ b/dlls/ntdll/time.c
+@@ -392,14 +392,16 @@
+  * keeping them aligned is the firmware's job and some machines are seconds off. Linux tests
+  * that at boot (check_tsc_sync_source) and falls back to hpet or acpi_pm when it fails, as
+  * Windows does when its own boot-time check fails. current_clocksource is that verdict, read
+- * through the unix namespace at start-up, then on the first call made more than a second
+- * after the last check, so a TSC the kernel demotes later is dropped too.
++ * through the unix namespace once, at start-up. It is not read again later: the file read
++ * goes through NtOpenFile/NtReadFile, which programs hook (Reloaded-II's File Emulation
++ * Framework does, with managed code), and a timer call from a thread that cannot run that
++ * code then aborts the process.
+  *
+  * Calibration publishes a rate once two consecutive passes agree. Each (counter, TSC) pair is
+  * bracketed by two rdtscp and discarded unless both report the same processor and lie within
+  * QPC_TSC_SAMPLE_CYCLES of each other.
+  *
+- * The hot path is rdtscp, two predictable compares and one 64x64->128 multiply, with plain
++ * The hot path is rdtscp, one predictable compare and one 64x64->128 multiply, with plain
+  * loads only: no locked instruction and no shared write, because an earlier version enforcing
+  * monotonicity with an interlocked clamp bounced a cache line between the callers and gave no
+  * gain at all. A TSC read below the calibrated base would wrap the unsigned subtraction into
+@@ -411,7 +413,6 @@
+ #define QPC_TSC_RATE_TOLERANCE    2000                 /* two rates agree when within 1/2000 */
+ #define QPC_TSC_MAX_PASSES        32                   /* give up calibrating if they never do */
+ #define QPC_TSC_MAX_PROBES        64                   /* retries while the clocksource is unreadable */
+-#define QPC_TSC_CHECK_TICKS       TICKSPERSEC          /* ask the kernel again once a second */
+ 
+ enum
+ {
+@@ -424,15 +425,12 @@
+ };
+ 
+ static volatile LONG qpc_tsc_state;
+-static volatile LONG qpc_tsc_checking;   /* one thread asking the kernel at a time */
+-static BOOL      qpc_tsc_forced;         /* WINE_ENABLE_QPC_TSC: do not follow the kernel clocksource */
+ 
+ /* written before qpc_tsc_state releases them, then constant; qpc_tsc_base_qpc is also read by
+  * calibrating callers while a pass is being closed, hence the relaxed atomics on it */
+ static LONGLONG  qpc_tsc_base_qpc;
+ static ULONGLONG qpc_tsc_base_tsc;
+ static ULONGLONG qpc_tsc_mult;           /* TICKSPERSEC * 2^32 / tsc_hz */
+-static ULONGLONG qpc_tsc_check_step;     /* QPC_TSC_CHECK_TICKS expressed in TSC cycles */
+ 
+ /* calibration state, owned by whoever holds QPC_TSC_PROBING or QPC_TSC_PUBLISHING */
+ static LONGLONG  qpc_tsc_first_qpc;      /* the very first sample, for the full-span rate */
+@@ -441,10 +439,6 @@
+ static LONG      qpc_tsc_passes;
+ static LONG      qpc_tsc_probes;
+ 
+-/* written after publication while every caller reads it: relaxed atomics, which on x86-64
+- * are plain 64-bit loads and stores, keep the compiler from tearing or caching it */
+-static ULONGLONG qpc_tsc_check_start;    /* TSC at the last check; the next one is due a step later */
+-
+ struct qpc_tsc_sample
+ {
+     LONGLONG  qpc;
+@@ -549,7 +543,7 @@
+         return 0;
+     }
+ 
+-    if ((qpc_tsc_forced = qpc_tsc_env_set( L"WINE_ENABLE_QPC_TSC" )))
++    if (qpc_tsc_env_set( L"WINE_ENABLE_QPC_TSC" ))
+     {
+         TRACE_(qpc)( "WINE_ENABLE_QPC_TSC set, not following the kernel clocksource\n" );
+         return 1;
+@@ -624,13 +618,10 @@
+             delta = span_hz > hz ? span_hz - hz : hz - span_hz;
+             if (delta * QPC_TSC_RATE_TOLERANCE <= hz) hz = span_hz;
+ 
+-            /* rebase on this sample so the switch is continuous, arm the first check, then
+-             * publish (release) */
++            /* rebase on this sample so the switch is continuous, then publish (release) */
+             qpc_tsc_mult = (ULONGLONG)(((unsigned __int128)TICKSPERSEC << 32) / hz);
+             qpc_tsc_base_tsc = sample->tsc;
+-            qpc_tsc_check_step = hz * QPC_TSC_CHECK_TICKS / TICKSPERSEC;
+             __atomic_store_n( &qpc_tsc_base_qpc, sample->qpc, __ATOMIC_RELAXED );
+-            __atomic_store_n( &qpc_tsc_check_start, sample->tsc, __ATOMIC_RELAXED );
+             TRACE_(qpc)( "calibrated at %I64u Hz after %ld passes, using the TSC\n",
+                          hz, qpc_tsc_passes + 1 );
+             InterlockedExchange( (LONG *)&qpc_tsc_state, QPC_TSC_READY );
+@@ -650,25 +641,6 @@
+     InterlockedExchange( (LONG *)&qpc_tsc_state, QPC_TSC_CALIBRATING );
+ }
+ 
+-/* Once a second, one caller asks the kernel whether it still uses the TSC. Returns FALSE
+- * once it does not and the TSC path has been given up. */
+-static BOOL qpc_tsc_check( ULONGLONG tsc )
+-{
+-    BOOL ok = TRUE;
+-
+-    if (InterlockedCompareExchange( (LONG *)&qpc_tsc_checking, 1, 0 )) return TRUE;
+-    if (__atomic_load_n( &qpc_tsc_state, __ATOMIC_ACQUIRE ) != QPC_TSC_READY) ok = FALSE;
+-    else if (!qpc_tsc_forced && qpc_tsc_kernel_clocksource() != 1)
+-    {
+-        WARN_(qpc)( "the kernel no longer selects the TSC, falling back to the syscall path\n" );
+-        InterlockedExchange( (LONG *)&qpc_tsc_state, QPC_TSC_DISABLED );
+-        ok = FALSE;
+-    }
+-    else __atomic_store_n( &qpc_tsc_check_start, tsc, __ATOMIC_RELAXED );
+-    InterlockedExchange( (LONG *)&qpc_tsc_checking, 0 );
+-    return ok;
+-}
+-
+ static BOOL qpc_tsc_counter( LARGE_INTEGER *counter )
+ {
+     /* acquire: the values published below must not be loaded before the state that releases
+@@ -691,10 +663,6 @@
+                         tsc, qpc_tsc_base_tsc, cpu );
+             return FALSE;
+         }
+-        /* unsigned: a TSC that went backwards wraps this and asks the kernel at once */
+-        if (tsc - __atomic_load_n( &qpc_tsc_check_start, __ATOMIC_RELAXED ) >= qpc_tsc_check_step &&
+-            !qpc_tsc_check( tsc ))
+-            return FALSE;
+         counter->QuadPart = qpc_tsc_ticks( tsc );
+         return TRUE;
+     }
