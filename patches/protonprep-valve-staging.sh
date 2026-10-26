@@ -39,6 +39,8 @@ apply_all_in_dir() {
     apply_patch "../patches/dxvk/dxgi-auto-detect-hdr.patch"
     # StarCraft II: avoid GPU hangs with D3D9 constant buffer streaming (#790).
     apply_patch "../patches/dxvk/starcraft2-disable-constant-buffer-streaming.patch"
+    # Local-JIT: multi-prefix and deterministic JIT shared cache support
+    apply_patch "../patches/dxvk/dxvk-localjit-shared-cache.patch"
     popd
 
     pushd d7vk
