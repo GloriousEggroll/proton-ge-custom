@@ -264,7 +264,15 @@ apply_all_in_dir() {
     apply_all_in_dir "../patches/wine-hotfixes/wine-staging/winex11-Window_Style/"
 
     echo "WINE: -STAGING- wininet-Cleanup manually applied"
-    apply_all_in_dir "../wine-staging/patches/wininet-Cleanup/"
+    # Skip 0005: it makes HTTP_ADDREQ_FLAG_REPLACE fail for headers not yet
+    # present, while Windows 10 adds them. TLOU Part II adds Content-Type and
+    # Authorization that way, so its leaderboard requests were sent without
+    # them and rejected (403).
+    # https://github.com/GloriousEggroll/proton-ge-custom/issues/463
+    apply_patch "../wine-staging/patches/wininet-Cleanup/0001-wininet-tests-Add-more-tests-for-cookies.patch"
+    apply_patch "../wine-staging/patches/wininet-Cleanup/0002-wininet-tests-Test-auth-credential-reusage-with-host.patch"
+    apply_patch "../wine-staging/patches/wininet-Cleanup/0003-wininet-tests-Check-cookie-behaviour-when-overriding.patch"
+    apply_patch "../wine-staging/patches/wininet-Cleanup/0004-wininet-Strip-filename-if-no-path-is-set-in-cookie.patch"
 
     echo "WINE: -STAGING- Staging manually applied"
     apply_all_in_dir "../wine-staging/patches/Staging/"
