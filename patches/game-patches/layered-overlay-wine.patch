@@ -24,7 +24,10 @@ readback drives the visible bounding shape. WINE_LAYERED_OVERLAY_INPUT_SHAPE=0 s
 shape, and the readback that feeds it, altogether: with it off the window keeps the stock
 empty-input-shape pass-through rather than falling back to taking input over its whole
 rectangle. 1080p full-screen overlay on XWayland: 11.26 -> 1.16 ms per present, with a
-bit-identical block mask.
+bit-identical block mask. The offscreen client window is parked at the origin of the dummy
+parent, so XShmGetImage on it fails with BadMatch as soon as it is wider or taller than the
+root window; for that window the readback goes through its composite pixmap instead, which
+holds the same pixels and keeps the MIT-SHM path working at any window size.
 
 Based on the original TBH-specific XShape patch by Solarisfire; generalised, flicker fixed,
 extended with the real-alpha (ARGB) path and per-pixel input shaping.
@@ -179,7 +182,7 @@ index 614450e72d6..8cb0f0d2b52 100644
  }
  
  static void x11drv_client_surface_detach( struct client_surface *client )
-@@ -465,6 +563,265 @@ static void x11drv_client_surface_update( struct client_surface *client )
+@@ -465,6 +563,278 @@ static void x11drv_client_surface_update( struct client_surface *client )
      client_surface_update_offscreen( hwnd, surface );
  }
  
@@ -322,11 +325,24 @@ index 614450e72d6..8cb0f0d2b52 100644
 +#ifdef HAVE_LIBXXSHM
 +    if (ensure_shm_image( surface, width, height ))
 +    {
++        Drawable drawable = surface->window;
++        Pixmap pixmap = 0;
 +        BOOL got;
 +
-+        /* a window reaching past the root window fails here, but not in XGetImage */
 +        X11DRV_expect_error( gdi_display, overlay_xshm_error, NULL );
-+        got = XShmGetImage( gdi_display, surface->window, surface->shm_image, 0, 0, AllPlanes );
++#ifdef SONAME_LIBXCOMPOSITE
++        /* The offscreen client window sits at the origin of the dummy parent, so XShmGetImage
++           fails on it with BadMatch once it is wider or taller than the root window. Its
++           redirected pixmap holds the same pixels and has no on-screen check, so read that. */
++        if (usexcomposite && surface->client.offscreen)
++            drawable = pixmap = pXCompositeNameWindowPixmap( gdi_display, surface->window );
++#endif
++        got = XShmGetImage( gdi_display, drawable, surface->shm_image, 0, 0, AllPlanes );
++        if (pixmap)
++        {
++            XFreePixmap( gdi_display, pixmap );
++            XSync( gdi_display, False );
++        }
 +        if (X11DRV_check_error()) got = FALSE;
 +        if (got)
 +        {
@@ -445,7 +461,7 @@ index 614450e72d6..8cb0f0d2b52 100644
  static void X11DRV_client_surface_present( struct client_surface *client, HDC hdc )
  {
      struct x11drv_client_surface *surface = impl_from_client_surface( client );
-@@ -493,8 +850,12 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
+@@ -493,8 +863,12 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
          TRACE( "Surface is present.\n" );
          region = get_dc_monitor_region( hwnd, hdc );
          if (region) NtGdiExtSelectClipRgn( hdc, region, RGN_COPY );
@@ -460,7 +476,7 @@ index 614450e72d6..8cb0f0d2b52 100644
          if (region) NtGdiDeleteObjectApp( region );
          window_surface_release( win_surface );
          return;
-@@ -527,8 +888,9 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
+@@ -527,8 +901,9 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
          set_dc_drawable( surface->hdc_dst, window, &rect_dst, IncludeInferiors );
      if (region) NtGdiExtSelectClipRgn( surface->hdc_dst, region, RGN_COPY );
  
@@ -472,7 +488,7 @@ index 614450e72d6..8cb0f0d2b52 100644
      XFlush( gdi_display );
  
  done:
-@@ -570,6 +932,22 @@ Window x11drv_client_surface_create( HWND hwnd, BOOL raw, int format, struct cli
+@@ -570,6 +945,22 @@ Window x11drv_client_surface_create( HWND hwnd, BOOL raw, int format, struct cli
  
      if (format && !visual_from_pixel_format( format, &visual )) return None;
  
