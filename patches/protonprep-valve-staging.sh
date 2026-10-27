@@ -315,6 +315,7 @@ apply_all_in_dir() {
 
     echo "WINE: -GAME FIXES- add TBH: Task Bar Hero fixes"
     apply_patch "../patches/game-patches/layered-overlay-wine.patch"
+    apply_patch "../patches/game-patches/layered-overlay-direct-present.patch"
 
     # multi-process-launcher-x11-fallback.patch is intentionally disabled.
     # Wine-Wayland now renders cross-process launcher windows directly.

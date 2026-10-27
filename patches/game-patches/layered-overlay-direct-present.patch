@@ -1,0 +1,89 @@
+From: Mihnea Gîrbăcică (Mihnea8848)
+Subject: [PATCH] winex11: let ALPHA-mode layered overlays present directly
+
+With WINE_LAYERED_OVERLAY_ALPHA=1 every WS_EX_LAYERED window renders offscreen
+and each frame is copied to the ARGB window afterwards. The copy runs right
+after vkQueuePresentKHR returns, before the driver's present has landed in the
+offscreen window, so it picks up the new frame on some presents and the old one
+on others: about a third of the frames are shown twice and others never
+(Desktop Mate: 60 frames rendered, about 45 distinct frames on screen).
+
+WINE_LAYERED_OVERLAY_DIRECT=1 skips the forced offscreen rendering, so the
+swapchain presents straight into the ARGB window. The input shape is then
+sampled on present from the toplevel's composite pixmap, which also works for
+windows larger than the root.
+
+diff --git a/dlls/winex11.drv/init.c b/dlls/winex11.drv/init.c
+--- a/dlls/winex11.drv/init.c
++++ b/dlls/winex11.drv/init.c
+@@ -297,6 +297,19 @@
+     return enabled;
+ }
+ 
++/* WINE_LAYERED_OVERLAY_DIRECT=1 lets ALPHA-mode windows present straight into the ARGB
++ * window instead of rendering offscreen and copying every frame */
++static BOOL layered_overlay_direct_enabled(void)
++{
++    static int enabled = -1;
++    if (enabled == -1)
++    {
++        const char *e = getenv( "WINE_LAYERED_OVERLAY_DIRECT" );
++        enabled = e && atoi( e );
++    }
++    return enabled;
++}
++
+ /* minimum ms between ALPHA-mode input-shape samples; 0 samples on every present */
+ static DWORD layered_overlay_shape_interval(void)
+ {
+@@ -331,7 +344,8 @@
+         needs_offscreen = TRUE;
+ 
+     /* Layered overlay (DWM-glass style) painting per-pixel alpha via a 3D client surface. */
+-    if (!needs_offscreen && (layered_overlay_shape_enabled() || layered_overlay_alpha_enabled()) && (ex_style & WS_EX_LAYERED))
++    if (!needs_offscreen && (layered_overlay_shape_enabled() || layered_overlay_alpha_enabled()) && (ex_style & WS_EX_LAYERED) &&
++        !(layered_overlay_alpha_enabled() && layered_overlay_direct_enabled()))
+         needs_offscreen = TRUE;
+ 
+     if (!needs_offscreen && (surface = window_surface_get( hwnd )))
+@@ -704,6 +718,7 @@
+     {
+         Drawable drawable = surface->window;
+         Pixmap pixmap = 0;
++        int src_x = 0, src_y = 0;
+         BOOL got;
+ 
+         X11DRV_expect_error( gdi_display, overlay_xshm_error, NULL );
+@@ -713,8 +728,15 @@
+            redirected pixmap holds the same pixels and has no on-screen check, so read that. */
+         if (usexcomposite && surface->client.offscreen)
+             drawable = pixmap = pXCompositeNameWindowPixmap( gdi_display, surface->window );
++        /* presenting directly: read the toplevel's pixmap (Xwayland redirects toplevels) */
++        else if (usexcomposite && alpha_mode)
++        {
++            drawable = pixmap = pXCompositeNameWindowPixmap( gdi_display, window );
++            src_x = surface->changes.x;
++            src_y = surface->changes.y;
++        }
+ #endif
+-        got = XShmGetImage( gdi_display, drawable, surface->shm_image, 0, 0, AllPlanes );
++        got = XShmGetImage( gdi_display, drawable, surface->shm_image, src_x, src_y, AllPlanes );
+         if (pixmap)
+         {
+             XFreePixmap( gdi_display, pixmap );
+@@ -848,7 +870,14 @@
+     client_surface_update_geometry( hwnd, surface );
+     client_surface_update_offscreen( hwnd, surface );
+ 
+-    if (!hdc) return;
++    if (!hdc)
++    {
++        /* direct present: nothing to copy, but the input shape still follows the pixels */
++        if (layered_overlay_alpha_enabled() && layered_overlay_direct_enabled() &&
++            (NtUserGetWindowLongW( toplevel, GWL_EXSTYLE ) & WS_EX_LAYERED))
++            update_layered_overlay_shape( surface, toplevel );
++        return;
++    }
+ 
+     if (hwnd && (win_surface = window_surface_get( hwnd )))
+     {
