@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Alexandre Derumier <aderumier@gmail.com>
+Date: Thu, 30 Oct 2026 19:10:00 +0100
+Subject: [PATCH] winedmo: Keep the WM reader's flush from freeing a sample
+ being read.
+
+reader_GetNextSample() for a given stream number leaves reader->cs
+before wm_reader_read_stream_sample(), which copies the stream's
+partially consumed packet (current_data) into the output sample. A seek
+(reinit_stream()) or reader_Close() on another thread flushes the
+stream queues meanwhile, and wm_flush_stream_queue() freed current_data
+with no lock: the copy read freed memory and crashed in memcpy (the
+async reader's read thread, wmvcore). EA SPORTS Madden NFL Football
+Season 2's (Global VR) cabinet frontend crashed at the end of almost
+every attract movie.
+
+Serialize the consumer's read with the flush of current_data with a
+per-stream lock. Both flush callers set queue_flushing first, so a
+consumer waiting for a packet with the lock held returns.
+---
+diff --git a/dlls/winedmo/wm_reader.c b/dlls/winedmo/wm_reader.c
+--- a/dlls/winedmo/wm_reader.c
++++ b/dlls/winedmo/wm_reader.c
+@@ -59,7 +59,9 @@
+     bool queue_eos;
+     bool queue_flushing;
+ 
+-    /* Partial packet consumption (for audio chunking) */
++    /* Partial packet consumption (for audio chunking), protected by read_cs:
++     * a consumer copies from current_data without holding reader->cs. */
++    CRITICAL_SECTION read_cs;
+     BYTE *current_data;
+     UINT32 current_size;
+     UINT32 current_offset;
+@@ -1015,9 +1017,13 @@
+     LeaveCriticalSection(&stream->queue_cs);
+     WakeAllConditionVariable(&stream->queue_cv);
+ 
++    /* A consumer may be copying from current_data: queue_flushing is set by
++     * the callers, a consumer waiting for a packet returns without it. */
++    EnterCriticalSection(&stream->read_cs);
+     free(stream->current_data);
+     stream->current_data = NULL;
+     stream->current_size = stream->current_offset = 0;
++    LeaveCriticalSection(&stream->read_cs);
+ }
+ 
+ static BOOL wm_stream_wait_queue_space(struct wm_reader *reader, struct wm_stream *stream)
+@@ -2311,6 +2317,7 @@
+         stream->index = i;
+         list_init(&stream->packet_queue);
+         InitializeCriticalSection(&stream->queue_cs);
++        InitializeCriticalSection(&stream->read_cs);
+         InitializeConditionVariable(&stream->queue_cv);
+         InitializeCriticalSection(&stream->decoder_cs);
+         wm_stream_reset_decoded_timing(stream);
+@@ -2356,6 +2363,7 @@
+             free(reader->streams[i].compressed_fmt);
+             DeleteCriticalSection(&reader->streams[i].decoder_cs);
+             DeleteCriticalSection(&reader->streams[i].queue_cs);
++            DeleteCriticalSection(&reader->streams[i].read_cs);
+         }
+         free(reader->streams);
+         reader->streams = NULL;
+@@ -2469,7 +2477,7 @@
+     return S_OK;
+ }
+ 
+-static HRESULT wm_reader_read_stream_sample(struct wm_reader *reader, struct wm_stream *stream,
++static HRESULT wm_reader_read_stream_sample_locked(struct wm_reader *reader, struct wm_stream *stream,
+         INSSBuffer **sample, QWORD *pts, QWORD *duration, DWORD *flags)
+ {
+     BYTE *raw_data = NULL;
+@@ -2544,6 +2552,17 @@
+     return S_OK;
+ }
+ 
++static HRESULT wm_reader_read_stream_sample(struct wm_reader *reader, struct wm_stream *stream,
++        INSSBuffer **sample, QWORD *pts, QWORD *duration, DWORD *flags)
++{
++    HRESULT hr;
++
++    EnterCriticalSection(&stream->read_cs);
++    hr = wm_reader_read_stream_sample_locked(reader, stream, sample, pts, duration, flags);
++    LeaveCriticalSection(&stream->read_cs);
++    return hr;
++}
++
+ static BOOL wm_stream_peek_pending_sample(struct wm_stream *stream, INT64 *pts)
+ {
+     BOOL has_sample = FALSE;
+@@ -2768,6 +2787,7 @@
+         wm_flush_stream_queue(stream);
+         DeleteCriticalSection(&stream->decoder_cs);
+         DeleteCriticalSection(&stream->queue_cs);
++        DeleteCriticalSection(&stream->read_cs);
+         free(stream->compressed_fmt);
+         stream->compressed_fmt = NULL;
+         if (stream->output_allocator)
+-- 
+2.51.0
