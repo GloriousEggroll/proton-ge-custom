@@ -984,6 +984,31 @@ static Bool match_overlay_event(Display *display, XEvent *event, XPointer arg)
            event->xany.serial == match->serial && event->type == match->type;
 }
 
+static Bool match_no_overlay_event(Display *display, XEvent *event,
+                                   XPointer arg)
+{
+    (void)display;
+    (void)event;
+    (void)arg;
+    return False;
+}
+
+/* An X11 game polls Xlib continuously, so Steam's interposed XCheckIfEvent
+ * runs hundreds of times per second and services the overlay from there. The
+ * Wayland path only calls it when forwarding input, so poll it once per
+ * presented frame while the overlay is open. The predicate never matches. */
+void ge_overlay_bridge_pump(void)
+{
+    XEvent returned;
+
+    pthread_mutex_lock(&overlay_mutex);
+    if (overlay_active && overlay_initialized > 0 && overlay_display &&
+        overlay_check_if_event)
+        overlay_check_if_event(overlay_display, &returned,
+                               match_no_overlay_event, NULL);
+    pthread_mutex_unlock(&overlay_mutex);
+}
+
 static uint32_t cursor_shape_from_glyph(unsigned int glyph)
 {
     switch (glyph)
