@@ -50,6 +50,10 @@ struct ge_overlay_wayland_surface
     uint32_t fractional_scale_manager_name;
     uint32_t pointer_serial;
     int relative_motion_seen;
+    int relative_pending;
+    int last_motion_valid;
+    wl_fixed_t last_motion_x;
+    wl_fixed_t last_motion_y;
     int bridge_registered;
     int keyboard_focus;
     int pointer_focus;
@@ -63,6 +67,7 @@ struct ge_overlay_wayland_surface
     unsigned int refs;
     uint8_t keys[256];
     struct ge_steam_overlay_pointer_frame frame;
+    struct ge_steam_overlay_pointer_frame relative_frame;
 };
 
 static pthread_mutex_t input_surface_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -315,10 +320,18 @@ void ge_overlay_wayland_set_cursor_position(int32_t x, int32_t y)
         focused_pointer->pointer_x = x;
         focused_pointer->pointer_y = y;
         if (focused_pointer->overlay_cursor_subsurface)
+        {
             wl_subsurface_set_position(
                 focused_pointer->overlay_cursor_subsurface,
                 x - focused_pointer->cursor_hotspot_x,
                 y - focused_pointer->cursor_hotspot_y);
+            /* The protocol applies the position on the parent's next commit,
+             * but Smithay compositors (niri, COSMIC) latch it with the
+             * subsurface's own commit. Committing the unchanged cursor
+             * surface works for both. */
+            wl_surface_commit(focused_pointer->overlay_cursor_surface);
+            wl_display_flush(focused_pointer->display);
+        }
     }
     pthread_mutex_unlock(&focused_pointer_mutex);
 }
@@ -582,6 +595,11 @@ static void pointer_enter(void *data, struct wl_pointer *pointer,
     surface->pointer_x = wl_fixed_to_int(x);
     surface->pointer_y = wl_fixed_to_int(y);
     surface->relative_motion_seen = 0;
+    surface->last_motion_x = x;
+    surface->last_motion_y = y;
+    surface->last_motion_valid = 1;
+    surface->relative_pending = 0;
+    memset(&surface->relative_frame, 0, sizeof(surface->relative_frame));
     surface->frame.time = 0;
     surface->frame.x = surface->pointer_x;
     surface->frame.y = surface->pointer_y;
@@ -618,6 +636,9 @@ static void pointer_leave(void *data, struct wl_pointer *pointer,
     surface->pointer_focus = 0;
     surface->pointer_serial = 0;
     surface->relative_motion_seen = 0;
+    surface->last_motion_valid = 0;
+    surface->relative_pending = 0;
+    memset(&surface->relative_frame, 0, sizeof(surface->relative_frame));
     memset(&surface->frame, 0, sizeof(surface->frame));
     update_bridge_focus(surface);
     overlay_trace("Wayland toplevel lost pointer focus");
@@ -630,7 +651,17 @@ static void pointer_motion(void *data, struct wl_pointer *pointer,
 
     (void)pointer;
     if (!surface->pointer_focus) return;
-    if (surface->relative_motion_seen) return;
+    /* Compositors such as niri send wl_pointer.motion and relative motion
+     * together for every move while the pointer is unconstrained. Absolute
+     * coordinates are exact there, so prefer them whenever they change. Only
+     * stationary motion events, as sent while Wine has locked the pointer,
+     * defer to the relative deltas buffered for this frame. */
+    if (surface->last_motion_valid &&
+        x == surface->last_motion_x && y == surface->last_motion_y)
+        return;
+    surface->last_motion_x = x;
+    surface->last_motion_y = y;
+    surface->last_motion_valid = 1;
     surface->pointer_x = wl_fixed_to_int(x);
     surface->pointer_y = wl_fixed_to_int(y);
     surface->frame.time = time;
@@ -681,6 +712,15 @@ static void pointer_frame(void *data, struct wl_pointer *pointer)
 
     (void)pointer;
     if (!surface->pointer_focus) return;
+    if (surface->relative_pending)
+    {
+        /* Relative deltas only drive the cursor when this frame carried no
+         * real absolute movement, i.e. while the game pointer is locked. */
+        if (!(surface->frame.flags & GE_STEAM_OVERLAY_FRAME_ABSOLUTE))
+            ge_overlay_bridge_filter_pointer_frame(&surface->relative_frame);
+        surface->relative_pending = 0;
+        memset(&surface->relative_frame, 0, sizeof(surface->relative_frame));
+    }
     ge_overlay_bridge_filter_pointer_frame(&surface->frame);
     memset(&surface->frame, 0, sizeof(surface->frame));
 }
@@ -740,7 +780,6 @@ static void relative_pointer_motion(
     wl_fixed_t dx_unaccel, wl_fixed_t dy_unaccel)
 {
     struct ge_overlay_wayland_surface *surface = data;
-    struct ge_steam_overlay_pointer_frame frame = {0};
     uint64_t usec = ((uint64_t)utime_hi << 32) | utime_lo;
 
     (void)relative_pointer;
@@ -749,26 +788,23 @@ static void relative_pointer_motion(
 
     if (!surface->pointer_focus) return;
 
-    frame.time = (uint32_t)(usec / 1000);
-
     /* Relative-pointer events continue while Wine has constrained the game
-     * pointer. Once they begin, use them for the remainder of this pointer
-     * focus. Some compositors also emit a stationary wl_pointer.motion event;
-     * using a time gate for that event can otherwise suppress every real
-     * relative delta and leave Steam's visible cursor frozen in place. */
+     * pointer. Buffer them until wl_pointer.frame: pointer_frame() only uses
+     * them when the same frame carried no real absolute movement, so an
+     * unconstrained pointer keeps its exact surface position. */
     if (!surface->relative_motion_seen)
     {
         surface->relative_motion_seen = 1;
-        surface->frame.flags &= ~GE_STEAM_OVERLAY_FRAME_ABSOLUTE;
         overlay_trace("relative-pointer motion is active");
     }
 
-    frame.dx = wl_fixed_to_double(dx);
-    frame.dy = wl_fixed_to_double(dy);
-    frame.scale_x = surface->pointer_scale;
-    frame.scale_y = surface->pointer_scale;
-    frame.flags = GE_STEAM_OVERLAY_FRAME_RELATIVE;
-    ge_overlay_bridge_filter_pointer_frame(&frame);
+    surface->relative_frame.time = (uint32_t)(usec / 1000);
+    surface->relative_frame.dx += wl_fixed_to_double(dx);
+    surface->relative_frame.dy += wl_fixed_to_double(dy);
+    surface->relative_frame.scale_x = surface->pointer_scale;
+    surface->relative_frame.scale_y = surface->pointer_scale;
+    surface->relative_frame.flags = GE_STEAM_OVERLAY_FRAME_RELATIVE;
+    surface->relative_pending = 1;
 }
 
 static const struct zwp_relative_pointer_v1_listener relative_pointer_listener =
