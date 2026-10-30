@@ -1102,6 +1102,7 @@ void ge_overlay_wayland_surface_dispatch(struct ge_overlay_wayland_surface *surf
     if (!surface || !surface->display || !surface->queue) return;
     if (wl_display_dispatch_queue_pending(surface->display, surface->queue) < 0)
         overlay_trace("failed to dispatch private Wayland input queue");
+    ge_overlay_bridge_pump();
 }
 
 void ge_overlay_wayland_surface_destroy(struct ge_overlay_wayland_surface *surface)

@@ -87,6 +87,7 @@ void ge_overlay_bridge_enable_opengl_presenter(int32_t x, int32_t y,
 void ge_overlay_bridge_present_opengl(int32_t x, int32_t y,
                                       uint32_t width, uint32_t height);
 void ge_overlay_bridge_focus(int focused);
+void ge_overlay_bridge_pump(void);
 int ge_overlay_bridge_filter_key(uint32_t time, uint32_t key, int pressed,
                                  uint32_t utf32);
 int ge_overlay_bridge_filter_pointer_button(uint32_t time, uint32_t button,
