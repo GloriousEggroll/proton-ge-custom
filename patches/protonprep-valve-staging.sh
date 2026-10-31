@@ -587,6 +587,11 @@ apply_all_in_dir() {
     echo "WINE: -HOTFIX- ntdll: skip needless wake in RtlReleaseSRWLockShared (ValveSoftware/wine#367)"
     apply_patch "../patches/wine-hotfixes/pending/ntdll-srwlock-skip-needless-shared-release-wake.patch"
 
+    # https://bugs.winehq.org/show_bug.cgi?id=60589
+    # https://gitlab.winehq.org/wine/wine/-/merge_requests/12472
+    echo "WINE: -HOTFIX- ntdll: reuse free blocks of partially used LFH groups (EVE Online heap growth)"
+    apply_patch "../patches/wine-hotfixes/pending/ntdll-heap-reuse-free-blocks-of-partially-used-lfh-groups.patch"
+
     # https://github.com/ValveSoftware/Proton/issues/8072
     echo "WINE: -GAME FIXES- ntdll: don't leave a stale alert after a raced RtlWaitOnAddress() timeout (Space Marine 2 mid-mission crash)"
     apply_patch "../patches/wine-hotfixes/pending/ntdll-take-in-flight-alert-when-wait-on-address-times-out.patch"
