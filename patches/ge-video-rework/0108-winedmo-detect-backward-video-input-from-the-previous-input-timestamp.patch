@@ -1,0 +1,111 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Alexandre Derumier <aderumier@gmail.com>
+Date: Sun, 1 Nov 2026 10:30:00 +0100
+Subject: [PATCH] winedmo: Detect backward video input from the previous input
+ timestamp.
+
+The video decoder flushes its transform when an input timestamp is more
+than 0.2 s before decoder->sample_time, taken as a seek back. But
+sample_time is the last output's pts plus its duration, and for WMV the
+unix side makes a frame last as long as the largest input delta seen
+(up to 2 s): after a gap in a stream's timestamps (frames the encoder
+dropped on a still picture), every following frame lasts that long, the
+next input on time looks 1.5 s back and the decoder is flushed. The
+next P-frame then decodes against no reference, gray blocks until the
+next key frame.
+
+The attract movies of PGA TOUR Golf Championship Edition III (Global
+VR, WMV3 played through quartz's DMO wrapper) were corrupted after each
+such gap, from a fade until the next key frame.
+
+Compare with the previous input timestamp instead, in the DMO and MFT
+paths.
+---
+diff --git a/dlls/winedmo/video_decoder.c b/dlls/winedmo/video_decoder.c
+--- a/dlls/winedmo/video_decoder.c
++++ b/dlls/winedmo/video_decoder.c
+@@ -123,6 +123,8 @@
+     const GUID *const *default_output_types;
+ 
+     UINT64 sample_time;
++    /* the last input timestamp, INT64_MIN when none */
++    LONGLONG last_input_time;
+     IMFMediaType *input_type;
+     MFT_INPUT_STREAM_INFO input_info;
+     IMFMediaType *output_type;
+@@ -1160,12 +1162,14 @@
+     case MFT_MESSAGE_COMMAND_FLUSH:
+         if (!decoder->winedmo_transform.handle) return MF_E_TRANSFORM_TYPE_NOT_SET;
+         decoder->sample_time = -1;
++        decoder->last_input_time = INT64_MIN;
+         decoder->last_output_pts = INT64_MIN;
+         decoder->observed_output_duration = 0;
+         return winedmo_transform_flush(decoder->winedmo_transform) ? E_FAIL : S_OK;
+ 
+     case MFT_MESSAGE_NOTIFY_START_OF_STREAM:
+         decoder->sample_time = -1;
++        decoder->last_input_time = INT64_MIN;
+         decoder->last_output_pts = INT64_MIN;
+         decoder->observed_output_duration = 0;
+         return S_OK;
+@@ -1218,15 +1222,19 @@
+     if (SUCCEEDED(IMFSample_GetUINT32(sample, &MFSampleExtension_Discontinuity, &value)) && value)
+         push_flags |= WINEDMO_SAMPLE_FLAG_DISCONTINUITY;
+ 
+-    if (time != INT64_MIN && decoder->sample_time != -1 && time + 2000000 < decoder->sample_time)
++    /* Compared with the previous input: the output time (pts + duration) runs ahead after a gap
++     * in the stream's timestamps (a WMV frame lasting up to the largest input delta seen). */
++    if (time != INT64_MIN && decoder->last_input_time != INT64_MIN && time + 2000000 < decoder->last_input_time)
+     {
+         TRACE("Resetting decoder timeline on backward input timestamp %s -> %s.\n",
+-                wine_dbgstr_longlong(decoder->sample_time), wine_dbgstr_longlong(time));
++                wine_dbgstr_longlong(decoder->last_input_time), wine_dbgstr_longlong(time));
+         decoder->sample_time = -1;
+         winedmo_transform_flush(decoder->winedmo_transform);
+         push_flags |= WINEDMO_SAMPLE_FLAG_DISCONTINUITY;
+     }
+ 
++    if (time != INT64_MIN)
++        decoder->last_input_time = time;
+     status = winedmo_transform_push_input(decoder->winedmo_transform, data, size, time, dts, duration, push_flags);
+     IMFMediaBuffer_Unlock(buffer);
+     IMFMediaBuffer_Release(buffer);
+@@ -2065,6 +2073,7 @@
+         return DMO_E_TYPE_NOT_SET;
+ 
+     decoder->sample_time = -1;
++    decoder->last_input_time = INT64_MIN;
+     if (winedmo_transform_flush(decoder->winedmo_transform))
+         return E_FAIL;
+ 
+@@ -2129,15 +2138,17 @@
+     if (flags & DMO_INPUT_DATA_BUFFERF_SYNCPOINT) push_flags |= WINEDMO_SAMPLE_FLAG_SYNC_POINT;
+     if (flags & DMO_INPUT_DATA_BUFFERF_DISCONTINUITY) push_flags |= WINEDMO_SAMPLE_FLAG_DISCONTINUITY;
+ 
+-    if ((flags & DMO_INPUT_DATA_BUFFERF_TIME) && decoder->sample_time != -1
+-            && timestamp + 2000000 < decoder->sample_time)
++    if ((flags & DMO_INPUT_DATA_BUFFERF_TIME) && decoder->last_input_time != INT64_MIN
++            && timestamp + 2000000 < decoder->last_input_time)
+     {
+         TRACE("Resetting decoder timeline on backward DMO input timestamp %s -> %s.\n",
+-                wine_dbgstr_longlong(decoder->sample_time), wine_dbgstr_longlong(timestamp));
++                wine_dbgstr_longlong(decoder->last_input_time), wine_dbgstr_longlong(timestamp));
+         decoder->sample_time = -1;
+         winedmo_transform_flush(decoder->winedmo_transform);
+         push_flags |= WINEDMO_SAMPLE_FLAG_DISCONTINUITY;
+     }
++    if (flags & DMO_INPUT_DATA_BUFFERF_TIME)
++        decoder->last_input_time = timestamp;
+ 
+     status = winedmo_transform_push_input(decoder->winedmo_transform, data, size,
+             (flags & DMO_INPUT_DATA_BUFFERF_TIME) ? timestamp : INT64_MIN,
+@@ -2371,6 +2382,7 @@
+     decoder->default_output_type_count = output_type_count;
+     decoder->default_output_types = output_types;
+     decoder->last_output_pts = INT64_MIN;
++    decoder->last_input_time = INT64_MIN;
+ 
+     if (FAILED(hr = MFCreateMediaType(&decoder->stream_type)))
+         goto failed;
+-- 
+2.51.0
