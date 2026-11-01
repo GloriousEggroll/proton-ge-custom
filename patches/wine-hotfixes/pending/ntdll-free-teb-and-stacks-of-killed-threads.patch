@@ -1,0 +1,119 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jason Eggleston <eggnet@gmail.com>
+Date: Sun, 1 Nov 2026 14:57:35 -0800
+Subject: [PATCH] ntdll: Free the TEB and stacks of a thread killed by another
+ thread.
+
+A thread killed with TerminateThread() leaves through abort_thread(),
+which never frees its TEB, its stack or its kernel stack: only
+exit_thread() hands a thread's TEB on to the next exiting thread to
+free. So every killed thread kept about 2 MiB mapped for good, and its
+TEB stayed in the TEB list. Windows frees the initial stack of a
+terminated thread.
+
+A killed thread cannot free its own stacks, and abort_thread() may run
+with a lock held, when the server connection breaks in the middle of a
+request. So abort_thread() only queues the TEB, and the next thread
+that is created or exits joins the killed thread and frees its TEB and
+stacks.
+
+Helldivers 2's anti-tamper code creates two suspended threads and kills
+them every 0.4 seconds, which kept about 34 GiB of stacks mapped and
+about 360 MiB of memory resident per hour.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/ntdll/unix/thread.c       | 37 ++++++++++++++++++++++++++++++++++
+ dlls/ntdll/unix/unix_private.h |  1 +
+ 2 files changed, 38 insertions(+)
+
+diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
+index 8e5070998de..e06e0b24701 100644
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -85,6 +85,7 @@ WINE_DECLARE_DEBUG_CHANNEL(threadname);
+ pthread_key_t teb_key = 0;
+ 
+ static LONG nb_threads = 1;
++static TEB *killed_threads;  /* killed threads whose TEB and stacks are still to be freed */
+ 
+ static inline int get_unix_exit_code( NTSTATUS status )
+ {
+@@ -1146,6 +1147,27 @@ static void start_thread( TEB *teb )
+ }
+ 
+ 
++/***********************************************************************
++ *           free_killed_threads
++ *
++ * Free the TEB and stacks of the threads that abort_thread() queued.
++ */
++static void free_killed_threads(void)
++{
++    TEB *teb = InterlockedExchangePointer( (void **)&killed_threads, NULL );
++
++    while (teb)
++    {
++        struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
++        TEB *next = thread_data->next_killed;
++
++        pthread_join( thread_data->pthread_id, NULL );
++        virtual_free_teb( teb );
++        teb = next;
++    }
++}
++
++
+ /***********************************************************************
+  *           get_machine_context_size
+  */
+@@ -1432,6 +1454,8 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
+ 
+     pthread_sigmask( SIG_BLOCK, &server_block_set, &sigset );
+ 
++    free_killed_threads();
++
+     if ((status = virtual_alloc_teb( &teb ))) goto done;
+ 
+     if ((status = init_thread_stack( teb, get_zero_bits_limit( zero_bits ), stack_reserve, stack_commit )))
+@@ -1611,8 +1635,19 @@ done:
+  */
+ void abort_thread( int status )
+ {
++    struct ntdll_thread_data *thread_data = ntdll_get_thread_data();
++
+     pthread_sigmask( SIG_BLOCK, &server_block_set, NULL );
+     if (InterlockedDecrement( &nb_threads ) <= 0) abort_process( status );
++
++    /* A killed thread cannot free its own stacks, and it may hold a lock here: leave them
++     * to the next thread that is created or exits. */
++    if (thread_data->pthread_id)
++    {
++        do thread_data->next_killed = killed_threads;
++        while (InterlockedCompareExchangePointer( (void **)&killed_threads, NtCurrentTeb(),
++                                                  thread_data->next_killed ) != thread_data->next_killed);
++    }
+     pthread_exit_wrapper( status );
+ }
+ 
+@@ -1642,6 +1677,8 @@ static DECLSPEC_NORETURN void exit_thread( int status )
+ 
+     if (InterlockedDecrement( &nb_threads ) <= 0) exit_process( status );
+ 
++    free_killed_threads();
++
+     if ((teb = InterlockedExchangePointer( &prev_teb, NtCurrentTeb() )))
+     {
+         struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index 6ef9efa90a4..ef4db3945d8 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -118,6 +118,7 @@ struct ntdll_thread_data
+     void                     *jmp_buf;       /* setjmp buffer for exception handling */
+     BOOL                      system_thread; /* thread runs only on the Unix side */
+     int                      *fsync_apc_futex;
++    TEB                      *next_killed;   /* next in the list of killed threads to free */
+ };
+ 
+ C_ASSERT( sizeof(struct ntdll_thread_data) <= sizeof(((TEB *)0)->GdiTebBatch) );
