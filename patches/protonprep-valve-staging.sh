@@ -655,6 +655,11 @@ apply_all_in_dir() {
     echo "WINE: -HOTFIX- Add Bluetooth LE GATT and WinRT BLE support"
     apply_all_in_dir "../patches/wine-hotfixes/bluetooth-le/"
 
+    # https://github.com/jegglest/proton-je/blob/je-11.0/docs-je/killed-thread-stacks.md
+    echo "WINE: -PENDING- ntdll: free the TEB and stacks of a thread killed by another thread (Helldivers 2 memory growth)"
+    apply_patch "../patches/wine-hotfixes/pending/ntdll-free-teb-and-stacks-of-killed-threads.patch"
+    apply_patch "../patches/wine-hotfixes/pending/kernel32-tests-killed-thread-stack-freed.patch"
+
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
     ./tools/make_requests

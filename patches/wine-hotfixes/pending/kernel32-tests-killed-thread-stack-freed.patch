@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jason Eggleston <eggnet@gmail.com>
+Date: Sun, 1 Nov 2026 14:57:35 -0800
+Subject: [PATCH] kernel32/tests: Test that the stack of a killed thread is
+ freed.
+
+A thread killed with TerminateThread(), while it waits or before it
+ever ran, must not leave its stack allocated.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/kernel32/tests/thread.c | 100 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 100 insertions(+)
+
+diff --git a/dlls/kernel32/tests/thread.c b/dlls/kernel32/tests/thread.c
+index 4fb49c93673..51683aba18f 100644
+--- a/dlls/kernel32/tests/thread.c
++++ b/dlls/kernel32/tests/thread.c
+@@ -648,6 +648,105 @@ static VOID test_TerminateThread(void)
+   ok(CloseHandle(thread)!=0,"Error Closing thread handle\n");
+ }
+ 
++static DWORD WINAPI thread_wait_forever( void *event )
++{
++    SetEvent( event );
++    for (;;) Sleep( INFINITE );
++    return 0;
++}
++
++static DWORD WINAPI thread_return( void *arg )
++{
++    return 0;
++}
++
++static void *get_thread_stack( HANDLE thread )
++{
++    THREAD_BASIC_INFORMATION info;
++    NTSTATUS status;
++    unsigned int i;
++
++    /* Wine knows the TEB of a new thread only once the thread has started up */
++    for (i = 0; i < 1000; i++)
++    {
++        status = pNtQueryInformationThread( thread, ThreadBasicInformation, &info, sizeof(info), NULL );
++        ok( !status, "NtQueryInformationThread failed, status %#lx.\n", status );
++        if (status) return NULL;
++        if (info.TebBaseAddress) return ((TEB *)info.TebBaseAddress)->DeallocationStack;
++        Sleep( 1 );
++    }
++    ok( 0, "got no TEB.\n" );
++    return NULL;
++}
++
++/* Windows frees the stack of a killed thread by the time the thread is signaled, Wine when
++ * another thread starts or exits: run threads until the stack is gone, or in use again. */
++static BOOL is_stack_freed( void *stack )
++{
++    MEMORY_BASIC_INFORMATION mbi;
++    HANDLE thread;
++    void *other;
++    unsigned int i;
++
++    for (i = 0; i < 50; i++)
++    {
++        if (!VirtualQuery( stack, &mbi, sizeof(mbi) )) return FALSE;
++        if (mbi.State == MEM_FREE || mbi.AllocationBase != stack) return TRUE;
++        thread = CreateThread( NULL, 0, thread_return, NULL, CREATE_SUSPENDED, NULL );
++        other = get_thread_stack( thread );
++        ResumeThread( thread );
++        WaitForSingleObject( thread, INFINITE );
++        CloseHandle( thread );
++        if (other == stack) return TRUE;
++        Sleep( 10 );
++    }
++    return FALSE;
++}
++
++static void test_TerminateThread_stack(void)
++{
++    HANDLE thread, event;
++    void *stack;
++    BOOL freed;
++    DWORD ret;
++
++    if (!pNtQueryInformationThread)
++    {
++        win_skip( "NtQueryInformationThread is not available.\n" );
++        return;
++    }
++
++    event = CreateEventW( NULL, FALSE, FALSE, NULL );
++    thread = CreateThread( NULL, 0, thread_wait_forever, event, 0, NULL );
++    ok( !!thread, "CreateThread failed, error %lu.\n", GetLastError() );
++    ret = WaitForSingleObject( event, 5000 );
++    ok( !ret, "thread did not start, ret %#lx.\n", ret );
++    stack = get_thread_stack( thread );
++    ok( !!stack, "got no stack.\n" );
++    ret = TerminateThread( thread, 1 );
++    ok( ret, "TerminateThread failed, error %lu.\n", GetLastError() );
++    ret = WaitForSingleObject( thread, 5000 );
++    ok( !ret, "thread did not end, ret %#lx.\n", ret );
++    CloseHandle( thread );
++    freed = stack && is_stack_freed( stack );
++    ok( freed, "stack %p of a thread killed while waiting was not freed.\n", stack );
++
++    /* killed before it ever ran */
++    thread = CreateThread( NULL, 0, thread_return, NULL, CREATE_SUSPENDED, NULL );
++    ok( !!thread, "CreateThread failed, error %lu.\n", GetLastError() );
++    stack = get_thread_stack( thread );
++    ok( !!stack, "got no stack.\n" );
++    ret = TerminateThread( thread, 1 );
++    ok( ret, "TerminateThread failed, error %lu.\n", GetLastError() );
++    ret = WaitForSingleObject( thread, 5000 );
++    ok( !ret, "thread did not end, ret %#lx.\n", ret );
++    CloseHandle( thread );
++    freed = stack && is_stack_freed( stack );
++    ok( freed, "stack %p of a thread killed before it ran was not freed.\n", stack );
++
++    CloseHandle( event );
++}
++
+ /* Check if CreateThread obeys the specified stack size.  This code does
+    not work properly, and is currently disabled
+ */
+@@ -2915,6 +3014,7 @@ START_TEST(thread)
+    test_CreateThread_suspended();
+    test_SuspendThread();
+    test_TerminateThread();
++   test_TerminateThread_stack();
+    test_CreateThread_stack();
+    test_thread_priority();
+    test_GetCurrentThreadStackLimits();
