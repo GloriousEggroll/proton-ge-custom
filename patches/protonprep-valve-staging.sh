@@ -636,6 +636,13 @@ apply_all_in_dir() {
     echo "WINE: -HOTFIX- win32u: defer destroying NVIDIA Wayland host Vulkan instances while another is alive (NVIDIA driver clears its global libwayland table, EA app crash on winewayland)"
     apply_patch "../patches/wine-hotfixes/pending/win32u-defer-nvidia-wayland-host-instance-destroy.patch"
 
+    # https://bugs.winehq.org/show_bug.cgi?id=60417
+    # https://bugs.winehq.org/show_bug.cgi?id=60524
+    echo "WINE: -PENDING- server: abandon an ntsync mutex whose handle was closed while it was owned or in use"
+    apply_patch "../patches/wine-hotfixes/pending/server-keep-owned-ntsync-mutex-until-owner-releases-or-dies.patch"
+    apply_patch "../patches/wine-hotfixes/pending/server-keep-in-process-mutex-closed-while-in-use.patch"
+    apply_patch "../patches/wine-hotfixes/pending/kernel32-tests-abandon-mutex-acquired-after-close.patch"
+
     # Bluetooth LE GATT and WinRT BLE (Zwift, Rouvy trainers). winebth.sys stays disabled
     # unless PROTON_ENABLE_WINEBTH=1. https://github.com/GloriousEggroll/proton-ge-custom/issues/814
     # https://github.com/evanjt/wine
