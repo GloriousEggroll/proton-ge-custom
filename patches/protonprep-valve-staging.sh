@@ -588,8 +588,10 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/ntdll-srwlock-skip-needless-shared-release-wake.patch"
 
     # https://github.com/ValveSoftware/Proton/issues/8072
+    # https://bugs.winehq.org/show_bug.cgi?id=60523
     echo "WINE: -GAME FIXES- ntdll: don't leave a stale alert after a raced RtlWaitOnAddress() timeout (Space Marine 2 mid-mission crash)"
     apply_patch "../patches/wine-hotfixes/pending/ntdll-take-in-flight-alert-when-wait-on-address-times-out.patch"
+    apply_patch "../patches/wine-hotfixes/pending/ntdll-tests-wait-on-address-wake-racing-timeout.patch"
 
     # https://github.com/GloriousEggroll/proton-ge-custom/issues/870
     echo "WINE: -GAME FIXES- ntdll: run NCSOFT PURPLE's VMProtect-packed purple-agent.exe in new WoW64 mode (Initialization Error 1)"
