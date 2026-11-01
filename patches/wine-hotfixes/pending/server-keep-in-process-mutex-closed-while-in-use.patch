@@ -1,0 +1,334 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jason Eggleston <eggnet@gmail.com>
+Date: Wed, 30 Sep 2026 16:12:23 -0700
+Subject: [PATCH] server: Keep an in-process mutex a client closed while still
+ using it.
+
+A thread can be waiting on a mutex whose last handle its process has
+closed: the wait holds a duplicate of the ntsync fd, and it can still
+acquire the mutex later, for instance in a wait-all whose other objects
+are signaled afterwards. The server only sends NTSYNC_IOC_MUTEX_KILL to
+the mutexes it still has objects for, so if that thread then dies the
+mutex is never abandoned and other waiters block forever. The previous
+commit covers mutexes that are owned when their object is destroyed,
+not those acquired afterwards.
+
+The cache entry of an in-process sync counts its users, so
+close_inproc_sync() can tell when another thread is still using a
+mutex. It then asks the server, with the new keep_inproc_sync request
+sent before the handle is closed, to keep a reference to the in-process
+sync under the entry's serial; the entry's last user drops it with
+release_kept_inproc_sync. A process's records go away with the process.
+The comment above struct inproc_sync already describes the client
+keeping the object until its last user is done; this does so only when
+it matters: closing a handle that nobody else is using, the common
+case, sends no extra request.
+
+The serial makes struct inproc_sync 20 bytes, which no longer divides
+the 64K cache blocks evenly, and anon_mmap_alloc() asserts that its
+size is a multiple of the page size: map whole 64K blocks rather than
+the entries' exact size.
+
+Wine-Bug: https://bugs.winehq.org/show_bug.cgi?id=60524
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/ntdll/unix/sync.c | 54 ++++++++++++++++++++++---
+ server/inproc_sync.c   | 91 ++++++++++++++++++++++++++++++++++++++++++
+ server/object.h        |  1 +
+ server/process.c       |  2 +
+ server/protocol.def    | 16 ++++++++
+ 5 files changed, 159 insertions(+), 5 deletions(-)
+
+diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+index f8d0a95611a..d4edbfd7ada 100644
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -542,9 +542,14 @@ struct inproc_sync
+     unsigned int   access;    /* handle access rights */
+     unsigned short type;      /* enum inproc_sync_type as short to save space */
+     unsigned short closed;    /* fd has been closed but sync is still referenced */
++    unsigned int   serial;    /* id of this cache entry for keep_inproc_sync, 0 if none */
+ };
+ 
+-#define INPROC_SYNC_CACHE_BLOCK_SIZE  (65536 / sizeof(struct inproc_sync))
++static LONG next_inproc_sync_serial;
++
++/* a cache block is 64K, a multiple of any host page size; the entries need not fill it */
++#define INPROC_SYNC_CACHE_BLOCK_BYTES 65536
++#define INPROC_SYNC_CACHE_BLOCK_SIZE  (INPROC_SYNC_CACHE_BLOCK_BYTES / sizeof(struct inproc_sync))
+ #define INPROC_SYNC_CACHE_ENTRIES     128
+ 
+ static struct inproc_sync *inproc_sync_cache[INPROC_SYNC_CACHE_ENTRIES];
+@@ -582,8 +587,8 @@ static struct inproc_sync *cache_inproc_sync( HANDLE handle, struct inproc_sync
+         if (!entry) inproc_sync_cache[0] = inproc_sync_cache_initial_block;
+         else
+         {
+-            static const size_t size = INPROC_SYNC_CACHE_BLOCK_SIZE * sizeof(struct inproc_sync);
+-            void *ptr = anon_mmap_alloc( size, PROT_READ | PROT_WRITE );
++            /* map the whole block: mmap() needs whole pages, and the entries don't fill it exactly */
++            void *ptr = anon_mmap_alloc( INPROC_SYNC_CACHE_BLOCK_BYTES, PROT_READ | PROT_WRITE );
+             if (ptr == MAP_FAILED) return sync;
+             inproc_sync_cache[entry] = ptr;
+         }
+@@ -604,6 +609,7 @@ static struct inproc_sync *cache_inproc_sync( HANDLE handle, struct inproc_sync
+     cache->access = sync->access;
+     cache->type = sync->type;
+     cache->closed = sync->closed;
++    while (!(cache->serial = InterlockedIncrement( &next_inproc_sync_serial ))) ;
+     /* Make sure we set the other members before the refcount; this store needs
+      * release semantics [paired with the load in get_cached_inproc_sync()].
+      * Set the refcount to 2 (one for the handle, one for the caller). */
+@@ -628,15 +634,30 @@ static inline LONG interlocked_inc_if_nonzero( LONG *dest )
+     return val;
+ }
+ 
++static void release_kept_inproc_sync( unsigned int serial )
++{
++    SERVER_START_REQ( release_kept_inproc_sync )
++    {
++        req->serial = serial;
++        wine_server_call( req );
++    }
++    SERVER_END_REQ;
++}
++
+ static void release_inproc_sync( struct inproc_sync *sync )
+ {
+-    /* save the fd now; as soon as the refcount hits 0 we cannot
++    /* save the fd and serial now; as soon as the refcount hits 0 we cannot
+      * access the cache anymore */
+     int fd = sync->fd;
++    unsigned int serial = sync->serial;
+     LONG ref = InterlockedDecrement( &sync->refcount );
+ 
+     assert( ref >= 0 );
+-    if (!ref) close( fd );
++    if (ref) return;
++    close( fd );
++    /* The handle was closed while the object was in use, and close_inproc_sync()
++     * had the server keep the object under this serial: let it go now. */
++    if (serial) release_kept_inproc_sync( serial );
+ }
+ 
+ static struct inproc_sync *get_cached_inproc_sync( HANDLE handle )
+@@ -682,6 +703,7 @@ static NTSTATUS get_server_inproc_sync( HANDLE handle, struct inproc_sync *sync
+             sync->access = reply->access;
+             sync->type = reply->type;
+             sync->closed = 0;
++            sync->serial = 0;
+         }
+     }
+     SERVER_END_REQ;
+@@ -760,6 +782,20 @@ extern NTSTATUS check_signal_access( struct inproc_sync *sync )
+     return STATUS_OBJECT_TYPE_MISMATCH;
+ }
+ 
++static NTSTATUS keep_inproc_sync( HANDLE handle, unsigned int serial )
++{
++    NTSTATUS ret;
++
++    SERVER_START_REQ( keep_inproc_sync )
++    {
++        req->handle = wine_server_obj_handle( handle );
++        req->serial = serial;
++        ret = wine_server_call( req );
++    }
++    SERVER_END_REQ;
++    return ret;
++}
++
+ /* caller must hold fd_cache_mutex */
+ void close_inproc_sync( HANDLE handle )
+ {
+@@ -774,6 +810,14 @@ void close_inproc_sync( HANDLE handle )
+     if ((cache = get_cached_inproc_sync( handle )))
+     {
+         cache->closed = 1;
++        /* One reference is the handle's and one is ours; any other belongs to a
++         * thread in the middle of an operation, typically a wait, which can still
++         * acquire a mutex through the fd. The server must then still know the
++         * mutex to abandon it if that thread dies, so have it keep the mutex under
++         * this entry's serial until the last user releases the entry. */
++        if (cache->type != INPROC_SYNC_MUTEX || InterlockedCompareExchange( &cache->refcount, 0, 0 ) <= 2
++            || keep_inproc_sync( handle, cache->serial ))
++            cache->serial = 0;
+         /* once for the reference we just grabbed, and once for the handle */
+         release_inproc_sync( cache );
+         release_inproc_sync( cache );
+diff --git a/server/inproc_sync.c b/server/inproc_sync.c
+index 7199915ac76..f3fe5a37d59 100644
+--- a/server/inproc_sync.c
++++ b/server/inproc_sync.c
+@@ -107,6 +107,20 @@ static void prune_orphan_mutexes(void)
+     }
+ }
+ 
++/* Mutexes whose handle a process closed while one of its threads was still using the cached fd (typically a
++ * wait in progress). That thread can still acquire the mutex through the fd, so the server keeps the object,
++ * and with it the mutex's place on inproc_mutexes, until the client reports that the last user is done, or
++ * the process dies. */
++struct kept_sync
++{
++    struct list         entry;
++    struct process     *process;  /* process that closed the handle; the record dies with it */
++    unsigned int        serial;   /* id chosen by the client, unique within the process */
++    struct inproc_sync *sync;     /* the reference this record holds */
++};
++
++static struct list kept_syncs = LIST_INIT( kept_syncs );
++
+ static void inproc_sync_dump( struct object *obj, int verbose );
+ static int inproc_sync_signal( struct object *obj, unsigned int access, int signal );
+ static void inproc_sync_destroy( struct object *obj );
+@@ -328,6 +342,55 @@ void abandon_inproc_mutexes( thread_id_t tid )
+     prune_orphan_mutexes();
+ }
+ 
++static void keep_inproc_mutex( struct process *process, struct object *obj, unsigned int serial )
++{
++    struct object *sync;
++    struct kept_sync *kept;
++
++    if (!(sync = get_obj_sync( obj ))) return;
++    if (sync->ops == &inproc_sync_ops && ((struct inproc_sync *)sync)->type == INPROC_SYNC_MUTEX)
++    {
++        if ((kept = mem_alloc( sizeof(*kept) )))
++        {
++            kept->process = process;
++            kept->serial  = serial;
++            kept->sync    = (struct inproc_sync *)sync;  /* keeps the reference from get_obj_sync() */
++            list_add_tail( &kept_syncs, &kept->entry );
++            return;
++        }
++    }
++    else set_error( STATUS_OBJECT_TYPE_MISMATCH );
++    release_object( sync );
++}
++
++static void release_kept_inproc_mutex( struct process *process, unsigned int serial )
++{
++    struct kept_sync *kept;
++
++    LIST_FOR_EACH_ENTRY( kept, &kept_syncs, struct kept_sync, entry )
++    {
++        if (kept->process != process || kept->serial != serial) continue;
++        list_remove( &kept->entry );
++        release_object( kept->sync );
++        free( kept );
++        return;
++    }
++    set_error( STATUS_INVALID_PARAMETER );
++}
++
++void release_kept_inproc_syncs( struct process *process )
++{
++    struct kept_sync *kept, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE( kept, next, &kept_syncs, struct kept_sync, entry )
++    {
++        if (kept->process != process) continue;
++        list_remove( &kept->entry );
++        release_object( kept->sync );
++        free( kept );
++    }
++}
++
+ static int get_obj_inproc_sync( struct object *obj, int *type )
+ {
+     struct object *sync;
+@@ -389,6 +452,20 @@ void abandon_inproc_mutexes( thread_id_t tid )
+ {
+ }
+ 
++static void keep_inproc_mutex( struct process *process, struct object *obj, unsigned int serial )
++{
++    set_error( STATUS_NOT_IMPLEMENTED );
++}
++
++static void release_kept_inproc_mutex( struct process *process, unsigned int serial )
++{
++    set_error( STATUS_NOT_IMPLEMENTED );
++}
++
++void release_kept_inproc_syncs( struct process *process )
++{
++}
++
+ static int get_obj_inproc_sync( struct object *obj, int *type )
+ {
+     return -1;
+@@ -411,3 +488,17 @@ DECL_HANDLER(get_inproc_sync_fd)
+ 
+     release_object( obj );
+ }
++
++DECL_HANDLER(keep_inproc_sync)
++{
++    struct object *obj;
++
++    if (!(obj = get_handle_obj( current->process, req->handle, 0, NULL ))) return;
++    keep_inproc_mutex( current->process, obj, req->serial );
++    release_object( obj );
++}
++
++DECL_HANDLER(release_kept_inproc_sync)
++{
++    release_kept_inproc_mutex( current->process, req->serial );
++}
+diff --git a/server/object.h b/server/object.h
+index 21f5ea88bd3..90561e393fc 100644
+--- a/server/object.h
++++ b/server/object.h
+@@ -255,6 +255,7 @@ extern struct inproc_sync *create_inproc_event_sync( int manual, int signaled );
+ extern struct inproc_sync *create_inproc_semaphore_sync( unsigned int initial, unsigned int max );
+ extern struct inproc_sync *create_inproc_mutex_sync( thread_id_t owner, unsigned int count );
+ extern void abandon_inproc_mutexes( thread_id_t owner );
++extern void release_kept_inproc_syncs( struct process *process );
+ extern void signal_inproc_sync( struct inproc_sync *sync );
+ extern void reset_inproc_sync( struct inproc_sync *sync );
+ 
+diff --git a/server/process.c b/server/process.c
+index b3992304aaf..7cf792de80a 100644
+--- a/server/process.c
++++ b/server/process.c
+@@ -811,6 +811,7 @@ static void process_destroy( struct object *obj )
+     assert( !process->sigkill_timeout );  /* timeout should hold a reference to the process */
+ 
+     close_process_handles( process );
++    release_kept_inproc_syncs( process );
+     set_process_startup_state( process, STARTUP_ABORTED );
+ 
+     if (process->job)
+@@ -1016,6 +1017,7 @@ static void process_killed( struct process *process )
+     process->desktop = 0;
+     cancel_terminating_process_asyncs( process );
+     close_process_handles( process );
++    release_kept_inproc_syncs( process );
+     if (process->idle_event) release_object( process->idle_event );
+     process->idle_event = NULL;
+     assert( !process->console );
+diff --git a/server/protocol.def b/server/protocol.def
+index 4eb22fb2bb1..ad3a5b836ac 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -4558,3 +4558,19 @@ enum fsync_type
+ @REPLY
+     unsigned int   status;              /* enum hwnd_dmabuf_status */
+ @END
++
++
++/* The next two requests are appended after every other one so that existing request numbers stay the same. */
++
++/* Keep the in-process sync of a mutex whose handle is about to be closed while another thread of the process
++ * is still using it, until release_kept_inproc_sync with the same serial or the death of the process */
++@REQ(keep_inproc_sync)
++    obj_handle_t handle;        /* handle that is about to be closed */
++    unsigned int serial;        /* id chosen by the client, unique within the process */
++@END
++
++
++/* Stop keeping an in-process sync that keep_inproc_sync kept: its last user is done */
++@REQ(release_kept_inproc_sync)
++    unsigned int serial;        /* serial given to keep_inproc_sync */
++@END
