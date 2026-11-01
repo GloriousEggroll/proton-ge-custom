@@ -483,6 +483,11 @@ apply_all_in_dir() {
     echo "WINE: -HOTFIX- Keep builtin AMD AGS ahead of the native-version heuristic"
     apply_patch "../patches/wine-hotfixes/pending/ntdll-keep-builtin-amd-ags-ahead-of-version-heuristic.patch"
 
+    # https://github.com/ValveSoftware/Proton/issues/7486
+    # Valve's Wine d5c4b850198 (Paul Gofman), in Proton Experimental since 20261027b; drop once the wine submodule has it.
+    echo "WINE: -BACKPORT- ntdll: ignore semaphore errors in RtlpUnWaitCriticalSection() (Helldivers 2 crash)"
+    apply_patch "../patches/wine-hotfixes/pending/ntdll-ignore-semaphore-errors-in-rtlpunwaitcriticalsection.patch"
+
 ### END WINE HOTFIX/BACKPORT SECTION ###
 
 ### (2-6) WINE PENDING UPSTREAM SECTION ###
