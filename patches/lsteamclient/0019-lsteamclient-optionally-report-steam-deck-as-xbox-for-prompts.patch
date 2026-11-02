@@ -1,0 +1,402 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] lsteamclient: Optionally report Steam Deck and Steam Controller as
+ Xbox One controllers.
+
+Some games only have prompts for the gamepad types they know. Rune Factory 5
+uses ISteamInput002, asks GetInputTypeForHandle() for the device type and
+shows keyboard prompts on a Steam Deck or with a Steam Controller.
+
+With PROTON_STEAM_INPUT_XBOX_PROMPTS=1, report native Steam Controller and
+Steam Deck handles as k_ESteamInputType_XBoxOneController, and translate
+SteamController/SteamDeck action origins returned by Get*ActionOrigins() to
+Xbox One origins through the interface's own TranslateActionOrigin(), so
+glyph and string lookups return Xbox prompts. Synthetic XInput fallback
+handles keep their existing handling.
+
+Update the wrapper generator and checked-in wrappers together.
+
+https://github.com/GloriousEggroll/proton-ge-custom/issues/841
+---
+--- a/lsteamclient/gen_wrapper.py
++++ b/lsteamclient/gen_wrapper.py
+@@ -1185,6 +1185,11 @@
+         "ISteamController_SteamController007") else "FALSE"
+     session_config_method = None
+     connected_controllers_method = None
++    translate_origin_method = None
++
++    if is_steaminput and method.name in ("GetDigitalActionOrigins", "GetAnalogActionOrigins"):
++        translate_origin_method = next((candidate for candidate in klass.methods
++                if candidate.name == "TranslateActionOrigin"), None)
+ 
+     if (is_steaminput or is_legacy_steaminput) and method.name == "Init":
+         session_config_method = next((candidate for candidate in klass.methods
+@@ -1295,6 +1300,26 @@
+             out(u'    params._ret = steaminput006_xinput_register_digital_action( params._ret, pszActionName );\n')
+         elif is_steaminput and method.name == "GetAnalogActionHandle":
+             out(u'    params._ret = steaminput006_xinput_register_analog_action( params._ret, pszActionName );\n')
++        elif is_steaminput and method.name == "GetInputTypeForHandle":
++            out(u'    params._ret = steaminput_native_input_type( params._ret );\n')
++        elif is_steaminput and method.name in ("GetDigitalActionOrigins", "GetAnalogActionOrigins") and translate_origin_method:
++            out(u'    if (steaminput_report_xbox_identity())\n')
++            out(u'    {\n')
++            out(f'        struct {translate_origin_method.full_name}_params translate_params =\n')
++            out(u'        {\n')
++            out(u'            .u_iface = _this->u_iface,\n')
++            out(u'            .eDestinationInputType = 3, /* k_ESteamInputType_XBoxOneController */\n')
++            out(u'        };\n')
++            out(u'        int32_t i;\n')
++            out(u'\n')
++            out(u'        for (i = 0; i < params._ret; i++)\n')
++            out(u'        {\n')
++            out(u'            if (!steaminput_origin_needs_xbox( originsOut[i] )) continue;\n')
++            out(u'            translate_params.eSourceOrigin = originsOut[i];\n')
++            out(f'            STEAMCLIENT_CALL( {translate_origin_method.full_name}, &translate_params );\n')
++            out(u'            if (translate_params._ret) originsOut[i] = translate_params._ret;\n')
++            out(u'        }\n')
++            out(u'    }\n')
+     if method.name in OUTSTR_PARAMS and OUTSTR_PARAMS[method.name] in names:
+         out(f'    if ({OUTSTR_PARAMS[method.name]}) *{OUTSTR_PARAMS[method.name]} = get_unix_buffer( params._str );\n')
+ 
+--- a/lsteamclient/winISteamInput.c
++++ b/lsteamclient/winISteamInput.c
+@@ -223,6 +223,23 @@
+     };
+     TRACE("%p\n", _this);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput001_GetDigitalActionOrigins, &params );
++    if (steaminput_report_xbox_identity())
++    {
++        struct ISteamInput_SteamInput001_TranslateActionOrigin_params translate_params =
++        {
++            .u_iface = _this->u_iface,
++            .eDestinationInputType = 3, /* k_ESteamInputType_XBoxOneController */
++        };
++        int32_t i;
++
++        for (i = 0; i < params._ret; i++)
++        {
++            if (!steaminput_origin_needs_xbox( originsOut[i] )) continue;
++            translate_params.eSourceOrigin = originsOut[i];
++            STEAMCLIENT_CALL( ISteamInput_SteamInput001_TranslateActionOrigin, &translate_params );
++            if (translate_params._ret) originsOut[i] = translate_params._ret;
++        }
++    }
+     return params._ret;
+ }
+ 
+@@ -267,6 +284,23 @@
+     };
+     TRACE("%p\n", _this);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput001_GetAnalogActionOrigins, &params );
++    if (steaminput_report_xbox_identity())
++    {
++        struct ISteamInput_SteamInput001_TranslateActionOrigin_params translate_params =
++        {
++            .u_iface = _this->u_iface,
++            .eDestinationInputType = 3, /* k_ESteamInputType_XBoxOneController */
++        };
++        int32_t i;
++
++        for (i = 0; i < params._ret; i++)
++        {
++            if (!steaminput_origin_needs_xbox( originsOut[i] )) continue;
++            translate_params.eSourceOrigin = originsOut[i];
++            STEAMCLIENT_CALL( ISteamInput_SteamInput001_TranslateActionOrigin, &translate_params );
++            if (translate_params._ret) originsOut[i] = translate_params._ret;
++        }
++    }
+     return params._ret;
+ }
+ 
+@@ -388,6 +422,7 @@
+     TRACE("%p\n", _this);
+     if (steaminput006_xinput_get_input_type( &params._ret, inputHandle, TRUE )) return params._ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput001_GetInputTypeForHandle, &params );
++    params._ret = steaminput_native_input_type( params._ret );
+     return params._ret;
+ }
+ 
+@@ -755,6 +790,23 @@
+     };
+     TRACE("%p\n", _this);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput002_GetDigitalActionOrigins, &params );
++    if (steaminput_report_xbox_identity())
++    {
++        struct ISteamInput_SteamInput002_TranslateActionOrigin_params translate_params =
++        {
++            .u_iface = _this->u_iface,
++            .eDestinationInputType = 3, /* k_ESteamInputType_XBoxOneController */
++        };
++        int32_t i;
++
++        for (i = 0; i < params._ret; i++)
++        {
++            if (!steaminput_origin_needs_xbox( originsOut[i] )) continue;
++            translate_params.eSourceOrigin = originsOut[i];
++            STEAMCLIENT_CALL( ISteamInput_SteamInput002_TranslateActionOrigin, &translate_params );
++            if (translate_params._ret) originsOut[i] = translate_params._ret;
++        }
++    }
+     return params._ret;
+ }
+ 
+@@ -799,6 +851,23 @@
+     };
+     TRACE("%p\n", _this);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput002_GetAnalogActionOrigins, &params );
++    if (steaminput_report_xbox_identity())
++    {
++        struct ISteamInput_SteamInput002_TranslateActionOrigin_params translate_params =
++        {
++            .u_iface = _this->u_iface,
++            .eDestinationInputType = 3, /* k_ESteamInputType_XBoxOneController */
++        };
++        int32_t i;
++
++        for (i = 0; i < params._ret; i++)
++        {
++            if (!steaminput_origin_needs_xbox( originsOut[i] )) continue;
++            translate_params.eSourceOrigin = originsOut[i];
++            STEAMCLIENT_CALL( ISteamInput_SteamInput002_TranslateActionOrigin, &translate_params );
++            if (translate_params._ret) originsOut[i] = translate_params._ret;
++        }
++    }
+     return params._ret;
+ }
+ 
+@@ -920,6 +989,7 @@
+     TRACE("%p\n", _this);
+     if (steaminput006_xinput_get_input_type( &params._ret, inputHandle, FALSE )) return params._ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput002_GetInputTypeForHandle, &params );
++    params._ret = steaminput_native_input_type( params._ret );
+     return params._ret;
+ }
+ 
+@@ -1364,6 +1434,23 @@
+     };
+     TRACE("%p\n", _this);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput005_GetDigitalActionOrigins, &params );
++    if (steaminput_report_xbox_identity())
++    {
++        struct ISteamInput_SteamInput005_TranslateActionOrigin_params translate_params =
++        {
++            .u_iface = _this->u_iface,
++            .eDestinationInputType = 3, /* k_ESteamInputType_XBoxOneController */
++        };
++        int32_t i;
++
++        for (i = 0; i < params._ret; i++)
++        {
++            if (!steaminput_origin_needs_xbox( originsOut[i] )) continue;
++            translate_params.eSourceOrigin = originsOut[i];
++            STEAMCLIENT_CALL( ISteamInput_SteamInput005_TranslateActionOrigin, &translate_params );
++            if (translate_params._ret) originsOut[i] = translate_params._ret;
++        }
++    }
+     return params._ret;
+ }
+ 
+@@ -1420,6 +1507,23 @@
+     };
+     TRACE("%p\n", _this);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput005_GetAnalogActionOrigins, &params );
++    if (steaminput_report_xbox_identity())
++    {
++        struct ISteamInput_SteamInput005_TranslateActionOrigin_params translate_params =
++        {
++            .u_iface = _this->u_iface,
++            .eDestinationInputType = 3, /* k_ESteamInputType_XBoxOneController */
++        };
++        int32_t i;
++
++        for (i = 0; i < params._ret; i++)
++        {
++            if (!steaminput_origin_needs_xbox( originsOut[i] )) continue;
++            translate_params.eSourceOrigin = originsOut[i];
++            STEAMCLIENT_CALL( ISteamInput_SteamInput005_TranslateActionOrigin, &translate_params );
++            if (translate_params._ret) originsOut[i] = translate_params._ret;
++        }
++    }
+     return params._ret;
+ }
+ 
+@@ -1586,6 +1690,7 @@
+     TRACE("%p\n", _this);
+     if (steaminput006_xinput_get_input_type( &params._ret, inputHandle, FALSE )) return params._ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput005_GetInputTypeForHandle, &params );
++    params._ret = steaminput_native_input_type( params._ret );
+     return params._ret;
+ }
+ 
+@@ -2055,6 +2160,23 @@
+     };
+     TRACE("%p\n", _this);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput006_GetDigitalActionOrigins, &params );
++    if (steaminput_report_xbox_identity())
++    {
++        struct ISteamInput_SteamInput006_TranslateActionOrigin_params translate_params =
++        {
++            .u_iface = _this->u_iface,
++            .eDestinationInputType = 3, /* k_ESteamInputType_XBoxOneController */
++        };
++        int32_t i;
++
++        for (i = 0; i < params._ret; i++)
++        {
++            if (!steaminput_origin_needs_xbox( originsOut[i] )) continue;
++            translate_params.eSourceOrigin = originsOut[i];
++            STEAMCLIENT_CALL( ISteamInput_SteamInput006_TranslateActionOrigin, &translate_params );
++            if (translate_params._ret) originsOut[i] = translate_params._ret;
++        }
++    }
+     return params._ret;
+ }
+ 
+@@ -2111,6 +2233,23 @@
+     };
+     TRACE("%p\n", _this);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput006_GetAnalogActionOrigins, &params );
++    if (steaminput_report_xbox_identity())
++    {
++        struct ISteamInput_SteamInput006_TranslateActionOrigin_params translate_params =
++        {
++            .u_iface = _this->u_iface,
++            .eDestinationInputType = 3, /* k_ESteamInputType_XBoxOneController */
++        };
++        int32_t i;
++
++        for (i = 0; i < params._ret; i++)
++        {
++            if (!steaminput_origin_needs_xbox( originsOut[i] )) continue;
++            translate_params.eSourceOrigin = originsOut[i];
++            STEAMCLIENT_CALL( ISteamInput_SteamInput006_TranslateActionOrigin, &translate_params );
++            if (translate_params._ret) originsOut[i] = translate_params._ret;
++        }
++    }
+     return params._ret;
+ }
+ 
+@@ -2277,6 +2416,7 @@
+     TRACE("%p\n", _this);
+     if (steaminput006_xinput_get_input_type( &params._ret, inputHandle, FALSE )) return params._ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput006_GetInputTypeForHandle, &params );
++    params._ret = steaminput_native_input_type( params._ret );
+     return params._ret;
+ }
+ 
+@@ -2759,6 +2899,23 @@
+     };
+     TRACE("%p\n", _this);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput007_GetDigitalActionOrigins, &params );
++    if (steaminput_report_xbox_identity())
++    {
++        struct ISteamInput_SteamInput007_TranslateActionOrigin_params translate_params =
++        {
++            .u_iface = _this->u_iface,
++            .eDestinationInputType = 3, /* k_ESteamInputType_XBoxOneController */
++        };
++        int32_t i;
++
++        for (i = 0; i < params._ret; i++)
++        {
++            if (!steaminput_origin_needs_xbox( originsOut[i] )) continue;
++            translate_params.eSourceOrigin = originsOut[i];
++            STEAMCLIENT_CALL( ISteamInput_SteamInput007_TranslateActionOrigin, &translate_params );
++            if (translate_params._ret) originsOut[i] = translate_params._ret;
++        }
++    }
+     return params._ret;
+ }
+ 
+@@ -2815,6 +2972,23 @@
+     };
+     TRACE("%p\n", _this);
+     STEAMCLIENT_CALL( ISteamInput_SteamInput007_GetAnalogActionOrigins, &params );
++    if (steaminput_report_xbox_identity())
++    {
++        struct ISteamInput_SteamInput007_TranslateActionOrigin_params translate_params =
++        {
++            .u_iface = _this->u_iface,
++            .eDestinationInputType = 3, /* k_ESteamInputType_XBoxOneController */
++        };
++        int32_t i;
++
++        for (i = 0; i < params._ret; i++)
++        {
++            if (!steaminput_origin_needs_xbox( originsOut[i] )) continue;
++            translate_params.eSourceOrigin = originsOut[i];
++            STEAMCLIENT_CALL( ISteamInput_SteamInput007_TranslateActionOrigin, &translate_params );
++            if (translate_params._ret) originsOut[i] = translate_params._ret;
++        }
++    }
+     return params._ret;
+ }
+ 
+@@ -2981,6 +3155,7 @@
+     TRACE("%p\n", _this);
+     if (steaminput006_xinput_get_input_type( &params._ret, inputHandle, FALSE )) return params._ret;
+     STEAMCLIENT_CALL( ISteamInput_SteamInput007_GetInputTypeForHandle, &params );
++    params._ret = steaminput_native_input_type( params._ret );
+     return params._ret;
+ }
+ 
+--- a/lsteamclient/steam_input_manual.c
++++ b/lsteamclient/steam_input_manual.c
+@@ -31,9 +31,11 @@
+ 
+ enum steam_input_type
+ {
++    STEAM_INPUT_TYPE_STEAM_CONTROLLER = 1,
+     STEAM_INPUT_TYPE_XBOX_ONE = 3,
+     STEAM_INPUT_TYPE_PS4 = 5,
+     STEAM_INPUT_TYPE_PS5 = 13,
++    STEAM_INPUT_TYPE_STEAM_DECK = 14,
+ };
+ 
+ enum steam_input_configuration
+@@ -774,6 +776,33 @@
+     return TRUE;
+ }
+ 
++/* Some games only have gamepad prompts for the controller types they know and
++ * fall back to keyboard prompts for a Steam Deck or Steam Controller. With
++ * PROTON_STEAM_INPUT_XBOX_PROMPTS=1, report those native devices as Xbox One
++ * controllers and let Steam translate their action origins to Xbox ones. */
++int steaminput_report_xbox_identity(void)
++{
++    static LONG enabled = -1;
++
++    if (ReadAcquire(&enabled) == -1)
++        InterlockedExchange(&enabled, env_enabled("PROTON_STEAM_INPUT_XBOX_PROMPTS"));
++    return ReadAcquire(&enabled);
++}
++
++uint32_t steaminput_native_input_type(uint32_t type)
++{
++    if (!steaminput_report_xbox_identity()) return type;
++    if (type == STEAM_INPUT_TYPE_STEAM_CONTROLLER || type == STEAM_INPUT_TYPE_STEAM_DECK)
++        return STEAM_INPUT_TYPE_XBOX_ONE;
++    return type;
++}
++
++int steaminput_origin_needs_xbox(uint32_t origin)
++{
++    /* k_EInputActionOrigin_SteamController_* and k_EInputActionOrigin_SteamDeck_* */
++    return (origin >= 1 && origin <= 49) || (origin >= 333 && origin <= 405);
++}
++
+ int steamcontroller_xinput_get_action_origin(uint32_t *origin, uint64_t input_handle, uint32_t xbox_origin,
+         BOOL legacy_sony)
+ {
+--- a/lsteamclient/steamclient_private.h
++++ b/lsteamclient/steamclient_private.h
+@@ -70,6 +70,9 @@
+         BOOL legacy_sony );
+ int steamcontroller_xinput_get_action_origin( uint32_t *origin, uint64_t input_handle, uint32_t xbox_origin,
+         BOOL legacy_sony );
++int steaminput_report_xbox_identity( void );
++uint32_t steaminput_native_input_type( uint32_t type );
++int steaminput_origin_needs_xbox( uint32_t origin );
+ 
+ #ifdef __cplusplus
+ }
