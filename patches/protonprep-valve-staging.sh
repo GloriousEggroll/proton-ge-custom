@@ -616,6 +616,10 @@ apply_all_in_dir() {
     echo "WINE: -WAYLAND- winewayland: fix win_data locking in the IME text input paths (freeze when using Fcitx5 with WAYLANDDRV_IME=1)"
     apply_patch "../patches/wine-hotfixes/pending/winewayland-fix-win-data-locking-in-ime-text-input.patch"
 
+    # https://github.com/GloriousEggroll/proton-ge-custom/issues/908
+    echo "WINE: -WAYLAND- winewayland: don't take the USER lock under win_data from client surface callbacks, post WM_CANCELMODE on keyboard leave (Galaxy Idle Clicker freeze and exit hang)"
+    apply_patch "../patches/wine-hotfixes/pending/winewayland-avoid-user-lock-under-win-data-in-client-surface-callbacks.patch"
+
     # https://github.com/GloriousEggroll/proton-ge-custom/issues/852
     echo "WINE: -GAME FIXES- winewayland: advertise the OpenVR/OpenXR Vulkan device pseudo-extensions like winex11 (DXVK/vkd3d device creation fails on Wayland with an OpenXR runtime installed)"
     apply_patch "../patches/wine-hotfixes/pending/winewayland-advertise-openvr-openxr-device-extensions.patch"
