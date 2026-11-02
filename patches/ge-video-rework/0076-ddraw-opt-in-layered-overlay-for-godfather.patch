@@ -1,18 +1,18 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: AITUS95 <AITUS95@users.noreply.github.com>
 Date: Sat, 31 Oct 2026 23:00:00 +0100
-Subject: [PATCH] ddraw: opt-in layered overlay window for The Godfather FMV
+Subject: [PATCH] ddraw: fix The Godfather FMV flicker and edge flash
 
-The Godfather (2006) mixes YUY2 DirectDraw FMVs and D3D9 rendering.
-Use a layered 254/255 overlay popup, show it after its first video blit,
-and restore the original swapchain window on exit.
+The Godfather (2006) draws YUY2 DirectDraw videos alongside D3D9.
+Use a layered overlay window to avoid flicker and show it only after
+its first blit to prevent the right-edge flash. Restore the original
+swapchain window when video playback ends.
 
-Auto-enable for godfather.exe and The Godfather The Game.exe; leave
-other games unaffected unless explicitly opted in. Use
-GF_DDRAW_DISABLE=1 as an emergency override.
+Apply only to the game's executables. GF_DDRAW_DISABLE=1 disables the
+workaround if necessary. Other games keep the existing DirectDraw path.
 
-Verified manually with GE-Proton on Ubuntu 26.04; wider compatibility
-remains untested.
+Tested on Ubuntu 26.04 with GE-Proton, NVIDIA and a Wayland desktop.
+The other Proton rendering backends did not fix the original flicker.
 ---
 diff --git a/dlls/ddraw/ddraw.c b/dlls/ddraw/ddraw.c
 --- a/dlls/ddraw/ddraw.c
@@ -21,10 +21,9 @@ diff --git a/dlls/ddraw/ddraw.c b/dlls/ddraw/ddraw.c
  {
      unsigned int i;
  
--    TRACE("Destroying the swapchain.\n");
 +    ddraw_gf_close_overlay_window(ddraw);
 +
-+    TRACE("Destroying the swapchain.\n");
+     TRACE("Destroying the swapchain.\n");
  
      wined3d_swapchain_decref(ddraw->wined3d_swapchain);
  
@@ -50,8 +49,7 @@ diff --git a/dlls/ddraw/ddraw_private.h b/dlls/ddraw/ddraw_private.h
      /* The visible overlay, composited over its destination when the
       * destination is presented. */
      struct ddraw_surface *overlay, *overlay_dst;
--    RECT overlay_src_rect, overlay_dst_rect;
-+    RECT overlay_src_rect, overlay_dst_rect;
+     RECT overlay_src_rect, overlay_dst_rect;
 +    HWND gf_overlay_window, gf_previous_window;
      struct wined3d_texture *gdi_surface;
      struct wined3d_swapchain *wined3d_swapchain;
@@ -60,10 +58,9 @@ diff --git a/dlls/ddraw/ddraw_private.h b/dlls/ddraw/ddraw_private.h
  HRESULT ddraw_get_d3dcaps(const struct ddraw *ddraw, D3DDEVICEDESC7 *caps);
  void ddraw_update_lost_surfaces(struct ddraw *ddraw);
  
--static inline void ddraw_set_swapchain_window(struct ddraw *ddraw, HWND window)
 +void ddraw_gf_close_overlay_window(struct ddraw *ddraw);
 +
-+static inline void ddraw_set_swapchain_window(struct ddraw *ddraw, HWND window)
+ static inline void ddraw_set_swapchain_window(struct ddraw *ddraw, HWND window)
  {
      if (window == GetDesktopWindow())
          window = NULL;
@@ -82,68 +79,43 @@ diff --git a/dlls/ddraw/surface.c b/dlls/ddraw/surface.c
      {
          /* Nothing to do, we control the frontbuffer, or at least the parts we
           * care about. */
-@@ -4163,7 +4164,190 @@
+@@ -4163,7 +4164,155 @@
  /* Wine has no hardware overlays: the visible overlay is drawn over its
   * destination when that is presented (see ddraw_surface_update_frontbuffer()).
   * Only one overlay is shown at a time. */
--static void ddraw_surface_set_visible_overlay(struct ddraw_surface *overlay, const RECT *src_rect,
-+/* The Godfather (2006) displays YUY2 overlays while D3D9 also presents.
-+ * An opt-in, almost opaque video window avoids the two presenters racing. */
-+/* Match the executable name exactly, without depending on Steam IDs. */
-+static BOOL ddraw_gf_is_target_game(void)
-+{
-+    WCHAR path[MAX_PATH];
-+    const WCHAR *filename = path;
-+    DWORD len;
-+    unsigned int i;
-+
-+    len = GetModuleFileNameW(NULL, path, ARRAY_SIZE(path));
-+    if (!len || len >= ARRAY_SIZE(path))
-+        return FALSE;
-+
-+    for (i = 0; i < len; ++i)
-+        if (path[i] == '\\' || path[i] == '/')
-+            filename = path + i + 1;
-+
-+    return !lstrcmpiW(filename, L"godfather.exe")
-+            || !lstrcmpiW(filename, L"The Godfather The Game.exe");
-+}
-+
-+static BOOL ddraw_gf_disabled(void)
-+{
-+    char value[4];
-+
-+    return GetEnvironmentVariableA("GF_DDRAW_DISABLE", value, sizeof(value)) == 1
-+            && value[0] == '1';
-+}
-+
-+static BOOL ddraw_gf_defer_show_enabled(void)
-+{
-+    char value[4];
-+
-+    if (ddraw_gf_disabled())
-+        return FALSE;
-+
-+    return ddraw_gf_is_target_game()
-+            || (GetEnvironmentVariableA("GF_DDRAW_DEFER_SHOW", value, sizeof(value)) == 1
-+                && value[0] == '1');
-+}
-+
++/* The Godfather uses DirectDraw overlays alongside D3D9 presents. */
 +static BOOL ddraw_gf_overlay_enabled(void)
 +{
++    static LONG cached = -1;
++    WCHAR path[MAX_PATH];
++    const WCHAR *filename;
 +    char value[4];
++    DWORD len;
++    LONG match;
++    unsigned int i;
 +
-+    if (ddraw_gf_disabled())
-+        return FALSE;
-+    if (ddraw_gf_is_target_game())
-+        return TRUE;
-+
-+    if (GetEnvironmentVariableA("GF_DDRAW_SEPARATE_WINDOW", value, sizeof(value)) != 1
-+            || value[0] != '1')
++    if (GetEnvironmentVariableA("GF_DDRAW_DISABLE", value, sizeof(value)) == 1
++            && value[0] == '1')
 +        return FALSE;
 +
-+    return GetEnvironmentVariableA("GF_DDRAW_ALPHA_TEST", value, sizeof(value)) == 1
-+            && value[0] == '1';
++    if ((match = InterlockedCompareExchange(&cached, -1, -1)) != -1)
++        return match;
++
++    match = 0;
++    len = GetModuleFileNameW(NULL, path, ARRAY_SIZE(path));
++    if (len && len < ARRAY_SIZE(path))
++    {
++        filename = path;
++        for (i = 0; i < len; ++i)
++            if (path[i] == '\\' || path[i] == '/')
++                filename = path + i + 1;
++
++        match = !lstrcmpiW(filename, L"godfather.exe")
++                || !lstrcmpiW(filename, L"The Godfather The Game.exe");
++    }
++
++    InterlockedCompareExchange(&cached, match, -1);
++    return match;
 +}
 +
 +void ddraw_gf_close_overlay_window(struct ddraw *ddraw)
@@ -170,10 +142,10 @@ diff --git a/dlls/ddraw/surface.c b/dlls/ddraw/surface.c
 +    {
 +        DWORD error = GetLastError();
 +        ShowWindow(window, SW_HIDE);
-+        WARN("GF-DDRAW-WINDOW: DestroyWindow failed, error %lu.\n", error);
++        TRACE("GF-DDRAW-WINDOW: DestroyWindow failed, error %lu.\n", error);
 +    }
 +
-+    WARN("GF-DDRAW-WINDOW: closed.\n");
++    TRACE("GF-DDRAW-WINDOW: closed.\n");
 +}
 +
 +static void ddraw_gf_prepare_overlay_window(struct ddraw *ddraw)
@@ -182,9 +154,6 @@ diff --git a/dlls/ddraw/surface.c b/dlls/ddraw/surface.c
 +    RECT client, current;
 +    POINT origin = {0, 0};
 +    int width, height;
-+    BYTE opacity = 254;
-+    char opaque_value[4];
-+    BOOL defer_show;
 +
 +    if (!ddraw_gf_overlay_enabled()
 +            || !(ddraw->cooperative_level & DDSCL_EXCLUSIVE)
@@ -215,7 +184,7 @@ diff --git a/dlls/ddraw/surface.c b/dlls/ddraw/surface.c
 +    {
 +        if (ddraw->swapchain_window != ddraw->dest_window)
 +        {
-+            WARN("GF-DDRAW-WINDOW: unexpected swapchain window %p, game %p.\n",
++            TRACE("GF-DDRAW-WINDOW: unexpected swapchain window %p, game %p.\n",
 +                    ddraw->swapchain_window, ddraw->dest_window);
 +            return;
 +        }
@@ -225,29 +194,21 @@ diff --git a/dlls/ddraw/surface.c b/dlls/ddraw/surface.c
 +                origin.x, origin.y, width, height, ddraw->dest_window, NULL, NULL, NULL);
 +        if (!window)
 +        {
-+            WARN("GF-DDRAW-WINDOW: creation failed, error %lu.\n", GetLastError());
++            TRACE("GF-DDRAW-WINDOW: creation failed, error %lu.\n", GetLastError());
 +            return;
 +        }
 +
-+        /* Diagnostic: test fully opaque layered presentation without a rebuild. */
-+        if (GetEnvironmentVariableA("GF_DDRAW_OPAQUE", opaque_value, sizeof(opaque_value)) == 1
-+                && opaque_value[0] == '1')
-+            opacity = 255;
-+
-+        if (!SetLayeredWindowAttributes(window, 0, opacity, LWA_ALPHA))
++        if (!SetLayeredWindowAttributes(window, 0, 254, LWA_ALPHA))
 +        {
-+            WARN("GF-DDRAW-WINDOW: layered attributes failed, error %lu.\n", GetLastError());
++            TRACE("GF-DDRAW-WINDOW: layered attributes failed, error %lu.\n", GetLastError());
 +            DestroyWindow(window);
 +            return;
 +        }
 +
-+        /* Show the target game's popup only after the first blit. */
-+        defer_show = ddraw_gf_defer_show_enabled();
-+
 +        if (!SetWindowPos(window, HWND_TOPMOST, origin.x, origin.y,
-+                width, height, SWP_NOACTIVATE | (defer_show ? 0 : SWP_SHOWWINDOW)))
++                width, height, SWP_NOACTIVATE))
 +        {
-+            WARN("GF-DDRAW-WINDOW: positioning failed, error %lu.\n", GetLastError());
++            TRACE("GF-DDRAW-WINDOW: positioning failed, error %lu.\n", GetLastError());
 +            DestroyWindow(window);
 +            return;
 +        }
@@ -257,8 +218,8 @@ diff --git a/dlls/ddraw/surface.c b/dlls/ddraw/surface.c
 +        wined3d_swapchain_set_window(ddraw->wined3d_swapchain, window);
 +        ddraw_set_swapchain_window(ddraw, window);
 +
-+        WARN("GF-DDRAW-WINDOW: opened %p at %d,%d size %dx%d opacity=%u/255.\n",
-+                window, origin.x, origin.y, width, height, opacity);
++        TRACE("GF-DDRAW-WINDOW: opened %p at %d,%d size %dx%d opacity=254/255.\n",
++                window, origin.x, origin.y, width, height);
 +    }
 +    else if (GetWindowRect(window, &current)
 +            && (current.left != origin.x || current.top != origin.y
@@ -270,44 +231,38 @@ diff --git a/dlls/ddraw/surface.c b/dlls/ddraw/surface.c
 +    }
 +}
 +
-+static void ddraw_surface_set_visible_overlay(struct ddraw_surface *overlay, const RECT *src_rect,
+ static void ddraw_surface_set_visible_overlay(struct ddraw_surface *overlay, const RECT *src_rect,
          struct ddraw_surface *dst, const RECT *dst_rect, DWORD flags)
  {
      struct ddraw *ddraw = overlay->ddraw;
-@@ -4176,7 +4360,8 @@
+@@ -4176,7 +4325,8 @@
      {
          if (ddraw->overlay != overlay)
              return;
--        old_dst = ddraw->overlay_dst;
 +        ddraw_gf_close_overlay_window(ddraw);
-+        old_dst = ddraw->overlay_dst;
+         old_dst = ddraw->overlay_dst;
          old_dst_rect = ddraw->overlay_dst_rect;
          ddraw->overlay = ddraw->overlay_dst = NULL;
          /* Uncover the destination. */
-@@ -4221,7 +4406,21 @@
+@@ -4221,7 +4371,17 @@
      else
          SetRect(&ddraw->overlay_dst_rect, 0, 0, dst->surface_desc.dwWidth, dst->surface_desc.dwHeight);
  
--    ddraw_surface_update_overlay_dst(ddraw);
 +    ddraw_gf_prepare_overlay_window(ddraw);
-+    ddraw_surface_update_overlay_dst(ddraw);
+     ddraw_surface_update_overlay_dst(ddraw);
 +
-+    /* Experiment: show only after the initial overlay blit was submitted. */
++    if (ddraw->gf_overlay_window && !IsWindowVisible(ddraw->gf_overlay_window))
 +    {
-+        if (ddraw->gf_overlay_window && ddraw_gf_defer_show_enabled()
-+                && !IsWindowVisible(ddraw->gf_overlay_window))
-+        {
-+            if (!SetWindowPos(ddraw->gf_overlay_window, HWND_TOPMOST, 0, 0, 0, 0,
-+                    SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW))
-+                WARN("GF-DDRAW-DEFER-SHOW: show failed, error %lu.\n", GetLastError());
-+            else
-+                WARN("GF-DDRAW-DEFER-SHOW: first blit submitted before show.\n");
-+        }
++        if (!SetWindowPos(ddraw->gf_overlay_window, HWND_TOPMOST, 0, 0, 0, 0,
++                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW))
++            TRACE("GF-DDRAW-DEFER-SHOW: show failed, error %lu.\n", GetLastError());
++        else
++            TRACE("GF-DDRAW-DEFER-SHOW: first blit submitted before show.\n");
 +    }
  }
  
  /*****************************************************************************
-@@ -6324,8 +6523,11 @@
+@@ -6324,8 +6484,11 @@
          surface->ddraw->gdi_surface = NULL;
      }
  
