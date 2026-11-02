@@ -1,0 +1,101 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] win32u: Prefer the native HDR colorspace when the host supports it.
+
+Since KWin 6.8 advertises windows_bt2100/windows_scrgb, winewayland maps
+HDR10_ST2084 and scRGB swapchains to PASS_THROUGH and attaches a Windows
+image description to the surface. Host Vulkan layers such as MangoHud and the
+Steam overlay then only see PASS_THROUGH and draw SDR colors into the PQ
+buffer, which looks oversaturated.
+
+Keep the requested HDR colorspace when the host lists it for the swapchain
+format, and use the driver mapping only as a fallback. This is the path
+winewayland already took on compositors without the Windows descriptions.
+WINE_WAYLAND_HDR_PASSTHROUGH=1 restores the previous preference.
+
+https://github.com/GloriousEggroll/proton-ge-custom/issues/898
+https://github.com/GloriousEggroll/proton-ge-custom/issues/916
+---
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -5127,6 +5127,41 @@
+     return !wcsicmp( name, doom_eternalW ) || !wcsicmp( name, doom_dark_agesW );
+ }
+ 
++/* Host layers such as MangoHud and the Steam overlay only see the host swapchain
++ * colorspace, and draw SDR colors into a pass-through HDR swapchain. Keep a native
++ * HDR10/scRGB colorspace when the host can present it, and only fall back to the
++ * driver's colorspace mapping when it can't. WINE_WAYLAND_HDR_PASSTHROUGH=1
++ * restores the previous preference for the mapping. */
++static BOOL prefer_native_hdr_colorspace( struct vulkan_physical_device *physical_device, struct surface *surface,
++                                          VkFormat format, VkColorSpaceKHR color_space )
++{
++    struct vulkan_instance *instance = physical_device->instance;
++    VkSurfaceFormatKHR *formats;
++    uint32_t i, count = 0;
++    BOOL found = FALSE;
++    const char *env;
++
++    if (color_space != VK_COLOR_SPACE_HDR10_ST2084_EXT && color_space != VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT)
++        return FALSE;
++    if ((env = getenv( "WINE_WAYLAND_HDR_PASSTHROUGH" )) && atoi( env )) return FALSE;
++
++    if (instance->p_vkGetPhysicalDeviceSurfaceFormatsKHR( physical_device->host.physical_device,
++                                                          surface->obj.host.surface, &count, NULL ) || !count)
++        return FALSE;
++    if (!(formats = calloc( count, sizeof(*formats) ))) return FALSE;
++
++    if (!instance->p_vkGetPhysicalDeviceSurfaceFormatsKHR( physical_device->host.physical_device,
++                                                           surface->obj.host.surface, &count, formats ))
++    {
++        for (i = 0; i < count && !found; i++)
++            found = formats[i].format == format && formats[i].colorSpace == color_space;
++    }
++    free( formats );
++
++    TRACE( "format %u colorspace %u native %u\n", format, color_space, found );
++    return found;
++}
++
+ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwapchainCreateInfoKHR *create_info,
+                                              const VkAllocationCallbacks *allocator, VkSwapchainKHR *ret )
+ {
+@@ -5142,7 +5177,7 @@
+     VkSwapchainKHR host_swapchain;
+     uint32_t format_count = 0;
+     VkSurfaceFormatKHR *formats;
+-    BOOL presentation_owner;
++    BOOL presentation_owner, native_hdr;
+     RECT client_rect;
+     VkResult res;
+     BOOL lite;
+@@ -5163,7 +5198,6 @@
+     res = instance->p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR( physical_device->host.physical_device, surface->obj.host.surface, &capabilities );
+     if (res) return res;
+ 
+-    create_info_host.imageColorSpace = driver_funcs->p_vulkan_map_colorspace( create_info_host.imageColorSpace, surface->client );
+     driver_funcs->p_vulkan_surface_set_alpha( create_info_host.compositeAlpha, surface->client );
+     create_info_host.imageExtent.width = max( create_info_host.imageExtent.width, capabilities.minImageExtent.width );
+     create_info_host.imageExtent.height = max( create_info_host.imageExtent.height, capabilities.minImageExtent.height );
+@@ -5221,6 +5255,13 @@
+                    create_info_host.imageFormat );
+     }
+ 
++    native_hdr = prefer_native_hdr_colorspace( physical_device, surface, create_info_host.imageFormat,
++                                               create_info_host.imageColorSpace );
++    if (native_hdr) /* detach any color description attached for a previous swapchain */
++        driver_funcs->p_vulkan_map_colorspace( VK_COLOR_SPACE_SRGB_NONLINEAR_KHR, surface->client );
++    else
++        create_info_host.imageColorSpace = driver_funcs->p_vulkan_map_colorspace( create_info_host.imageColorSpace, surface->client );
++
+     /* check if the new colorspace works with the provided format */
+     if (create_info_host.imageColorSpace != create_info->imageColorSpace)
+     {
+@@ -5263,7 +5304,7 @@
+ 
+         free(formats);
+     }
+-    else driver_funcs->p_vulkan_map_colorspace( create_info->imageColorSpace, surface->client );
++    else if (!native_hdr) driver_funcs->p_vulkan_map_colorspace( create_info->imageColorSpace, surface->client );
+ 
+     InterlockedIncrement( &surface->client->busy_ref );
+     client_surface_update( surface->client );
