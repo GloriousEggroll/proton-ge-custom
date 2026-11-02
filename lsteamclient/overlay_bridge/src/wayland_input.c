@@ -798,6 +798,15 @@ static void relative_pointer_motion(
         overlay_trace("relative-pointer motion is active");
     }
 
+    /* Don't depend on wl_pointer.frame after relative-only motion: if earlier
+     * deltas are still buffered with no absolute motion since, apply them now
+     * so a compositor that skips the frame can't freeze the overlay cursor. */
+    if (surface->relative_pending && !(surface->frame.flags & GE_STEAM_OVERLAY_FRAME_ABSOLUTE))
+    {
+        ge_overlay_bridge_filter_pointer_frame(&surface->relative_frame);
+        memset(&surface->relative_frame, 0, sizeof(surface->relative_frame));
+    }
+
     surface->relative_frame.time = (uint32_t)(usec / 1000);
     surface->relative_frame.dx += wl_fixed_to_double(dx);
     surface->relative_frame.dy += wl_fixed_to_double(dy);
