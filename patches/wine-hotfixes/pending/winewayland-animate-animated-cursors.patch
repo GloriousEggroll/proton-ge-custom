@@ -1,0 +1,390 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Mon, 2 Nov 2026 12:00:00 -0700
+Subject: [PATCH] winewayland: Animate animated cursors.
+
+winewayland only read the first frame of a cursor, so game-supplied
+animated cursors (.ani) were static, while winex11 hands every frame and
+its delay to Xcursor.
+
+Render every step of an animated cursor into its own buffer when the
+cursor is set, and have a helper thread attach them to the cursor surface
+in turn, at each frame's delay. The thread only uses the prerendered
+buffers and Wayland objects, under the pointer mutex. It idles while the
+pointer is outside our windows, while a system cursor shape is in use,
+and for static cursors.
+
+https://github.com/GloriousEggroll/proton-ge-custom/issues/919
+---
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -136,12 +136,23 @@
+     unsigned char keystate[0x300];
+ };
+ 
++struct wayland_cursor_frame
++{
++    struct wayland_shm_buffer *shm_buffer;
++    int hotspot_x, hotspot_y;
++    UINT delay_ms;
++};
++
+ struct wayland_cursor
+ {
+     struct wayland_shm_buffer *shm_buffer;
+     struct wl_surface *wl_surface;
+     struct wp_viewport *wp_viewport;
+     int hotspot_x, hotspot_y;
++    double scale;
++    /* Frames of an animated cursor, NULL for a static one. */
++    struct wayland_cursor_frame *frames;
++    UINT num_frames, current_frame;
+ };
+ 
+ enum wayland_pointer_frame_flags
+--- a/dlls/winewayland.drv/wayland_pointer.c
++++ b/dlls/winewayland.drv/wayland_pointer.c
+@@ -24,9 +24,12 @@
+ 
+ #include "config.h"
+ 
++#include <errno.h>
+ #include <linux/input.h>
+ #undef SW_MAX /* Also defined in winuser.rh */
+ #include <math.h>
++#include <pthread.h>
++#include <signal.h>
+ #include <stdlib.h>
+ #include <time.h>
+ 
+@@ -705,72 +708,143 @@
+     return TRUE;
+ }
+ 
+-static void wayland_pointer_update_cursor_buffer(HCURSOR hcursor, double scale)
++/* Create the buffer and the scaled hotspot for one cursor image. */
++static struct wayland_shm_buffer *create_cursor_image_buffer(HCURSOR hcursor, double scale,
++                                                             int *hotspot_x, int *hotspot_y)
+ {
+-    struct wayland_cursor *cursor = &process_wayland.pointer.cursor;
++    struct wayland_shm_buffer *shm_buffer = NULL;
+     ICONINFOEXW info = {0};
+-
+-    if (!hcursor) goto clear_cursor;
+-
+-    /* Create a new buffer for the specified cursor. */
+-    if (cursor->shm_buffer)
+-    {
+-        wayland_shm_buffer_unref(cursor->shm_buffer);
+-        cursor->shm_buffer = NULL;
+-    }
++    int x, y;
+ 
+     if (!get_icon_info(hcursor, &info))
+     {
+         ERR("Failed to get icon info for cursor=%p\n", hcursor);
+-        goto clear_cursor;
++        return NULL;
+     }
+ 
+     if (info.hbmColor)
+     {
+         HDC hdc = NtGdiCreateCompatibleDC(0);
+-        cursor->shm_buffer =
+-            wayland_shm_buffer_from_color_bitmaps(hdc, info.hbmColor, info.hbmMask, FALSE);
++        shm_buffer = wayland_shm_buffer_from_color_bitmaps(hdc, info.hbmColor, info.hbmMask, FALSE);
+         NtGdiDeleteObjectApp(hdc);
+     }
+     else
+     {
+-        cursor->shm_buffer = create_mono_cursor_buffer(info.hbmMask);
++        shm_buffer = create_mono_cursor_buffer(info.hbmMask);
+     }
+ 
+     if (info.hbmColor) NtGdiDeleteObjectApp(info.hbmColor);
+     if (info.hbmMask) NtGdiDeleteObjectApp(info.hbmMask);
+ 
+-    cursor->hotspot_x = info.xHotspot;
+-    cursor->hotspot_y = info.yHotspot;
+-
+-    if (!cursor->shm_buffer)
++    if (!shm_buffer)
+     {
+         ERR("Failed to create shm_buffer for cursor=%p\n", hcursor);
+-        goto clear_cursor;
++        return NULL;
+     }
+ 
+-    if (cursor_buffer_is_transparent(cursor->shm_buffer))
+-        goto clear_cursor;
++    x = info.xHotspot;
++    y = info.yHotspot;
+ 
+     /* Make sure the hotspot is valid. */
+-    if (cursor->hotspot_x >= cursor->shm_buffer->width ||
+-        cursor->hotspot_y >= cursor->shm_buffer->height)
++    if (x >= shm_buffer->width || y >= shm_buffer->height)
+     {
+-        cursor->hotspot_x = cursor->shm_buffer->width / 2;
+-        cursor->hotspot_y = cursor->shm_buffer->height / 2;
++        x = shm_buffer->width / 2;
++        y = shm_buffer->height / 2;
+     }
+ 
+-    cursor->hotspot_x = round(cursor->hotspot_x / scale);
+-    cursor->hotspot_y = round(cursor->hotspot_y / scale);
++    *hotspot_x = round(x / scale);
++    *hotspot_y = round(y / scale);
+ 
+-    return;
++    return shm_buffer;
++}
+ 
+-clear_cursor:
++static void wayland_cursor_free_frames(struct wayland_cursor *cursor)
++{
++    UINT i;
++
++    for (i = 0; i < cursor->num_frames; i++)
++        if (cursor->frames[i].shm_buffer)
++            wayland_shm_buffer_unref(cursor->frames[i].shm_buffer);
++    free(cursor->frames);
++    cursor->frames = NULL;
++    cursor->num_frames = 0;
++    cursor->current_frame = 0;
++}
++
++/* Render every step of an animated cursor. Returns FALSE for a static
++ * cursor, or if a frame can't be rendered, so that the caller falls back to
++ * showing a single image. */
++static BOOL wayland_cursor_create_frames(struct wayland_cursor *cursor,
++                                         HCURSOR hcursor, double scale)
++{
++    struct wayland_cursor_frame *frames;
++    DWORD delay_jiffies, num_steps;
++    UINT i;
++
++    if (!NtUserGetCursorFrameInfo(hcursor, 0, &delay_jiffies, &num_steps)) return FALSE;
++    /* win32u reports ~0 steps for an animation with a single step. */
++    if (num_steps <= 1 || num_steps == ~0u) return FALSE;
++    if (num_steps > 256) num_steps = 256;
++
++    if (!(frames = calloc(num_steps, sizeof(*frames)))) return FALSE;
++
++    for (i = 0; i < num_steps; i++)
++    {
++        HCURSOR frame = NtUserGetCursorFrameInfo(hcursor, i, &delay_jiffies, &num_steps);
++
++        if (!frame ||
++            !(frames[i].shm_buffer = create_cursor_image_buffer(frame, scale,
++                                                                &frames[i].hotspot_x,
++                                                                &frames[i].hotspot_y)))
++        {
++            WARN("Failed to create frame %u of cursor=%p, not animating\n", i, hcursor);
++            cursor->frames = frames;
++            cursor->num_frames = i;
++            wayland_cursor_free_frames(cursor);
++            return FALSE;
++        }
++
++        /* The delay is in jiffies (1/60 s). */
++        frames[i].delay_ms = delay_jiffies ? max(delay_jiffies * 100 / 6, 10) : 100;
++    }
++
++    TRACE("cursor=%p has %u frames\n", hcursor, i);
++
++    cursor->frames = frames;
++    cursor->num_frames = i;
++    cursor->current_frame = 0;
++    cursor->shm_buffer = frames[0].shm_buffer;
++    wayland_shm_buffer_ref(cursor->shm_buffer);
++    cursor->hotspot_x = frames[0].hotspot_x;
++    cursor->hotspot_y = frames[0].hotspot_y;
++    return TRUE;
++}
++
++static void wayland_pointer_update_cursor_buffer(HCURSOR hcursor, double scale)
++{
++    struct wayland_cursor *cursor = &process_wayland.pointer.cursor;
++
++    /* Create new buffers for the specified cursor. */
++    wayland_cursor_free_frames(cursor);
+     if (cursor->shm_buffer)
+     {
+         wayland_shm_buffer_unref(cursor->shm_buffer);
+         cursor->shm_buffer = NULL;
+     }
++
++    if (!hcursor) return;
++
++    if (wayland_cursor_create_frames(cursor, hcursor, scale)) return;
++
++    cursor->shm_buffer = create_cursor_image_buffer(hcursor, scale,
++                                                    &cursor->hotspot_x,
++                                                    &cursor->hotspot_y);
++
++    if (cursor->shm_buffer && cursor_buffer_is_transparent(cursor->shm_buffer))
++    {
++        wayland_shm_buffer_unref(cursor->shm_buffer);
++        cursor->shm_buffer = NULL;
++    }
+ }
+ 
+ static void wayland_pointer_clear_cursor_surface(void)
+@@ -792,6 +866,7 @@
+         wayland_shm_buffer_unref(cursor->shm_buffer);
+         cursor->shm_buffer = NULL;
+     }
++    wayland_cursor_free_frames(cursor);
+ }
+ 
+ static void wayland_pointer_update_cursor_surface(double scale)
+@@ -800,6 +875,8 @@
+ 
+     if (!cursor->shm_buffer) goto clear_cursor;
+ 
++    cursor->scale = scale;
++
+     if (!cursor->wl_surface)
+     {
+         cursor->wl_surface =
+@@ -845,6 +922,132 @@
+     wayland_pointer_clear_cursor_surface();
+ }
+ 
++/* Animated cursors: the frames are rendered when the cursor is set, and this
++ * thread attaches them to the cursor surface in turn. It only uses Wayland
++ * objects and the prerendered buffers, all under the pointer mutex. */
++static pthread_once_t cursor_animation_once = PTHREAD_ONCE_INIT;
++static pthread_cond_t cursor_animation_cond;
++static BOOL cursor_animation_ok;
++static struct timespec cursor_animation_deadline;
++
++static void timespec_add_ms(struct timespec *ts, UINT ms)
++{
++    ts->tv_sec += ms / 1000;
++    ts->tv_nsec += (long)(ms % 1000) * 1000000;
++    if (ts->tv_nsec >= 1000000000)
++    {
++        ts->tv_sec++;
++        ts->tv_nsec -= 1000000000;
++    }
++}
++
++static BOOL cursor_animation_active(void)
++{
++    struct wayland_pointer *pointer = &process_wayland.pointer;
++
++    return pointer->cursor.num_frames > 1 && pointer->cursor.wl_surface &&
++           pointer->wl_pointer && pointer->focused_hwnd;
++}
++
++static void *cursor_animation_thread(void *arg)
++{
++    struct wayland_pointer *pointer = &process_wayland.pointer;
++    struct wayland_cursor *cursor = &pointer->cursor;
++    struct wayland_cursor_frame *frame;
++    struct timespec now;
++    sigset_t sigset;
++    UINT delay_ms;
++
++    /* Leave signals to the Wine threads. */
++    sigfillset(&sigset);
++    pthread_sigmask(SIG_BLOCK, &sigset, NULL);
++
++    pthread_mutex_lock(&pointer->mutex);
++    for (;;)
++    {
++        if (!cursor_animation_active())
++        {
++            pthread_cond_wait(&cursor_animation_cond, &pointer->mutex);
++            continue;
++        }
++
++        /* Woken early when the cursor changed: start over with the new state. */
++        if (pthread_cond_timedwait(&cursor_animation_cond, &pointer->mutex,
++                                   &cursor_animation_deadline) != ETIMEDOUT)
++            continue;
++        if (!cursor_animation_active()) continue;
++
++        cursor->current_frame = (cursor->current_frame + 1) % cursor->num_frames;
++        frame = &cursor->frames[cursor->current_frame];
++        /* Updating the surface frees the frames if it fails. */
++        delay_ms = frame->delay_ms;
++
++        wayland_shm_buffer_unref(cursor->shm_buffer);
++        cursor->shm_buffer = frame->shm_buffer;
++        wayland_shm_buffer_ref(cursor->shm_buffer);
++
++        if (frame->hotspot_x != cursor->hotspot_x || frame->hotspot_y != cursor->hotspot_y)
++        {
++            cursor->hotspot_x = frame->hotspot_x;
++            cursor->hotspot_y = frame->hotspot_y;
++            wl_pointer_set_cursor(pointer->wl_pointer, pointer->enter_serial,
++                                  cursor->wl_surface, cursor->hotspot_x,
++                                  cursor->hotspot_y);
++        }
++        wayland_pointer_update_cursor_surface(cursor->scale);
++        wl_display_flush(process_wayland.wl_display);
++
++        /* Don't try to catch up on frames we were too late for. */
++        clock_gettime(CLOCK_MONOTONIC, &now);
++        timespec_add_ms(&cursor_animation_deadline, delay_ms);
++        if (cursor_animation_deadline.tv_sec < now.tv_sec ||
++            (cursor_animation_deadline.tv_sec == now.tv_sec &&
++             cursor_animation_deadline.tv_nsec < now.tv_nsec))
++        {
++            cursor_animation_deadline = now;
++            timespec_add_ms(&cursor_animation_deadline, delay_ms);
++        }
++    }
++
++    return NULL;
++}
++
++static void cursor_animation_init(void)
++{
++    pthread_condattr_t attr;
++    pthread_attr_t thread_attr;
++    pthread_t thread;
++
++    pthread_condattr_init(&attr);
++    pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
++    pthread_cond_init(&cursor_animation_cond, &attr);
++    pthread_condattr_destroy(&attr);
++
++    pthread_attr_init(&thread_attr);
++    pthread_attr_setdetachstate(&thread_attr, PTHREAD_CREATE_DETACHED);
++    if (!pthread_create(&thread, &thread_attr, cursor_animation_thread, NULL))
++        cursor_animation_ok = TRUE;
++    else
++        ERR("Failed to create the cursor animation thread\n");
++    pthread_attr_destroy(&thread_attr);
++}
++
++/* Called with the pointer mutex held, after the cursor surface has been set. */
++static void wayland_pointer_restart_cursor_animation(void)
++{
++    struct wayland_cursor *cursor = &process_wayland.pointer.cursor;
++
++    if (cursor->num_frames <= 1) return;
++
++    pthread_once(&cursor_animation_once, cursor_animation_init);
++    if (!cursor_animation_ok) return;
++
++    clock_gettime(CLOCK_MONOTONIC, &cursor_animation_deadline);
++    timespec_add_ms(&cursor_animation_deadline,
++                    cursor->frames[cursor->current_frame].delay_ms);
++    pthread_cond_signal(&cursor_animation_cond);
++}
++
+ static void reapply_cursor_clipping(void)
+ {
+     RECT rect;
+@@ -967,6 +1170,7 @@
+                                   pointer->cursor.hotspot_x,
+                                   pointer->cursor.hotspot_y);
+             wayland_pointer_clear_cursor_shape();
++            wayland_pointer_restart_cursor_animation();
+         }
+         wl_display_flush(process_wayland.wl_display);
+         reapply_clip = TRUE;
