@@ -68,6 +68,8 @@ apply_all_in_dir() {
     pushd protonfixes
     git reset --hard HEAD
     git clean -xdf
+    echo "PROTONFIXES: add PROTON_STREAMLINE_UPGRADE"
+    apply_all_in_dir "../patches/protonfixes/"
     popd
 
     pushd wineopenxr
@@ -556,6 +558,10 @@ apply_all_in_dir() {
     echo "WINE: add optiscaler patch"
     apply_patch "../patches/proton/0001-HACK-kernelbase-allow-overriding-dlls-for-DLSS-XeSS-.patch"
     apply_patch "../patches/proton/0002-HACK-ntdll-add-optiscaler-inection-hack.patch"
+
+    # https://github.com/GloriousEggroll/proton-ge-custom/issues/875
+    echo "WINE: redirect NVIDIA Streamline dlls for PROTON_STREAMLINE_UPGRADE"
+    apply_patch "../patches/proton/0003-HACK-ntdll-redirect-streamline-dlls-for-upgrade.patch"
 
     # https://github.com/GloriousEggroll/proton-ge-custom/pull/759
     echo "WINE: -PERF- read QueryPerformanceCounter from the TSC in user mode (DCS World: 39 -> 62 FPS)"
