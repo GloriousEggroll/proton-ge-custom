@@ -17,7 +17,7 @@ Keep the real controller identity internally so direct USB haptics, controller a
  3 files changed, 460 insertions(+), 18 deletions(-)
 
 diff --git a/dlls/winebus.sys/bus_udev.c b/dlls/winebus.sys/bus_udev.c
-index a2fab98..333bf96 100644
+index 9922878df6ccaa77032b74c0e199b213b746f573..2e7729fd644e4962c671f5ef23882cd159dee38c 100644
 --- a/dlls/winebus.sys/bus_udev.c
 +++ b/dlls/winebus.sys/bus_udev.c
 @@ -1512,6 +1512,13 @@ static BOOL enable_sony_hidraw_xinput(void)
@@ -47,7 +47,7 @@ index a2fab98..333bf96 100644
      if (!desc.product[0] && ioctl(fd, HIDIOCGRAWNAME(sizeof(buffer) - 1), buffer) >= 0)
          ntdll_umbstowcs(buffer, strlen(buffer) + 1, desc.product, ARRAY_SIZE(desc.product));
 diff --git a/dlls/winebus.sys/main.c b/dlls/winebus.sys/main.c
-index a8699b2..da5e75a 100644
+index 42f51d29cb5e6b3252007016ac3fa5d1c59b25ed..767f46637bbbfd6eeb7386e239d38c42dbb02da0 100644
 --- a/dlls/winebus.sys/main.c
 +++ b/dlls/winebus.sys/main.c
 @@ -75,10 +75,32 @@ enum device_state
@@ -211,7 +211,7 @@ index a8699b2..da5e75a 100644
          if (input_len) pos += swprintf(dst + pos, len - pos, input_format, ext->desc.input);
          pos += 1;
          dst[pos] = 0;
-@@ -778,10 +889,89 @@ static BOOL deliver_next_report(struct device_extension *ext, IRP *irp)
+@@ -778,6 +889,84 @@ static BOOL deliver_next_report(struct device_extension *ext, IRP *irp)
      return TRUE;
  }
  
@@ -296,13 +296,38 @@ index a8699b2..da5e75a 100644
  static void process_hid_report(DEVICE_OBJECT *device, BYTE *report_buf, DWORD report_len)
  {
      struct device_extension *ext = (struct device_extension *)device->DeviceExtension;
--    ULONG size = offsetof(struct hid_report, buffer[report_len]);
-+    ULONG buffer_len = max(report_len, ext->desc.spoof_dualshock4 ? DUALSHOCK4_INPUT_REPORT_SIZE : 0);
-+    ULONG size = offsetof(struct hid_report, buffer[buffer_len]);
-     struct hid_report *report, *last_report;
-     IRP *irp;
+@@ -795,9 +984,12 @@ static void process_hid_report(DEVICE_OBJECT *device, BYTE *report_buf, DWORD re
+         return;
+     }
  
-@@ -791,6 +981,14 @@ static void process_hid_report(DEVICE_OBJECT *device, BYTE *report_buf, DWORD re
+-    if (!ext->collection_desc.ReportIDs[0].ReportID) last_report = ext->last_reports[0];
++    /* Spoofed DualSense reports only match the DS4 descriptor once translated,
++     * so their declared report is looked up after the translation below. */
++    if (ext->desc.spoof_dualshock4) last_report = NULL;
++    else if (!ext->collection_desc.ReportIDs[0].ReportID) last_report = ext->last_reports[0];
+     else last_report = ext->last_reports[report_buf[0]];
+-    if (!last_report)
++    if (!last_report && !ext->desc.spoof_dualshock4)
+     {
+         WARN("Ignoring report with unexpected id %#x\n", *report_buf);
+         RtlLeaveCriticalSection(&ext->cs);
+@@ -806,13 +998,13 @@ static void process_hid_report(DEVICE_OBJECT *device, BYTE *report_buf, DWORD re
+ 
+     /* Devices may send more data than their report declares, but the cached report
+      * and hidclass.sys buffers are only sized to hold the declared size. */
+-    if (report_len > last_report->length)
++    if (last_report && report_len > last_report->length)
+     {
+         WARN("overlong report %#x length %lu truncated to declared length %lu\n", *report_buf, report_len, last_report->length);
+         report_len = last_report->length;
+     }
+ 
+-    size = offsetof(struct hid_report, buffer[report_len]);
++    size = offsetof(struct hid_report, buffer[max(report_len, ext->desc.spoof_dualshock4 ? DUALSHOCK4_INPUT_REPORT_SIZE : 0)]);
+     if (!(report = RtlAllocateHeap(GetProcessHeap(), 0, size)))
+     {
+         RtlLeaveCriticalSection(&ext->cs);
+@@ -821,6 +1013,29 @@ static void process_hid_report(DEVICE_OBJECT *device, BYTE *report_buf, DWORD re
      memcpy(report->buffer, report_buf, report_len);
      report->length = report_len;
  
@@ -310,45 +335,41 @@ index a8699b2..da5e75a 100644
 +     * compatibility fixup reduces extended reports to their ten-byte form. */
 +    if (!hidraw_fixup_dualsense_input_as_dualshock4(ext, report))
 +    {
++        RtlLeaveCriticalSection(&ext->cs);
 +        RtlFreeHeap(GetProcessHeap(), 0, report);
 +        return;
++    }
++
++    if (ext->desc.spoof_dualshock4)
++    {
++        if (!ext->collection_desc.ReportIDs[0].ReportID) last_report = ext->last_reports[0];
++        else last_report = ext->last_reports[report->buffer[0]];
++        if (!last_report)
++        {
++            WARN("Ignoring report with unexpected id %#x\n", report->buffer[0]);
++            RtlLeaveCriticalSection(&ext->cs);
++            RtlFreeHeap(GetProcessHeap(), 0, report);
++            return;
++        }
++        report->length = min(report->length, last_report->length);
 +    }
 +
      if (ext->report_fixups & HIDRAW_FIXUP_DUALSHOCK_BT)
      {
          /* As described in the Linux kernel driver, when connected over bluetooth, DS4 controllers
-@@ -849,21 +1047,28 @@ static void process_hid_report(DEVICE_OBJECT *device, BYTE *report_buf, DWORD re
-     if (ext->state != DEVICE_STATE_STARTED)
-     {
-         RtlLeaveCriticalSection(&ext->cs);
-+        RtlFreeHeap(GetProcessHeap(), 0, report);
-         return;
-     }
- 
-     if (!ext->collection_desc.ReportIDs[0].ReportID) last_report = ext->last_reports[0];
-+    else if (ext->desc.spoof_dualshock4) last_report = ext->last_reports[report->buffer[0]];
-     else last_report = ext->last_reports[report_buf[0]];
-     if (!last_report)
-     {
--        WARN("Ignoring report with unexpected id %#x\n", *report_buf);
-+        WARN("Ignoring report with unexpected id %#x\n",
-+                ext->desc.spoof_dualshock4 ? report->buffer[0] : *report_buf);
-         RtlLeaveCriticalSection(&ext->cs);
-+        RtlFreeHeap(GetProcessHeap(), 0, report);
-         return;
-     }
+@@ -876,7 +1091,10 @@ static void process_hid_report(DEVICE_OBJECT *device, BYTE *report_buf, DWORD re
  
      list_add_tail(&ext->reports, &report->entry);
  
 -    memcpy(last_report->buffer, report_buf, report_len);
 +    if (ext->desc.spoof_dualshock4)
-+        memcpy(last_report->buffer, report->buffer, min(report->length, last_report->length));
++        memcpy(last_report->buffer, report->buffer, report->length);
 +    else
 +        memcpy(last_report->buffer, report_buf, report_len);
  
      if ((irp = pop_pending_read(ext)))
      {
-@@ -1020,6 +1225,32 @@ static NTSTATUS get_device_descriptors(UINT64 unix_device, BYTE **report_desc, U
+@@ -1033,6 +1251,32 @@ static NTSTATUS get_device_descriptors(UINT64 unix_device, BYTE **report_desc, U
      return STATUS_SUCCESS;
  }
  
@@ -381,7 +402,7 @@ index a8699b2..da5e75a 100644
  static USAGE_AND_PAGE get_device_usages(UINT64 unix_device, UINT *buttons)
  {
      HIDP_DEVICE_DESC device_desc;
-@@ -1524,8 +1755,8 @@ static NTSTATUS pdo_pnp_dispatch(DEVICE_OBJECT *device, IRP *irp)
+@@ -1537,8 +1781,8 @@ static NTSTATUS pdo_pnp_dispatch(DEVICE_OBJECT *device, IRP *irp)
              else if (ext->state == DEVICE_STATE_REMOVED) status = STATUS_DELETE_PENDING;
              else if ((status = unix_device_start(device)))
                  ERR("Failed to start device %p, status %#lx\n", device, status);
@@ -392,7 +413,7 @@ index a8699b2..da5e75a 100644
              {
                  status = STATUS_SUCCESS;
                  reports = ext->collection_desc.ReportIDs;
-@@ -1604,6 +1835,7 @@ static NTSTATUS WINAPI common_pnp_dispatch(DEVICE_OBJECT *device, IRP *irp)
+@@ -1617,6 +1861,7 @@ static NTSTATUS WINAPI common_pnp_dispatch(DEVICE_OBJECT *device, IRP *irp)
  static NTSTATUS hid_get_device_string(DEVICE_OBJECT *device, DWORD index, WCHAR *buffer, DWORD buffer_len)
  {
      struct device_extension *ext = (struct device_extension *)device->DeviceExtension;
@@ -400,7 +421,7 @@ index a8699b2..da5e75a 100644
      DWORD len;
  
      switch (index)
-@@ -1614,9 +1846,10 @@ static NTSTATUS hid_get_device_string(DEVICE_OBJECT *device, DWORD index, WCHAR
+@@ -1627,9 +1872,10 @@ static NTSTATUS hid_get_device_string(DEVICE_OBJECT *device, DWORD index, WCHAR
          else memcpy(buffer, ext->desc.manufacturer, len);
          return STATUS_SUCCESS;
      case HID_STRING_ID_IPRODUCT:
@@ -413,7 +434,7 @@ index a8699b2..da5e75a 100644
          return STATUS_SUCCESS;
      case HID_STRING_ID_ISERIALNUMBER:
          len = (wcslen(ext->desc.serialnumber) + 1) * sizeof(WCHAR);
-@@ -1642,7 +1875,7 @@ static void hidraw_disable_report_fixups(DEVICE_OBJECT *device)
+@@ -1655,7 +1901,7 @@ static void hidraw_disable_report_fixups(DEVICE_OBJECT *device)
      /* XInput consumes the translated basic input report even after sending a
       * valid Bluetooth output report, which switches Sony controllers to their
       * extended input report. */
@@ -422,7 +443,7 @@ index a8699b2..da5e75a 100644
  
      /* FIXME: we may want to validate CRC at the end of the outbound HID reports,
       * as controllers do not switch modes if it is incorrect.
-@@ -1668,6 +1901,194 @@ static BYTE dualsense_hid_haptics_intensity_to_motor(BYTE lo, BYTE hi)
+@@ -1681,6 +1927,194 @@ static BYTE dualsense_hid_haptics_intensity_to_motor(BYTE lo, BYTE hi)
      return value <= 0xff ? value : value / 257;
  }
  
@@ -617,7 +638,7 @@ index a8699b2..da5e75a 100644
  static BOOL hidraw_fixup_dualsense_usb_output_report(struct device_extension *ext,
          HID_XFER_PACKET *packet, HID_XFER_PACKET *fixed_packet, BYTE *fixed_report)
  {
-@@ -1749,8 +2170,8 @@ static NTSTATUS WINAPI hid_internal_dispatch(DEVICE_OBJECT *device, IRP *irp)
+@@ -1762,8 +2196,8 @@ static NTSTATUS WINAPI hid_internal_dispatch(DEVICE_OBJECT *device, IRP *irp)
              memset(attr, 0, sizeof(*attr));
              attr->Size = sizeof(*attr);
              attr->VendorID = ext->desc.vid;
@@ -628,7 +649,7 @@ index a8699b2..da5e75a 100644
  
              irp->IoStatus.Status = STATUS_SUCCESS;
              irp->IoStatus.Information = sizeof(*attr);
-@@ -1834,7 +2255,7 @@ static NTSTATUS WINAPI hid_internal_dispatch(DEVICE_OBJECT *device, IRP *irp)
+@@ -1847,7 +2281,7 @@ static NTSTATUS WINAPI hid_internal_dispatch(DEVICE_OBJECT *device, IRP *irp)
          {
              HID_XFER_PACKET *packet = (HID_XFER_PACKET *)irp->UserBuffer;
              HID_XFER_PACKET fixed_packet;
@@ -637,7 +658,7 @@ index a8699b2..da5e75a 100644
              if (TRACE_ON(hid))
              {
                  TRACE("write output report id %u length %lu:\n", packet->reportId, packet->reportBufferLen);
-@@ -1847,7 +2268,9 @@ static NTSTATUS WINAPI hid_internal_dispatch(DEVICE_OBJECT *device, IRP *irp)
+@@ -1860,7 +2294,9 @@ static NTSTATUS WINAPI hid_internal_dispatch(DEVICE_OBJECT *device, IRP *irp)
                      TRACE("%s\n", buffer);
                  }
              }
@@ -648,7 +669,7 @@ index a8699b2..da5e75a 100644
                  packet = &fixed_packet;
              unix_device_set_output_report(device, packet, &irp->IoStatus);
              if (!irp->IoStatus.Status) hidraw_disable_report_fixups(device);
-@@ -1856,8 +2279,11 @@ static NTSTATUS WINAPI hid_internal_dispatch(DEVICE_OBJECT *device, IRP *irp)
+@@ -1869,8 +2305,11 @@ static NTSTATUS WINAPI hid_internal_dispatch(DEVICE_OBJECT *device, IRP *irp)
          case IOCTL_HID_GET_FEATURE:
          {
              HID_XFER_PACKET *packet = (HID_XFER_PACKET *)irp->UserBuffer;
@@ -662,7 +683,7 @@ index a8699b2..da5e75a 100644
              if (!irp->IoStatus.Status && TRACE_ON(hid))
              {
                  TRACE("read feature report id %u length %lu:\n", packet->reportId, packet->reportBufferLen);
-@@ -1887,8 +2313,11 @@ static NTSTATUS WINAPI hid_internal_dispatch(DEVICE_OBJECT *device, IRP *irp)
+@@ -1900,8 +2339,11 @@ static NTSTATUS WINAPI hid_internal_dispatch(DEVICE_OBJECT *device, IRP *irp)
                      TRACE("%s\n", buffer);
                  }
              }
@@ -677,7 +698,7 @@ index a8699b2..da5e75a 100644
          }
          default:
 diff --git a/dlls/winebus.sys/unixlib.h b/dlls/winebus.sys/unixlib.h
-index ad3b268..562dd46 100644
+index ad3b268b0b679e9c3d612e1fca2a8ef921a0fb70..562dd46fe787528cb1b2db6483ee65b70a914e25 100644
 --- a/dlls/winebus.sys/unixlib.h
 +++ b/dlls/winebus.sys/unixlib.h
 @@ -41,6 +41,7 @@ struct device_desc
