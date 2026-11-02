@@ -21,17 +21,15 @@ Helldivers 2's anti-tamper code creates two suspended threads and kills
 them every 0.4 seconds, which kept about 34 GiB of stacks mapped and
 about 360 MiB of memory resident per hour.
 
+GE: use pthread_tryjoin_np() and queue threads that haven't finished
+exiting for a later pass, so a killed thread stuck in its unix-side exit
+(e.g. on a library lock) can't hang the next CreateThread() or thread exit.
+
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- dlls/ntdll/unix/thread.c       | 37 ++++++++++++++++++++++++++++++++++
- dlls/ntdll/unix/unix_private.h |  1 +
- 2 files changed, 38 insertions(+)
-
-diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
-index 8e5070998de..e06e0b24701 100644
 --- a/dlls/ntdll/unix/thread.c
 +++ b/dlls/ntdll/unix/thread.c
-@@ -85,6 +85,7 @@ WINE_DECLARE_DEBUG_CHANNEL(threadname);
+@@ -85,6 +85,7 @@
  pthread_key_t teb_key = 0;
  
  static LONG nb_threads = 1;
@@ -39,11 +37,10 @@ index 8e5070998de..e06e0b24701 100644
  
  static inline int get_unix_exit_code( NTSTATUS status )
  {
-@@ -1146,6 +1147,27 @@ static void start_thread( TEB *teb )
- }
+@@ -1147,6 +1148,40 @@
  
  
-+/***********************************************************************
+ /***********************************************************************
 + *           free_killed_threads
 + *
 + * Free the TEB and stacks of the threads that abort_thread() queued.
@@ -57,17 +54,31 @@ index 8e5070998de..e06e0b24701 100644
 +        struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
 +        TEB *next = thread_data->next_killed;
 +
++#ifdef __GLIBC__
++        /* A thread killed in a unix call may hold a library lock and not have
++         * finished exiting yet. Don't wait for it: queue it for a later pass. */
++        if (pthread_tryjoin_np( thread_data->pthread_id, NULL ) == EBUSY)
++        {
++            do thread_data->next_killed = killed_threads;
++            while (InterlockedCompareExchangePointer( (void **)&killed_threads, teb,
++                                                      thread_data->next_killed ) != thread_data->next_killed);
++            teb = next;
++            continue;
++        }
++#else
 +        pthread_join( thread_data->pthread_id, NULL );
++#endif
 +        virtual_free_teb( teb );
 +        teb = next;
 +    }
 +}
 +
 +
- /***********************************************************************
++/***********************************************************************
   *           get_machine_context_size
   */
-@@ -1432,6 +1454,8 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
+ static SIZE_T get_machine_context_size( USHORT machine )
+@@ -1432,6 +1467,8 @@
  
      pthread_sigmask( SIG_BLOCK, &server_block_set, &sigset );
  
@@ -76,7 +87,7 @@ index 8e5070998de..e06e0b24701 100644
      if ((status = virtual_alloc_teb( &teb ))) goto done;
  
      if ((status = init_thread_stack( teb, get_zero_bits_limit( zero_bits ), stack_reserve, stack_commit )))
-@@ -1611,8 +1635,19 @@ done:
+@@ -1611,8 +1648,19 @@
   */
  void abort_thread( int status )
  {
@@ -96,7 +107,7 @@ index 8e5070998de..e06e0b24701 100644
      pthread_exit_wrapper( status );
  }
  
-@@ -1642,6 +1677,8 @@ static DECLSPEC_NORETURN void exit_thread( int status )
+@@ -1642,6 +1690,8 @@
  
      if (InterlockedDecrement( &nb_threads ) <= 0) exit_process( status );
  
@@ -105,11 +116,9 @@ index 8e5070998de..e06e0b24701 100644
      if ((teb = InterlockedExchangePointer( &prev_teb, NtCurrentTeb() )))
      {
          struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
-diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
-index 6ef9efa90a4..ef4db3945d8 100644
 --- a/dlls/ntdll/unix/unix_private.h
 +++ b/dlls/ntdll/unix/unix_private.h
-@@ -118,6 +118,7 @@ struct ntdll_thread_data
+@@ -118,6 +118,7 @@
      void                     *jmp_buf;       /* setjmp buffer for exception handling */
      BOOL                      system_thread; /* thread runs only on the Unix side */
      int                      *fsync_apc_futex;
