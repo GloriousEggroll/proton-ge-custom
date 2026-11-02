@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Alexandre Derumier <aderumier@gmail.com>
+Date: Mon, 2 Nov 2026 14:00:00 +0100
+Subject: [PATCH] winedmo: Rewind the DirectShow parser after it delivered
+ samples.
+
+dmo_seeking_SetPositions() treats an absolute position equal to
+seek.llCurrent as unchanged and only records it, without flushing or
+seeking. But seek.llCurrent is the position the streams were last sought
+to, not where they are: once a stream thread delivered samples or
+EndOfStream, seeking back to that position must seek.
+
+Frenzy Express (Uniana's 2001 arcade scooter game, a Windows PC
+based cabinet) loops its music (MP3 through the MPEG-I splitter) with
+IMediaSeeking::SetPositions(0) on the filter graph when it gets
+EC_COMPLETE. The parser skipped the seek since its position was still 0:
+it never delivered anything again, nor EndOfStream (already sent), and
+the graph's next state change waited forever for the DirectSound
+renderer, hanging the game's window thread.
+
+Treat the position as unchanged only while no active pin delivered a
+sample or EndOfStream since the last seek or start.
+---
+ dlls/winedmo/winedmo_quartz_parser.c | 20 +++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/winedmo/winedmo_quartz_parser.c b/dlls/winedmo/winedmo_quartz_parser.c
+--- a/dlls/winedmo/winedmo_quartz_parser.c
++++ b/dlls/winedmo/winedmo_quartz_parser.c
+@@ -353,6 +353,23 @@
+     return pin->selected && pin->pin.pin.peer;
+ }
+ 
++/* Whether a stream thread delivered a sample or EndOfStream since the last seek or start: the
++ * streams moved away from seek.llCurrent, the position they were sought to. */
++static BOOL dmo_parser_delivered_since_seek(const struct dmo_parser *filter)
++{
++    unsigned int i;
++
++    for (i = 0; i < filter->source_count; ++i)
++    {
++        const struct dmo_parser_source *pin = filter->sources[i];
++
++        if (dmo_parser_source_is_active(pin) && (!pin->need_segment || pin->eos_sent))
++            return TRUE;
++    }
++
++    return FALSE;
++}
++
+ static BOOL dmo_parser_has_selected_stream_type(const struct dmo_parser *filter, const GUID *major_type)
+ {
+     unsigned int i;
+@@ -619,7 +636,8 @@
+     }
+ 
+     current_unchanged = !current || current_positioning == AM_SEEKING_NoPositioning
+-            || (current_positioning == AM_SEEKING_AbsolutePositioning && *current == pin->seek.llCurrent)
++            || (current_positioning == AM_SEEKING_AbsolutePositioning && *current == pin->seek.llCurrent
++                && !dmo_parser_delivered_since_seek(filter))
+             || (current_positioning == AM_SEEKING_RelativePositioning && !*current)
+             || (current_positioning == AM_SEEKING_IncrementalPositioning && !*current);
+     if (current_unchanged)
+-- 
+2.51.0
+
