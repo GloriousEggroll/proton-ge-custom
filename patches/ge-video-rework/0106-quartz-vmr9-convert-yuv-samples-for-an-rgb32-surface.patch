@@ -20,6 +20,11 @@ for this case, now shared.
 
 GE: also set the alpha channel in the converters, so an A8R8G8B8 surface that
 a presenter blends is opaque. VMR-7 only uses them for X8R8G8B8 surfaces.
+
+GE: the converters also take the source height separately, which locates
+the chroma planes, and convert at most the surface size: a surface smaller
+than the frame no longer falls back to the plane copy in VMR-9, and VMR-7
+no longer writes past a smaller RGB32 surface either.
 ---
 --- a/dlls/quartz/quartz_private.h
 +++ b/dlls/quartz/quartz_private.h
@@ -29,24 +34,32 @@ a presenter blends is opaque. VMR-7 only uses them for X8R8G8B8 surfaces.
  HRESULT vmr7_create(IUnknown *outer, IUnknown **out);
 +
 +void convert_nv12_to_rgb32(BYTE *dst, unsigned int dst_pitch,
-+        const BYTE *src, unsigned int src_pitch, unsigned int width, unsigned int height);
++        const BYTE *src, unsigned int src_pitch, unsigned int src_height, unsigned int width, unsigned int height);
 +void convert_yv12_to_rgb32(BYTE *dst, unsigned int dst_pitch,
-+        const BYTE *src, unsigned int src_pitch, unsigned int width, unsigned int height);
++        const BYTE *src, unsigned int src_pitch, unsigned int src_height, unsigned int width, unsigned int height);
  HRESULT vmr9_create(IUnknown *outer, IUnknown **out);
  HRESULT wave_parser_create(IUnknown *outer, IUnknown **out);
  
 --- a/dlls/quartz/vmr7.c
 +++ b/dlls/quartz/vmr7.c
-@@ -170,7 +170,7 @@
+@@ -170,11 +170,13 @@
      return value;
  }
  
 -static void convert_nv12_to_rgb32(BYTE *dst, unsigned int dst_pitch,
+-        const BYTE *src, unsigned int src_pitch, unsigned int width, unsigned int height)
++/* src_height locates the chroma planes; width and height are the size to convert,
++ * at most the source size, so that callers can clip to a smaller surface. */
 +void convert_nv12_to_rgb32(BYTE *dst, unsigned int dst_pitch,
-         const BYTE *src, unsigned int src_pitch, unsigned int width, unsigned int height)
++        const BYTE *src, unsigned int src_pitch, unsigned int src_height, unsigned int width, unsigned int height)
  {
      const BYTE *y_plane = src;
-@@ -197,12 +197,12 @@
+-    const BYTE *uv_plane = src + src_pitch * height;
++    const BYTE *uv_plane = src + src_pitch * src_height;
+     unsigned int x, y;
+ 
+     for (y = 0; y < height; ++y)
+@@ -197,17 +199,17 @@
              g = clamp_rgb_value((298 * c - 100 * d - 208 * e + 128) >> 8);
              b = clamp_rgb_value((298 * c + 516 * d + 128) >> 8);
  
@@ -57,11 +70,19 @@ a presenter blends is opaque. VMR-7 only uses them for X8R8G8B8 surfaces.
  }
  
 -static void convert_yv12_to_rgb32(BYTE *dst, unsigned int dst_pitch,
+-        const BYTE *src, unsigned int src_pitch, unsigned int width, unsigned int height)
 +void convert_yv12_to_rgb32(BYTE *dst, unsigned int dst_pitch,
-         const BYTE *src, unsigned int src_pitch, unsigned int width, unsigned int height)
++        const BYTE *src, unsigned int src_pitch, unsigned int src_height, unsigned int width, unsigned int height)
  {
      const BYTE *y_plane = src;
-@@ -231,7 +231,7 @@
+-    const BYTE *v_plane = src + src_pitch * height;
+-    const BYTE *u_plane = v_plane + (src_pitch / 2) * (height / 2);
++    const BYTE *v_plane = src + src_pitch * src_height;
++    const BYTE *u_plane = v_plane + (src_pitch / 2) * (src_height / 2);
+     unsigned int x, y;
+ 
+     for (y = 0; y < height; ++y)
+@@ -231,7 +233,7 @@
              g = clamp_rgb_value((298 * c - 100 * d - 208 * e + 128) >> 8);
              b = clamp_rgb_value((298 * c + 516 * d + 128) >> 8);
  
@@ -70,24 +91,46 @@ a presenter blends is opaque. VMR-7 only uses them for X8R8G8B8 surfaces.
          }
      }
  }
+@@ -339,7 +341,8 @@
+             && (surface_desc.ddpfPixelFormat.dwFlags & DDPF_RGB)
+             && surface_desc.ddpfPixelFormat.dwRGBBitCount == 32)
+     {
+-        convert_nv12_to_rgb32(surface_desc.lpSurface, surface_desc.lPitch, data, src_pitch, width, abs(height));
++        convert_nv12_to_rgb32(surface_desc.lpSurface, surface_desc.lPitch, data, src_pitch, abs(height),
++                min(width, surface_desc.dwWidth), min(abs(height), surface_desc.dwHeight));
+     }
+     else if (bitmap_header->biCompression == mmioFOURCC('N','V','1','2'))
+     {
+@@ -357,7 +360,8 @@
+         if ((surface_desc.ddpfPixelFormat.dwFlags & DDPF_RGB)
+                 && surface_desc.ddpfPixelFormat.dwRGBBitCount == 32)
+         {
+-            convert_yv12_to_rgb32(surface_desc.lpSurface, surface_desc.lPitch, data, src_pitch, width, abs(height));
++            convert_yv12_to_rgb32(surface_desc.lpSurface, surface_desc.lPitch, data, src_pitch, abs(height),
++                    min(width, surface_desc.dwWidth), min(abs(height), surface_desc.dwHeight));
+         }
+         else
+         {
 --- a/dlls/quartz/vmr9.c
 +++ b/dlls/quartz/vmr9.c
-@@ -293,7 +293,19 @@
+@@ -293,7 +293,21 @@
          return hr;
      }
  
 -    if (bitmap_header->biCompression == mmioFOURCC('N','V','1','2'))
 +    if ((bitmap_header->biCompression == mmioFOURCC('N','V','1','2')
 +            || bitmap_header->biCompression == mmioFOURCC('Y','V','1','2'))
-+            && (dst_desc.Format == D3DFMT_X8R8G8B8 || dst_desc.Format == D3DFMT_A8R8G8B8)
-+            && width <= dst_desc.Width && abs(height) <= dst_desc.Height)
++            && (dst_desc.Format == D3DFMT_X8R8G8B8 || dst_desc.Format == D3DFMT_A8R8G8B8))
 +    {
 +        /* A custom allocator can give an RGB32 surface for a YUV stream: copying the planes
-+         * there would write the chroma past the end of the surface, convert them instead. */
++         * there would write the chroma past the end of the surface, convert them instead,
++         * clipped to the surface. */
++        unsigned int rgb_width = min(width, dst_desc.Width), rgb_height = min(abs(height), dst_desc.Height);
++
 +        if (bitmap_header->biCompression == mmioFOURCC('N','V','1','2'))
-+            convert_nv12_to_rgb32(locked_rect.pBits, locked_rect.Pitch, data, src_pitch, width, abs(height));
++            convert_nv12_to_rgb32(locked_rect.pBits, locked_rect.Pitch, data, src_pitch, abs(height), rgb_width, rgb_height);
 +        else
-+            convert_yv12_to_rgb32(locked_rect.pBits, locked_rect.Pitch, data, src_pitch, width, abs(height));
++            convert_yv12_to_rgb32(locked_rect.pBits, locked_rect.Pitch, data, src_pitch, abs(height), rgb_width, rgb_height);
 +    }
 +    else if (bitmap_header->biCompression == mmioFOURCC('N','V','1','2'))
      {
