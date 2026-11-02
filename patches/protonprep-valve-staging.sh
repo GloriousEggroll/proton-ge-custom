@@ -612,6 +612,10 @@ apply_all_in_dir() {
     echo "WINE: -HDR- win32u: prefer the native HDR10/scRGB colorspace when the host supports it (oversaturated MangoHud/Steam overlay in HDR on KWin 6.8)"
     apply_patch "../patches/wine-hotfixes/pending/win32u-prefer-native-hdr-colorspace-for-host-layers.patch"
 
+    # https://github.com/GloriousEggroll/proton-ge-custom/issues/798
+    echo "WINE: -WAYLAND- winewayland: fix win_data locking in the IME text input paths (freeze when using Fcitx5 with WAYLANDDRV_IME=1)"
+    apply_patch "../patches/wine-hotfixes/pending/winewayland-fix-win-data-locking-in-ime-text-input.patch"
+
     # https://github.com/GloriousEggroll/proton-ge-custom/issues/852
     echo "WINE: -GAME FIXES- winewayland: advertise the OpenVR/OpenXR Vulkan device pseudo-extensions like winex11 (DXVK/vkd3d device creation fails on Wayland with an OpenXR runtime installed)"
     apply_patch "../patches/wine-hotfixes/pending/winewayland-advertise-openvr-openxr-device-extensions.patch"
