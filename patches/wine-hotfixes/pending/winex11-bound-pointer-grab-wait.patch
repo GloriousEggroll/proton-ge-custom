@@ -1,0 +1,58 @@
+From: Syrupdesu <122212359+Syrupdesu@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 23:10:00 -0800
+Subject: [PATCH] winex11.drv: Don't wait forever for the pointer grab on focus
+ change.
+
+wait_grab_pointer() retries XGrabPointer() every 10ms until it succeeds.
+That never happens when the grab is held by another thread of the same
+process that is blocked in a synchronous SendMessage() to the thread
+changing focus: the sender cannot release the grab before its message is
+processed, and the receiver cannot process the message before the grab is
+released.
+
+Reproduced with Arknights: Endfield 1.6.3 (Steam AppID 4732690) on KWin
+Wayland in desktop mode. Opening the in-game web view creates a Qt
+WebEngine window and the main thread ends up in
+
+  NtUserPeekMessage -> X11DRV_ProcessEvents -> X11DRV_ClientMessage ->
+  set_focus -> wait_grab_pointer
+
+while another thread of the same process is stuck in
+send_inter_thread_message -> wait_message_reply. Because the pointer grab
+is global, the rest of the desktop stops receiving pointer input as well,
+which makes the Steam client look frozen too.
+
+Stop waiting after one second so that the pending message can be
+processed and the grab released. The original purpose of the wait,
+delaying WM_ACTIVATE while the window manager is still moving or resizing
+the window, is preserved for grabs shorter than that.
+---
+diff --git a/dlls/winex11.drv/event.c b/dlls/winex11.drv/event.c
+--- a/dlls/winex11.drv/event.c
++++ b/dlls/winex11.drv/event.c
+@@ -324,6 +324,7 @@ static Bool filter_event( Display *display, XEvent *event, char *arg )
+ static void wait_grab_pointer( Display *display )
+ {
+     RECT rect;
++    unsigned int retries = 0;
+ 
+     /* unnecessary on gamescope, windows cannot be moved with the mouse */
+     if (X11DRV_HasWindowManager( "steamcompmgr" )) return;
+@@ -336,6 +337,17 @@ static void wait_grab_pointer( Display *display )
+                          None, None, CurrentTime ) != GrabSuccess)
+     {
+         LARGE_INTEGER timeout = {.QuadPart = -10 * (ULONGLONG)10000};
++
++        /* The grab can be held by another thread of this process which is
++         * waiting for us to process a sent message, in which case it will
++         * never be released. Stop waiting after a while so that the message
++         * can be processed. */
++        if (++retries >= 100)
++        {
++            WARN( "giving up waiting for pointer grab\n" );
++            break;
++        }
++
+         NtDelayExecution( FALSE, &timeout );
+     }
+ 
