@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jason Eggleston <eggnet@gmail.com>
+Date: Tue, 3 Nov 2026 11:14:01 -0800
+Subject: [PATCH] ntdll: Don't queue a killed thread twice.
+
+abort_thread() and free_killed_threads() put a TEB on killed_threads in
+a compare-and-swap loop that compares the result with next_killed, read
+back from the TEB. Once the exchange has succeeded, free_killed_threads()
+in another thread can take the TEB, find the thread still running and
+queue it again, which changes next_killed. The first loop then sees a
+different value, goes round once more and puts the TEB on the list a
+second time. The TEB is then freed twice, which also puts it twice on
+the list of free TEBs, and pthread_tryjoin_np() reads the pthread
+structure of a thread whose stacks are already freed. That faults inside
+the syscall, so NtCreateThreadEx() returns STATUS_ACCESS_VIOLATION after
+the server has created the new thread.
+
+Compare with the value passed to the exchange instead, in a helper that
+both use.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/ntdll/unix/thread.c | 30 +++++++++++++++++++++---------
+ 1 file changed, 21 insertions(+), 9 deletions(-)
+
+diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
+index 00303a5c184..57d181468ff 100644
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -1147,6 +1147,25 @@ static void start_thread( TEB *teb )
+ }
+ 
+ 
++/***********************************************************************
++ *           queue_killed_thread
++ *
++ * Put a TEB on the list of killed threads whose TEB and stacks are still to be freed.
++ */
++static void queue_killed_thread( TEB *teb )
++{
++    struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
++    TEB *next;
++
++    /* once the TEB is on the list, another thread can take it and change next_killed */
++    do
++    {
++        next = killed_threads;
++        thread_data->next_killed = next;
++    } while (InterlockedCompareExchangePointer( (void **)&killed_threads, teb, next ) != next);
++}
++
++
+ /***********************************************************************
+  *           free_killed_threads
+  *
+@@ -1166,9 +1185,7 @@ static void free_killed_threads(void)
+          * finished exiting yet. Don't wait for it: queue it for a later pass. */
+         if (pthread_tryjoin_np( thread_data->pthread_id, NULL ) == EBUSY)
+         {
+-            do thread_data->next_killed = killed_threads;
+-            while (InterlockedCompareExchangePointer( (void **)&killed_threads, teb,
+-                                                      thread_data->next_killed ) != thread_data->next_killed);
++            queue_killed_thread( teb );
+             teb = next;
+             continue;
+         }
+@@ -1655,12 +1672,7 @@ void abort_thread( int status )
+ 
+     /* A killed thread cannot free its own stacks, and it may hold a lock here: leave them
+      * to the next thread that is created or exits. */
+-    if (thread_data->pthread_id)
+-    {
+-        do thread_data->next_killed = killed_threads;
+-        while (InterlockedCompareExchangePointer( (void **)&killed_threads, NtCurrentTeb(),
+-                                                  thread_data->next_killed ) != thread_data->next_killed);
+-    }
++    if (thread_data->pthread_id) queue_killed_thread( NtCurrentTeb() );
+     pthread_exit_wrapper( status );
+ }
+ 

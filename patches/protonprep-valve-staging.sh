@@ -683,6 +683,10 @@ apply_all_in_dir() {
     echo "WINE: -PENDING- server: keep the request's status when receive_fd() drops a stale fd (spurious thread creation failures)"
     apply_patch "../patches/wine-hotfixes/pending/server-keep-request-status-when-dropping-stale-fd.patch"
 
+    # The killed-thread freeing (#917 follow-up) can put a TEB on its list twice
+    echo "WINE: -PENDING- ntdll: don't queue a killed thread twice for freeing (double free under thread churn)"
+    apply_patch "../patches/wine-hotfixes/pending/ntdll-dont-queue-a-killed-thread-twice.patch"
+
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
     ./tools/make_requests
