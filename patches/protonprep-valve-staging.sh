@@ -645,6 +645,10 @@ apply_all_in_dir() {
     echo "WINE: -WAYLAND- winewayland: animate animated cursors (game cursors static on Wine-Wayland, The Sims 3)"
     apply_patch "../patches/wine-hotfixes/pending/winewayland-animate-animated-cursors.patch"
 
+    # https://github.com/GloriousEggroll/proton-ge-custom/issues/899
+    echo "WINE: -GAME FIXES- rtworkq: don't hold queues_section while shutting down the system queues (MFShutdown deadlock, Kingdom Hearts 358/2 Days port hangs after the first cutscene)"
+    apply_patch "../patches/wine-hotfixes/pending/rtworkq-dont-hold-queues-section-during-system-queue-shutdown.patch"
+
     # https://github.com/GloriousEggroll/proton-ge-custom/issues/881
     echo "WINE: -HOTFIX- win32u: defer destroying NVIDIA Wayland host Vulkan instances while another is alive (NVIDIA driver clears its global libwayland table, EA app crash on winewayland)"
     apply_patch "../patches/wine-hotfixes/pending/win32u-defer-nvidia-wayland-host-instance-destroy.patch"
