@@ -649,6 +649,10 @@ apply_all_in_dir() {
     echo "WINE: -GAME FIXES- rtworkq: don't hold queues_section while shutting down the system queues (MFShutdown deadlock, Kingdom Hearts 358/2 Days port hangs after the first cutscene)"
     apply_patch "../patches/wine-hotfixes/pending/rtworkq-dont-hold-queues-section-during-system-queue-shutdown.patch"
 
+    # https://github.com/GloriousEggroll/proton-ge-custom/issues/521
+    echo "WINE: -GAME FIXES- dsound: keep the high quality resampler for any number of buffers (BGM crackles after voice lines in Liarsoft codeX RScript games)"
+    apply_patch "../patches/wine-hotfixes/pending/dsound-keep-hq-resampler-for-any-buffer-count.patch"
+
     # https://github.com/GloriousEggroll/proton-ge-custom/issues/881
     echo "WINE: -HOTFIX- win32u: defer destroying NVIDIA Wayland host Vulkan instances while another is alive (NVIDIA driver clears its global libwayland table, EA app crash on winewayland)"
     apply_patch "../patches/wine-hotfixes/pending/win32u-defer-nvidia-wayland-host-instance-destroy.patch"
