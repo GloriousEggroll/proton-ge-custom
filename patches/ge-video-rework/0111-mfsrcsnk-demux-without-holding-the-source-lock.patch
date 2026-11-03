@@ -1,0 +1,165 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Alexandre Derumier <aderumier@gmail.com>
+Date: Tue, 3 Nov 2026 21:30:00 +0100
+Subject: [PATCH] mfsrcsnk: Demux without holding the source lock.
+
+The source read samples from its IO queue work item holding the source
+lock, the demuxer reading from the byte stream meanwhile. An application
+byte stream may complete a synchronous Read through its own BeginRead and
+MFInvokeCallback, on the standard queue (its callback has no parameters):
+the standard queue has one thread, which waited for the source lock in a
+stream sample request, and the read never completed. Pokken Tournament
+(Bandai Namco, arcade) reads its MP4 movies from such a byte stream: its
+movies froze from time to time and stopping one hung the game (the title
+screen stayed still).
+
+Demux under a lock of its own, taken before the source lock, leaving the
+source lock while the demuxer reads. A seek is left to the next read, on
+the IO queue as well, and a sample read before a seek, a stop or a
+shutdown is dropped. Shutdown waits for a read in progress before closing
+the byte stream.
+---
+--- a/dlls/mfsrcsnk/media_source.c
++++ b/dlls/mfsrcsnk/media_source.c
+@@ -320,6 +320,8 @@
+     LONG refcount;
+ 
+     CRITICAL_SECTION cs;
++    /* Serializes demuxer and byte stream access, taken before cs. */
++    CRITICAL_SECTION demux_cs;
+     IMFMediaEventQueue *queue;
+     IMFByteStream *stream;
+     WCHAR *url;
+@@ -348,6 +350,10 @@
+     BOOL eop_queued;
+     BOOL demux_eos;
+     UINT pending_reads;
++    /* Seek done by the next read, seek_count counts the seeks requested. */
++    BOOL seek_pending;
++    INT64 seek_time;
++    UINT64 seek_count;
+ };
+ 
+ static struct media_source *media_source_from_IMFMediaSource(IMFMediaSource *iface)
+@@ -509,7 +515,6 @@
+         GUID *format, PROPVARIANT *position)
+ {
+     BOOL starting = source->state == SOURCE_STOPPED, seeking = !starting && position->vt != VT_EMPTY;
+-    NTSTATUS status;
+     DWORD i, count;
+     HRESULT hr;
+ 
+@@ -567,8 +572,11 @@
+     if (position->vt == VT_I8)
+     {
+         WARN("MF media source seek to %s before starting streams.\n", debugstr_time(position->hVal.QuadPart));
+-        if ((status = winedmo_demuxer_seek(source->winedmo_demuxer, position->hVal.QuadPart)))
+-            WARN("Failed to seek to %I64d, status %#lx\n", position->hVal.QuadPart, status);
++        /* The demuxer may read from the byte stream to seek: leave it to the next read, on
++         * the IO queue, see media_source_read. */
++        source->seek_pending = TRUE;
++        source->seek_time = position->hVal.QuadPart;
++        source->seek_count++;
+     }
+ 
+     for (i = 0; i < source->stream_count; i++)
+@@ -782,16 +790,38 @@
+     return S_OK;
+ }
+ 
++/* Called with demux_cs and cs held, returns with them held. A byte stream read can wait
++ * for a work item of its own (an application byte stream completing a read through
++ * MFInvokeCallback): cs is left while demuxing, so the work items of the source on the
++ * standard queue never wait for it. */
+ static HRESULT media_source_read(struct media_source *source)
+ {
+-    IMFSample *sample;
++    BOOL seek = source->seek_pending;
++    INT64 seek_time = source->seek_time;
++    UINT64 seek_count = source->seek_count;
++    IMFSample *sample = NULL;
++    NTSTATUS status;
+     UINT i, index;
+     HRESULT hr;
+ 
+     if (source->state != SOURCE_RUNNING)
+         return S_OK;
++    source->seek_pending = FALSE;
++
++    LeaveCriticalSection(&source->cs);
++    if (seek && (status = winedmo_demuxer_seek(source->winedmo_demuxer, seek_time)))
++        WARN("Failed to seek to %I64d, status %#lx\n", seek_time, status);
++    hr = demuxer_read_sample(source->winedmo_demuxer, &index, &sample);
++    EnterCriticalSection(&source->cs);
++
++    /* Data from before a seek, or the source was stopped or shut down meanwhile. */
++    if (source->seek_count != seek_count || (source->state != SOURCE_RUNNING && source->state != SOURCE_PAUSED))
++    {
++        if (sample) IMFSample_Release(sample);
++        return S_OK;
++    }
+ 
+-    if (FAILED(hr = demuxer_read_sample(source->winedmo_demuxer, &index, &sample)) && hr != MF_E_END_OF_STREAM)
++    if (FAILED(hr) && hr != MF_E_END_OF_STREAM)
+     {
+         WARN("Failed to read stream %u data, hr %#lx\n", index, hr);
+         return hr;
+@@ -821,6 +851,7 @@
+     if (!(state = IMFAsyncResult_GetStateNoAddRef(result))) return E_INVALIDARG;
+     params = async_read_params_from_IUnknown(state);
+ 
++    EnterCriticalSection(&source->demux_cs);
+     EnterCriticalSection(&source->cs);
+     source->pending_reads--;
+ 
+@@ -830,6 +861,7 @@
+         WARN("Failed to request sample, hr %#lx\n", hr);
+ 
+     LeaveCriticalSection(&source->cs);
++    LeaveCriticalSection(&source->demux_cs);
+ 
+     return S_OK;
+ }
+@@ -1397,6 +1429,8 @@
+ 
+         source->cs.DebugInfo->Spare[0] = 0;
+         DeleteCriticalSection(&source->cs);
++        source->demux_cs.DebugInfo->Spare[0] = 0;
++        DeleteCriticalSection(&source->demux_cs);
+ 
+         free(source);
+     }
+@@ -1584,11 +1618,14 @@
+ 
+     TRACE("source %p\n", source);
+ 
++    /* Wait for a read in progress to stop using the byte stream. */
++    EnterCriticalSection(&source->demux_cs);
+     EnterCriticalSection(&source->cs);
+ 
+     if (source->state == SOURCE_SHUTDOWN)
+     {
+         LeaveCriticalSection(&source->cs);
++        LeaveCriticalSection(&source->demux_cs);
+         return MF_E_SHUTDOWN;
+     }
+     source->state = SOURCE_SHUTDOWN;
+@@ -1607,6 +1644,7 @@
+     }
+ 
+     LeaveCriticalSection(&source->cs);
++    LeaveCriticalSection(&source->demux_cs);
+ 
+     return S_OK;
+ }
+@@ -2119,6 +2157,8 @@
+     source->rate = 1.0f;
+     InitializeCriticalSectionEx(&source->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+     source->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": cs");
++    InitializeCriticalSectionEx(&source->demux_cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
++    source->demux_cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": demux_cs");
+ 
+     *out = &source->IMFMediaSource_iface;
+     TRACE("created source %p\n", source);
+-- 
+2.51.0
