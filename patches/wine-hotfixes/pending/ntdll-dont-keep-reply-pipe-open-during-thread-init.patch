@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jason Eggleston <eggnet@gmail.com>
+Date: Mon, 2 Nov 2026 19:36:51 -0800
+Subject: [PATCH] ntdll: Don't keep the reply pipe's write end open during
+ thread init.
+
+init_thread_pipe() sends the write end of a new thread's reply pipe to
+the server. Since 44699c324f2 the thread closes its own copy only after
+its init_thread or init_first_thread request has returned.
+
+If the thread is killed after it has written that request but before
+the server has read it, the server closes the thread's request pipe and
+the reply fd it was sent, and never replies. The thread keeps waiting
+for the reply, and since it holds the write end itself, the read never
+sees end-of-file: the thread stays blocked for the life of the process,
+with its pipes and its stacks. A thread killed just before it writes
+the request gets EPIPE and exits, but leaks the write end.
+
+Close the write end as soon as the server has it, as before 44699c324f2.
+The fd number is still what the request passes: the server looks it up
+among the fds this thread has sent.
+
+Helldivers 2's anti-tamper code creates suspended threads and kills them
+right away, several times a second, so these threads pile up during a
+session.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/ntdll/unix/server.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+index 8a02609bee1..0336bebc57f 100644
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -1623,6 +1623,10 @@ static int init_thread_pipe(void)
+     wine_server_send_fd( reply_pipe[1] );
+     wine_server_send_fd( ntdll_get_thread_data()->wait_fd[1] );
+     ntdll_get_thread_data()->reply_fd = reply_pipe[0];
++    /* The server has its own copy now. If we kept ours until the init request
++     * returns, a thread killed before the server reads the request would wait
++     * for the reply forever. */
++    close( reply_pipe[1] );
+     return reply_pipe[1];
+ }
+ 
+@@ -1780,7 +1784,6 @@ size_t server_init_process(void)
+         }
+     }
+     SERVER_END_REQ;
+-    close( reply_pipe );
+ 
+     if (ret) server_protocol_error( "init_first_thread failed with status %x\n", ret );
+ 
+@@ -1899,7 +1902,6 @@ void server_init_thread( void *entry_point, BOOL *suspend )
+         *suspend = reply->suspend;
+     }
+     SERVER_END_REQ;
+-    close( reply_pipe );
+ }
+ 
+ NTSTATUS WINAPI NtAllocateReserveObject( HANDLE *handle, const OBJECT_ATTRIBUTES *attr,
