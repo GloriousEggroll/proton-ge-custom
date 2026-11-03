@@ -441,7 +441,7 @@ apply_all_in_dir() {
     echo "WINE: -HOTFIX- Reconcile unsupported minimization on xwayland-satellite"
     apply_patch "../patches/wine-hotfixes/pending/winex11-handle-unsupported-minimization-on-satellite.patch"
 
-    echo "WINE: -HOTFIX- Don't wait forever for the pointer grab on focus change"
+    echo "WINE: -HOTFIX- winex11: don't wait for the pointer grab with a sent message pending (Arknights: Endfield web view freezes the desktop)"
     apply_patch "../patches/wine-hotfixes/pending/winex11-bound-pointer-grab-wait.patch"
 
     echo "WINE: -HOTFIX- Do not paint off-desktop minimized frames into retained host windows"
