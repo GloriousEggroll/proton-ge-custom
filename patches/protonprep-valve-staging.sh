@@ -37,8 +37,8 @@ apply_all_in_dir() {
     apply_patch "../patches/dxvk/dxgi-respect-output-hdr-state.patch"
     # Query the active output by default instead of requiring an HDR opt-in.
     apply_patch "../patches/dxvk/dxgi-auto-detect-hdr.patch"
-    # StarCraft II: avoid GPU hangs with D3D9 constant buffer streaming (#790).
-    apply_patch "../patches/dxvk/starcraft2-disable-constant-buffer-streaming.patch"
+    # StarCraft II: avoid GPU hangs with D3D9 constant buffer streaming on Navi 10 (#790, #845).
+    apply_patch "../patches/dxvk/starcraft2-disable-constant-buffer-streaming-on-navi10.patch"
     popd
 
     pushd d7vk
