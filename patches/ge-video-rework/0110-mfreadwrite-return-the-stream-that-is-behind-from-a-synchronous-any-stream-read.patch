@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Alexandre Derumier <aderumier@gmail.com>
+Date: Tue, 3 Nov 2026 19:30:00 +0100
+Subject: [PATCH] mfreadwrite: Return the stream that is behind from a
+ synchronous ANY_STREAM read.
+
+A synchronous ReadSample(MF_SOURCE_READER_ANY_STREAM) returned whichever
+stream had a sample ready, the one with the lowest timestamp among them.
+The stream that is behind may still be decoding, so the reader handed out
+the other one: in an MP4 with H.264 video and AAC audio, the video ran
+about half a second ahead of the audio. Pokken Tournament (Bandai Namco,
+arcade) reads its movies this way and shows video frames on its audio
+clock from a small pool of video frames: the pool filled while the audio
+it needed was still to be read, its reader thread waited for a free frame
+holding the movie, its audio stopped and every movie froze after a few
+seconds (the attract screen stayed black, pressing start hung the game in
+the movie's stop).
+
+Read the selected stream whose last delivered sample has the lowest
+timestamp (an ended stream's end of stream first), as Windows does. The
+Windows Media reader mode (flag_eos_for_all_streams) keeps its path.
+---
+--- a/dlls/mfreadwrite/reader.c
++++ b/dlls/mfreadwrite/reader.c
+@@ -3405,6 +3405,44 @@
+     return hr;
+ }
+ 
++/* A synchronous ANY_STREAM read returns the selected stream that is behind (the lowest delivered
++ * timestamp; an ended stream's end of stream first), as on Windows. A sample of a stream that is
++ * ahead let it run away from the others: a game showing video frames on its audio clock fills its
++ * video frames while the audio it needs is still to be read (Pokken Tournament's movies). */
++static HRESULT source_reader_get_stream_behind(struct source_reader *reader, DWORD *stream_index)
++{
++    LONGLONG min_ts = MAXLONGLONG;
++    BOOL selected, found = FALSE;
++    unsigned int i;
++
++    for (i = 0; i < reader->stream_count; ++i)
++    {
++        struct media_stream *stream = &reader->streams[i];
++
++        if (FAILED(source_reader_get_stream_selection(reader, i, &selected)) || !selected)
++            continue;
++
++        if (stream->state == STREAM_STATE_EOS && !stream->responses)
++        {
++            if (!(stream->flags & STREAM_FLAG_EOS_REPORTED))
++            {
++                *stream_index = i;
++                return S_OK;
++            }
++            continue;
++        }
++
++        if (stream->delivered_sample_ts < min_ts)
++        {
++            min_ts = stream->delivered_sample_ts;
++            *stream_index = i;
++            found = TRUE;
++        }
++    }
++
++    return found ? S_OK : E_FAIL;
++}
++
+ static HRESULT source_reader_read_sample(struct source_reader *reader, DWORD index, DWORD flags, DWORD *actual_index,
+         DWORD *stream_flags, LONGLONG *timestamp, IMFSample **sample)
+ {
+@@ -3431,6 +3469,10 @@
+ 
+     if (SUCCEEDED(hr = source_reader_start_source(reader)))
+     {
++        if (index == MF_SOURCE_READER_ANY_STREAM && !reader->flag_eos_for_all_streams
++                && SUCCEEDED(source_reader_get_stream_behind(reader, &stream_index)))
++            index = stream_index;
++
+         if (index == MF_SOURCE_READER_ANY_STREAM)
+         {
+             BOOL have_result;
