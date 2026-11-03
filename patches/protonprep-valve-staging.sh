@@ -68,7 +68,7 @@ apply_all_in_dir() {
     pushd protonfixes
     git reset --hard HEAD
     git clean -xdf
-    echo "PROTONFIXES: add PROTON_STREAMLINE_UPGRADE"
+    echo "PROTONFIXES: apply GE protonfixes patches"
     apply_all_in_dir "../patches/protonfixes/"
     popd
 
