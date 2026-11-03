@@ -522,6 +522,10 @@ apply_all_in_dir() {
     echo "WINE: -PENDING-  Import upstream icuu forwarders patches to fix broken GoW2Hollow_Setup.exe for Gears of War 2 Hollow"
     apply_patch "../patches/wine-hotfixes/pending/icuuc-icuin-forwarder-dlls.patch"
 
+    # https://gitlab.winehq.org/wine/wine/-/merge_requests/12499
+    echo "WINE: -PENDING- dinput: Map user offsets for effect parameters"
+    apply_patch "../patches/wine-hotfixes/pending/0001-dinput-Map-user-offsets-for-effect-parameters.patch"
+
 
     # Separate OpenXR steam reliance
     # https://github.com/GloriousEggroll/proton-ge-custom/issues/214

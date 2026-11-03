@@ -1,0 +1,155 @@
+From 970acba3583eef6ff1d895d6259401bce637131c Mon Sep 17 00:00:00 2001
+From: Matthias Gorzellik <matthias.gorzellik@gmail.com>
+Date: Tue, 3 Nov 2026 22:40:37 +0100
+Subject: [PATCH] dinput: Map user offsets for effect parameters
+
+DirectInput applications can install a custom data format whose axis and
+button offsets differ from the HID device's native format.  For
+DIEFF_OBJECTOFFSETS, SetParameters passed those application offsets
+directly to enum_objects(), so DIPH_BYOFFSET could select the wrong
+object or no object at all.
+
+Translate the offsets through the matched user and device data formats
+before enumerating effect axes and trigger buttons.
+
+Add a regression test with X at 0x100 and button 0 at 0x104, verifying
+that SetParameters/GetParameters round-trip the application offsets.
+---
+ dlls/dinput/joystick_hid.c         | 26 ++++++++++++-
+ dlls/dinput/tests/force_feedback.c | 62 ++++++++++++++++++++++++++++++
+ 2 files changed, 86 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/dinput/joystick_hid.c b/dlls/dinput/joystick_hid.c
+index 78ccf107009..64c7656f72b 100644
+--- a/dlls/dinput/joystick_hid.c
++++ b/dlls/dinput/joystick_hid.c
+@@ -2885,6 +2885,24 @@ static HRESULT WINAPI hid_joystick_effect_GetParameters( IDirectInputEffect *ifa
+     return DI_OK;
+ }
+ 
++static DWORD user_offset_to_device_offset( struct dinput_device *device, DWORD offset )
++{
++    DIDATAFORMAT *device_format = &device->device_format;
++    DIDATAFORMAT *user_format = &device->user_format;
++    DWORD i;
++
++    if (!user_format->rgodf) return offset;
++
++    for (i = 0; i < device_format->dwNumObjs; ++i)
++    {
++        if (!user_format->rgodf[i].dwType) continue;
++        if (user_format->rgodf[i].dwOfs != offset) continue;
++        return device_format->rgodf[i].dwOfs;
++    }
++
++    return offset;
++}
++
+ static BOOL set_parameters_object( struct dinput_device *device, UINT index, struct hid_value_caps *caps,
+                                    const DIDEVICEOBJECTINSTANCEW *instance, void *data )
+ {
+@@ -2928,7 +2946,9 @@ static HRESULT WINAPI hid_joystick_effect_SetParameters( IDirectInputEffect *ifa
+         impl->params.cAxes = params->cAxes;
+         for (i = 0; i < params->cAxes; ++i)
+         {
+-            filter.dwObj = params->rgdwAxes[i];
++            filter.dwObj = filter.dwHow == DIPH_BYOFFSET
++                           ? user_offset_to_device_offset( &impl->joystick->base, params->rgdwAxes[i] )
++                           : params->rgdwAxes[i];
+             ret = enum_objects( impl->joystick, &filter, DIDFT_AXIS, set_parameters_object,
+                                 &impl->params.rgdwAxes[i] );
+             if (ret != DIENUM_STOP) impl->params.rgdwAxes[i] = 0;
+@@ -3046,7 +3066,9 @@ static HRESULT WINAPI hid_joystick_effect_SetParameters( IDirectInputEffect *ifa
+     {
+         if (!object_flags) return DIERR_INVALIDPARAM;
+ 
+-        filter.dwObj = params->dwTriggerButton;
++        filter.dwObj = filter.dwHow == DIPH_BYOFFSET
++                       ? user_offset_to_device_offset( &impl->joystick->base, params->dwTriggerButton )
++                       : params->dwTriggerButton;
+         old_value = impl->params.dwTriggerButton;
+         ret = enum_objects( impl->joystick, &filter, DIDFT_BUTTON, set_parameters_object,
+                             &impl->params.dwTriggerButton );
+diff --git a/dlls/dinput/tests/force_feedback.c b/dlls/dinput/tests/force_feedback.c
+index 54b5acae5e7..892fc173598 100644
+--- a/dlls/dinput/tests/force_feedback.c
++++ b/dlls/dinput/tests/force_feedback.c
+@@ -1904,6 +1904,66 @@ static void test_condition_effect( IDirectInputDevice8W *device, HANDLE file, DW
+     set_hid_expect( file, NULL, 0 );
+ }
+ 
++static void test_effect_user_offsets( IDirectInputDevice8W *device, DWORD version )
++{
++    DIOBJECTDATAFORMAT objects[] =
++    {
++        {&GUID_XAxis, 0x100, DIDFT_ABSAXIS | DIDFT_MAKEINSTANCE( 0 ), DIDOI_ASPECTPOSITION},
++        {&GUID_Button, 0x104, DIDFT_PSHBUTTON | DIDFT_MAKEINSTANCE( 0 ), DIDOI_FFEFFECTTRIGGER},
++    };
++    DIDATAFORMAT format =
++    {
++        .dwSize = sizeof(DIDATAFORMAT),
++        .dwObjSize = sizeof(DIOBJECTDATAFORMAT),
++        .dwFlags = DIDF_ABSAXIS,
++        .dwDataSize = 0x108,
++        .dwNumObjs = ARRAY_SIZE(objects),
++        .rgodf = objects,
++    };
++    DIEFFECT desc = {0}, get = {0};
++    IDirectInputEffect *effect = NULL;
++    DWORD axis = 0x100, trigger = 0x104, got_axis = 0;
++    HRESULT hr;
++
++    hr = IDirectInputDevice8_SetDataFormat( device, &format );
++    ok( hr == DI_OK, "SetDataFormat returned %#lx\n", hr );
++    if (FAILED(hr)) goto done;
++
++    hr = IDirectInputDevice8_CreateEffect( device, &GUID_ConstantForce, NULL, &effect, NULL );
++    ok( hr == DI_OK, "CreateEffect returned %#lx\n", hr );
++    if (FAILED(hr)) goto done;
++
++    desc.dwSize = version >= 0x700 ? sizeof(DIEFFECT_DX6) : sizeof(DIEFFECT_DX5);
++    desc.dwFlags = DIEFF_OBJECTOFFSETS;
++    desc.dwTriggerButton = trigger;
++    desc.cAxes = 1;
++    desc.rgdwAxes = &axis;
++    hr = IDirectInputEffect_SetParameters( effect, &desc,
++                                           DIEP_AXES | DIEP_TRIGGERBUTTON | DIEP_NODOWNLOAD );
++    ok( hr == DI_DOWNLOADSKIPPED, "SetParameters returned %#lx\n", hr );
++
++    get.dwSize = desc.dwSize;
++    get.dwFlags = DIEFF_OBJECTOFFSETS;
++    get.cAxes = 1;
++    get.rgdwAxes = &got_axis;
++    hr = IDirectInputEffect_GetParameters( effect, &get, DIEP_AXES );
++    ok( hr == DI_OK, "GetParameters returned %#lx\n", hr );
++    ok( got_axis == axis, "got axis %#lx expected %#lx\n", got_axis, axis );
++
++    memset( &get, 0, sizeof(get) );
++    get.dwSize = desc.dwSize;
++    get.dwFlags = DIEFF_OBJECTOFFSETS;
++    hr = IDirectInputEffect_GetParameters( effect, &get, DIEP_TRIGGERBUTTON );
++    ok( hr == DI_OK, "GetParameters returned %#lx\n", hr );
++    ok( get.dwTriggerButton == trigger, "got trigger %#lx expected %#lx\n",
++        get.dwTriggerButton, trigger );
++
++done:
++    if (effect) IDirectInputEffect_Release( effect );
++    hr = IDirectInputDevice8_SetDataFormat( device, &c_dfDIJoystick2 );
++    ok( hr == DI_OK, "SetDataFormat returned %#lx\n", hr );
++}
++
+ static void test_constantforce_effect( IDirectInputDevice8W *device, HANDLE file, DWORD version )
+ {
+     struct hid_expect expect_create_0[] =
+@@ -3644,6 +3704,8 @@ static BOOL test_force_feedback_joystick( DWORD version )
+     ok( hr == DI_OK, "Unacquire returned: %#lx\n", hr );
+     set_hid_expect( file, NULL, 0 );
+ 
++    test_effect_user_offsets( device, version );
++
+     ref = IDirectInputDevice8_Release( device );
+     ok( ref == 0, "Release returned %ld\n", ref );
+ 
+-- 
+2.55.0
+
