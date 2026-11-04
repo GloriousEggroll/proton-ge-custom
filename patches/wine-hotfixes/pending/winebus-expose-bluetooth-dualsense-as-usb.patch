@@ -21,6 +21,13 @@ USB HID report descriptor and report layout, like a wired controller
 - feature reports written by the game get the Bluetooth feature CRC;
   feature report 0x08 is not forwarded, the controller stops responding
   and disconnects after it over Bluetooth (seen with Stellar Blade).
+- output reports are coalesced and sent at most every 10 ms: games may
+  write them every few milliseconds (Assassin's Creed Shadows animates
+  the lightbar at ~400 reports/s), which backs up the Bluetooth link
+  next to the haptics audio reports until the controller drops its HID
+  connection. Reports with the same valid flags replace each other and
+  are sent in the order of their latest update, so the final state is
+  unchanged.
 
 The USB report descriptors and the feature CRC seed follow vDS
 (https://github.com/hurryman2212/vds, MIT license).
@@ -196,7 +203,17 @@ The USB report descriptors and the feature CRC seed follow vDS
  /* A valid CUH-ZCT1 firmware report. */
  static const BYTE dualshock4_v1_firmware_info[] =
  {
-@@ -617,7 +688,7 @@
+@@ -294,6 +365,9 @@
+     BYTE sony_output_seq;
+     BYTE sony_control_state[9];
+     BOOL sony_control_state_valid;
++    BYTE sony_bt_output[4][DUALSENSE_OUTPUT_REPORT_COMMON_SIZE];
++    UINT sony_bt_output_count;
++    ULONGLONG sony_bt_output_time;
+     UINT64 unix_device;
+ };
+ 
+@@ -617,7 +691,7 @@
      WCHAR *dst;
  
      assert(ext->desc.bus_type < BUS_TYPE_COUNT);
@@ -205,7 +222,7 @@ The USB report descriptors and the feature CRC seed follow vDS
      if (ext->desc.input != -1) input_len = 14;
  
      len += winebus_len + input_len + wcslen(bus_str) + 1;
-@@ -814,7 +885,8 @@
+@@ -814,7 +888,8 @@
          TRACE("Enabling report fixup for Bluetooth DualShock4 device %p\n", device);
          ext->report_fixups |= HIDRAW_FIXUP_DUALSHOCK_BT;
      }
@@ -215,7 +232,7 @@ The USB report descriptors and the feature CRC seed follow vDS
      {
          TRACE("Enabling report fixup for Bluetooth DualSense device %p\n", device);
          ext->report_fixups |= HIDRAW_FIXUP_DUALSENSE_BT;
-@@ -1428,10 +1500,58 @@
+@@ -1428,10 +1503,60 @@
      return TRUE;
  }
  
@@ -266,6 +283,8 @@ The USB report descriptors and the feature CRC seed follow vDS
 +    return FALSE;
 +}
 +
++static void sony_bt_flush_output(DEVICE_OBJECT *device, struct device_extension *ext, BOOL force);
++
  static void process_hid_report(DEVICE_OBJECT *device, BYTE *report_buf, DWORD report_len)
  {
      struct device_extension *ext = (struct device_extension *)device->DeviceExtension;
@@ -275,7 +294,17 @@ The USB report descriptors and the feature CRC seed follow vDS
      struct hid_report *report, *last_report;
      ULONG size;
      IRP *irp;
-@@ -1466,7 +1586,8 @@
+@@ -1446,6 +1571,9 @@
+         return;
+     }
+ 
++    /* Input reports arrive every few milliseconds, send queued output. */
++    if (ext->desc.spoof_dualsense_usb) sony_bt_flush_output(device, ext, FALSE);
++
+     /* Spoofed reports only match the DS4 descriptor once translated, so
+      * their declared report is looked up after the translation below. */
+     if (translate) last_report = NULL;
+@@ -1466,7 +1594,8 @@
          report_len = last_report->length;
      }
  
@@ -285,7 +314,7 @@ The USB report descriptors and the feature CRC seed follow vDS
      if (!(report = RtlAllocateHeap(GetProcessHeap(), 0, size)))
      {
          RtlLeaveCriticalSection(&ext->cs);
-@@ -1489,6 +1610,12 @@
+@@ -1489,6 +1618,12 @@
          RtlFreeHeap(GetProcessHeap(), 0, report);
          return;
      }
@@ -298,7 +327,7 @@ The USB report descriptors and the feature CRC seed follow vDS
  
      if (translate)
      {
-@@ -1733,13 +1860,25 @@
+@@ -1733,13 +1868,25 @@
      {
          spoofed_report_desc = dualshock4_v1_report_descriptor;
          *report_desc_length = sizeof(dualshock4_v1_report_descriptor);
@@ -326,7 +355,7 @@ The USB report descriptors and the feature CRC seed follow vDS
      }
      else
          return get_device_descriptors(ext->unix_device, report_desc, report_desc_length, device_desc);
-@@ -1757,7 +1896,7 @@
+@@ -1757,7 +1904,7 @@
          return status;
      }
  
@@ -335,7 +364,7 @@ The USB report descriptors and the feature CRC seed follow vDS
              generation, ext->desc.vid, ext->desc.pid);
      return STATUS_SUCCESS;
  }
-@@ -2432,6 +2571,63 @@
+@@ -2432,6 +2579,134 @@
      report[report_len - 1] = crc >> 24;
  }
  
@@ -396,19 +425,97 @@ The USB report descriptors and the feature CRC seed follow vDS
 +    return TRUE;
 +}
 +
++/* Over USB, games may write output reports every few milliseconds, for
++ * example to animate the lightbar. A Bluetooth controller can't keep up with
++ * that next to the haptics and speaker audio reports: the link backs up and
++ * the controller drops its HID connection. Queue the state blocks instead,
++ * one per set of valid flags, so a newer block replaces an older one that
++ * changes the same fields, and send them at most every 10 ms. Sending them in
++ * the order of their latest update keeps the final state the same as sending
++ * every report. */
++#define DUALSENSE_BT_OUTPUT_INTERVAL_MS 10
++
++static ULONGLONG sony_bt_output_clock(void)
++{
++    LARGE_INTEGER counter, freq;
++
++    NtQueryPerformanceCounter(&counter, &freq);
++    return counter.QuadPart * 1000 / freq.QuadPart;
++}
++
++static void sony_bt_send_output(DEVICE_OBJECT *device, struct device_extension *ext, const BYTE *common)
++{
++    BYTE report[DUALSENSE_OUTPUT_REPORT_BT_SIZE] = {0};
++    HID_XFER_PACKET packet = {0};
++    IO_STATUS_BLOCK io;
++
++    report[0] = DUALSENSE_OUTPUT_REPORT_BT;
++    report[1] = (ext->sony_output_seq++ & 0x0f) << 4;
++    report[2] = DUALSENSE_OUTPUT_REPORT_BT_TAG;
++    memcpy(report + DUALSENSE_OUTPUT_REPORT_BT_COMMON_OFFSET, common, DUALSENSE_OUTPUT_REPORT_COMMON_SIZE);
++    sony_set_output_report_crc(report, sizeof(report));
++
++    packet.reportId = DUALSENSE_OUTPUT_REPORT_BT;
++    packet.reportBuffer = report;
++    packet.reportBufferLen = sizeof(report);
++    unix_device_set_output_report(device, &packet, &io);
++    if (io.Status) WARN("Failed to send Bluetooth DualSense output report, status %#lx.\n", io.Status);
++    ext->sony_bt_output_time = sony_bt_output_clock();
++}
++
++static void sony_bt_flush_output(DEVICE_OBJECT *device, struct device_extension *ext, BOOL force)
++{
++    if (!ext->sony_bt_output_count) return;
++    if (!force && sony_bt_output_clock() - ext->sony_bt_output_time < DUALSENSE_BT_OUTPUT_INTERVAL_MS) return;
++
++    sony_bt_send_output(device, ext, ext->sony_bt_output[0]);
++    memmove(ext->sony_bt_output[0], ext->sony_bt_output[1],
++            --ext->sony_bt_output_count * sizeof(ext->sony_bt_output[0]));
++}
++
++static void sony_bt_queue_output(DEVICE_OBJECT *device, struct device_extension *ext, const BYTE *common)
++{
++    UINT i;
++
++    for (i = 0; i < ext->sony_bt_output_count; ++i)
++    {
++        const BYTE *slot = ext->sony_bt_output[i];
++
++        if (slot[DUALSENSE_OUTPUT_COMMON_VALID_FLAG0_OFFSET] == common[DUALSENSE_OUTPUT_COMMON_VALID_FLAG0_OFFSET] &&
++                slot[DUALSENSE_OUTPUT_COMMON_VALID_FLAG1_OFFSET] == common[DUALSENSE_OUTPUT_COMMON_VALID_FLAG1_OFFSET] &&
++                slot[DUALSENSE_OUTPUT_COMMON_VALID_FLAG2_OFFSET] == common[DUALSENSE_OUTPUT_COMMON_VALID_FLAG2_OFFSET])
++        {
++            memmove(ext->sony_bt_output[i], ext->sony_bt_output[i + 1],
++                    (--ext->sony_bt_output_count - i) * sizeof(ext->sony_bt_output[0]));
++            break;
++        }
++    }
++    if (ext->sony_bt_output_count == ARRAY_SIZE(ext->sony_bt_output))
++        sony_bt_flush_output(device, ext, TRUE);
++    memcpy(ext->sony_bt_output[ext->sony_bt_output_count++], common, DUALSENSE_OUTPUT_REPORT_COMMON_SIZE);
++    sony_bt_flush_output(device, ext, FALSE);
++}
++
  static void hidraw_get_vitapad_feature_report(struct device_extension *ext,
          HID_XFER_PACKET *packet, IO_STATUS_BLOCK *io)
  {
-@@ -2932,6 +3128,8 @@
+@@ -2932,6 +3207,15 @@
              }
              if (hidraw_fixup_spoofed_dualshock4_output_report(ext, packet, &fixed_packet, fixed_report))
                  packet = &fixed_packet;
 +            else if (hidraw_fixup_bluetooth_dualsense_usb_output_report(ext, packet, &fixed_packet, fixed_report))
-+                packet = &fixed_packet;
++            {
++                sony_bt_queue_output(device, ext, fixed_report + DUALSENSE_OUTPUT_REPORT_BT_COMMON_OFFSET);
++                irp->IoStatus.Information = packet->reportBufferLen;
++                irp->IoStatus.Status = STATUS_SUCCESS;
++                if (code != IOCTL_HID_WINE_SET_XINPUT_OUTPUT_REPORT)
++                    hidraw_disable_report_fixups(device);
++                break;
++            }
              else if (hidraw_fixup_dualsense_usb_output_report(ext, packet, &fixed_packet, fixed_report))
                  packet = &fixed_packet;
              hidraw_preserve_dualsense_usb_speaker_route(ext, packet);
-@@ -2981,6 +3179,28 @@
+@@ -2981,6 +3265,28 @@
              }
              if (!hidraw_set_spoofed_dualshock4_feature_report(ext, packet, &irp->IoStatus))
              {
