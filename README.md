@@ -164,7 +164,7 @@ case "$(uname -m)" in
 esac
 
 tarball_url=$(echo "$release_json" |
-    grep browser_download_url |
+    grep -o '"browser_download_url": *"[^"]*"' |
     cut -d\" -f4 |
     grep -E "$tarball_pattern" |
     head -n1 || true)
@@ -185,7 +185,7 @@ fi
 
 # Resolve checksum URL
 checksum_url=$(echo "$release_json" |
-    grep browser_download_url |
+    grep -o '"browser_download_url": *"[^"]*"' |
     cut -d\" -f4 |
     grep "$release_name.sha512sum$" || true)
 
@@ -322,7 +322,7 @@ case "$(uname -m)" in
 esac
 
 tarball_url=$(echo "$release_json" |
-    grep browser_download_url |
+    grep -o '"browser_download_url": *"[^"]*"' |
     cut -d\" -f4 |
     grep -E "$tarball_pattern" |
     head -n1 || true)
@@ -343,7 +343,7 @@ fi
 
 # Resolve checksum URL
 checksum_url=$(echo "$release_json" |
-    grep browser_download_url |
+    grep -o '"browser_download_url": *"[^"]*"' |
     cut -d\" -f4 |
     grep "$release_name.sha512sum$" || true)
 
