@@ -1,0 +1,600 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] winepulse: send DualSense haptics to Bluetooth controllers.
+
+A Bluetooth DualSense has no USB audio function, so games find no
+four-channel controller endpoint for HD haptics. When winebus presents
+the controller as USB (Steam Input disabled), expose a synthetic
+48 kHz four-channel endpoint for it with the same container ID, and send
+channels 3 and 4 to the controller as Bluetooth haptics report 0x32
+through hidraw: resampled to 3 kHz, 8-bit, 64 bytes per report, paced in
+real time. Speaker audio (channels 1 and 2) is not sent.
+PROTON_DUALSENSE_BT_HAPTICS=0 disables it.
+
+Packet layout and resampling follow DS5Dongle
+(https://github.com/awalol/DS5Dongle) and vDS
+(https://github.com/hurryman2212/vds), both MIT licensed.
+---
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -37,6 +37,7 @@
+ #include <poll.h>
+ #include <sys/ioctl.h>
+ #include <unistd.h>
++#include <dirent.h>
+ 
+ #ifdef HAVE_LINUX_HIDRAW_H
+ # include <linux/hidraw.h>
+@@ -105,6 +106,17 @@
+     char *speaker_device;
+     snd_pcm_t *haptic_pcm;
+     char *haptic_alsa_path;
++    /* Bluetooth DualSense haptics, written as hidraw output reports. */
++    BOOL hid_haptics;
++    int hid_fd;
++    pa_usec_t hid_start_time;
++    UINT64 hid_consumed;
++    INT32 hid_sum[2];
++    UINT32 hid_sum_count;
++    INT8 hid_chunk[64];
++    UINT32 hid_chunk_pos;
++    UINT32 hid_silent_chunks;
++    BYTE hid_seq, hid_counter;
+     pa_sample_spec ss;
+     pa_channel_map map;
+     pa_buffer_attr attr;
+@@ -196,6 +208,7 @@
+     GUID container_id;
+     char *raw_haptic_target;
+     char *raw_haptic_alsa_path;
++    char *bt_hidraw;
+     char *endpoint_id;
+     char pulse_name[0];
+ } PhysDevice;
+@@ -372,6 +385,7 @@
+     free(dev->name);
+     free(dev->raw_haptic_target);
+     free(dev->raw_haptic_alsa_path);
++    free(dev->bt_hidraw);
+     free(dev->endpoint_id);
+     free(dev);
+ }
+@@ -1186,6 +1200,9 @@
+             stream->dualsense_haptic_registered)
+         return stream->dataflow == eRender;
+ 
++    if (!stream->stream && stream->hid_haptics)
++        return stream->dataflow == eRender && stream->hid_fd >= 0;
++
+     if (!stream->stream)
+         return stream->dataflow == eRender && stream->haptic_pcm && stream->haptic_alsa_path
+                 && stream->haptic_alsa_path[0];
+@@ -1934,6 +1951,7 @@
+     dev->min_period = 0;
+     dev->raw_haptic_target = NULL;
+     dev->raw_haptic_alsa_path = NULL;
++    dev->bt_hidraw = NULL;
+     dev->endpoint_id = NULL;
+     dev->ready = TRUE;
+     dev->length = 0;
+@@ -1984,6 +2002,205 @@
+     TRACE("%s\n", debugstr_w(dev->name));
+ }
+ 
++/* Bluetooth DualSense controllers have no USB audio function, so there is no
++ * Pulse sink for their haptics. Expose a four-channel endpoint like the USB
++ * one for each of them, with the container ID winebus gives the controller,
++ * and send channels 3 and 4 to the controller as Bluetooth haptics reports.
++ * Packet layout and resampling follow DS5Dongle and vDS (MIT license). */
++static PhysDevice *pulse_find_device(struct list *list, const char *pulse_name);
++
++#define BT_DUALSENSE_PULSE_PREFIX "wine_bluetooth.Sony_Interactive_Entertainment_"
++#define BT_DUALSENSE_HAPTIC_PATH_PREFIX "wine-bluetooth-hidraw:"
++#define BT_DUALSENSE_HAPTIC_REPORT_ID 0x32
++#define BT_DUALSENSE_HAPTIC_REPORT_SIZE 142
++#define BT_DUALSENSE_HAPTIC_DECIMATION 16 /* 48 kHz to 3 kHz */
++#define BT_DUALSENSE_HAPTIC_LEAD_FRAMES 1024
++
++static BOOL steam_virtual_gamepad_present(void)
++{
++    char path[PATH_MAX], value[16];
++    struct dirent *entry;
++    BOOL found = FALSE;
++    DIR *dir;
++    FILE *f;
++
++    if (!(dir = opendir("/sys/class/input")))
++        return FALSE;
++    while (!found && (entry = readdir(dir)))
++    {
++        if (strncmp(entry->d_name, "input", 5))
++            continue;
++        snprintf(path, sizeof(path), "/sys/class/input/%s/id/vendor", entry->d_name);
++        if (!(f = fopen(path, "r")))
++            continue;
++        found = fgets(value, sizeof(value), f) && !strncmp(value, "28de", 4);
++        fclose(f);
++        if (!found)
++            continue;
++        snprintf(path, sizeof(path), "/sys/class/input/%s/id/product", entry->d_name);
++        found = FALSE;
++        if (!(f = fopen(path, "r")))
++            continue;
++        found = fgets(value, sizeof(value), f) && !strncmp(value, "11ff", 4);
++        fclose(f);
++    }
++    closedir(dir);
++    return found;
++}
++
++/* Matches the conditions under which winebus presents the controller as USB. */
++static BOOL bt_dualsense_haptics_enabled(void)
++{
++    const char *env;
++
++    if ((env = getenv("PROTON_DUALSENSE_BT_AS_USB")) && !strcmp(env, "0"))
++        return FALSE;
++    if ((env = getenv("PROTON_DUALSENSE_BT_HAPTICS")) && !strcmp(env, "0"))
++        return FALSE;
++    if ((env = getenv("PROTON_EMULATE_STEAMINPUT")) && atoi(env))
++        return FALSE;
++    if ((env = getenv("PROTON_NO_STEAMINPUT")) && !strcmp(env, "1"))
++        return TRUE;
++    return !steam_virtual_gamepad_present();
++}
++
++/* Must match set_bluetooth_dualsense_container_id() in winebus. */
++static GUID bt_dualsense_container_id(USHORT pid, const unsigned int *mac)
++{
++    GUID guid = {0};
++    unsigned int i;
++
++    guid.Data1 = MAKELONG(0x054c, pid);
++    guid.Data2 = 0x4254;
++    guid.Data3 = (mac[0] << 8) | mac[1];
++    for (i = 0; i < 4; ++i) guid.Data4[i] = mac[i + 2];
++    return guid;
++}
++
++static void pulse_add_bluetooth_dualsense_device(struct list *list, const char *hidraw,
++        USHORT pid, const unsigned int *mac)
++{
++    const char *model = pid == 0x0df2 ? "DualSense_Edge_Wireless_Controller" : "DualSense_Wireless_Controller";
++    const char *desc = pid == 0x0df2 ? "DualSense Edge Wireless Controller" : "DualSense Wireless Controller";
++    WAVEFORMATEXTENSIBLE *fmt;
++    char pulse_name[160];
++    PhysDevice *dev;
++    size_t len;
++
++    len = snprintf(pulse_name, sizeof(pulse_name), "%s%s.%02x%02x%02x%02x%02x%02x",
++            BT_DUALSENSE_PULSE_PREFIX, model, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
++    if (pulse_find_device(list, pulse_name))
++        return;
++    if (!(dev = calloc(1, FIELD_OFFSET(PhysDevice, pulse_name[len + 1]))))
++        return;
++    if (!(dev->name = get_device_name(desc, NULL)) || !(dev->bt_hidraw = strdup(hidraw)))
++    {
++        free(dev->name);
++        free(dev);
++        return;
++    }
++
++    dev->flow = eRender;
++    dev->form = Speakers;
++    dev->channel_mask = KSAUDIO_SPEAKER_QUAD;
++    dev->bus_type = phys_device_bus_usb;
++    dev->vendor_id = 0x054c;
++    dev->product_id = pid;
++    dev->alsa_card = -1;
++    dev->container_id = bt_dualsense_container_id(pid, mac);
++    dev->def_period = 100000;
++    dev->min_period = 30000;
++    dev->ready = TRUE;
++    dev->probe_status = 0;
++    pthread_mutex_init(&dev->ready_mutex, NULL);
++    pthread_cond_init(&dev->ready_cond, NULL);
++
++    fmt = &dev->fmt;
++    fmt->Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
++    fmt->Format.nChannels = 4;
++    fmt->Format.nSamplesPerSec = 48000;
++    fmt->Format.wBitsPerSample = 32;
++    fmt->Format.nBlockAlign = 16;
++    fmt->Format.nAvgBytesPerSec = 48000 * 16;
++    fmt->Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
++    fmt->Samples.wValidBitsPerSample = 32;
++    fmt->dwChannelMask = KSAUDIO_SPEAKER_QUAD;
++    fmt->SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
++
++    memcpy(dev->pulse_name, pulse_name, len + 1);
++    if (!pulse_set_endpoint_id(dev, list))
++    {
++        pulse_dev_free(dev);
++        return;
++    }
++    list_add_tail(list, &dev->entry);
++    TRACE("Added Bluetooth DualSense haptics endpoint %s for %s, container %s.\n",
++            debugstr_a(dev->pulse_name), hidraw, debugstr_guid(&dev->container_id));
++}
++
++static void pulse_add_bluetooth_dualsense_devices(struct list *list)
++{
++    char path[PATH_MAX], line[256], hidraw[64];
++    struct dirent *entry;
++    DIR *dir;
++    FILE *f;
++
++    if (!bt_dualsense_haptics_enabled())
++        return;
++    if (!(dir = opendir("/sys/class/hidraw")))
++        return;
++    while ((entry = readdir(dir)))
++    {
++        unsigned int bus = 0, vid = 0, pid = 0, mac[6];
++        BOOL have_mac = FALSE;
++
++        if (strncmp(entry->d_name, "hidraw", 6))
++            continue;
++        snprintf(path, sizeof(path), "/sys/class/hidraw/%s/device/uevent", entry->d_name);
++        if (!(f = fopen(path, "r")))
++            continue;
++        while (fgets(line, sizeof(line), f))
++        {
++            if (!strncmp(line, "HID_ID=", 7))
++                sscanf(line + 7, "%x:%x:%x", &bus, &vid, &pid);
++            else if (!strncmp(line, "HID_UNIQ=", 9))
++                have_mac = sscanf(line + 9, "%x:%x:%x:%x:%x:%x", &mac[0], &mac[1], &mac[2],
++                        &mac[3], &mac[4], &mac[5]) == 6;
++        }
++        fclose(f);
++
++        if (bus != 0x0005 || vid != 0x054c || (pid != 0x0ce6 && pid != 0x0df2) || !have_mac)
++            continue;
++        snprintf(hidraw, sizeof(hidraw), "/dev/%s", entry->d_name);
++        pulse_add_bluetooth_dualsense_device(list, hidraw, pid, mac);
++    }
++    closedir(dir);
++}
++
++/* Returns the haptic path for a Bluetooth DualSense endpoint, or NULL. */
++static char *pulse_find_bluetooth_dualsense_haptic_path(const char *name)
++{
++    PhysDevice *dev;
++    char *path = NULL;
++
++    if (!name)
++        return NULL;
++    g_phys_lock();
++    LIST_FOR_EACH_ENTRY(dev, &g_phys_speakers, PhysDevice, entry)
++    {
++        size_t len;
++
++        if (!dev->bt_hidraw || !pulse_device_matches(dev, name))
++            continue;
++        len = sizeof(BT_DUALSENSE_HAPTIC_PATH_PREFIX) + strlen(dev->bt_hidraw);
++        if ((path = malloc(len)))
++            snprintf(path, len, "%s%s", BT_DUALSENSE_HAPTIC_PATH_PREFIX, dev->bt_hidraw);
++        break;
++    }
++    g_phys_unlock();
++    return path;
++}
++
+ static void pulse_resolve_dualsense_split_targets(struct list *devices)
+ {
+     PhysDevice *quad, *dev;
+@@ -2221,6 +2438,8 @@
+     }
+ 
+     pulse_probe_device_list(ml, ctx, &current, flow == eRender);
++    if (flow == eRender)
++        pulse_add_bluetooth_dualsense_devices(&current);
+ 
+     g_phys_lock();
+ 
+@@ -2573,6 +2792,7 @@
+         pulse_probe_settings(ml, ctx, 1, dev->pulse_name, &dev->fmt, &dev->def_period, &dev->min_period);
+         apply_windows_sony_audio_format(dev);
+     }
++    pulse_add_bluetooth_dualsense_devices(&g_phys_speakers);
+ 
+     LIST_FOR_EACH_ENTRY(dev, &g_phys_sources, PhysDevice, entry) {
+         pulse_probe_settings(ml, ctx, 0, dev->pulse_name, &dev->fmt, &dev->def_period, &dev->min_period);
+@@ -3629,6 +3849,164 @@
+ #endif
+ }
+ 
++static void pulse_haptic_advance(struct pulse_stream *stream, UINT32 frames, UINT32 frame_size);
++
++static UINT32 bt_dualsense_crc32(UINT32 crc, const BYTE *data, SIZE_T size)
++{
++    unsigned int bit;
++
++    while (size--)
++    {
++        crc ^= *data++;
++        for (bit = 0; bit < 8; ++bit)
++            crc = (crc >> 1) ^ (0xedb88320 & -(crc & 1));
++    }
++    return crc;
++}
++
++static void pulse_bt_haptic_close(struct pulse_stream *stream)
++{
++    if (stream->hid_haptics && stream->hid_fd >= 0)
++        close(stream->hid_fd);
++    stream->hid_fd = -1;
++}
++
++static HRESULT pulse_bt_haptic_connect(struct pulse_stream *stream, const char *hidraw)
++{
++    stream->attr.minreq = stream->period_bytes;
++    stream->attr.fragsize = stream->period_bytes;
++    stream->attr.tlength = stream->period_bytes * 3;
++    stream->attr.maxlength = stream->bufsize_frames * pa_frame_size(&stream->ss);
++    stream->attr.prebuf = 0;
++
++    if (stream->ss.channels != 4 || stream->ss.rate != 48000 ||
++            (stream->ss.format != PA_SAMPLE_FLOAT32LE && stream->ss.format != PA_SAMPLE_S16LE))
++    {
++        WARN("Unsupported format for Bluetooth DualSense haptics.\n");
++        return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
++    }
++
++    if ((stream->hid_fd = open(hidraw, O_WRONLY | O_NONBLOCK | O_CLOEXEC)) < 0)
++    {
++        WARN("Unable to open %s for Bluetooth DualSense haptics: %s\n", hidraw, strerror(errno));
++        return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
++    }
++    stream->hid_haptics = TRUE;
++    stream->hid_start_time = 0;
++    stream->hid_consumed = 0;
++    stream->hid_sum_count = stream->hid_chunk_pos = stream->hid_silent_chunks = 0;
++    stream->hid_sum[0] = stream->hid_sum[1] = 0;
++    TRACE("Sending DualSense haptics to Bluetooth controller %s.\n", hidraw);
++    return S_OK;
++}
++
++static void pulse_bt_haptic_send_chunk(struct pulse_stream *stream)
++{
++    static const BYTE seed = 0xa2;
++    BYTE report[BT_DUALSENSE_HAPTIC_REPORT_SIZE] = {0};
++    BOOL silent = TRUE;
++    UINT32 crc, i;
++
++    for (i = 0; i < sizeof(stream->hid_chunk); ++i)
++        silent &= !stream->hid_chunk[i];
++    /* Keep sending a few silent chunks so the actuators settle, then stop
++     * until the game plays haptics again. */
++    if (silent && ++stream->hid_silent_chunks > 4)
++        return;
++    if (!silent)
++        stream->hid_silent_chunks = 0;
++
++    report[0] = BT_DUALSENSE_HAPTIC_REPORT_ID;
++    report[1] = (stream->hid_seq++ & 0x0f) << 4;
++    report[2] = 0x91;
++    report[3] = 4;
++    report[4] = 0x66;
++    report[5] = 48;
++    report[6] = 48;
++    report[7] = stream->hid_counter++;
++    report[8] = 0x92;
++    report[9] = sizeof(stream->hid_chunk);
++    memcpy(report + 10, stream->hid_chunk, sizeof(stream->hid_chunk));
++
++    crc = bt_dualsense_crc32(0xffffffff, &seed, 1);
++    crc = ~bt_dualsense_crc32(crc, report, sizeof(report) - 4);
++    report[sizeof(report) - 4] = crc;
++    report[sizeof(report) - 3] = crc >> 8;
++    report[sizeof(report) - 2] = crc >> 16;
++    report[sizeof(report) - 1] = crc >> 24;
++
++    if (write(stream->hid_fd, report, sizeof(report)) < 0 && errno != EAGAIN)
++        WARN("Bluetooth DualSense haptics write failed: %s\n", strerror(errno));
++}
++
++static void pulse_bt_haptic_write(struct pulse_stream *stream, UINT32 held_frames, UINT32 frame_size)
++{
++    UINT64 played;
++    UINT32 frames, contiguous_frames, i, c;
++    const BYTE *src;
++    pa_usec_t now;
++
++    if (stream->hid_fd < 0)
++        return;
++
++    /* There is no device clock, consume the buffer in real time, a short
++     * lead ahead so the controller always has the next packet. */
++    now = pa_rtclock_now();
++    if (!stream->hid_start_time)
++    {
++        stream->hid_start_time = now;
++        stream->hid_consumed = 0;
++    }
++    played = (now - stream->hid_start_time) * stream->ss.rate / 1000000 + BT_DUALSENSE_HAPTIC_LEAD_FRAMES;
++    if (played > stream->hid_consumed + 2 * BT_DUALSENSE_HAPTIC_LEAD_FRAMES)
++    {
++        /* Underrun, don't send the missed time in a burst. */
++        stream->hid_start_time = now - stream->hid_consumed * 1000000 / stream->ss.rate;
++        played = stream->hid_consumed + BT_DUALSENSE_HAPTIC_LEAD_FRAMES;
++    }
++    if (played <= stream->hid_consumed)
++        return;
++
++    contiguous_frames = (stream->real_bufsize_bytes - stream->pa_offs_bytes) / frame_size;
++    frames = min(min((UINT32)(played - stream->hid_consumed), held_frames), contiguous_frames);
++    if (!frames)
++        return;
++    src = stream->local_buffer + stream->pa_offs_bytes;
++
++    for (i = 0; i < frames; ++i)
++    {
++        for (c = 0; c < 2; ++c)
++        {
++            int sample;
++
++            if (stream->ss.format == PA_SAMPLE_FLOAT32LE)
++                sample = float_to_s16(((const float *)src)[i * 4 + 2 + c]);
++            else
++                sample = ((const int16_t *)src)[i * 4 + 2 + c];
++            stream->hid_sum[c] += sample;
++        }
++        if (++stream->hid_sum_count < BT_DUALSENSE_HAPTIC_DECIMATION)
++            continue;
++
++        for (c = 0; c < 2; ++c)
++        {
++            int value = stream->hid_sum[c] / BT_DUALSENSE_HAPTIC_DECIMATION / 256;
++
++            stream->hid_chunk[stream->hid_chunk_pos++] = max(-128, min(127, value));
++            stream->hid_sum[c] = 0;
++        }
++        stream->hid_sum_count = 0;
++        if (stream->hid_chunk_pos == sizeof(stream->hid_chunk))
++        {
++            pulse_bt_haptic_send_chunk(stream);
++            stream->hid_chunk_pos = 0;
++        }
++    }
++
++    stream->hid_consumed += frames;
++    pulse_haptic_advance(stream, frames, frame_size);
++}
++
+ static HRESULT pulse_haptic_stream_connect(struct pulse_stream *stream, const char *alsa_path)
+ {
+     snd_pcm_hw_params_t *hw_params;
+@@ -3638,6 +4016,9 @@
+     unsigned int rate = stream->ss.rate;
+     int err;
+ 
++    if (!strncmp(alsa_path, BT_DUALSENSE_HAPTIC_PATH_PREFIX, sizeof(BT_DUALSENSE_HAPTIC_PATH_PREFIX) - 1))
++        return pulse_bt_haptic_connect(stream, alsa_path + sizeof(BT_DUALSENSE_HAPTIC_PATH_PREFIX) - 1);
++
+     stream->attr.minreq = stream->period_bytes;
+     stream->attr.fragsize = stream->period_bytes;
+     stream->attr.tlength = stream->period_bytes * 3;
+@@ -4061,6 +4442,7 @@
+ static void pulse_haptic_invalidate(struct pulse_stream *stream, const char *reason)
+ {
+     TRACE("Invalidating DualSense haptic PCM after %s.\n", reason);
++    pulse_bt_haptic_close(stream);
+     if (stream->haptic_pcm)
+     {
+         snd_pcm_close(stream->haptic_pcm);
+@@ -4078,6 +4460,9 @@
+ 
+ static BOOL pulse_haptic_refresh_path(struct pulse_stream *stream)
+ {
++    if (stream->hid_haptics)
++        return stream->hid_fd >= 0;
++
+     if (!use_pipewire_dualsense_haptic_target())
+     {
+         if (stream->haptic_pcm && stream->haptic_hotplug_generation == g_haptic_hotplug_generation)
+@@ -4284,6 +4669,11 @@
+ 
+     if (!pulse_stream_haptic(stream) || !held_frames)
+         return;
++    if (stream->hid_haptics)
++    {
++        pulse_bt_haptic_write(stream, held_frames, frame_size);
++        return;
++    }
+     if (!pulse_haptic_refresh_path(stream))
+         return;
+     if (!stream->haptic_pcm)
+@@ -4426,6 +4816,7 @@
+     char *resolved_device = NULL;
+     const char *connect_device;
+     BOOL haptic_candidate, dualsense_mono_candidate, dualsense_pulse_haptic_candidate = FALSE;
++    BOOL bt_haptics = FALSE;
+ 
+     if (params->sony_windows_audio_mode &&
+             !InterlockedExchange(&g_sony_windows_audio_mode, 1))
+@@ -4456,6 +4847,7 @@
+     }
+ 
+     stream->dataflow = params->flow;
++    stream->hid_fd = -1;
+     list_init(&stream->dualsense_mono_entry);
+     list_init(&stream->dualsense_haptic_entry);
+     for (i = 0; i < ARRAY_SIZE(stream->vol); ++i)
+@@ -4490,7 +4882,13 @@
+         stream->map.map[1] = PA_CHANNEL_POSITION_AUX1;
+         stream->map.map[2] = PA_CHANNEL_POSITION_AUX2;
+         stream->map.map[3] = PA_CHANNEL_POSITION_AUX3;
+-        if (use_pipewire_dualsense_haptic_target() && haptic_target)
++        if ((haptic_alsa_path = pulse_find_bluetooth_dualsense_haptic_path(params->device)))
++        {
++            bt_haptics = TRUE;
++            TRACE("Routing DualSense stream from %s to Bluetooth haptics %s.\n",
++                    params->device, haptic_alsa_path);
++        }
++        else if (use_pipewire_dualsense_haptic_target() && haptic_target)
+         {
+             haptic_alsa_path = make_pipewire_dualsense_haptic_path(haptic_target);
+             TRACE("Routing DualSense stream from %s through ALSA PipeWire target %s.\n",
+@@ -4509,7 +4907,7 @@
+             WARN("No PipeWire parent was found for the DualSense haptic stream from %s.\n",
+                     params->device);
+ 
+-        if (use_dualsense_split_audio() && !use_death_stranding_controller_effects() &&
++        if (!bt_haptics && use_dualsense_split_audio() && !use_death_stranding_controller_effects() &&
+                 stream->ss.format == PA_SAMPLE_FLOAT32LE)
+             split_speaker = get_dualsense_speaker_sink(params->device, TRUE);
+     }
+@@ -4558,7 +4956,7 @@
+                 hr = pulse_haptic_stream_connect(stream, stream->haptic_alsa_path);
+             else
+                 hr = AUDCLNT_E_ENDPOINT_CREATE_FAILED;
+-            if (FAILED(hr))
++            if (FAILED(hr) && !bt_haptics)
+             {
+                 TRACE("Falling back to Pulse routing for DualSense haptic stream.\n");
+                 free(stream->haptic_alsa_path);
+@@ -4625,7 +5023,7 @@
+             }
+         }
+         stream->device = strdup(connect_device);
+-        if (haptic_candidate && use_dualsense_split_audio() &&
++        if (haptic_candidate && !bt_haptics && use_dualsense_split_audio() &&
+                 !use_death_stranding_controller_effects() && haptic_alsa_path &&
+                 stream->ss.format == PA_SAMPLE_FLOAT32LE)
+         {
+@@ -4653,7 +5051,7 @@
+             list_add_tail(&dualsense_mono_streams, &stream->dualsense_mono_entry);
+             stream->dualsense_mono_registered = TRUE;
+         }
+-        if (SUCCEEDED(hr) && haptic_candidate &&
++        if (SUCCEEDED(hr) && haptic_candidate && !bt_haptics &&
+                 use_pipewire_dualsense_haptic_target())
+         {
+             list_add_tail(&dualsense_haptic_streams, &stream->dualsense_haptic_entry);
+@@ -4673,6 +5071,7 @@
+         }
+         free(stream->device);
+         free(stream->haptic_alsa_path);
++        pulse_bt_haptic_close(stream);
+         pulse_split_speaker_disconnect(stream);
+         free(stream->speaker_device);
+         free(stream->speaker_buffer);
+@@ -5369,6 +5768,7 @@
+         snd_pcm_drop(stream->haptic_pcm);
+         snd_pcm_close(stream->haptic_pcm);
+     }
++    pulse_bt_haptic_close(stream);
+     pulse_unlock();
+ 
+     if (stream->tmp_buffer) {
+@@ -5424,7 +5824,9 @@
+     {
+         if (pulse_haptic_refresh_path(stream))
+         {
+-            snd_pcm_prepare(stream->haptic_pcm);
++            if (stream->haptic_pcm)
++                snd_pcm_prepare(stream->haptic_pcm);
++            stream->hid_start_time = 0;
+             pulse_write(stream);
+         }
+         else
