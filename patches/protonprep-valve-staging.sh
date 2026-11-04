@@ -597,7 +597,7 @@ apply_all_in_dir() {
     echo "WINE: expose Bluetooth DualSense controllers as USB when Steam Input is disabled"
     apply_patch "../patches/wine-hotfixes/pending/winebus-expose-bluetooth-dualsense-as-usb.patch"
 
-    echo "WINE: send DualSense haptics to Bluetooth controllers"
+    echo "WINE: send DualSense haptics and speaker audio to Bluetooth controllers"
     apply_patch "../patches/wine-hotfixes/pending/winepulse-bluetooth-dualsense-haptics.patch"
 
     echo "WINE: -HOTFIX- ntdll: skip needless wake in RtlReleaseSRWLockShared (ValveSoftware/wine#367)"
