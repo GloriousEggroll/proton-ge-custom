@@ -14,8 +14,11 @@ it to the controller through hidraw, paced in real time:
   The headphone jack state from the input reports selects the speaker
   or headphone output.
 
-While speaker audio plays, report 0x36 carries both; otherwise report
-0x32 carries haptics only. Without libopus only haptics are sent.
+While speaker audio plays, report 0x36 carries both, with a state block
+that selects the speaker (or headphone) output path and volume: over
+USB the controller routes its audio function by itself, over Bluetooth
+nothing plays until the path is set. Otherwise report 0x32 carries
+haptics only. Without libopus only haptics are sent.
 PROTON_DUALSENSE_BT_HAPTICS=0 disables it.
 
 Packet layout and resampling follow DS5Dongle
@@ -314,7 +317,7 @@ Packet layout and resampling follow DS5Dongle
  
      LIST_FOR_EACH_ENTRY(dev, &g_phys_sources, PhysDevice, entry) {
          pulse_probe_settings(ml, ctx, 0, dev->pulse_name, &dev->fmt, &dev->def_period, &dev->min_period);
-@@ -3629,6 +3856,331 @@
+@@ -3629,6 +3856,352 @@
  #endif
  }
  
@@ -523,26 +526,47 @@ Packet layout and resampling follow DS5Dongle
 +    if (speaker)
 +    {
 +        pulse_bt_haptic_update_jack(stream);
-+        if (!pulse_bt_haptic_encode_speaker(stream, report + 79))
++        if (!pulse_bt_haptic_encode_speaker(stream, report + 144))
 +            speaker = FALSE;
 +    }
 +
 +    if (speaker)
 +    {
-+        /* Single-frame haptics and speaker report, layout from DS5Dongle. */
++        BYTE *state = report + 13;
++
++        /* Haptics and speaker report with an embedded state block, layout
++         * from vDS. Over USB the controller routes its audio function to
++         * the speaker by itself; over Bluetooth the output path and volume
++         * must be set, so select them with every speaker report. */
 +        size = BT_DUALSENSE_SPEAKER_REPORT_SIZE;
 +        report[0] = BT_DUALSENSE_SPEAKER_REPORT_ID;
 +        report[1] = (stream->hid_seq++ & 0x0f) << 4;
 +        report[2] = 0x91;
 +        report[3] = 7;
 +        report[4] = 0xfe;
-+        report[5] = report[6] = report[7] = report[8] = report[9] = 48;
++        report[5] = report[6] = report[7] = report[8] = report[9] = 64;
 +        report[10] = stream->hid_counter++;
-+        report[11] = 0x92;
-+        report[12] = sizeof(stream->hid_chunk);
-+        memcpy(report + 13, stream->hid_chunk, sizeof(stream->hid_chunk));
-+        report[77] = stream->hid_headphones ? 0x96 : 0x93;
-+        report[78] = BT_DUALSENSE_SPEAKER_OPUS_SIZE;
++        report[11] = 0x90;
++        report[12] = 63;
++        state[1] = 0x80; /* allow audio control 2 */
++        state[37] = 0x01; /* audio control 2 */
++        if (stream->hid_headphones)
++        {
++            state[0] = 0x80 | 0x10; /* allow audio control, headphone volume */
++            state[4] = 0x7f; /* headphone volume */
++            state[7] = 0x08; /* headphone output, automatic mic select */
++        }
++        else
++        {
++            state[0] = 0x80 | 0x20; /* allow audio control, speaker volume */
++            state[5] = 0x64; /* speaker volume */
++            state[7] = 0x39; /* speaker output, internal mic */
++        }
++        report[76] = 0x92;
++        report[77] = sizeof(stream->hid_chunk);
++        memcpy(report + 78, stream->hid_chunk, sizeof(stream->hid_chunk));
++        report[142] = stream->hid_headphones ? 0x96 : 0x93;
++        report[143] = BT_DUALSENSE_SPEAKER_OPUS_SIZE;
 +    }
 +    else
 +    {
@@ -646,7 +670,7 @@ Packet layout and resampling follow DS5Dongle
  static HRESULT pulse_haptic_stream_connect(struct pulse_stream *stream, const char *alsa_path)
  {
      snd_pcm_hw_params_t *hw_params;
-@@ -3638,6 +4190,9 @@
+@@ -3638,6 +4211,9 @@
      unsigned int rate = stream->ss.rate;
      int err;
  
@@ -656,7 +680,7 @@ Packet layout and resampling follow DS5Dongle
      stream->attr.minreq = stream->period_bytes;
      stream->attr.fragsize = stream->period_bytes;
      stream->attr.tlength = stream->period_bytes * 3;
-@@ -4061,6 +4616,7 @@
+@@ -4061,6 +4637,7 @@
  static void pulse_haptic_invalidate(struct pulse_stream *stream, const char *reason)
  {
      TRACE("Invalidating DualSense haptic PCM after %s.\n", reason);
@@ -664,7 +688,7 @@ Packet layout and resampling follow DS5Dongle
      if (stream->haptic_pcm)
      {
          snd_pcm_close(stream->haptic_pcm);
-@@ -4078,6 +4634,9 @@
+@@ -4078,6 +4655,9 @@
  
  static BOOL pulse_haptic_refresh_path(struct pulse_stream *stream)
  {
@@ -674,7 +698,7 @@ Packet layout and resampling follow DS5Dongle
      if (!use_pipewire_dualsense_haptic_target())
      {
          if (stream->haptic_pcm && stream->haptic_hotplug_generation == g_haptic_hotplug_generation)
-@@ -4284,6 +4843,11 @@
+@@ -4284,6 +4864,11 @@
  
      if (!pulse_stream_haptic(stream) || !held_frames)
          return;
@@ -686,7 +710,7 @@ Packet layout and resampling follow DS5Dongle
      if (!pulse_haptic_refresh_path(stream))
          return;
      if (!stream->haptic_pcm)
-@@ -4426,6 +4990,7 @@
+@@ -4426,6 +5011,7 @@
      char *resolved_device = NULL;
      const char *connect_device;
      BOOL haptic_candidate, dualsense_mono_candidate, dualsense_pulse_haptic_candidate = FALSE;
@@ -694,7 +718,7 @@ Packet layout and resampling follow DS5Dongle
  
      if (params->sony_windows_audio_mode &&
              !InterlockedExchange(&g_sony_windows_audio_mode, 1))
-@@ -4456,6 +5021,7 @@
+@@ -4456,6 +5042,7 @@
      }
  
      stream->dataflow = params->flow;
@@ -702,7 +726,7 @@ Packet layout and resampling follow DS5Dongle
      list_init(&stream->dualsense_mono_entry);
      list_init(&stream->dualsense_haptic_entry);
      for (i = 0; i < ARRAY_SIZE(stream->vol); ++i)
-@@ -4490,7 +5056,13 @@
+@@ -4490,7 +5077,13 @@
          stream->map.map[1] = PA_CHANNEL_POSITION_AUX1;
          stream->map.map[2] = PA_CHANNEL_POSITION_AUX2;
          stream->map.map[3] = PA_CHANNEL_POSITION_AUX3;
@@ -717,7 +741,7 @@ Packet layout and resampling follow DS5Dongle
          {
              haptic_alsa_path = make_pipewire_dualsense_haptic_path(haptic_target);
              TRACE("Routing DualSense stream from %s through ALSA PipeWire target %s.\n",
-@@ -4509,7 +5081,7 @@
+@@ -4509,7 +5102,7 @@
              WARN("No PipeWire parent was found for the DualSense haptic stream from %s.\n",
                      params->device);
  
@@ -726,7 +750,7 @@ Packet layout and resampling follow DS5Dongle
                  stream->ss.format == PA_SAMPLE_FLOAT32LE)
              split_speaker = get_dualsense_speaker_sink(params->device, TRUE);
      }
-@@ -4558,7 +5130,7 @@
+@@ -4558,7 +5151,7 @@
                  hr = pulse_haptic_stream_connect(stream, stream->haptic_alsa_path);
              else
                  hr = AUDCLNT_E_ENDPOINT_CREATE_FAILED;
@@ -735,7 +759,7 @@ Packet layout and resampling follow DS5Dongle
              {
                  TRACE("Falling back to Pulse routing for DualSense haptic stream.\n");
                  free(stream->haptic_alsa_path);
-@@ -4625,7 +5197,7 @@
+@@ -4625,7 +5218,7 @@
              }
          }
          stream->device = strdup(connect_device);
@@ -744,7 +768,7 @@ Packet layout and resampling follow DS5Dongle
                  !use_death_stranding_controller_effects() && haptic_alsa_path &&
                  stream->ss.format == PA_SAMPLE_FLOAT32LE)
          {
-@@ -4653,7 +5225,7 @@
+@@ -4653,7 +5246,7 @@
              list_add_tail(&dualsense_mono_streams, &stream->dualsense_mono_entry);
              stream->dualsense_mono_registered = TRUE;
          }
@@ -753,7 +777,7 @@ Packet layout and resampling follow DS5Dongle
                  use_pipewire_dualsense_haptic_target())
          {
              list_add_tail(&dualsense_haptic_streams, &stream->dualsense_haptic_entry);
-@@ -4673,6 +5245,7 @@
+@@ -4673,6 +5266,7 @@
          }
          free(stream->device);
          free(stream->haptic_alsa_path);
@@ -761,7 +785,7 @@ Packet layout and resampling follow DS5Dongle
          pulse_split_speaker_disconnect(stream);
          free(stream->speaker_device);
          free(stream->speaker_buffer);
-@@ -5369,6 +5942,7 @@
+@@ -5369,6 +5963,7 @@
          snd_pcm_drop(stream->haptic_pcm);
          snd_pcm_close(stream->haptic_pcm);
      }
@@ -769,7 +793,7 @@ Packet layout and resampling follow DS5Dongle
      pulse_unlock();
  
      if (stream->tmp_buffer) {
-@@ -5424,7 +5998,9 @@
+@@ -5424,7 +6019,9 @@
      {
          if (pulse_haptic_refresh_path(stream))
          {
