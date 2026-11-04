@@ -594,6 +594,9 @@ apply_all_in_dir() {
     echo "WINE: expose native DualSense Edge as DualSense for Diablo IV"
     apply_patch "../patches/wine-hotfixes/pending/winebus-diablo-iv-dualsense-edge-identity.patch"
 
+    echo "WINE: optionally expose Bluetooth DualSense controllers as USB (PROTON_DUALSENSE_BT_AS_USB)"
+    apply_patch "../patches/wine-hotfixes/pending/winebus-expose-bluetooth-dualsense-as-usb.patch"
+
     echo "WINE: -HOTFIX- ntdll: skip needless wake in RtlReleaseSRWLockShared (ValveSoftware/wine#367)"
     apply_patch "../patches/wine-hotfixes/pending/ntdll-srwlock-skip-needless-shared-release-wake.patch"
 

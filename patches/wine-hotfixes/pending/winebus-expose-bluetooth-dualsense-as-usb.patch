@@ -1,0 +1,360 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] winebus: optionally expose Bluetooth DualSense controllers as USB.
+
+With PROTON_DUALSENSE_BT_AS_USB=1 and Steam Input disabled, a DualSense
+or DualSense Edge connected over Bluetooth is presented to games with the
+USB HID report descriptor and report layout, like a wired controller:
+
+- extended Bluetooth input report 0x31 is passed on as USB report 0x01
+  with the full payload (motion, touchpad, battery); the short report
+  sent before the controller switches modes is expanded to the USB layout;
+- USB output report 0x02 is sent as Bluetooth report 0x31 with sequence
+  number, tag and CRC, so adaptive triggers, lightbar, player LEDs and
+  rumble work for games that only speak the USB protocol;
+- feature reports written by the game get the Bluetooth feature CRC.
+
+The USB report descriptors and the feature CRC seed follow vDS
+(https://github.com/hurryman2212/vds, MIT license).
+---
+--- a/dlls/winebus.sys/bus_udev.c
++++ b/dlls/winebus.sys/bus_udev.c
+@@ -1526,13 +1526,12 @@
+     return env && env[0] == '1' && !env[1];
+ }
+ 
+-static BOOL spoof_dualsense_edge_as_dualsense(void)
++static BOOL sony_steam_input_disabled(void)
+ {
+-    const char *env = getenv("PROTON_SONY_DUALSENSE_EDGE_AS_DUALSENSE");
++    const char *env;
+     struct udev_enumerate *enumerate;
+     BOOL enabled = FALSE;
+ 
+-    if (!env || strcmp(env, "1")) return FALSE;
+     env = getenv("PROTON_EMULATE_STEAMINPUT");
+     if (env && atoi(env)) return FALSE;
+     env = getenv("PROTON_NO_STEAMINPUT");
+@@ -1551,6 +1550,22 @@
+     return enabled;
+ }
+ 
++static BOOL spoof_dualsense_edge_as_dualsense(void)
++{
++    const char *env = getenv("PROTON_SONY_DUALSENSE_EDGE_AS_DUALSENSE");
++
++    if (!env || strcmp(env, "1")) return FALSE;
++    return sony_steam_input_disabled();
++}
++
++static BOOL spoof_bluetooth_dualsense_as_usb(void)
++{
++    const char *env = getenv("PROTON_DUALSENSE_BT_AS_USB");
++
++    if (!env || strcmp(env, "1")) return FALSE;
++    return sony_steam_input_disabled();
++}
++
+ static NTSTATUS hidraw_device_create(struct udev_device *dev, int fd, const char *devnode, struct device_desc desc)
+ {
+ #ifdef HAVE_LINUX_HIDRAW_H
+@@ -1597,6 +1612,19 @@
+                 desc.vid, desc.pid);
+     }
+ 
++    if (!desc.is_gamepad && !desc.spoof_dualshock4 && !desc.spoof_dualshock4_v1 &&
++            desc.bus_type == BUS_TYPE_BLUETOOTH && is_dualsense_gamepad(desc.vid, desc.pid) &&
++            spoof_bluetooth_dualsense_as_usb())
++    {
++        /* Present the Bluetooth controller with its USB report layout, the way
++         * games expect a wired DualSense. Interface 3 matches the USB HID
++         * interface in the instance path. */
++        desc.spoof_dualsense_usb = TRUE;
++        desc.input = 3;
++        TRACE("exposing Bluetooth DualSense%s %04x:%04x as a USB DualSense.\n",
++                desc.pid == 0x0df2 && !desc.spoof_dualsense ? " Edge" : "", desc.vid, desc.pid);
++    }
++
+     if (!desc.product[0] && ioctl(fd, HIDIOCGRAWNAME(sizeof(buffer) - 1), buffer) >= 0)
+         ntdll_umbstowcs(buffer, strlen(buffer) + 1, desc.product, ARRAY_SIZE(desc.product));
+ 
+--- a/dlls/winebus.sys/main.c
++++ b/dlls/winebus.sys/main.c
+@@ -249,6 +249,77 @@
+     0xb1, 0x02, 0xc0,
+ };
+ 
++/* USB HID report descriptors of the DualSense (0x0ce6) and DualSense Edge
++ * (0x0df2), used to present Bluetooth controllers as wired ones. Byte arrays
++ * taken from vDS (https://github.com/hurryman2212/vds, MIT license),
++ * include/vds/ds5_usb.h. */
++static const BYTE dualsense_usb_report_descriptor[] =
++{
++    0x05, 0x01, 0x09, 0x05, 0xa1, 0x01, 0x85, 0x01, 0x09, 0x30, 0x09, 0x31,
++    0x09, 0x32, 0x09, 0x35, 0x09, 0x33, 0x09, 0x34, 0x15, 0x00, 0x26, 0xff,
++    0x00, 0x75, 0x08, 0x95, 0x06, 0x81, 0x02, 0x06, 0x00, 0xff, 0x09, 0x20,
++    0x95, 0x01, 0x81, 0x02, 0x05, 0x01, 0x09, 0x39, 0x15, 0x00, 0x25, 0x07,
++    0x35, 0x00, 0x46, 0x3b, 0x01, 0x65, 0x14, 0x75, 0x04, 0x95, 0x01, 0x81,
++    0x42, 0x65, 0x00, 0x05, 0x09, 0x19, 0x01, 0x29, 0x0f, 0x15, 0x00, 0x25,
++    0x01, 0x75, 0x01, 0x95, 0x0f, 0x81, 0x02, 0x06, 0x00, 0xff, 0x09, 0x21,
++    0x95, 0x0d, 0x81, 0x02, 0x06, 0x00, 0xff, 0x09, 0x22, 0x15, 0x00, 0x26,
++    0xff, 0x00, 0x75, 0x08, 0x95, 0x34, 0x81, 0x02, 0x85, 0x02, 0x09, 0x23,
++    0x95, 0x2f, 0x91, 0x02, 0x85, 0x05, 0x09, 0x33, 0x95, 0x28, 0xb1, 0x02,
++    0x85, 0x08, 0x09, 0x34, 0x95, 0x2f, 0xb1, 0x02, 0x85, 0x09, 0x09, 0x24,
++    0x95, 0x13, 0xb1, 0x02, 0x85, 0x0a, 0x09, 0x25, 0x95, 0x1a, 0xb1, 0x02,
++    0x85, 0x0b, 0x09, 0x41, 0x95, 0x29, 0xb1, 0x02, 0x85, 0x0c, 0x09, 0x42,
++    0x95, 0x29, 0xb1, 0x02, 0x85, 0x20, 0x09, 0x26, 0x95, 0x3f, 0xb1, 0x02,
++    0x85, 0x21, 0x09, 0x27, 0x95, 0x04, 0xb1, 0x02, 0x85, 0x22, 0x09, 0x40,
++    0x95, 0x3f, 0xb1, 0x02, 0x85, 0x80, 0x09, 0x28, 0x95, 0x3f, 0xb1, 0x02,
++    0x85, 0x81, 0x09, 0x29, 0x95, 0x3f, 0xb1, 0x02, 0x85, 0x82, 0x09, 0x2a,
++    0x95, 0x09, 0xb1, 0x02, 0x85, 0x83, 0x09, 0x2b, 0x95, 0x3f, 0xb1, 0x02,
++    0x85, 0x84, 0x09, 0x2c, 0x95, 0x3f, 0xb1, 0x02, 0x85, 0x85, 0x09, 0x2d,
++    0x95, 0x02, 0xb1, 0x02, 0x85, 0xa0, 0x09, 0x2e, 0x95, 0x01, 0xb1, 0x02,
++    0x85, 0xe0, 0x09, 0x2f, 0x95, 0x3f, 0xb1, 0x02, 0x85, 0xf0, 0x09, 0x30,
++    0x95, 0x3f, 0xb1, 0x02, 0x85, 0xf1, 0x09, 0x31, 0x95, 0x3f, 0xb1, 0x02,
++    0x85, 0xf2, 0x09, 0x32, 0x95, 0x0f, 0xb1, 0x02, 0x85, 0xf4, 0x09, 0x35,
++    0x95, 0x3f, 0xb1, 0x02, 0x85, 0xf5, 0x09, 0x36, 0x95, 0x03, 0xb1, 0x02,
++    0xc0,
++};
++
++static const BYTE dualsense_edge_usb_report_descriptor[] =
++{
++    0x05, 0x01, 0x09, 0x05, 0xa1, 0x01, 0x85, 0x01, 0x09, 0x30, 0x09, 0x31,
++    0x09, 0x32, 0x09, 0x35, 0x09, 0x33, 0x09, 0x34, 0x15, 0x00, 0x26, 0xff,
++    0x00, 0x75, 0x08, 0x95, 0x06, 0x81, 0x02, 0x06, 0x00, 0xff, 0x09, 0x20,
++    0x95, 0x01, 0x81, 0x02, 0x05, 0x01, 0x09, 0x39, 0x15, 0x00, 0x25, 0x07,
++    0x35, 0x00, 0x46, 0x3b, 0x01, 0x65, 0x14, 0x75, 0x04, 0x95, 0x01, 0x81,
++    0x42, 0x65, 0x00, 0x05, 0x09, 0x19, 0x01, 0x29, 0x0f, 0x15, 0x00, 0x25,
++    0x01, 0x75, 0x01, 0x95, 0x0f, 0x81, 0x02, 0x06, 0x00, 0xff, 0x09, 0x21,
++    0x95, 0x0d, 0x81, 0x02, 0x06, 0x00, 0xff, 0x09, 0x22, 0x15, 0x00, 0x26,
++    0xff, 0x00, 0x75, 0x08, 0x95, 0x34, 0x81, 0x02, 0x85, 0x02, 0x09, 0x23,
++    0x95, 0x3f, 0x91, 0x02, 0x85, 0x05, 0x09, 0x33, 0x95, 0x28, 0xb1, 0x02,
++    0x85, 0x08, 0x09, 0x34, 0x95, 0x2f, 0xb1, 0x02, 0x85, 0x09, 0x09, 0x24,
++    0x95, 0x13, 0xb1, 0x02, 0x85, 0x0a, 0x09, 0x25, 0x95, 0x1a, 0xb1, 0x02,
++    0x85, 0x0b, 0x09, 0x41, 0x95, 0x29, 0xb1, 0x02, 0x85, 0x0c, 0x09, 0x42,
++    0x95, 0x29, 0xb1, 0x02, 0x85, 0x20, 0x09, 0x26, 0x95, 0x3f, 0xb1, 0x02,
++    0x85, 0x21, 0x09, 0x27, 0x95, 0x04, 0xb1, 0x02, 0x85, 0x22, 0x09, 0x40,
++    0x95, 0x3f, 0xb1, 0x02, 0x85, 0x80, 0x09, 0x28, 0x95, 0x3f, 0xb1, 0x02,
++    0x85, 0x81, 0x09, 0x29, 0x95, 0x3f, 0xb1, 0x02, 0x85, 0x82, 0x09, 0x2a,
++    0x95, 0x09, 0xb1, 0x02, 0x85, 0x83, 0x09, 0x2b, 0x95, 0x3f, 0xb1, 0x02,
++    0x85, 0x84, 0x09, 0x2c, 0x95, 0x3f, 0xb1, 0x02, 0x85, 0x85, 0x09, 0x2d,
++    0x95, 0x02, 0xb1, 0x02, 0x85, 0xa0, 0x09, 0x2e, 0x95, 0x01, 0xb1, 0x02,
++    0x85, 0xe0, 0x09, 0x2f, 0x95, 0x3f, 0xb1, 0x02, 0x85, 0xf0, 0x09, 0x30,
++    0x95, 0x3f, 0xb1, 0x02, 0x85, 0xf1, 0x09, 0x31, 0x95, 0x3f, 0xb1, 0x02,
++    0x85, 0xf2, 0x09, 0x32, 0x95, 0x34, 0xb1, 0x02, 0x85, 0xf4, 0x09, 0x35,
++    0x95, 0x3f, 0xb1, 0x02, 0x85, 0xf5, 0x09, 0x36, 0x95, 0x03, 0xb1, 0x02,
++    0x85, 0x60, 0x09, 0x41, 0x95, 0x3f, 0xb1, 0x02, 0x85, 0x61, 0x09, 0x42,
++    0xb1, 0x02, 0x85, 0x62, 0x09, 0x43, 0xb1, 0x02, 0x85, 0x63, 0x09, 0x44,
++    0xb1, 0x02, 0x85, 0x64, 0x09, 0x45, 0xb1, 0x02, 0x85, 0x65, 0x09, 0x46,
++    0xb1, 0x02, 0x85, 0x68, 0x09, 0x47, 0xb1, 0x02, 0x85, 0x70, 0x09, 0x48,
++    0xb1, 0x02, 0x85, 0x71, 0x09, 0x49, 0xb1, 0x02, 0x85, 0x72, 0x09, 0x4a,
++    0xb1, 0x02, 0x85, 0x73, 0x09, 0x4b, 0xb1, 0x02, 0x85, 0x74, 0x09, 0x4c,
++    0xb1, 0x02, 0x85, 0x75, 0x09, 0x4d, 0xb1, 0x02, 0x85, 0x76, 0x09, 0x4e,
++    0xb1, 0x02, 0x85, 0x77, 0x09, 0x4f, 0xb1, 0x02, 0x85, 0x78, 0x09, 0x50,
++    0xb1, 0x02, 0x85, 0x79, 0x09, 0x51, 0xb1, 0x02, 0x85, 0x7a, 0x09, 0x52,
++    0xb1, 0x02, 0x85, 0x7b, 0x09, 0x53, 0xb1, 0x02, 0xc0,
++};
++
+ /* A valid CUH-ZCT1 firmware report. */
+ static const BYTE dualshock4_v1_firmware_info[] =
+ {
+@@ -814,7 +885,8 @@
+         TRACE("Enabling report fixup for Bluetooth DualShock4 device %p\n", device);
+         ext->report_fixups |= HIDRAW_FIXUP_DUALSHOCK_BT;
+     }
+-    if (desc->is_hidraw && (desc->bus_type == BUS_TYPE_BLUETOOTH) && is_dualsense_gamepad(desc->vid, desc->pid))
++    if (desc->is_hidraw && (desc->bus_type == BUS_TYPE_BLUETOOTH) && is_dualsense_gamepad(desc->vid, desc->pid) &&
++            !desc->spoof_dualsense_usb)
+     {
+         TRACE("Enabling report fixup for Bluetooth DualSense device %p\n", device);
+         ext->report_fixups |= HIDRAW_FIXUP_DUALSENSE_BT;
+@@ -1428,10 +1500,58 @@
+     return TRUE;
+ }
+ 
++/* Bluetooth DualSense input as the USB report #1. The extended Bluetooth
++ * report #0x31 carries the complete USB payload after a one byte header,
++ * followed by a CRC. Before the controller is switched to extended reports it
++ * sends a ten byte report #1 with a different field order. The report buffer
++ * must hold DUALSENSE_INPUT_REPORT_USB_SIZE bytes. */
++static BOOL hidraw_fixup_bluetooth_dualsense_input_as_usb(struct device_extension *ext,
++        struct hid_report *report)
++{
++    BYTE *buf = report->buffer;
++
++    if (!ext->desc.spoof_dualsense_usb) return TRUE;
++
++    if (buf[0] == DUALSENSE_INPUT_REPORT_BT &&
++            report->length >= 2 + DUALSENSE_INPUT_REPORT_USB_SIZE - 1)
++    {
++        /* Payload type 2 carries microphone audio instead of controller state. */
++        if ((buf[1] & 0x0f) == 0x02) return FALSE;
++        memmove(buf + 1, buf + 2, DUALSENSE_INPUT_REPORT_USB_SIZE - 1);
++        buf[0] = DUALSENSE_INPUT_REPORT_USB;
++        report->length = DUALSENSE_INPUT_REPORT_USB_SIZE;
++        return TRUE;
++    }
++
++    if (buf[0] == DUALSENSE_INPUT_REPORT_USB && report->length >= 10 &&
++            report->length < DUALSENSE_INPUT_REPORT_USB_SIZE)
++    {
++        BYTE basic[10];
++
++        /* Basic: id, LX, LY, RX, RY, Buttons[3], L2, R2.
++         * USB:   id, LX, LY, RX, RY, L2, R2, Counter, Buttons[4], ... */
++        memcpy(basic, buf, sizeof(basic));
++        memset(buf, 0, DUALSENSE_INPUT_REPORT_USB_SIZE);
++        buf[0] = DUALSENSE_INPUT_REPORT_USB;
++        memcpy(buf + 1, basic + 1, 4);
++        buf[5] = basic[8];
++        buf[6] = basic[9];
++        memcpy(buf + 8, basic + 5, 3);
++        /* Mark both touch points as inactive. */
++        buf[33] = 0x80;
++        buf[37] = 0x80;
++        report->length = DUALSENSE_INPUT_REPORT_USB_SIZE;
++        return TRUE;
++    }
++
++    return FALSE;
++}
++
+ static void process_hid_report(DEVICE_OBJECT *device, BYTE *report_buf, DWORD report_len)
+ {
+     struct device_extension *ext = (struct device_extension *)device->DeviceExtension;
+-    BOOL translate = ext->desc.spoof_dualshock4 || ext->desc.spoof_dualshock4_v1;
++    BOOL translate = ext->desc.spoof_dualshock4 || ext->desc.spoof_dualshock4_v1 ||
++            ext->desc.spoof_dualsense_usb;
+     struct hid_report *report, *last_report;
+     ULONG size;
+     IRP *irp;
+@@ -1466,7 +1586,8 @@
+         report_len = last_report->length;
+     }
+ 
+-    size = offsetof(struct hid_report, buffer[max(report_len, translate ? DUALSHOCK4_INPUT_REPORT_SIZE : 0)]);
++    size = offsetof(struct hid_report, buffer[max(report_len, translate ?
++            max(DUALSHOCK4_INPUT_REPORT_SIZE, DUALSENSE_INPUT_REPORT_USB_SIZE) : 0)]);
+     if (!(report = RtlAllocateHeap(GetProcessHeap(), 0, size)))
+     {
+         RtlLeaveCriticalSection(&ext->cs);
+@@ -1489,6 +1610,12 @@
+         RtlFreeHeap(GetProcessHeap(), 0, report);
+         return;
+     }
++    if (!hidraw_fixup_bluetooth_dualsense_input_as_usb(ext, report))
++    {
++        RtlLeaveCriticalSection(&ext->cs);
++        RtlFreeHeap(GetProcessHeap(), 0, report);
++        return;
++    }
+ 
+     if (translate)
+     {
+@@ -1741,6 +1868,18 @@
+         *report_desc_length = sizeof(dualshock4_v2_report_descriptor);
+         generation = "v2";
+     }
++    else if (ext->desc.spoof_dualsense_usb && ext->desc.pid == 0x0df2 && !ext->desc.spoof_dualsense)
++    {
++        spoofed_report_desc = dualsense_edge_usb_report_descriptor;
++        *report_desc_length = sizeof(dualsense_edge_usb_report_descriptor);
++        generation = "DualSense Edge USB";
++    }
++    else if (ext->desc.spoof_dualsense_usb)
++    {
++        spoofed_report_desc = dualsense_usb_report_descriptor;
++        *report_desc_length = sizeof(dualsense_usb_report_descriptor);
++        generation = "DualSense USB";
++    }
+     else
+         return get_device_descriptors(ext->unix_device, report_desc, report_desc_length, device_desc);
+ 
+@@ -2432,6 +2571,50 @@
+     report[report_len - 1] = crc >> 24;
+ }
+ 
++/* Bluetooth DualSense feature reports end with a CRC32 seeded with the HIDP
++ * SET_REPORT header, the controller ignores them otherwise. */
++static void sony_set_feature_report_crc(BYTE *report, ULONG report_len)
++{
++    const BYTE seed = 0x53;
++    DWORD crc;
++
++    crc = RtlComputeCrc32(0, &seed, sizeof(seed));
++    crc = RtlComputeCrc32(crc, report, report_len - sizeof(crc));
++    report[report_len - 4] = crc;
++    report[report_len - 3] = crc >> 8;
++    report[report_len - 2] = crc >> 16;
++    report[report_len - 1] = crc >> 24;
++}
++
++/* Games write the USB output report #2 to a DualSense presented as USB. Over
++ * Bluetooth the same 47 byte state block goes in report #0x31 after a sequence
++ * number and tag, followed by a CRC. */
++static BOOL hidraw_fixup_bluetooth_dualsense_usb_output_report(struct device_extension *ext,
++        HID_XFER_PACKET *packet, HID_XFER_PACKET *fixed_packet, BYTE *fixed_report)
++{
++    if (!ext->desc.spoof_dualsense_usb) return FALSE;
++    if (packet->reportId != DUALSENSE_OUTPUT_REPORT_USB
++            || packet->reportBufferLen < DUALSENSE_OUTPUT_REPORT_USB_COMMON_OFFSET + DUALSENSE_OUTPUT_REPORT_COMMON_SIZE
++            || packet->reportBuffer[0] != DUALSENSE_OUTPUT_REPORT_USB)
++        return FALSE;
++
++    memset(fixed_report, 0, DUALSENSE_OUTPUT_REPORT_BT_SIZE);
++    fixed_report[0] = DUALSENSE_OUTPUT_REPORT_BT;
++    fixed_report[1] = (ext->sony_output_seq++ & 0x0f) << 4;
++    fixed_report[2] = DUALSENSE_OUTPUT_REPORT_BT_TAG;
++    memcpy(fixed_report + DUALSENSE_OUTPUT_REPORT_BT_COMMON_OFFSET,
++            packet->reportBuffer + DUALSENSE_OUTPUT_REPORT_USB_COMMON_OFFSET,
++            DUALSENSE_OUTPUT_REPORT_COMMON_SIZE);
++    sony_set_output_report_crc(fixed_report, DUALSENSE_OUTPUT_REPORT_BT_SIZE);
++
++    *fixed_packet = *packet;
++    fixed_packet->reportId = DUALSENSE_OUTPUT_REPORT_BT;
++    fixed_packet->reportBuffer = fixed_report;
++    fixed_packet->reportBufferLen = DUALSENSE_OUTPUT_REPORT_BT_SIZE;
++    TRACE("translated USB DualSense output report to Bluetooth report %#x.\n", DUALSENSE_OUTPUT_REPORT_BT);
++    return TRUE;
++}
++
+ static void hidraw_get_vitapad_feature_report(struct device_extension *ext,
+         HID_XFER_PACKET *packet, IO_STATUS_BLOCK *io)
+ {
+@@ -2932,6 +3115,8 @@
+             }
+             if (hidraw_fixup_spoofed_dualshock4_output_report(ext, packet, &fixed_packet, fixed_report))
+                 packet = &fixed_packet;
++            else if (hidraw_fixup_bluetooth_dualsense_usb_output_report(ext, packet, &fixed_packet, fixed_report))
++                packet = &fixed_packet;
+             else if (hidraw_fixup_dualsense_usb_output_report(ext, packet, &fixed_packet, fixed_report))
+                 packet = &fixed_packet;
+             hidraw_preserve_dualsense_usb_speaker_route(ext, packet);
+@@ -2981,6 +3166,18 @@
+             }
+             if (!hidraw_set_spoofed_dualshock4_feature_report(ext, packet, &irp->IoStatus))
+             {
++                HID_XFER_PACKET fixed_packet;
++                BYTE fixed_report[64];
++
++                if (ext->desc.spoof_dualsense_usb && packet->reportBufferLen > sizeof(DWORD) &&
++                        packet->reportBufferLen <= sizeof(fixed_report))
++                {
++                    memcpy(fixed_report, packet->reportBuffer, packet->reportBufferLen);
++                    sony_set_feature_report_crc(fixed_report, packet->reportBufferLen);
++                    fixed_packet = *packet;
++                    fixed_packet.reportBuffer = fixed_report;
++                    packet = &fixed_packet;
++                }
+                 unix_device_set_feature_report(device, packet, &irp->IoStatus);
+                 if (!irp->IoStatus.Status) hidraw_disable_report_fixups(device);
+             }
+--- a/dlls/winebus.sys/unixlib.h
++++ b/dlls/winebus.sys/unixlib.h
+@@ -44,6 +44,7 @@
+     BOOL spoof_dualshock4;
+     BOOL spoof_dualshock4_v1;
+     BOOL spoof_dualsense;
++    BOOL spoof_dualsense_usb;
+     BOOL use_xbox_identity;
+ 
+     WCHAR manufacturer[MAX_PATH];
