@@ -693,6 +693,9 @@ apply_all_in_dir() {
     echo "WINE: -PENDING- ntdll: don't queue a killed thread twice for freeing (double free under thread churn)"
     apply_patch "../patches/wine-hotfixes/pending/ntdll-dont-queue-a-killed-thread-twice.patch"
 
+    # https://github.com/GloriousEggroll/proton-ge-custom/issues/937
+    apply_patch "../patches/wine-hotfixes/pending/winewayland-use-steam-app-id-as-app-id.patch"
+
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
     ./tools/make_requests
