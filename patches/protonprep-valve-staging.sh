@@ -696,6 +696,9 @@ apply_all_in_dir() {
     # https://github.com/GloriousEggroll/proton-ge-custom/issues/937
     apply_patch "../patches/wine-hotfixes/pending/winewayland-use-steam-app-id-as-app-id.patch"
 
+    # https://github.com/GloriousEggroll/proton-ge-custom/issues/877
+    apply_patch "../patches/wine-hotfixes/pending/win32u-winewayland-add-focus-debug-channel.patch"
+
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
     ./tools/make_requests

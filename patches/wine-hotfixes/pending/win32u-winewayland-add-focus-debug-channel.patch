@@ -1,0 +1,235 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] win32u, winewayland: add a lightweight focus debug channel.
+
++win is too heavy for timing-sensitive focus bugs and makes them go away.
+The focus channel only logs foreground and active window changes, where
+each one came from (application call, SetWindowPos, mouse click,
+cross-thread activation, host state change), and in the Wayland driver
+how keyboard enter/leave events are turned into foreground changes.
+
+Use with PROTON_LOG=+focus (or WINEDEBUG=+focus).
+
+Refs: https://github.com/GloriousEggroll/proton-ge-custom/issues/877
+---
+--- a/dlls/win32u/defwnd.c
++++ b/dlls/win32u/defwnd.c
+@@ -29,6 +29,7 @@
+ #include "wine/server.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(win);
++WINE_DECLARE_DEBUG_CHANNEL(focus);
+ 
+ #define WINE_MOUSE_HANDLE       ((HANDLE)1)
+ #define WINE_KEYBOARD_HANDLE    ((HANDLE)2)
+@@ -2247,6 +2248,7 @@
+                 top = parent;
+             }
+ 
++            TRACE_(focus)( "caption click activates %p\n", top );
+             if (set_foreground_window( top, TRUE, FALSE ) || (get_active_window() == top))
+                 send_message( hwnd, WM_SYSCOMMAND, SC_MOVE + HTCAPTION, lparam );
+             break;
+--- a/dlls/win32u/input.c
++++ b/dlls/win32u/input.c
+@@ -40,6 +40,7 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(win);
+ WINE_DECLARE_DEBUG_CHANNEL(keyboard);
++WINE_DECLARE_DEBUG_CHANNEL(focus);
+ 
+ static const WCHAR keyboard_layouts_keyW[] =
+ {
+@@ -2148,6 +2149,8 @@
+             previous = wine_server_ptr_handle( reply->previous );
+     }
+     SERVER_END_REQ;
++    if (!ret || previous != hwnd)
++        TRACE_(focus)( "active %p -> %p, mouse %u, ret %u\n", previous, hwnd, mouse, ret );
+     if (!ret) return FALSE;
+     if (prev) *prev = previous;
+     if (previous == hwnd) goto done;
+@@ -2237,6 +2240,7 @@
+     HWND prev;
+ 
+     TRACE( "%p\n", hwnd );
++    TRACE_(focus)( "SetActiveWindow %p, active %p\n", hwnd, get_active_window() );
+ 
+     if (hwnd)
+     {
+@@ -2298,9 +2302,14 @@
+         if (call_hooks( WH_CBT, HCBT_SETFOCUS, (WPARAM)hwnd, (LPARAM)previous, 0 )) return 0;
+ 
+         /* activate hwndTop if needed. */
+-        if (!(active = get_active_window()) && !set_foreground_window( hwndTop, FALSE, FALSE )) return 0;
++        if (!(active = get_active_window()))
++        {
++            TRACE_(focus)( "SetFocus %p with no active window, setting foreground %p\n", hwnd, hwndTop );
++            if (!set_foreground_window( hwndTop, FALSE, FALSE )) return 0;
++        }
+         if (hwndTop != active)
+         {
++            TRACE_(focus)( "SetFocus %p activates %p, active %p\n", hwnd, hwndTop, active );
+             if (!set_active_window( hwndTop, NULL, FALSE, FALSE, 0 )) return 0;
+             if (!is_window( hwnd )) return 0;  /* Abort if window destroyed */
+ 
+@@ -2323,6 +2332,7 @@
+  */
+ BOOL WINAPI NtUserSetForegroundWindow( HWND hwnd )
+ {
++    TRACE_(focus)( "SetForegroundWindow %p, foreground %p\n", hwnd, NtUserGetForegroundWindow() );
+     return set_foreground_window( hwnd, FALSE, FALSE );
+ }
+ 
+@@ -2352,6 +2362,8 @@
+     SERVER_END_REQ;
+ 
+     TRACE( "hwnd %p, mouse %u, internal %u -> ret %u, previous %p\n", hwnd, mouse, internal, ret, previous );
++    if (!ret || previous != hwnd)
++        TRACE_(focus)( "foreground %p -> %p, mouse %u, internal %u, ret %u\n", previous, hwnd, mouse, internal, ret );
+ 
+     if (ret && previous != hwnd)
+     {
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -41,6 +41,7 @@
+ WINE_DEFAULT_DEBUG_CHANNEL(msg);
+ WINE_DECLARE_DEBUG_CHANNEL(key);
+ WINE_DECLARE_DEBUG_CHANNEL(relay);
++WINE_DECLARE_DEBUG_CHANNEL(focus);
+ 
+ #define QS_DRIVER       0x80000000
+ #define QS_HARDWARE     0x40000000
+@@ -2262,7 +2263,12 @@
+     {
+         HWND prev;
+ 
+-        if (!wparam && NtUserGetForegroundWindow() == hwnd) return 0;
++        if (!wparam && NtUserGetForegroundWindow() == hwnd)
++        {
++            TRACE_(focus)( "WM_WINE_SETACTIVEWINDOW deactivation of foreground %p ignored\n", hwnd );
++            return 0;
++        }
++        TRACE_(focus)( "WM_WINE_SETACTIVEWINDOW %p on %p\n", (HWND)wparam, hwnd );
+         if (!set_active_window( (HWND)wparam, &prev, FALSE, TRUE, lparam )) return 0;
+         return (LRESULT)prev;
+     }
+@@ -2296,11 +2302,19 @@
+         if (!user_driver->pGetWindowStateUpdates( hwnd, &state_cmd, &swp_flags, &window_rect, &foreground )) goto unlock;
+         window_rect = map_rect_raw_to_virt( window_rect, get_thread_dpi() );
+ 
+-        if (foreground) set_foreground_window( foreground, FALSE, TRUE );
++        if (foreground)
++        {
++            TRACE_(focus)( "host state change on %p sets foreground %p\n", hwnd, foreground );
++            set_foreground_window( foreground, FALSE, TRUE );
++        }
+         switch (LOWORD(state_cmd))
+         {
+         case SC_RESTORE:
+-            if (HIWORD(state_cmd) && !foreground) set_foreground_window( hwnd, FALSE, TRUE );
++            if (HIWORD(state_cmd) && !foreground)
++            {
++                TRACE_(focus)( "host restore of %p sets it foreground\n", hwnd );
++                set_foreground_window( hwnd, FALSE, TRUE );
++            }
+ 
+             /* make the win32 window restore to the current host window config, if present */
+             if (!IsRectEmpty( &window_rect )) set_window_normal_placement( hwnd, window_rect );
+@@ -2910,6 +2924,7 @@
+                     /* fall through */
+                 case MA_ACTIVATE:
+                 case 0:
++                    TRACE_(focus)( "mouse click activates %p\n", hwndTop );
+                     if (!set_foreground_window( hwndTop, TRUE, FALSE )) eat_msg = TRUE;
+                     break;
+                 default:
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -34,6 +34,7 @@
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(win);
++WINE_DECLARE_DEBUG_CHANNEL(focus);
+ 
+ #define USER_HANDLE_TO_INDEX(hwnd) ((LOWORD(hwnd) - FIRST_USER_HANDLE) >> 1)
+ #define USER_HANDLE_FROM_INDEX(index, generation) UlongToHandle( (index << 1) + FIRST_USER_HANDLE + (generation << 16) )
+@@ -4369,7 +4370,10 @@
+         if ((style & (WS_CHILD | WS_POPUP)) == WS_CHILD)
+             send_message( winpos->hwnd, WM_CHILDACTIVATE, 0, 0 );
+         else if (!(style & WS_MINIMIZE))
++        {
++            TRACE_(focus)( "SetWindowPos %p flags %#x activates it\n", winpos->hwnd, winpos->flags );
+             set_foreground_window( winpos->hwnd, FALSE, FALSE );
++        }
+     }
+ 
+     if(!(orig_flags & SWP_DEFERERASE))
+@@ -4713,6 +4717,7 @@
+  done:
+     fg = NtUserGetForegroundWindow();
+     TRACE( "win = %p fg = %p\n", hwnd_to, fg );
++    TRACE_(focus)( "activating other window %p instead of %p, foreground %p\n", hwnd_to, hwnd, fg );
+     if (!fg || hwnd == fg)
+     {
+         if (set_foreground_window( hwnd_to, FALSE, FALSE )) return;
+@@ -6591,6 +6596,7 @@
+         return 0;
+ 
+     case NtUserCallHwnd_SetForegroundWindowInternal:
++        TRACE_(focus)( "internal SetForegroundWindow %p, foreground %p\n", hwnd, NtUserGetForegroundWindow() );
+         return set_foreground_window( hwnd, FALSE, TRUE );
+ 
+     case NtUserCallHwnd_GetDpiForWindow:
+--- a/dlls/winewayland.drv/wayland_keyboard.c
++++ b/dlls/winewayland.drv/wayland_keyboard.c
+@@ -38,6 +38,7 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(keyboard);
+ WINE_DECLARE_DEBUG_CHANNEL(key);
++WINE_DECLARE_DEBUG_CHANNEL(focus);
+ 
+ struct layout
+ {
+@@ -985,6 +986,8 @@
+     keyboard->focused_hwnd = hwnd;
+     pthread_mutex_unlock(&keyboard->mutex);
+ 
++    TRACE_(focus)("host keyboard enter %p, foreground %p\n", hwnd, NtUserGetForegroundWindow());
++
+     NtUserPostMessage(hwnd, WM_INPUTLANGCHANGEREQUEST, 0 /*FIXME*/, (LPARAM)keyboard_hkl);
+     NtUserPostMessage(hwnd, WM_WINE_WINDOW_STATE_CHANGED, 0, 0);
+ 
+@@ -1055,9 +1058,13 @@
+ 
+     if (hwnd == foreground)
+     {
++        TRACE_(focus)("host keyboard leave %p, foreground %p: %s\n", hwnd, foreground,
++                      wayland_disable_focus_loss() ? "focus loss disabled" : "posting focus loss");
+         if (!wayland_disable_focus_loss())
+             NtUserPostMessage(hwnd, WM_WINE_WINDOW_STATE_CHANGED, 0, 0);
+     }
++    else
++        TRACE_(focus)("host keyboard leave %p, foreground %p: not foreground, ignored\n", hwnd, foreground);
+ }
+ 
+ static inline void update_keystate(uint32_t key, uint32_t state)
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -37,6 +37,7 @@
+ #include "wine/hwnd_dmabuf.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
++WINE_DECLARE_DEBUG_CHANNEL(focus);
+ 
+ 
+ static int wayland_win_data_cmp_rb(const void *key,
+@@ -1740,6 +1741,9 @@
+ 
+     if (!*foreground && old_foreground != focused_hwnd) *foreground = focused_hwnd;
+ 
++    TRACE_(focus)("state update %p: foreground %p, host keyboard focus %p -> new foreground %p\n",
++                  hwnd, old_foreground, focused_hwnd, *foreground);
++
+     /* we can't track if the host window is minimized or unminimized, but
+      * if we have keyboard focus on this window we can treat it as restored.
+      * An unsupported minimize may never have changed the host keyboard focus,
