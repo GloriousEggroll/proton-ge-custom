@@ -1,0 +1,181 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] upscalers: enable installed upscalers for run and runinprefix
+
+Since the upscaler setup follows the protonfixes conditions, programs
+started with the run or runinprefix verb get no upscalers at all. Lutris
+uses runinprefix for a second game in a prefix that is already running,
+and Lutris 0.5.22 launches the first game on a new prefix with run.
+
+For those verbs, don't download, remove or replace anything, but still
+enable the upscalers a previous waitforexitandrun launch installed, if
+their files are present and match the tracking file.
+
+Refs: https://github.com/GloriousEggroll/proton-ge-custom/issues/930
+---
+--- a/__init__.py
++++ b/__init__.py
+@@ -48,6 +48,20 @@
+     )
+ 
+ 
++def check_run_conditions() -> bool:
++    """Determine if a program was started with the run or runinprefix verb.
++
++    Returns:
++        bool: True, if already installed upscaler files may be enabled.
++
++    """
++    return (
++        len(sys.argv) >= 2
++        and 'STEAM_COMPAT_DATA_PATH' in os.environ
++        and sys.argv[1] in {'run', 'runinprefix'}
++    )
++
++
+ def check_disabled() -> bool:
+     """Determine if protonfixes has been explicitly disabled
+ 
+@@ -128,12 +142,17 @@
+     """Execute upscaler setup"""
+     if check_iscriptevaluator():
+         log.debug('Skipping upscaler setup. We are running "iscriptevaluator.exe".')
+-    elif not check_conditions():
+-        log.warn('Skipping upscaler setup. Execution conditions are not satisfied.')
+     elif upscalers.check_upscalers_disabled():
+         log.warn('Skipping upscaler setup. Explicitly disabled from the environment.')
+-    else:
++    elif check_conditions():
+         upscalers.setup_upscalers(compat_config, env, compat_dir, prefix_dir)
++    elif check_run_conditions():
++        # run/runinprefix (e.g. a second game in a prefix that is already running): don't
++        # download or replace anything, but enable what a previous launch already installed.
++        log.info('Using installed upscaler files only (no downloads).')
++        upscalers.setup_upscalers(compat_config, env, compat_dir, prefix_dir, install=False)
++    else:
++        log.warn('Skipping upscaler setup. Execution conditions are not satisfied.')
+ 
+ 
+ __all__ = [
+--- a/upscalers.py
++++ b/upscalers.py
+@@ -646,12 +646,57 @@
+         log.crit(str(e))
+ 
+ 
++def check_installed(name: str, compat_dir: str, prefix_dir: str) -> bool:
++    """Check that the files a previous setup installed are still in place.
++
++    Only reads the tracking file and the prefix: no manifest download, and
++    nothing is removed or replaced.
++    """
++    sections = {
++        'dlss': __dlss_section,
++        'xess': __xess_section,
++        'fsr4': __fsr4_section,
++        'ffx3': __ffx3_section,
++        'ffx4': __ffx4_section,
++        'optiscaler': __opti_section,
++        'streamline': __nvsl_section,
++    }
++    if name not in sections:
++        return False
++    return __check_installed_section(compat_dir, prefix_dir, sections[name])
++
++
++def __check_installed_section(compat_dir: str, prefix_dir: str, section: str) -> bool:
++    try:
++        tracked_items = __get_tracked_items(compat_dir, section)
++    except Exception:
++        return False
++    if not tracked_items:
++        return False
++
++    for dst, tracked in tracked_items.items():
++        target = os.path.join(prefix_dir, dst)
++        if not os.path.isfile(target) or os.path.islink(target):
++            log.warn(f'Missing file from prefix "{dst}"')
++            return False
++        tracked_md5 = tracked.get('md5_hash')
++        if tracked_md5:
++            with open(target, 'rb') as dst_fd:
++                if hashlib.md5(dst_fd.read()).hexdigest().lower() != tracked_md5.lower():
++                    log.warn(f'MD5 checksum mismatch between tracking file and prefix "{dst}"')
++                    return False
++    return True
++
++
+ def setup_upscaler(
+     name: str,
+     compat_dir: str,
+     prefix_dir: str,
+     version: str,
++    install: bool = True,
+ ) -> bool:
++    if not install:
++        return check_installed(name, compat_dir, prefix_dir)
+     log.info(f'Setting up {name} version "{version}".')
+     download_upscaler(name, compat_dir, prefix_dir, version)
+     enabled = check_upscaler(name, compat_dir, prefix_dir, version, ignore_version=True)
+@@ -663,7 +708,10 @@
+     compat_dir: str,
+     prefix_dir: str,
+     version: str,
++    install: bool = True,
+ ) -> bool:
++    if not install:
++        return check_installed('optiscaler', compat_dir, prefix_dir)
+     log.info(f'Setting up optiscaler version "{version}".')
+     download_component("optiscaler", compat_dir, prefix_dir, version)
+     enabled = check_component("optiscaler", compat_dir, prefix_dir, version, ignore_version=True)
+@@ -744,11 +792,13 @@
+ 
+ 
+ def setup_upscalers(
+-    compat_config: set, env: dict, compat_dir: str, prefix_dir: str
++    compat_config: set, env: dict, compat_dir: str, prefix_dir: str, install: bool = True
+ ) -> None:
+     """Setup configured upscalers
+ 
+     usage: setup_upscalers(g_session.compat_config, g_session.env, g_compatdata.base_dir, g_compatdata.prefix_dir)
++    install: False only enables files a previous setup installed, without downloading,
++             removing or replacing anything
+     """
+     dlss_version: str = get_version(env, 'PROTON_DLSS_UPGRADE', 'default')
+     xess_version: str = get_version(env, 'PROTON_XESS_UPGRADE', 'default')
+@@ -777,7 +827,7 @@
+     )
+     for upscaler in upscalers:
+         name, version, enabled = upscaler
+-        if enabled and setup_upscaler(name, compat_dir, prefix_dir, version):
++        if enabled and setup_upscaler(name, compat_dir, prefix_dir, version, install):
+             log.info(f'Automatic {name} upgrade enabled.')
+             upscaler_replace.add(name)
+ 
+@@ -785,16 +835,22 @@
+     # too old for the driver's DLSS overrides. Wine redirects the game's
+     # sl.*.dll to the upgraded copy.
+     if 'streamline' in compat_config and 'optiscaler' not in compat_config:
+-        log.info(f'Setting up streamline version "{streamline_version}".')
+-        download_component('streamline', compat_dir, prefix_dir, streamline_version)
+-        if check_component('streamline', compat_dir, prefix_dir, streamline_version, ignore_version=True):
++        if not install:
++            streamline_enabled = check_installed('streamline', compat_dir, prefix_dir)
++        else:
++            log.info(f'Setting up streamline version "{streamline_version}".')
++            download_component('streamline', compat_dir, prefix_dir, streamline_version)
++            streamline_enabled = check_component(
++                'streamline', compat_dir, prefix_dir, streamline_version, ignore_version=True
++            )
++        if streamline_enabled:
+             log.info('Automatic streamline upgrade enabled.')
+             upscaler_replace.add('streamline')
+ 
+     if 'optiscaler' in compat_config:
+-        if setup_optiscaler(env, compat_dir, prefix_dir, optiscaler_version):
++        if setup_optiscaler(env, compat_dir, prefix_dir, optiscaler_version, install):
+             log.info('OptiScaler enabled.')
+-            if 'fsr4' in compat_config:
++            if 'fsr4' in compat_config and install:
+                 if ffx4_version in {'4.0.0', '4.0.1'}:
+                     clean_tracked_files('ffx4', compat_dir, prefix_dir)
+                 else:
