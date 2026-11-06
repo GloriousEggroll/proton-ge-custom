@@ -706,6 +706,7 @@ apply_all_in_dir() {
     # Bluetooth DualShock 4 presented as a wired one, like the DualSense
     apply_patch "../patches/wine-hotfixes/pending/winebus-expose-bluetooth-dualshock4-as-usb.patch"
     apply_patch "../patches/wine-hotfixes/pending/winepulse-bluetooth-dualshock4-audio.patch"
+    apply_patch "../patches/wine-hotfixes/pending/winedmo-disable-d3d11-aware-for-phantom-blade-zero.patch"
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
