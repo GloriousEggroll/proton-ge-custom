@@ -1,0 +1,325 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] winebus: expose Bluetooth DualShock 4 controllers as USB ones.
+
+Like the Bluetooth DualSense, present a Bluetooth DualShock 4 (05c4 / 09cc)
+with its USB report descriptor, USB bus and HID interface 3 when Steam Input
+is disabled. Games written for a wired DS4 get the 64 byte USB input report,
+and their USB output and feature reports are translated: output #5 goes out
+as Bluetooth #0x11 with its CRC, calibration #2 comes from Bluetooth #5,
+the MAC reports #0x12 / #0x81 come from the Bluetooth address, the firmware
+report #0xa3 is padded to its USB size, and the USB initialization report
+#0x14 is consumed. This reuses the existing DualShock 4 v2 as v1 Bluetooth
+translation, which already did this for a different generation.
+
+PROTON_DUALSHOCK4_BT_AS_USB=0 keeps the Bluetooth layout.
+
+Report layouts as in the Linux hid-playstation driver and DS4Dongle
+(https://github.com/snipem/DS4Dongle, MIT license).
+---
+--- a/dlls/winebus.sys/unixlib.h
++++ b/dlls/winebus.sys/unixlib.h
+@@ -45,6 +45,7 @@
+     BOOL spoof_dualshock4_v1;
+     BOOL spoof_dualsense;
+     BOOL spoof_dualsense_usb;
++    BOOL spoof_dualshock4_usb;
+     BOOL use_xbox_identity;
+ 
+     WCHAR manufacturer[MAX_PATH];
+--- a/dlls/winebus.sys/bus_udev.c
++++ b/dlls/winebus.sys/bus_udev.c
+@@ -1568,6 +1568,16 @@
+     return sony_steam_input_disabled();
+ }
+ 
++/* Enabled by default when Steam Input is disabled; PROTON_DUALSHOCK4_BT_AS_USB=0
++ * keeps the Bluetooth report layout. */
++static BOOL spoof_bluetooth_dualshock4_as_usb(void)
++{
++    const char *env = getenv("PROTON_DUALSHOCK4_BT_AS_USB");
++
++    if (env && !strcmp(env, "0")) return FALSE;
++    return sony_steam_input_disabled();
++}
++
+ /* Bluetooth controllers have no USB topology to derive a container ID from.
+  * Use one based on the controller address instead; winepulse computes the
+  * same value for the synthetic haptics endpoint of the controller. */
+@@ -1655,6 +1665,20 @@
+                 desc.pid == 0x0df2 && !desc.spoof_dualsense ? " Edge" : "");
+     }
+ 
++    if (!desc.is_gamepad && !desc.spoof_dualshock4 && desc.bus_type == BUS_TYPE_BLUETOOTH &&
++            desc.vid == 0x054c && (desc.pid == 0x05c4 || desc.pid == 0x09cc) &&
++            spoof_bluetooth_dualshock4_as_usb())
++    {
++        /* Present the Bluetooth controller with its USB report layout, the way
++         * games expect a wired DualShock 4. Interface 3 matches the USB HID
++         * interface in the instance path. */
++        desc.spoof_dualshock4_usb = TRUE;
++        desc.input = 3;
++        set_bluetooth_dualsense_container_id(&desc);
++        TRACE("exposing Bluetooth DualShock 4 %04x:%04x as a USB DualShock 4%s.\n",
++                desc.vid, desc.pid, desc.spoof_dualshock4_v1 ? " v1" : "");
++    }
++
+     if (!desc.product[0] && ioctl(fd, HIDIOCGRAWNAME(sizeof(buffer) - 1), buffer) >= 0)
+         ntdll_umbstowcs(buffer, strlen(buffer) + 1, desc.product, ARRAY_SIZE(desc.product));
+ 
+--- a/dlls/winebus.sys/main.c
++++ b/dlls/winebus.sys/main.c
+@@ -99,6 +99,8 @@
+ #define DUALSHOCK4_FEATURE_REPORT_CALIBRATION_BT_SIZE 41
+ #define DUALSHOCK4_FEATURE_REPORT_PAIRING_INFO 0x12
+ #define DUALSHOCK4_FEATURE_REPORT_PAIRING_INFO_SIZE 16
++#define DUALSHOCK4_FEATURE_REPORT_MAC_ADDRESS 0x81
++#define DUALSHOCK4_FEATURE_REPORT_MAC_ADDRESS_SIZE 7
+ #define DUALSHOCK4_FEATURE_REPORT_FIRMWARE_INFO 0xa3
+ #define DUALSHOCK4_FEATURE_REPORT_FIRMWARE_INFO_SIZE 49
+ #define DUALSHOCK4_FEATURE_REPORT_USB_INIT 0x14
+@@ -691,7 +693,8 @@
+     WCHAR *dst;
+ 
+     assert(ext->desc.bus_type < BUS_TYPE_COUNT);
+-    bus_str = bus_type_str[ext->desc.spoof_dualsense_usb ? BUS_TYPE_USB : ext->desc.bus_type];
++    bus_str = bus_type_str[ext->desc.spoof_dualsense_usb || ext->desc.spoof_dualshock4_usb
++            ? BUS_TYPE_USB : ext->desc.bus_type];
+     if (ext->desc.input != -1) input_len = 14;
+ 
+     len += winebus_len + input_len + wcslen(bus_str) + 1;
+@@ -883,7 +886,8 @@
+     ext->unix_device        = unix_device;
+     list_init(&ext->reports);
+ 
+-    if (desc->is_hidraw && (desc->bus_type == BUS_TYPE_BLUETOOTH) && is_dualshock4_gamepad(desc->vid, desc->pid))
++    if (desc->is_hidraw && (desc->bus_type == BUS_TYPE_BLUETOOTH) && is_dualshock4_gamepad(desc->vid, desc->pid) &&
++            !desc->spoof_dualshock4_usb)
+     {
+         TRACE("Enabling report fixup for Bluetooth DualShock4 device %p\n", device);
+         ext->report_fixups |= HIDRAW_FIXUP_DUALSHOCK_BT;
+@@ -1468,14 +1472,27 @@
+     return TRUE;
+ }
+ 
+-static BOOL hidraw_fixup_dualshock4_v2_input_as_v1(struct device_extension *ext,
++/* A physical Bluetooth DualShock 4 presented with a USB DualShock 4 report
++ * descriptor, of either generation. */
++static BOOL is_bluetooth_dualshock4_as_usb(const struct device_extension *ext)
++{
++    return ext->desc.is_hidraw && ext->desc.bus_type == BUS_TYPE_BLUETOOTH && !ext->desc.spoof_dualshock4 &&
++            (ext->desc.spoof_dualshock4_v1 || ext->desc.spoof_dualshock4_usb);
++}
++
++/* Bluetooth DualShock 4 input as the USB report #1. The extended Bluetooth
++ * report #0x11 carries the USB payload after a two byte header, followed by a
++ * fourth touch sample and a CRC; the basic report #1 sent before the controller
++ * is switched to it is the start of the USB report. Layouts as in the Linux
++ * hid-playstation driver and DS4Dongle (https://github.com/snipem/DS4Dongle,
++ * MIT license), which bridges a Bluetooth DS4 to USB. */
++static BOOL hidraw_fixup_bluetooth_dualshock4_input_as_usb(struct device_extension *ext,
+         struct hid_report *report)
+ {
+     BYTE translated[DUALSHOCK4_INPUT_REPORT_SIZE] = {0};
+     BYTE touch_reports;
+ 
+-    if (!ext->desc.spoof_dualshock4_v1 || ext->desc.spoof_dualshock4 ||
+-            ext->desc.bus_type != BUS_TYPE_BLUETOOTH)
++    if (!is_bluetooth_dualshock4_as_usb(ext))
+         return TRUE;
+ 
+     if (report->buffer[0] == 0x01 && report->length >= 10)
+@@ -1493,7 +1510,7 @@
+     }
+     else
+     {
+-        WARN("Ignoring unexpected DualShock 4 v2 Bluetooth input report %#x/%lu while spoofing v1.\n",
++        WARN("Ignoring unexpected Bluetooth DualShock 4 input report %#x/%lu while presenting it as USB.\n",
+                 report->buffer[0], report->length);
+         return FALSE;
+     }
+@@ -1556,7 +1573,7 @@
+ {
+     struct device_extension *ext = (struct device_extension *)device->DeviceExtension;
+     BOOL translate = ext->desc.spoof_dualshock4 || ext->desc.spoof_dualshock4_v1 ||
+-            ext->desc.spoof_dualsense_usb;
++            ext->desc.spoof_dualsense_usb || ext->desc.spoof_dualshock4_usb;
+     struct hid_report *report, *last_report;
+     ULONG size;
+     IRP *irp;
+@@ -1612,7 +1629,7 @@
+         RtlFreeHeap(GetProcessHeap(), 0, report);
+         return;
+     }
+-    if (!hidraw_fixup_dualshock4_v2_input_as_v1(ext, report))
++    if (!hidraw_fixup_bluetooth_dualshock4_input_as_usb(ext, report))
+     {
+         RtlLeaveCriticalSection(&ext->cs);
+         RtlFreeHeap(GetProcessHeap(), 0, report);
+@@ -1876,6 +1893,18 @@
+         *report_desc_length = sizeof(dualshock4_v2_report_descriptor);
+         generation = "DualShock 4 v2";
+     }
++    else if (ext->desc.spoof_dualshock4_usb && ext->desc.pid == 0x05c4)
++    {
++        spoofed_report_desc = dualshock4_v1_report_descriptor;
++        *report_desc_length = sizeof(dualshock4_v1_report_descriptor);
++        generation = "DualShock 4 v1 USB";
++    }
++    else if (ext->desc.spoof_dualshock4_usb)
++    {
++        spoofed_report_desc = dualshock4_v2_report_descriptor;
++        *report_desc_length = sizeof(dualshock4_v2_report_descriptor);
++        generation = "DualShock 4 v2 USB";
++    }
+     else if (ext->desc.spoof_dualsense_usb && ext->desc.pid == 0x0df2 && !ext->desc.spoof_dualsense)
+     {
+         spoofed_report_desc = dualsense_edge_usb_report_descriptor;
+@@ -2541,7 +2570,7 @@
+      * valid Bluetooth output report, which switches Sony controllers to their
+      * extended input report. */
+     if (sony_hidraw_xinput_enabled() || ext->desc.spoof_dualshock4 ||
+-            ext->desc.spoof_dualshock4_v1) return;
++            ext->desc.spoof_dualshock4_v1 || ext->desc.spoof_dualshock4_usb) return;
+ 
+     /* FIXME: we may want to validate CRC at the end of the outbound HID reports,
+      * as controllers do not switch modes if it is incorrect.
+@@ -2757,6 +2786,76 @@
+     io->Status = STATUS_SUCCESS;
+ }
+ 
++/* USB DualShock 4 feature reports with no Bluetooth equivalent, or a different
++ * Bluetooth size, as DS4Dongle answers them: the controller MAC reports #0x12
++ * and #0x81 come from the Bluetooth address, and the Bluetooth firmware report
++ * #0xa3 is shorter than the USB one and ends with a CRC. */
++static BOOL hidraw_get_bluetooth_dualshock4_usb_feature_report(DEVICE_OBJECT *device,
++        struct device_extension *ext, HID_XFER_PACKET *packet, IO_STATUS_BLOCK *io)
++{
++    BYTE native_report[64] = {0};
++    HID_XFER_PACKET native_packet = {.reportBuffer = native_report};
++    IO_STATUS_BLOCK native_io = {0};
++    const WCHAR *str;
++    WCHAR *end;
++    ULONG mac[6], size, i;
++
++    switch (packet->reportId)
++    {
++        case DUALSHOCK4_FEATURE_REPORT_PAIRING_INFO: size = DUALSHOCK4_FEATURE_REPORT_PAIRING_INFO_SIZE; break;
++        case DUALSHOCK4_FEATURE_REPORT_MAC_ADDRESS: size = DUALSHOCK4_FEATURE_REPORT_MAC_ADDRESS_SIZE; break;
++        case DUALSHOCK4_FEATURE_REPORT_FIRMWARE_INFO: size = DUALSHOCK4_FEATURE_REPORT_FIRMWARE_INFO_SIZE; break;
++        default: return FALSE;
++    }
++
++    if (packet->reportBufferLen < size)
++    {
++        io->Information = 0;
++        io->Status = STATUS_BUFFER_TOO_SMALL;
++        return TRUE;
++    }
++
++    if (packet->reportId == DUALSHOCK4_FEATURE_REPORT_FIRMWARE_INFO)
++    {
++        native_packet.reportId = DUALSHOCK4_FEATURE_REPORT_FIRMWARE_INFO;
++        native_packet.reportBufferLen = sizeof(native_report);
++        native_report[0] = native_packet.reportId;
++        unix_device_get_feature_report(device, &native_packet, &native_io);
++        if (native_io.Status || native_io.Information <= 1 + sizeof(DWORD))
++        {
++            WARN("Failed to retrieve Bluetooth DualShock 4 firmware report, status %#lx.\n", native_io.Status);
++            return FALSE;
++        }
++        memset(packet->reportBuffer, 0, packet->reportBufferLen);
++        memcpy(packet->reportBuffer, native_report, min(native_io.Information - sizeof(DWORD), size));
++    }
++    else
++    {
++        /* hidraw reports the Bluetooth address as the serial number. */
++        for (i = 0, str = ext->desc.serialnumber; i < 6; ++i, str = end + 1)
++        {
++            mac[i] = wcstoul(str, &end, 16);
++            if (end == str || mac[i] > 0xff || *end != (i < 5 ? ':' : 0)) return FALSE;
++        }
++        memset(packet->reportBuffer, 0, packet->reportBufferLen);
++        packet->reportBuffer[0] = packet->reportId;
++        /* The address is stored least significant byte first. The pairing
++         * report continues with the paired host address, which is unknown. */
++        for (i = 0; i < 6; ++i) packet->reportBuffer[1 + i] = mac[5 - i];
++        if (packet->reportId == DUALSHOCK4_FEATURE_REPORT_PAIRING_INFO)
++        {
++            packet->reportBuffer[7] = 0x08;
++            packet->reportBuffer[8] = 0x25;
++        }
++    }
++
++    io->Information = size;
++    io->Status = STATUS_SUCCESS;
++    TRACE("returned USB DualShock 4 feature report %#x for Bluetooth device %04x:%04x.\n",
++            packet->reportId, ext->desc.vid, ext->desc.pid);
++    return TRUE;
++}
++
+ static BOOL hidraw_get_spoofed_dualshock4_feature_report(DEVICE_OBJECT *device,
+         HID_XFER_PACKET *packet, IO_STATUS_BLOCK *io)
+ {
+@@ -2772,10 +2871,11 @@
+     ULONG response_size;
+ 
+     if (!ext->desc.is_hidraw ||
+-            (!ext->desc.spoof_dualshock4 && !ext->desc.spoof_dualshock4_v1))
++            (!ext->desc.spoof_dualshock4 && !ext->desc.spoof_dualshock4_v1 && !ext->desc.spoof_dualshock4_usb))
+         return FALSE;
+ 
+-    if (packet->reportId == DUALSHOCK4_FEATURE_REPORT_FIRMWARE_INFO)
++    if (packet->reportId == DUALSHOCK4_FEATURE_REPORT_FIRMWARE_INFO &&
++            (ext->desc.spoof_dualshock4 || ext->desc.spoof_dualshock4_v1))
+     {
+         if (ext->desc.spoof_dualshock4_v1)
+         {
+@@ -2810,6 +2910,10 @@
+         return TRUE;
+     }
+ 
++    if (is_bluetooth_dualshock4_as_usb(ext) &&
++            hidraw_get_bluetooth_dualshock4_usb_feature_report(device, ext, packet, io))
++        return TRUE;
++
+     if (!ext->desc.spoof_dualshock4)
+     {
+         /* DS4 v1 and v2 share their report layout. Bluetooth calibration is
+@@ -2897,7 +3001,7 @@
+ static BOOL hidraw_set_spoofed_dualshock4_feature_report(struct device_extension *ext,
+         HID_XFER_PACKET *packet, IO_STATUS_BLOCK *io)
+ {
+-    if (!ext->desc.spoof_dualshock4 || !ext->desc.is_hidraw)
++    if ((!ext->desc.spoof_dualshock4 && !is_bluetooth_dualshock4_as_usb(ext)) || !ext->desc.is_hidraw)
+         return FALSE;
+ 
+     if (packet->reportId != DUALSHOCK4_FEATURE_REPORT_USB_INIT)
+@@ -2931,7 +3035,7 @@
+     BYTE *common;
+ 
+     if (!ext->desc.is_hidraw ||
+-            (!ext->desc.spoof_dualshock4 && !ext->desc.spoof_dualshock4_v1))
++            (!ext->desc.spoof_dualshock4 && !ext->desc.spoof_dualshock4_v1 && !ext->desc.spoof_dualshock4_usb))
+         return FALSE;
+     if (packet->reportId != DUALSHOCK4_OUTPUT_REPORT_USB
+             || packet->reportBufferLen != DUALSHOCK4_OUTPUT_REPORT_USB_SIZE
+@@ -2956,7 +3060,7 @@
+         fixed_packet->reportBufferLen = DUALSHOCK4_OUTPUT_REPORT_BT_SIZE;
+         sony_set_output_report_crc(fixed_report, fixed_packet->reportBufferLen);
+ 
+-        TRACE("translated spoofed DualShock 4 v1 USB output report to physical v2 Bluetooth report.\n");
++        TRACE("translated USB DualShock 4 output report to Bluetooth report %#x.\n", DUALSHOCK4_OUTPUT_REPORT_BT);
+         return TRUE;
+     }
+ 
+@@ -3092,8 +3196,8 @@
+             attr->Size = sizeof(*attr);
+             attr->VendorID = get_windows_vendor_id(ext);
+             attr->ProductID = get_windows_product_id(ext);
+-            attr->VersionNumber = (ext->desc.spoof_dualshock4 || ext->desc.spoof_dualshock4_v1)
+-                    ? 0x0100 : ext->desc.version;
++            attr->VersionNumber = (ext->desc.spoof_dualshock4 || ext->desc.spoof_dualshock4_v1 ||
++                    ext->desc.spoof_dualshock4_usb) ? 0x0100 : ext->desc.version;
+ 
+             irp->IoStatus.Status = STATUS_SUCCESS;
+             irp->IoStatus.Information = sizeof(*attr);
