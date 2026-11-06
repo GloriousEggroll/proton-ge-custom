@@ -13,7 +13,10 @@ translation, which already did this for a different generation.
 
 Output reports are sent at most every 33 ms, merging the fields of reports
 written in between by their valid flags, as for the Bluetooth DualSense: the
-link also carries winepulse's speaker audio reports.
+link also carries winepulse's speaker audio reports. With a headset
+microphone plugged in (input status bit 6), output reports enable it, and
+the input reports #0x12 to #0x19 the controller then sends, its state
+followed by microphone audio for winepulse, are translated too.
 
 PROTON_DUALSHOCK4_BT_AS_USB=0 keeps the Bluetooth layout.
 
@@ -72,7 +75,17 @@ Report layouts as in the Linux hid-playstation driver and DS4Dongle
  
 --- a/dlls/winebus.sys/main.c
 +++ b/dlls/winebus.sys/main.c
-@@ -99,6 +99,8 @@
+@@ -80,6 +80,9 @@
+ #define DUALSHOCK4_INPUT_REPORT_SIZE 64
+ #define DUALSHOCK4_INPUT_REPORT_BT 0x11
+ #define DUALSHOCK4_INPUT_REPORT_BT_SIZE 78
++#define DUALSHOCK4_INPUT_REPORT_BT_AUDIO_LAST 0x19
++#define DUALSHOCK4_INPUT_REPORT_BT_STATE_SIZE 67
++#define DUALSHOCK4_STATUS_MIC 0x40
+ #define DUALSHOCK4_OUTPUT_REPORT_USB 0x05
+ #define DUALSHOCK4_OUTPUT_REPORT_USB_SIZE 32
+ #define DUALSHOCK4_OUTPUT_REPORT_BT 0x11
+@@ -99,6 +102,8 @@
  #define DUALSHOCK4_FEATURE_REPORT_CALIBRATION_BT_SIZE 41
  #define DUALSHOCK4_FEATURE_REPORT_PAIRING_INFO 0x12
  #define DUALSHOCK4_FEATURE_REPORT_PAIRING_INFO_SIZE 16
@@ -81,16 +94,26 @@ Report layouts as in the Linux hid-playstation driver and DS4Dongle
  #define DUALSHOCK4_FEATURE_REPORT_FIRMWARE_INFO 0xa3
  #define DUALSHOCK4_FEATURE_REPORT_FIRMWARE_INFO_SIZE 49
  #define DUALSHOCK4_FEATURE_REPORT_USB_INIT 0x14
-@@ -368,6 +370,8 @@
+@@ -368,6 +373,9 @@
      BYTE sony_bt_output[4][DUALSENSE_OUTPUT_REPORT_COMMON_SIZE];
      UINT sony_bt_output_count;
      ULONGLONG sony_bt_output_time;
 +    BYTE sony_ds4_bt_output[DUALSHOCK4_OUTPUT_REPORT_USB_SIZE - 1];
 +    BOOL sony_ds4_bt_output_pending;
++    BOOL sony_ds4_mic_present;
      UINT64 unix_device;
  };
  
-@@ -691,7 +695,8 @@
+@@ -501,7 +509,7 @@
+         else
+             return FALSE;
+     }
+-    else if (report[0] == DUALSHOCK4_INPUT_REPORT_BT && report_len >= 12)
++    else if (report[0] >= DUALSHOCK4_INPUT_REPORT_BT && report[0] <= 0x19 && report_len >= 12)
+         data = report + 3;
+     else if (report[0] == 0x01 && report_len >= 10)
+         data = report + 1;
+@@ -691,7 +699,8 @@
      WCHAR *dst;
  
      assert(ext->desc.bus_type < BUS_TYPE_COUNT);
@@ -100,7 +123,7 @@ Report layouts as in the Linux hid-playstation driver and DS4Dongle
      if (ext->desc.input != -1) input_len = 14;
  
      len += winebus_len + input_len + wcslen(bus_str) + 1;
-@@ -883,7 +888,8 @@
+@@ -883,7 +892,8 @@
      ext->unix_device        = unix_device;
      list_init(&ext->reports);
  
@@ -110,7 +133,7 @@ Report layouts as in the Linux hid-playstation driver and DS4Dongle
      {
          TRACE("Enabling report fixup for Bluetooth DualShock4 device %p\n", device);
          ext->report_fixups |= HIDRAW_FIXUP_DUALSHOCK_BT;
-@@ -1468,14 +1474,27 @@
+@@ -1468,23 +1478,43 @@
      return TRUE;
  }
  
@@ -141,7 +164,25 @@ Report layouts as in the Linux hid-playstation driver and DS4Dongle
          return TRUE;
  
      if (report->buffer[0] == 0x01 && report->length >= 10)
-@@ -1493,7 +1512,7 @@
+     {
+         memcpy(translated, report->buffer, min(report->length, sizeof(translated)));
+     }
+-    else if (report->buffer[0] == DUALSHOCK4_INPUT_REPORT_BT &&
+-            report->length >= DUALSHOCK4_INPUT_REPORT_BT_SIZE)
++    else if (report->buffer[0] >= DUALSHOCK4_INPUT_REPORT_BT && report->buffer[0] <= DUALSHOCK4_INPUT_REPORT_BT_AUDIO_LAST &&
++            report->length >= DUALSHOCK4_INPUT_REPORT_BT_STATE_SIZE)
+     {
++        /* With the headset microphone enabled, the controller sends reports
++         * #0x12 to #0x19, the #0x11 state followed by microphone audio, which
++         * winepulse decodes. DS4Dongle saw some carry a different state
++         * block, recognizable by an invalid touch report count. */
++        if (report->buffer[0] != DUALSHOCK4_INPUT_REPORT_BT && report->buffer[35] > 4)
++            return FALSE;
++        ext->sony_ds4_mic_present = !!(report->buffer[32] & DUALSHOCK4_STATUS_MIC);
+         translated[0] = 0x01;
+         memcpy(translated + 1, report->buffer + 3, 32);
+         touch_reports = min(report->buffer[35], 3);
+@@ -1493,7 +1523,7 @@
      }
      else
      {
@@ -150,7 +191,7 @@ Report layouts as in the Linux hid-playstation driver and DS4Dongle
                  report->buffer[0], report->length);
          return FALSE;
      }
-@@ -1551,12 +1570,13 @@
+@@ -1551,12 +1581,13 @@
  }
  
  static void sony_bt_flush_output(DEVICE_OBJECT *device, struct device_extension *ext, BOOL force);
@@ -165,7 +206,7 @@ Report layouts as in the Linux hid-playstation driver and DS4Dongle
      struct hid_report *report, *last_report;
      ULONG size;
      IRP *irp;
-@@ -1573,6 +1593,7 @@
+@@ -1573,6 +1604,7 @@
  
      /* Input reports arrive every few milliseconds, send queued output. */
      if (ext->desc.spoof_dualsense_usb) sony_bt_flush_output(device, ext, FALSE);
@@ -173,7 +214,7 @@ Report layouts as in the Linux hid-playstation driver and DS4Dongle
  
      /* Spoofed reports only match the DS4 descriptor once translated, so
       * their declared report is looked up after the translation below. */
-@@ -1612,7 +1633,7 @@
+@@ -1612,7 +1644,7 @@
          RtlFreeHeap(GetProcessHeap(), 0, report);
          return;
      }
@@ -182,7 +223,7 @@ Report layouts as in the Linux hid-playstation driver and DS4Dongle
      {
          RtlLeaveCriticalSection(&ext->cs);
          RtlFreeHeap(GetProcessHeap(), 0, report);
-@@ -1876,6 +1897,18 @@
+@@ -1876,6 +1908,18 @@
          *report_desc_length = sizeof(dualshock4_v2_report_descriptor);
          generation = "DualShock 4 v2";
      }
@@ -201,7 +242,7 @@ Report layouts as in the Linux hid-playstation driver and DS4Dongle
      else if (ext->desc.spoof_dualsense_usb && ext->desc.pid == 0x0df2 && !ext->desc.spoof_dualsense)
      {
          spoofed_report_desc = dualsense_edge_usb_report_descriptor;
-@@ -2541,7 +2574,7 @@
+@@ -2541,7 +2585,7 @@
       * valid Bluetooth output report, which switches Sony controllers to their
       * extended input report. */
      if (sony_hidraw_xinput_enabled() || ext->desc.spoof_dualshock4 ||
@@ -210,7 +251,7 @@ Report layouts as in the Linux hid-playstation driver and DS4Dongle
  
      /* FIXME: we may want to validate CRC at the end of the outbound HID reports,
       * as controllers do not switch modes if it is incorrect.
-@@ -2709,6 +2742,77 @@
+@@ -2709,6 +2753,79 @@
      sony_bt_flush_output(device, ext, FALSE);
  }
  
@@ -233,7 +274,9 @@ Report layouts as in the Linux hid-playstation driver and DS4Dongle
 +
 +    report[0] = DUALSHOCK4_OUTPUT_REPORT_BT;
 +    report[DUALSHOCK4_OUTPUT_REPORT_BT_HW_CONTROL_OFFSET] = DUALSHOCK4_OUTPUT_REPORT_BT_HW_CONTROL;
-+    report[2] = 0x20;
++    /* Bit 2 keeps the headset microphone enabled, winepulse sets it the same
++     * way from the same status bit. */
++    report[2] = 0x20 | (ext->sony_ds4_mic_present ? 0x04 : 0);
 +    memcpy(report + DUALSHOCK4_OUTPUT_REPORT_BT_COMMON_OFFSET, ext->sony_ds4_bt_output,
 +            sizeof(ext->sony_ds4_bt_output));
 +    sony_set_output_report_crc(report, sizeof(report));
@@ -288,7 +331,7 @@ Report layouts as in the Linux hid-playstation driver and DS4Dongle
  static void hidraw_get_vitapad_feature_report(struct device_extension *ext,
          HID_XFER_PACKET *packet, IO_STATUS_BLOCK *io)
  {
-@@ -2757,6 +2861,76 @@
+@@ -2757,6 +2874,76 @@
      io->Status = STATUS_SUCCESS;
  }
  
@@ -365,7 +408,7 @@ Report layouts as in the Linux hid-playstation driver and DS4Dongle
  static BOOL hidraw_get_spoofed_dualshock4_feature_report(DEVICE_OBJECT *device,
          HID_XFER_PACKET *packet, IO_STATUS_BLOCK *io)
  {
-@@ -2772,10 +2946,11 @@
+@@ -2772,10 +2959,11 @@
      ULONG response_size;
  
      if (!ext->desc.is_hidraw ||
@@ -379,7 +422,7 @@ Report layouts as in the Linux hid-playstation driver and DS4Dongle
      {
          if (ext->desc.spoof_dualshock4_v1)
          {
-@@ -2810,6 +2985,10 @@
+@@ -2810,6 +2998,10 @@
          return TRUE;
      }
  
@@ -390,7 +433,7 @@ Report layouts as in the Linux hid-playstation driver and DS4Dongle
      if (!ext->desc.spoof_dualshock4)
      {
          /* DS4 v1 and v2 share their report layout. Bluetooth calibration is
-@@ -2897,7 +3076,7 @@
+@@ -2897,7 +3089,7 @@
  static BOOL hidraw_set_spoofed_dualshock4_feature_report(struct device_extension *ext,
          HID_XFER_PACKET *packet, IO_STATUS_BLOCK *io)
  {
@@ -399,7 +442,7 @@ Report layouts as in the Linux hid-playstation driver and DS4Dongle
          return FALSE;
  
      if (packet->reportId != DUALSHOCK4_FEATURE_REPORT_USB_INIT)
-@@ -2931,34 +3110,17 @@
+@@ -2931,34 +3123,17 @@
      BYTE *common;
  
      if (!ext->desc.is_hidraw ||
@@ -438,7 +481,7 @@ Report layouts as in the Linux hid-playstation driver and DS4Dongle
  
      memset(fixed_report, 0, DUALSENSE_OUTPUT_REPORT_BT_SIZE);
      *fixed_packet = *packet;
-@@ -3092,8 +3254,8 @@
+@@ -3092,8 +3267,8 @@
              attr->Size = sizeof(*attr);
              attr->VendorID = get_windows_vendor_id(ext);
              attr->ProductID = get_windows_product_id(ext);
@@ -449,7 +492,7 @@ Report layouts as in the Linux hid-playstation driver and DS4Dongle
  
              irp->IoStatus.Status = STATUS_SUCCESS;
              irp->IoStatus.Information = sizeof(*attr);
-@@ -3207,6 +3369,15 @@
+@@ -3207,6 +3382,15 @@
                      TRACE("%s\n", buffer);
                  }
              }

@@ -1,0 +1,1027 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] winepulse: send DualShock 4 audio to and from Bluetooth controllers.
+
+A Bluetooth DualShock 4 has no USB audio function, so games find no
+speaker or headset microphone endpoint for it. When winebus presents the
+controller as USB (Steam Input disabled), expose synthetic endpoints like
+the wired ones, with the same container ID, and bridge them through hidraw,
+paced in real time, using libsbc loaded at runtime:
+
+- Speaker (stereo 32 kHz): four SBC frames (32 kHz dual channel, 16 blocks,
+  8 subbands, loudness, bitpool 25, 112 bytes each) per 16 ms output report
+  #0x17. Streams of any rate are resampled. The headset jack state from the
+  input reports selects the speaker or headset output, and the volumes are
+  set with output report #0x11.
+- Headset microphone (mono 16 kHz): with a headset microphone plugged in,
+  the controller sends one input report #0x12 to #0x19 with an SBC frame
+  (16 kHz mono, bitpool 29, 66 bytes, 8 ms) per output report it receives,
+  so while it is captured a no-op output report is sent every 8 ms without
+  another one. Frames are decoded into a ring, and capture streams read it
+  with a 48 ms jitter reserve, resampled to their rate.
+
+This reuses the Bluetooth DualSense mixer, so several streams on the
+speaker are mixed on one clock. PROTON_DUALSHOCK4_BT_AUDIO=0 disables it.
+
+Packet layouts and codec settings follow DS4Dongle
+(https://github.com/snipem/DS4Dongle), whose audio code is MPL-2.0.
+---
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -113,6 +113,12 @@
+     pa_usec_t hid_start_time;
+     UINT64 hid_consumed;
+     struct bt_dualsense_mixer *hid_mixer;
++    /* Bluetooth DualShock 4 resampling: position between hid_prev and the
++     * next source frame, in units of the destination rate. */
++    UINT32 hid_phase;
++    INT32 hid_prev[2];
++    UINT64 hid_mic_pos;
++    BOOL hid_mic_buffering;
+     pa_sample_spec ss;
+     pa_channel_map map;
+     pa_buffer_attr attr;
+@@ -205,6 +211,7 @@
+     char *raw_haptic_target;
+     char *raw_haptic_alsa_path;
+     char *bt_hidraw;
++    BOOL bt_dualshock4;
+     char *endpoint_id;
+     char pulse_name[0];
+ } PhysDevice;
+@@ -1197,7 +1204,7 @@
+         return stream->dataflow == eRender;
+ 
+     if (!stream->stream && stream->hid_haptics)
+-        return stream->dataflow == eRender && stream->hid_fd >= 0;
++        return stream->hid_fd >= 0;
+ 
+     if (!stream->stream)
+         return stream->dataflow == eRender && stream->haptic_pcm && stream->haptic_alsa_path
+@@ -1550,16 +1557,18 @@
+         dev->container_id = get_container_id(buffer);
+ }
+ 
++/* The synthetic Bluetooth DualShock 4 endpoint is a plain stereo endpoint,
++ * none of the USB Sony audio handling applies to it. */
+ static BOOL is_dualsense_audio_device(const PhysDevice *dev)
+ {
+-    return dev->bus_type == phys_device_bus_usb && dev->vendor_id == 0x054c
++    return !dev->bt_dualshock4 && dev->bus_type == phys_device_bus_usb && dev->vendor_id == 0x054c
+             && (dev->product_id == 0x05c4 || dev->product_id == 0x09cc ||
+                 dev->product_id == 0x0ce6 || dev->product_id == 0x0df2);
+ }
+ 
+ static BOOL is_dualshock_audio_device(const PhysDevice *dev)
+ {
+-    return dev->bus_type == phys_device_bus_usb && dev->vendor_id == 0x054c
++    return !dev->bt_dualshock4 && dev->bus_type == phys_device_bus_usb && dev->vendor_id == 0x054c
+             && (dev->product_id == 0x05c4 || dev->product_id == 0x09cc);
+ }
+ 
+@@ -1948,6 +1957,7 @@
+     dev->raw_haptic_target = NULL;
+     dev->raw_haptic_alsa_path = NULL;
+     dev->bt_hidraw = NULL;
++    dev->bt_dualshock4 = FALSE;
+     dev->endpoint_id = NULL;
+     dev->ready = TRUE;
+     dev->length = 0;
+@@ -2134,14 +2144,21 @@
+             debugstr_a(dev->pulse_name), hidraw, debugstr_guid(&dev->container_id));
+ }
+ 
+-static void pulse_add_bluetooth_dualsense_devices(struct list *list)
++static void pulse_add_bluetooth_dualshock4_device(struct list *list, EDataFlow flow, const char *hidraw,
++        USHORT pid, const unsigned int *mac);
++static BOOL bt_dualshock4_audio_enabled(void);
++
++/* Synthetic endpoints of Bluetooth Sony controllers: DualSense haptics and
++ * DualShock 4 speaker for render, DualShock 4 headset microphone for capture. */
++static void pulse_add_bluetooth_dualsense_devices(struct list *list, EDataFlow flow)
+ {
+     char path[PATH_MAX], line[256], hidraw[PATH_MAX];
+     struct dirent *entry;
++    BOOL dualsense = flow == eRender && bt_dualsense_haptics_enabled(), dualshock4 = bt_dualshock4_audio_enabled();
+     DIR *dir;
+     FILE *f;
+ 
+-    if (!bt_dualsense_haptics_enabled())
++    if (!dualsense && !dualshock4)
+         return;
+     if (!(dir = opendir("/sys/class/hidraw")))
+         return;
+@@ -2165,10 +2182,13 @@
+         }
+         fclose(f);
+ 
+-        if (bus != 0x0005 || vid != 0x054c || (pid != 0x0ce6 && pid != 0x0df2) || !have_mac)
++        if (bus != 0x0005 || vid != 0x054c || !have_mac)
+             continue;
+         snprintf(hidraw, sizeof(hidraw), "/dev/%s", entry->d_name);
+-        pulse_add_bluetooth_dualsense_device(list, hidraw, pid, mac);
++        if (dualsense && (pid == 0x0ce6 || pid == 0x0df2))
++            pulse_add_bluetooth_dualsense_device(list, hidraw, pid, mac);
++        else if (dualshock4 && (pid == 0x05c4 || pid == 0x09cc))
++            pulse_add_bluetooth_dualshock4_device(list, flow, hidraw, pid, mac);
+     }
+     closedir(dir);
+ }
+@@ -2186,7 +2206,7 @@
+     {
+         size_t len;
+ 
+-        if (!dev->bt_hidraw || !pulse_device_matches(dev, name))
++        if (!dev->bt_hidraw || dev->bt_dualshock4 || !pulse_device_matches(dev, name))
+             continue;
+         len = sizeof(BT_DUALSENSE_HAPTIC_PATH_PREFIX) + strlen(dev->bt_hidraw);
+         if ((path = malloc(len)))
+@@ -2197,6 +2217,118 @@
+     return path;
+ }
+ 
++/* Bluetooth DualShock 4 controllers have no USB audio function either. Like
++ * for the DualSense, expose the stereo 32 kHz speaker endpoint of a wired
++ * one with the container ID winebus gives the controller, and send it as SBC
++ * in Bluetooth output reports. Layout follows DS4Dongle
++ * (https://github.com/snipem/DS4Dongle). */
++#define BT_DUALSHOCK4_PATH_PREFIX "wine-bluetooth-ds4-hidraw:"
++
++/* Matches the conditions under which winebus presents the controller as USB. */
++static BOOL bt_dualshock4_audio_enabled(void)
++{
++    const char *env;
++
++    if ((env = getenv("PROTON_DUALSHOCK4_BT_AS_USB")) && !strcmp(env, "0"))
++        return FALSE;
++    if ((env = getenv("PROTON_DUALSHOCK4_BT_AUDIO")) && !strcmp(env, "0"))
++        return FALSE;
++    if ((env = getenv("PROTON_EMULATE_STEAMINPUT")) && atoi(env))
++        return FALSE;
++    if ((env = getenv("PROTON_NO_STEAMINPUT")) && !strcmp(env, "1"))
++        return TRUE;
++    return !steam_virtual_gamepad_present();
++}
++
++static void pulse_add_bluetooth_dualshock4_device(struct list *list, EDataFlow flow, const char *hidraw,
++        USHORT pid, const unsigned int *mac)
++{
++    /* Like the wired controller: a stereo 32 kHz speaker, a mono 16 kHz
++     * headset microphone. */
++    UINT channels = flow == eRender ? 2 : 1, rate = flow == eRender ? 32000 : 16000;
++    WAVEFORMATEXTENSIBLE *fmt;
++    char pulse_name[160];
++    PhysDevice *dev;
++    size_t len;
++
++    len = snprintf(pulse_name, sizeof(pulse_name), "%sWireless_Controller.%04x.%02x%02x%02x%02x%02x%02x%s",
++            BT_DUALSENSE_PULSE_PREFIX, pid, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
++            flow == eRender ? "" : ".mic");
++    if (pulse_find_device(list, pulse_name))
++        return;
++    if (!(dev = calloc(1, FIELD_OFFSET(PhysDevice, pulse_name[len + 1]))))
++        return;
++    if (!(dev->name = get_device_name("Wireless Controller", NULL)) || !(dev->bt_hidraw = strdup(hidraw)))
++    {
++        free(dev->name);
++        free(dev);
++        return;
++    }
++
++    dev->bt_dualshock4 = TRUE;
++    dev->flow = flow;
++    dev->form = flow == eRender ? Speakers : Headset;
++    dev->channel_mask = flow == eRender ? KSAUDIO_SPEAKER_STEREO : KSAUDIO_SPEAKER_MONO;
++    dev->bus_type = phys_device_bus_usb;
++    dev->vendor_id = 0x054c;
++    dev->product_id = pid;
++    dev->alsa_card = -1;
++    dev->container_id = bt_dualsense_container_id(pid, mac);
++    dev->def_period = 100000;
++    dev->min_period = 30000;
++    dev->ready = TRUE;
++    dev->probe_status = 0;
++    pthread_mutex_init(&dev->ready_mutex, NULL);
++    pthread_cond_init(&dev->ready_cond, NULL);
++
++    fmt = &dev->fmt;
++    fmt->Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
++    fmt->Format.nChannels = channels;
++    fmt->Format.nSamplesPerSec = rate;
++    fmt->Format.wBitsPerSample = 32;
++    fmt->Format.nBlockAlign = channels * 4;
++    fmt->Format.nAvgBytesPerSec = rate * channels * 4;
++    fmt->Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
++    fmt->Samples.wValidBitsPerSample = 32;
++    fmt->dwChannelMask = dev->channel_mask;
++    fmt->SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
++
++    memcpy(dev->pulse_name, pulse_name, len + 1);
++    if (!pulse_set_endpoint_id(dev, list))
++    {
++        pulse_dev_free(dev);
++        return;
++    }
++    list_add_tail(list, &dev->entry);
++    TRACE("Added Bluetooth DualShock 4 %s endpoint %s for %s, container %s.\n",
++            flow == eRender ? "speaker" : "microphone",
++            debugstr_a(dev->pulse_name), hidraw, debugstr_guid(&dev->container_id));
++}
++
++/* Returns the hidraw path for a Bluetooth DualShock 4 endpoint, or NULL. */
++static char *pulse_find_bluetooth_dualshock4_path(const char *name, EDataFlow flow)
++{
++    PhysDevice *dev;
++    char *path = NULL;
++
++    if (!name)
++        return NULL;
++    g_phys_lock();
++    LIST_FOR_EACH_ENTRY(dev, flow == eRender ? &g_phys_speakers : &g_phys_sources, PhysDevice, entry)
++    {
++        size_t len;
++
++        if (!dev->bt_dualshock4 || !pulse_device_matches(dev, name))
++            continue;
++        len = sizeof(BT_DUALSHOCK4_PATH_PREFIX) + strlen(dev->bt_hidraw);
++        if ((path = malloc(len)))
++            snprintf(path, len, "%s%s", BT_DUALSHOCK4_PATH_PREFIX, dev->bt_hidraw);
++        break;
++    }
++    g_phys_unlock();
++    return path;
++}
++
+ static void pulse_resolve_dualsense_split_targets(struct list *devices)
+ {
+     PhysDevice *quad, *dev;
+@@ -2434,8 +2566,7 @@
+     }
+ 
+     pulse_probe_device_list(ml, ctx, &current, flow == eRender);
+-    if (flow == eRender)
+-        pulse_add_bluetooth_dualsense_devices(&current);
++    pulse_add_bluetooth_dualsense_devices(&current, flow);
+ 
+     g_phys_lock();
+ 
+@@ -2788,11 +2919,12 @@
+         pulse_probe_settings(ml, ctx, 1, dev->pulse_name, &dev->fmt, &dev->def_period, &dev->min_period);
+         apply_windows_sony_audio_format(dev);
+     }
+-    pulse_add_bluetooth_dualsense_devices(&g_phys_speakers);
++    pulse_add_bluetooth_dualsense_devices(&g_phys_speakers, eRender);
+ 
+     LIST_FOR_EACH_ENTRY(dev, &g_phys_sources, PhysDevice, entry) {
+         pulse_probe_settings(ml, ctx, 0, dev->pulse_name, &dev->fmt, &dev->def_period, &dev->min_period);
+     }
++    pulse_add_bluetooth_dualsense_devices(&g_phys_sources, eCapture);
+ 
+     pa_context_unref(ctx);
+     pa_mainloop_free(ml);
+@@ -3931,6 +4063,111 @@
+ #define BT_DUALSENSE_MIX_LEAD 1536
+ #define BT_DUALSENSE_MIX_SEND_AHEAD 512
+ 
++/* The DualShock 4 speaker takes SBC over Bluetooth: 32 kHz dual channel,
++ * 16 blocks, 8 subbands, loudness allocation, bitpool 25, which gives 112 byte
++ * frames of 128 samples, four per output report #0x17 (16 ms), as DS4Dongle
++ * sends them. libsbc is loaded at runtime; without it no speaker audio is
++ * sent. */
++#define BT_DUALSHOCK4_RATE 32000
++#define BT_DUALSHOCK4_AUDIO_REPORT_ID 0x17
++#define BT_DUALSHOCK4_AUDIO_REPORT_SIZE 462
++#define BT_DUALSHOCK4_SBC_FRAME_SAMPLES 128
++#define BT_DUALSHOCK4_SBC_FRAME_SIZE 112
++#define BT_DUALSHOCK4_SBC_FRAMES_PER_REPORT 4
++#define BT_DUALSHOCK4_AUDIO_TARGET_SPEAKER 0x02
++#define BT_DUALSHOCK4_AUDIO_TARGET_HEADSET 0x24
++#define BT_DUALSHOCK4_OUTPUT_REPORT_ID 0x11
++#define BT_DUALSHOCK4_OUTPUT_REPORT_SIZE 78
++#define BT_DUALSHOCK4_VOLUME 0x50
++#define BT_DUALSHOCK4_MIC_VOLUME 0x40
++
++/* Headset microphone, as found by DS4Dongle: with output report byte 2 bit 2
++ * set, the controller sends one input report #0x12 to #0x19 per output report
++ * it receives, carrying the #0x11 state block and SBC frames (16 kHz mono,
++ * 16 blocks, 8 subbands, loudness, bitpool 29: 66 byte frames of 128 samples,
++ * 8 ms) after it. It only offers the microphone with a headset plugged in. */
++#define BT_DUALSHOCK4_MIC_RATE 16000
++#define BT_DUALSHOCK4_MIC_FRAME_SIZE 66
++#define BT_DUALSHOCK4_MIC_FRAME_SAMPLES 128
++#define BT_DUALSHOCK4_MIC_SCAN_OFFSET 74
++#define BT_DUALSHOCK4_MIC_INTERVAL_US 8000
++#define BT_DUALSHOCK4_MIC_RING 8192
++#define BT_DUALSHOCK4_MIC_JITTER 768 /* 48 ms */
++#define BT_DUALSHOCK4_STATUS_HEADSET 0x20
++#define BT_DUALSHOCK4_STATUS_MIC 0x40
++
++/* struct sbc_struct from sbc/sbc.h. */
++struct bt_sbc
++{
++    unsigned long flags;
++    uint8_t frequency;
++    uint8_t blocks;
++    uint8_t subbands;
++    uint8_t mode;
++    uint8_t allocation;
++    uint8_t bitpool;
++    uint8_t endian;
++    void *priv;
++    void *priv_alloc_base;
++};
++
++static int (*p_sbc_init)(struct bt_sbc *, unsigned long);
++static ssize_t (*p_sbc_encode)(struct bt_sbc *, const void *, size_t, void *, size_t, ssize_t *);
++static ssize_t (*p_sbc_decode)(struct bt_sbc *, const void *, size_t, void *, size_t, size_t *);
++static void (*p_sbc_finish)(struct bt_sbc *);
++static pthread_once_t bt_dualshock4_sbc_once = PTHREAD_ONCE_INIT;
++
++static void bt_dualshock4_load_sbc(void)
++{
++    void *handle;
++
++    if (!(handle = dlopen("libsbc.so.1", RTLD_NOW)))
++    {
++        WARN("libsbc not found, Bluetooth DualShock 4 speaker audio is disabled.\n");
++        return;
++    }
++    p_sbc_init = dlsym(handle, "sbc_init");
++    p_sbc_encode = dlsym(handle, "sbc_encode");
++    p_sbc_finish = dlsym(handle, "sbc_finish");
++    p_sbc_decode = dlsym(handle, "sbc_decode");
++    if (!p_sbc_init || !p_sbc_encode || !p_sbc_finish || !p_sbc_decode)
++    {
++        WARN("libsbc is missing symbols, Bluetooth DualShock 4 speaker audio is disabled.\n");
++        p_sbc_init = NULL;
++        dlclose(handle);
++    }
++}
++
++static struct bt_sbc *bt_dualshock4_create_sbc(void)
++{
++    struct bt_sbc *sbc;
++
++    pthread_once(&bt_dualshock4_sbc_once, bt_dualshock4_load_sbc);
++    if (!p_sbc_init || !(sbc = calloc(1, sizeof(*sbc))))
++        return NULL;
++    if (p_sbc_init(sbc, 0) < 0)
++    {
++        WARN("sbc_init failed.\n");
++        free(sbc);
++        return NULL;
++    }
++    sbc->frequency = 0x01;  /* SBC_FREQ_32000 */
++    sbc->blocks = 0x03;     /* SBC_BLK_16 */
++    sbc->subbands = 0x01;   /* SBC_SB_8 */
++    sbc->mode = 0x01;       /* SBC_MODE_DUAL_CHANNEL */
++    sbc->allocation = 0x00; /* SBC_AM_LOUDNESS */
++    sbc->bitpool = 25;
++    sbc->endian = 0x00;     /* SBC_LE */
++    return sbc;
++}
++
++static void bt_dualshock4_destroy_sbc(struct bt_sbc *sbc)
++{
++    if (!sbc) return;
++    p_sbc_finish(sbc);
++    free(sbc);
++}
++
+ struct bt_dualsense_mixer
+ {
+     struct list entry;
+@@ -3945,6 +4182,21 @@
+     BOOL headphones;
+     pa_usec_t stat_time;
+     UINT32 stat_speaker, stat_haptics, stat_skipped, stat_signal, stat_eagain, stat_rebase;
++    /* DualShock 4: 32 kHz stereo speaker audio, SBC encoded. */
++    BOOL dualshock4;
++    UINT32 rate;
++    struct bt_sbc *sbc;
++    UINT16 sbc_frames;
++    pa_usec_t volume_time;
++    /* DualShock 4 headset microphone. */
++    BOOL mic_present;
++    LONG capture_streams;
++    struct bt_sbc *mic_sbc;
++    pa_usec_t output_time;
++    UINT64 mic_written;
++    UINT32 stat_mic_frames, stat_mic_underruns;
++    pa_usec_t mic_stat_time;
++    int16_t mic_ring[BT_DUALSHOCK4_MIC_RING];
+     INT32 ring[BT_DUALSENSE_MIX_RING][4];
+ };
+ 
+@@ -3952,7 +4204,7 @@
+ 
+ static UINT64 bt_dualsense_mixer_clock(struct bt_dualsense_mixer *mixer)
+ {
+-    return (pa_rtclock_now() - mixer->start_time) * 48000 / 1000000;
++    return (pa_rtclock_now() - mixer->start_time) * mixer->rate / 1000000;
+ }
+ 
+ static void pulse_bt_haptic_close(struct pulse_stream *stream)
+@@ -3961,16 +4213,19 @@
+ 
+     stream->hid_fd = -1;
+     stream->hid_mixer = NULL;
++    if (mixer && stream->dataflow == eCapture) --mixer->capture_streams;
+     if (!mixer || --mixer->refs) return;
+ 
+     list_remove(&mixer->entry);
+     close(mixer->fd);
+     if (mixer->opus) p_opus_encoder_destroy(mixer->opus);
++    bt_dualshock4_destroy_sbc(mixer->sbc);
++    bt_dualshock4_destroy_sbc(mixer->mic_sbc);
+     free(mixer->path);
+     free(mixer);
+ }
+ 
+-static HRESULT pulse_bt_haptic_connect(struct pulse_stream *stream, const char *hidraw)
++static HRESULT pulse_bt_mixer_connect(struct pulse_stream *stream, const char *hidraw, BOOL dualshock4)
+ {
+     struct bt_dualsense_mixer *mixer;
+ 
+@@ -3980,16 +4235,20 @@
+     stream->attr.maxlength = stream->bufsize_frames * pa_frame_size(&stream->ss);
+     stream->attr.prebuf = 0;
+ 
+-    if (stream->ss.channels != 4 || stream->ss.rate != 48000 ||
+-            (stream->ss.format != PA_SAMPLE_FLOAT32LE && stream->ss.format != PA_SAMPLE_S16LE))
++    /* DualShock 4 streams are resampled, and use the first two channels. */
++    if (dualshock4 ? (stream->ss.format != PA_SAMPLE_FLOAT32LE && stream->ss.format != PA_SAMPLE_S16LE &&
++                      stream->ss.format != PA_SAMPLE_S32LE) || stream->ss.rate < 8000 || stream->ss.rate > 192000
++                   : (stream->ss.format != PA_SAMPLE_FLOAT32LE && stream->ss.format != PA_SAMPLE_S16LE) ||
++                      stream->ss.channels != 4 || stream->ss.rate != 48000)
+     {
+-        WARN("Unsupported format for Bluetooth DualSense haptics.\n");
++        WARN("Unsupported format %u Hz, %u channels for Bluetooth %s audio.\n", stream->ss.rate,
++                stream->ss.channels, dualshock4 ? "DualShock 4" : "DualSense");
+         return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
+     }
+ 
+     LIST_FOR_EACH_ENTRY(mixer, &bt_dualsense_mixers, struct bt_dualsense_mixer, entry)
+     {
+-        if (!strcmp(mixer->path, hidraw))
++        if (!strcmp(mixer->path, hidraw) && mixer->dualshock4 == dualshock4)
+         {
+             mixer->refs++;
+             goto done;
+@@ -4011,21 +4270,46 @@
+     }
+     mixer->refs = 1;
+     mixer->start_time = pa_rtclock_now();
+-    mixer->opus = bt_dualsense_create_opus_encoder();
++    mixer->dualshock4 = dualshock4;
++    if (dualshock4)
++    {
++        mixer->rate = BT_DUALSHOCK4_RATE;
++        mixer->sbc = bt_dualshock4_create_sbc();
++        if (mixer->sbc && (mixer->mic_sbc = calloc(1, sizeof(*mixer->mic_sbc))) &&
++                p_sbc_init(mixer->mic_sbc, 0) < 0)
++        {
++            free(mixer->mic_sbc);
++            mixer->mic_sbc = NULL;
++        }
++        TRACE("Sending DualShock 4 speaker audio to Bluetooth controller %s%s.\n", hidraw,
++                mixer->sbc ? "" : " (no SBC encoder, silent)");
++    }
++    else
++    {
++        mixer->rate = 48000;
++        mixer->opus = bt_dualsense_create_opus_encoder();
++        TRACE("Sending DualSense haptics%s to Bluetooth controller %s.\n",
++                mixer->opus ? " and speaker audio" : "", hidraw);
++    }
+     list_add_tail(&bt_dualsense_mixers, &mixer->entry);
+-    TRACE("Sending DualSense haptics%s to Bluetooth controller %s.\n",
+-            mixer->opus ? " and speaker audio" : "", hidraw);
+ 
+ done:
++    if (stream->dataflow == eCapture) mixer->capture_streams++;
+     stream->hid_haptics = TRUE;
+     stream->hid_mixer = mixer;
+     stream->hid_fd = mixer->fd;
+     stream->hid_start_time = 0;
+     stream->hid_consumed = 0;
+-    TRACE("Mixing stream %p into Bluetooth DualSense %s (%d streams).\n", stream, hidraw, (int)mixer->refs);
++    TRACE("Mixing stream %p into Bluetooth %s %s (%d streams).\n", stream,
++            dualshock4 ? "DualShock 4" : "DualSense", hidraw, (int)mixer->refs);
+     return S_OK;
+ }
+ 
++static HRESULT pulse_bt_haptic_connect(struct pulse_stream *stream, const char *hidraw)
++{
++    return pulse_bt_mixer_connect(stream, hidraw, FALSE);
++}
++
+ static void bt_dualsense_set_crc(BYTE *report, SIZE_T size)
+ {
+     static const BYTE seed = 0xa2;
+@@ -4203,6 +4487,176 @@
+     }
+ }
+ 
++static void bt_dualshock4_decode_mic(struct bt_dualsense_mixer *mixer, const BYTE *buf, ssize_t len)
++{
++    int16_t pcm[BT_DUALSHOCK4_MIC_FRAME_SAMPLES];
++    size_t written;
++    ssize_t i;
++    UINT32 j;
++
++    for (i = BT_DUALSHOCK4_MIC_SCAN_OFFSET; i + BT_DUALSHOCK4_MIC_FRAME_SIZE <= len - 4; ++i)
++    {
++        /* Match the whole frame header, a lone sync byte also occurs in the
++         * frame data and would desynchronize the decoder. */
++        if (buf[i] != 0x9c || buf[i + 1] != 0x31 || buf[i + 2] != 0x1d)
++            continue;
++        written = 0;
++        if (p_sbc_decode(mixer->mic_sbc, buf + i, BT_DUALSHOCK4_MIC_FRAME_SIZE, pcm, sizeof(pcm), &written) > 0 &&
++                written == sizeof(pcm))
++        {
++            for (j = 0; j < BT_DUALSHOCK4_MIC_FRAME_SAMPLES; ++j)
++                mixer->mic_ring[(mixer->mic_written + j) % BT_DUALSHOCK4_MIC_RING] = pcm[j];
++            mixer->mic_written += BT_DUALSHOCK4_MIC_FRAME_SAMPLES;
++            mixer->stat_mic_frames++;
++        }
++        i += BT_DUALSHOCK4_MIC_FRAME_SIZE - 1;
++    }
++}
++
++/* Reads the controller's input reports: the headset jack and microphone
++ * state from the status byte, USB byte 30, and microphone audio. */
++static void bt_dualshock4_read_input(struct bt_dualsense_mixer *mixer)
++{
++    BYTE buf[640];
++    ssize_t len;
++
++    while ((len = read(mixer->fd, buf, sizeof(buf))) > 0)
++    {
++        BYTE status;
++
++        if (buf[0] < 0x11 || buf[0] > 0x19 || len < 33)
++            continue;
++        status = buf[32];
++        if (mixer->headphones != !!(status & BT_DUALSHOCK4_STATUS_HEADSET) ||
++                mixer->mic_present != !!(status & BT_DUALSHOCK4_STATUS_MIC))
++        {
++            mixer->headphones = !!(status & BT_DUALSHOCK4_STATUS_HEADSET);
++            mixer->mic_present = !!(status & BT_DUALSHOCK4_STATUS_MIC);
++            TRACE("Bluetooth DualShock 4 %s: headset %s, microphone %s (status %#x).\n", mixer->path,
++                    mixer->headphones ? "plugged" : "unplugged", mixer->mic_present ? "present" : "absent", status);
++        }
++        if (buf[0] != 0x11 && mixer->mic_sbc && mixer->capture_streams)
++            bt_dualshock4_decode_mic(mixer, buf, len);
++    }
++}
++
++/* Output report byte 2: always set bit 5, bit 2 enables the microphone.
++ * winebus sets it the same way, from the same status bit. */
++static BYTE bt_dualshock4_audio_control(struct bt_dualsense_mixer *mixer)
++{
++    return 0x20 | (mixer->mic_present ? 0x04 : 0);
++}
++
++static void bt_dualshock4_write(struct bt_dualsense_mixer *mixer, BYTE *report, SIZE_T size)
++{
++    bt_dualsense_set_crc(report, size);
++    if (write(mixer->fd, report, size) < 0)
++    {
++        if (errno == EAGAIN) mixer->stat_eagain++;
++        else WARN("Bluetooth DualShock 4 write failed: %s\n", strerror(errno));
++    }
++    mixer->output_time = pa_rtclock_now();
++}
++
++/* Speaker, headset and microphone volume: output report #0x11 with only the
++ * volume fields marked valid, so lightbar and rumble state are left alone.
++ * Resent every second while audio plays, games may change it through their
++ * own output reports. */
++static void bt_dualshock4_send_volume(struct bt_dualsense_mixer *mixer)
++{
++    BYTE report[BT_DUALSHOCK4_OUTPUT_REPORT_SIZE] = {0};
++
++    if (mixer->volume_time && pa_rtclock_now() - mixer->volume_time < 1000000)
++        return;
++    report[0] = BT_DUALSHOCK4_OUTPUT_REPORT_ID;
++    report[1] = 0xc0; /* HID, CRC */
++    report[2] = bt_dualshock4_audio_control(mixer);
++    report[3] = 0x10 | 0x20 | 0x40 | 0x80; /* headset left, headset right, microphone, speaker volume */
++    report[21] = report[22] = report[24] = BT_DUALSHOCK4_VOLUME;
++    report[23] = BT_DUALSHOCK4_MIC_VOLUME;
++    bt_dualshock4_write(mixer, report, sizeof(report));
++    mixer->volume_time = pa_rtclock_now();
++}
++
++/* The controller sends one microphone report per output report, so while
++ * the microphone is captured, send a no-op output report whenever 8 ms, one
++ * microphone frame, passed without one. */
++static void bt_dualshock4_clock_mic(struct bt_dualsense_mixer *mixer)
++{
++    BYTE report[BT_DUALSHOCK4_OUTPUT_REPORT_SIZE] = {0};
++    pa_usec_t now = pa_rtclock_now();
++    UINT32 count = 0;
++
++    if (!mixer->mic_present || !mixer->capture_streams)
++        return;
++    bt_dualshock4_send_volume(mixer);
++    if (now - mixer->output_time > 4 * BT_DUALSHOCK4_MIC_INTERVAL_US)
++        mixer->output_time = now - BT_DUALSHOCK4_MIC_INTERVAL_US;
++    while (now - mixer->output_time >= BT_DUALSHOCK4_MIC_INTERVAL_US && count++ < 4)
++    {
++        memset(report, 0, sizeof(report));
++        report[0] = BT_DUALSHOCK4_OUTPUT_REPORT_ID;
++        report[1] = 0xc0;
++        report[2] = bt_dualshock4_audio_control(mixer);
++        bt_dualshock4_write(mixer, report, sizeof(report));
++        mixer->output_time += BT_DUALSHOCK4_MIC_INTERVAL_US;
++    }
++}
++
++static void bt_dualshock4_send_chunk(struct bt_dualsense_mixer *mixer, const int16_t (*pcm)[4])
++{
++    BYTE report[BT_DUALSHOCK4_AUDIO_REPORT_SIZE] = {0};
++    int16_t block[BT_DUALSHOCK4_SBC_FRAME_SAMPLES * 2];
++    BOOL signal = FALSE;
++    ssize_t consumed, written;
++    UINT32 i, f;
++
++    for (i = 0; i < BT_DUALSENSE_SPEAKER_WINDOW_FRAMES; ++i)
++        signal |= pcm[i][0] || pcm[i][1];
++    mixer->stat_signal += signal;
++
++    /* Keep going a little past the last sound so the decoder flushes its
++     * tail, then stop until the game plays audio again. */
++    if (signal)
++        mixer->spk_idle_chunks = 0;
++    else if (mixer->spk_idle_chunks < 16)
++        ++mixer->spk_idle_chunks;
++    if (!mixer->sbc || mixer->spk_idle_chunks >= 16)
++    {
++        mixer->stat_skipped++;
++        return;
++    }
++
++    bt_dualshock4_read_input(mixer);
++    bt_dualshock4_send_volume(mixer);
++
++    report[0] = BT_DUALSHOCK4_AUDIO_REPORT_ID;
++    report[1] = 0x40;
++    report[2] = 0x80 | bt_dualshock4_audio_control(mixer); /* enable audio */
++    report[3] = mixer->sbc_frames;
++    report[4] = mixer->sbc_frames >> 8;
++    report[5] = mixer->headphones ? BT_DUALSHOCK4_AUDIO_TARGET_HEADSET : BT_DUALSHOCK4_AUDIO_TARGET_SPEAKER;
++    for (f = 0; f < BT_DUALSHOCK4_SBC_FRAMES_PER_REPORT; ++f)
++    {
++        for (i = 0; i < BT_DUALSHOCK4_SBC_FRAME_SAMPLES; ++i)
++        {
++            block[i * 2] = pcm[f * BT_DUALSHOCK4_SBC_FRAME_SAMPLES + i][0];
++            block[i * 2 + 1] = pcm[f * BT_DUALSHOCK4_SBC_FRAME_SAMPLES + i][1];
++        }
++        written = 0;
++        consumed = p_sbc_encode(mixer->sbc, block, sizeof(block),
++                report + 6 + f * BT_DUALSHOCK4_SBC_FRAME_SIZE, BT_DUALSHOCK4_SBC_FRAME_SIZE, &written);
++        if (consumed != sizeof(block) || written != BT_DUALSHOCK4_SBC_FRAME_SIZE)
++        {
++            WARN("sbc_encode failed: %d, %d bytes.\n", (int)consumed, (int)written);
++            return;
++        }
++    }
++    mixer->sbc_frames += BT_DUALSHOCK4_SBC_FRAMES_PER_REPORT;
++    mixer->stat_speaker++;
++    bt_dualshock4_write(mixer, report, sizeof(report));
++}
++
+ static void bt_dualsense_mixer_skip_stale(struct bt_dualsense_mixer *mixer, UINT64 clock)
+ {
+     /* Nothing was written for a while, drop what is stale. */
+@@ -4229,7 +4683,10 @@
+             memset(frame, 0, sizeof(mixer->ring[0]));
+         }
+         mixer->sent += BT_DUALSENSE_SPEAKER_WINDOW_FRAMES;
+-        bt_dualsense_send_chunk(mixer, (const int16_t (*)[4])pcm);
++        if (mixer->dualshock4)
++            bt_dualshock4_send_chunk(mixer, (const int16_t (*)[4])pcm);
++        else
++            bt_dualsense_send_chunk(mixer, (const int16_t (*)[4])pcm);
+     }
+ 
+     if (TRACE_ON(pulse) && pa_rtclock_now() - mixer->stat_time >= 1000000)
+@@ -4244,6 +4701,194 @@
+     }
+ }
+ 
++/* Source sample of a DualShock 4 stream as 16-bit, mono streams play on both
++ * channels and others use their first two. */
++static INT32 bt_dualshock4_sample(const struct pulse_stream *stream, const BYTE *src, UINT32 frame, UINT32 c)
++{
++    UINT32 index = frame * stream->ss.channels + (stream->ss.channels == 1 ? 0 : c);
++
++    switch (stream->ss.format)
++    {
++    case PA_SAMPLE_FLOAT32LE: return float_to_s16(((const float *)src)[index]);
++    case PA_SAMPLE_S32LE: return ((const int32_t *)src)[index] >> 16;
++    default: return ((const int16_t *)src)[index];
++    }
++}
++
++/* Like pulse_bt_haptic_write(), resampling the stream to the controller's
++ * 32 kHz with linear interpolation. */
++static void pulse_bt_ds4_render(struct pulse_stream *stream, UINT32 held_frames, UINT32 frame_size)
++{
++    struct bt_dualsense_mixer *mixer = stream->hid_mixer;
++    UINT32 contiguous_frames, avail, in = 0, c;
++    UINT64 clock, target;
++    const BYTE *src;
++
++    clock = bt_dualsense_mixer_clock(mixer);
++    bt_dualsense_mixer_skip_stale(mixer, clock);
++    if (!stream->hid_start_time || stream->hid_consumed < mixer->sent)
++    {
++        /* Started, or fell behind: don't send the missed time in a burst. */
++        if (stream->hid_start_time) mixer->stat_rebase++;
++        stream->hid_start_time = 1;
++        stream->hid_consumed = max(mixer->sent, clock + BT_DUALSENSE_MIX_SEND_AHEAD);
++        stream->hid_phase = BT_DUALSHOCK4_RATE;
++        stream->hid_prev[0] = stream->hid_prev[1] = 0;
++    }
++
++    target = min(clock + BT_DUALSENSE_MIX_LEAD, mixer->sent + BT_DUALSENSE_MIX_RING);
++    contiguous_frames = (stream->real_bufsize_bytes - stream->pa_offs_bytes) / frame_size;
++    avail = min(held_frames, contiguous_frames);
++    src = stream->local_buffer + stream->pa_offs_bytes;
++
++    while (stream->hid_consumed < target)
++    {
++        INT32 *frame;
++
++        while (stream->hid_phase >= BT_DUALSHOCK4_RATE && in < avail)
++        {
++            for (c = 0; c < 2; ++c)
++                stream->hid_prev[c] = bt_dualshock4_sample(stream, src, in, c);
++            ++in;
++            stream->hid_phase -= BT_DUALSHOCK4_RATE;
++        }
++        if (in >= avail)
++            break;
++
++        frame = mixer->ring[stream->hid_consumed % BT_DUALSENSE_MIX_RING];
++        for (c = 0; c < 2; ++c)
++        {
++            INT32 next = bt_dualshock4_sample(stream, src, in, c);
++
++            frame[c] += stream->hid_prev[c] +
++                    (INT32)((INT64)(next - stream->hid_prev[c]) * stream->hid_phase / BT_DUALSHOCK4_RATE);
++        }
++        stream->hid_consumed++;
++        stream->hid_phase += stream->ss.rate;
++    }
++    if (in)
++        pulse_haptic_advance(stream, in, frame_size);
++
++    bt_dualsense_mixer_send(mixer, clock);
++}
++
++/* Takes the next capture packet, as pulse_read() does. */
++static BYTE *pulse_bt_capture_packet(struct pulse_stream *stream)
++{
++    LARGE_INTEGER stamp;
++    ACPacket *p, *next;
++
++    if (!(p = (ACPacket *)list_head(&stream->packet_free_head)))
++    {
++        p = (ACPacket *)list_head(&stream->packet_filled_head);
++        if (!p) return NULL;
++        if (!p->discont) {
++            next = (ACPacket *)p->entry.next;
++            next->discont = 1;
++        } else
++            p = (ACPacket *)list_tail(&stream->packet_filled_head);
++    }
++    else
++        stream->held_bytes += stream->period_bytes;
++    NtQueryPerformanceCounter(&stamp, NULL);
++    p->qpcpos = stamp.QuadPart;
++    p->discont = 0;
++    list_remove(&p->entry);
++    list_add_tail(&stream->packet_filled_head, &p->entry);
++    return p->data;
++}
++
++/* Bluetooth DualShock 4 headset microphone capture: there is no device
++ * clock either, so produce packets in real time from the decoded 16 kHz
++ * audio, resampled to the stream rate, with a jitter reserve since the
++ * controller sends it in bursts. */
++static void pulse_bt_ds4_capture(struct pulse_stream *stream)
++{
++    struct bt_dualsense_mixer *mixer = stream->hid_mixer;
++    UINT32 frame_size = pa_frame_size(&stream->ss), period_frames = stream->period_bytes / frame_size;
++    UINT32 rate = stream->ss.rate, i, c, underrun;
++    pa_usec_t now = pa_rtclock_now();
++    UINT64 due;
++    BYTE *dst;
++
++    if (!mixer || !period_frames)
++        return;
++    bt_dualshock4_read_input(mixer);
++    bt_dualshock4_clock_mic(mixer);
++
++    if (!stream->hid_start_time)
++    {
++        stream->hid_start_time = now;
++        stream->hid_consumed = 0;
++        stream->hid_mic_pos = mixer->mic_written;
++        stream->hid_mic_buffering = TRUE;
++        stream->hid_phase = 0;
++    }
++
++    due = (now - stream->hid_start_time) * rate / 1000000;
++    while (due >= stream->hid_consumed + period_frames)
++    {
++        if (!(dst = pulse_bt_capture_packet(stream)))
++            return;
++        underrun = 0;
++        for (i = 0; i < period_frames; ++i)
++        {
++            INT32 value = 0;
++
++            /* Keep the latency bounded after a burst. */
++            if (mixer->mic_written > stream->hid_mic_pos + 3 * BT_DUALSHOCK4_MIC_JITTER)
++            {
++                stream->hid_mic_pos = mixer->mic_written - BT_DUALSHOCK4_MIC_JITTER;
++                stream->hid_phase = 0;
++            }
++            if (stream->hid_mic_buffering && mixer->mic_written >= stream->hid_mic_pos + BT_DUALSHOCK4_MIC_JITTER)
++                stream->hid_mic_buffering = FALSE;
++            if (!stream->hid_mic_buffering && stream->hid_mic_pos + 1 < mixer->mic_written)
++            {
++                INT32 a = mixer->mic_ring[stream->hid_mic_pos % BT_DUALSHOCK4_MIC_RING];
++                INT32 b = mixer->mic_ring[(stream->hid_mic_pos + 1) % BT_DUALSHOCK4_MIC_RING];
++
++                value = a + (INT32)((INT64)(b - a) * stream->hid_phase / rate);
++                stream->hid_phase += BT_DUALSHOCK4_MIC_RATE;
++                while (stream->hid_phase >= rate)
++                {
++                    stream->hid_mic_pos++;
++                    stream->hid_phase -= rate;
++                }
++            }
++            else if (!stream->hid_mic_buffering)
++            {
++                /* Ran dry, refill the jitter reserve. */
++                stream->hid_mic_buffering = TRUE;
++                underrun = 1;
++            }
++
++            for (c = 0; c < stream->ss.channels; ++c)
++            {
++                UINT32 index = i * stream->ss.channels + c;
++
++                switch (stream->ss.format)
++                {
++                case PA_SAMPLE_FLOAT32LE: ((float *)dst)[index] = value / 32768.0f; break;
++                case PA_SAMPLE_S32LE: ((int32_t *)dst)[index] = value * 65536; break;
++                default: ((int16_t *)dst)[index] = value; break;
++                }
++            }
++        }
++        mixer->stat_mic_underruns += underrun;
++        stream->hid_consumed += period_frames;
++    }
++
++    if (TRACE_ON(pulse) && now - mixer->mic_stat_time >= 1000000)
++    {
++        TRACE("Bluetooth DualShock 4 %s: microphone %s, %u frames, %u underruns, %d capture streams.\n",
++                mixer->path, mixer->mic_present ? "present" : "absent", mixer->stat_mic_frames,
++                mixer->stat_mic_underruns, (int)mixer->capture_streams);
++        mixer->stat_mic_frames = mixer->stat_mic_underruns = 0;
++        mixer->mic_stat_time = now;
++    }
++}
++
+ static void pulse_bt_haptic_write(struct pulse_stream *stream, UINT32 held_frames, UINT32 frame_size)
+ {
+     struct bt_dualsense_mixer *mixer = stream->hid_mixer;
+@@ -4253,6 +4898,11 @@
+ 
+     if (!mixer)
+         return;
++    if (mixer->dualshock4)
++    {
++        pulse_bt_ds4_render(stream, held_frames, frame_size);
++        return;
++    }
+ 
+     /* There is no device clock, consume the buffer in real time, ahead of
+      * the mixer clock. hid_consumed is the stream's position on it. */
+@@ -5106,6 +5756,7 @@
+     const char *connect_device;
+     BOOL haptic_candidate, dualsense_mono_candidate, dualsense_pulse_haptic_candidate = FALSE;
+     BOOL bt_haptics = FALSE;
++    char *bt_dualshock4_path = NULL;
+ 
+     if (params->sony_windows_audio_mode &&
+             !InterlockedExchange(&g_sony_windows_audio_mode, 1))
+@@ -5148,7 +5799,11 @@
+     if (FAILED(hr))
+         goto exit;
+ 
+-    haptic_candidate = is_dualsense_haptic_format(stream)
++    if ((bt_dualshock4_path = pulse_find_bluetooth_dualshock4_path(params->device, stream->dataflow)))
++        TRACE("Routing %s stream from %s to Bluetooth DualShock 4 %s.\n",
++                stream->dataflow == eRender ? "render" : "capture", params->device, bt_dualshock4_path);
++
++    haptic_candidate = !bt_dualshock4_path && is_dualsense_haptic_format(stream)
+             && (string_contains_dualsense_name(params->device)
+                     || (haptic_target = get_dualsense_haptic_target(params->device, stream)));
+     /* A Sony endpoint name satisfies the first side of the expression above,
+@@ -5163,7 +5818,7 @@
+         TRACE("Bound Sony controller stream %p to container %s.\n", stream,
+                 debugstr_guid(&stream->sony_controller_container_id));
+     }
+-    dualsense_mono_candidate = !haptic_candidate && pulse_stream_dualsense_mono_format(stream)
++    dualsense_mono_candidate = !bt_dualshock4_path && !haptic_candidate && pulse_stream_dualsense_mono_format(stream)
+             && string_contains_dualsense_name(params->device);
+     if (haptic_candidate)
+     {
+@@ -5229,14 +5884,21 @@
+     else if ((resolved_device = pulse_resolve_device_name(connect_device)))
+         connect_device = resolved_device;
+ 
+-    if (!dualsense_mono_candidate && !haptic_candidate && pulse_name_is_dualsense_speaker_sink(connect_device))
++    if (!bt_dualshock4_path && !dualsense_mono_candidate && !haptic_candidate &&
++            pulse_name_is_dualsense_speaker_sink(connect_device))
+     {
+         TRACE("Tracking DualSense speaker stream for selected sink %s, channels %u.\n",
+                 debugstr_a(connect_device), stream->ss.channels);
+         dualsense_mono_candidate = TRUE;
+     }
+ 
+-    if (haptic_candidate)
++    if (bt_dualshock4_path)
++    {
++        stream->haptic_alsa_path = bt_dualshock4_path;
++        bt_dualshock4_path = NULL;
++        hr = pulse_bt_mixer_connect(stream, stream->haptic_alsa_path + sizeof(BT_DUALSHOCK4_PATH_PREFIX) - 1, TRUE);
++    }
++    else if (haptic_candidate)
+     {
+         stream->haptic_alsa_path = strdup(haptic_alsa_path ? haptic_alsa_path : "");
+         if (stream->haptic_alsa_path)
+@@ -5369,6 +6031,7 @@
+ 
+     free(haptic_target);
+     free(haptic_alsa_path);
++    free(bt_dualshock4_path);
+     free(dualsense_speaker);
+     free(split_speaker);
+     free(resolved_device);
+@@ -5893,18 +6556,20 @@
+                 stream->timeline_start_period_time = 0;
+                 stream->timeline_start_stream_time = 0;
+             }
+-            if (!pulse_stream_haptic(stream) && !pulse_stream_ready(stream))
++            BOOL no_pa_stream = pulse_stream_haptic(stream) || stream->hid_haptics;
++
++            if (!no_pa_stream && !pulse_stream_ready(stream))
+                 continue;
+-            if (!pulse_stream_haptic(stream) && !stream->update_timing_info_pending && (o = pa_stream_update_timing_info(stream->stream, pulse_update_timing_cb, stream)))
++            if (!no_pa_stream && !stream->update_timing_info_pending && (o = pa_stream_update_timing_info(stream->stream, pulse_update_timing_cb, stream)))
+             {
+                 pa_operation_unref(o);
+                 stream->update_timing_info_pending = TRUE;
+             }
+-            else if (!pulse_stream_haptic(stream) && stream->update_timing_info_pending)
++            else if (!no_pa_stream && stream->update_timing_info_pending)
+             {
+                 TRACE("pa_stream_update_timing_info is still pending.\n");
+             }
+-            else if (!pulse_stream_haptic(stream))
++            else if (!no_pa_stream)
+             {
+                 ERR("pa_stream_update_timing_info err %d.\n", pa_context_errno(pulse_ctx));
+             }
+@@ -5923,7 +6588,10 @@
+             }
+             else if (stream->dataflow == eCapture)
+             {
+-                pulse_read(stream);
++                if (stream->hid_haptics)
++                    pulse_bt_ds4_capture(stream);
++                else
++                    pulse_read(stream);
+             }
+         }
+         if (stream->event)
+@@ -6123,6 +6791,11 @@
+         if (SUCCEEDED(params->result))
+             pulse_split_speaker_set_corked(stream, FALSE);
+     }
++    else if (stream->hid_haptics)
++    {
++        /* Bluetooth DualShock 4 capture restarts its real-time clock. */
++        stream->hid_start_time = 0;
++    }
+     else
+     {
+         if (pulse_stream_ready(stream))
