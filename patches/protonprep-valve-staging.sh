@@ -699,6 +699,9 @@ apply_all_in_dir() {
     # https://github.com/GloriousEggroll/proton-ge-custom/issues/877
     apply_patch "../patches/wine-hotfixes/pending/win32u-winewayland-add-focus-debug-channel.patch"
 
+    # PROTON_PREFER_SDL / Steam Deck: Sony pads were dropped by both hidraw and SDL
+    apply_patch "../patches/wine-hotfixes/pending/winebus-sdl-keep-sony-pads-when-hidraw-is-disabled.patch"
+
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
     ./tools/make_requests
