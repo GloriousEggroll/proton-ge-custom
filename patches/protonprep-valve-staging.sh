@@ -450,6 +450,9 @@ apply_all_in_dir() {
     echo "WINE: -HOTFIX- Share selected cursor images across processes"
     apply_patch "../patches/wine-hotfixes/pending/win32u-share-selected-cursors-across-processes.patch"
 
+    echo "WINE: -HOTFIX- Share resource cursors when they are created (Rockstar overlay cursor)"
+    apply_patch "../patches/wine-hotfixes/pending/win32u-share-resource-cursors-at-creation.patch"
+
     echo "WINE: -HOTFIX- Limit the extra Vulkan swapchain image workaround to DOOM"
     apply_patch "../patches/wine-hotfixes/pending/win32u-limit-extra-swapchain-image-to-doom.patch"
 
