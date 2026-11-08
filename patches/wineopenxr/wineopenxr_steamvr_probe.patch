@@ -1,0 +1,272 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] wineopenxr: Don't start SteamVR from background OpenXR probes.
+
+Since 10-33, wineopenxr creates a test OpenXR instance whenever DXVK,
+vkd3d-proton or wineboot asks it for Vulkan extensions. With SteamVR as
+the active OpenXR runtime, that test instance launches SteamVR. Steam
+runs d3ddriverquery64.exe through every installed compatibility tool at
+startup, so SteamVR started with Steam, and with every non-VR game.
+
+Valve's Proton only creates that instance once vrclient's background
+check finds SteamVR already running. Restore that for SteamVR: report
+from the unix side whether the OpenXR loader would pick a manifest with
+VALVE_runtime_is_steamvr, and if so, only probe after vrclient has set
+is_hmd_present. Monado, WiVRn and other runtimes are probed as before,
+and a game's own xrCreateInstance still probes, since it wants VR.
+
+https://github.com/GloriousEggroll/proton-ge-custom/issues/942
+---
+--- a/openxr.c
++++ b/openxr.c
+@@ -5,6 +5,10 @@
+ #define _GNU_SOURCE
+ #include <dlfcn.h>
+ #include <fcntl.h>
++#include <limits.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
+ #include <unistd.h>
+ #include <time.h>
+ 
+@@ -577,9 +581,82 @@
+   return vk_create_device_callback(phys_dev, create_info, allocator, vk_device, pfnGetInstanceProcAddr, context);
+ }
+ 
++#if defined(__x86_64__)
++#define XR_LOADER_ARCH "x86_64"
++#elif defined(__aarch64__)
++#define XR_LOADER_ARCH "aarch64"
++#else
++#define XR_LOADER_ARCH "i686"
++#endif
++
++/* GE: report whether the OpenXR loader would pick SteamVR, from the runtime
++ * manifest's VALVE_runtime_is_steamvr key. */
++static BOOL runtime_json_is_steamvr(const char *path)
++{
++  static const char key[] = "\"VALVE_runtime_is_steamvr\"";
++  char buf[16384], *p;
++  ssize_t len;
++  int fd;
++
++  if ((fd = open(path, O_RDONLY | O_CLOEXEC)) == -1) return FALSE;
++  len = read(fd, buf, sizeof(buf) - 1);
++  close(fd);
++  if (len <= 0) return FALSE;
++  buf[len] = 0;
++
++  if (!(p = strstr(buf, key))) return FALSE;
++  p += sizeof(key) - 1;
++  while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ':') ++p;
++  return !strncmp(p, "true", 4);
++}
++
++static BOOL find_active_runtime(const char *dir, char *path, size_t size)
++{
++  snprintf(path, size, "%s/openxr/1/active_runtime." XR_LOADER_ARCH ".json", dir);
++  if (!access(path, R_OK)) return TRUE;
++  snprintf(path, size, "%s/openxr/1/active_runtime.json", dir);
++  return !access(path, R_OK);
++}
++
++static BOOL active_runtime_is_steamvr(void)
++{
++  const char *env, *dirs, *end;
++  char path[PATH_MAX], dir[PATH_MAX];
++
++  if ((env = getenv("XR_RUNTIME_JSON")) && *env)
++    return runtime_json_is_steamvr(env);
++
++  if ((env = getenv("XDG_CONFIG_HOME")) && *env)
++    snprintf(dir, sizeof(dir), "%s", env);
++  else if ((env = getenv("HOME")) && *env)
++    snprintf(dir, sizeof(dir), "%s/.config", env);
++  else
++    dir[0] = 0;
++  if (dir[0] && find_active_runtime(dir, path, sizeof(path)))
++    return runtime_json_is_steamvr(path);
++
++  if (!(dirs = getenv("XDG_CONFIG_DIRS")) || !*dirs) dirs = "/etc/xdg";
++  while (*dirs)
++  {
++    if (!(end = strchr(dirs, ':'))) end = dirs + strlen(dirs);
++    if (end > dirs && end - dirs < (ptrdiff_t)sizeof(dir))
++    {
++      memcpy(dir, dirs, end - dirs);
++      dir[end - dirs] = 0;
++      if (find_active_runtime(dir, path, sizeof(path)))
++        return runtime_json_is_steamvr(path);
++    }
++    dirs = *end ? end + 1 : end;
++  }
++
++  return find_active_runtime("/etc", path, sizeof(path)) && runtime_json_is_steamvr(path);
++}
++
+ NTSTATUS init_openxr(void *args) {
+   struct init_openxr_params *params = args;
+ 
++  params->runtime_is_steamvr = active_runtime_is_steamvr();
++
+ #ifdef _WIN64
+   params->create_instance_callback = (UINT64)(ULONG_PTR)&vk_create_instance_callback;
+   params->create_device_callback = (UINT64)(ULONG_PTR)&vk_create_device_callback;
+@@ -597,9 +674,11 @@
+     UINT32 winevulkan;
+     UINT64 create_instance_callback;
+     UINT64 create_device_callback;
++    UINT32 runtime_is_steamvr;
+   }
+   *params = args;
+ 
++  params->runtime_is_steamvr = active_runtime_is_steamvr();
+   params->create_instance_callback = (UINT64)(ULONG_PTR)&vk_create_instance_callback32;
+   params->create_device_callback = (UINT64)(ULONG_PTR)&vk_create_device_callback32;
+   return STATUS_SUCCESS;
+--- a/openxr_loader.c
++++ b/openxr_loader.c
+@@ -8,6 +8,7 @@
+ /* openxr_loader.c calls this from get_vulkan_extensions() when the XR registry cache
+  * hasn't been initialised yet. */
+ BOOL CDECL wineopenxr_init_registry(void);
++static BOOL init_registry(BOOL from_application);
+ 
+ #include "wine/unixlib.h"
+ #include "wine/vulkan_driver.h"
+@@ -28,6 +29,7 @@
+ }
+ 
+ static uint32_t g_physdev_vid, g_physdev_pid;
++static BOOL g_runtime_is_steamvr;
+ static char *g_instance_extensions, *g_device_extensions;
+ static XrVersion api_version = XR_CURRENT_API_VERSION;
+ 
+@@ -362,6 +364,7 @@
+   }
+   g_vk_create_instance_callback = params.create_instance_callback;
+   g_vk_create_device_callback = params.create_device_callback;
++  g_runtime_is_steamvr = params.runtime_is_steamvr;
+   return TRUE;
+ }
+ 
+@@ -619,7 +622,7 @@
+   };
+   /* Non-Steam launch paths do not run steam_helper, so populate the Wine XR
+    * registry cache when the OpenXR runtime is actually used. */
+-  wineopenxr_init_registry();
++  init_registry(TRUE);
+ 
+   UNIX_CALL_CHECKED(xrCreateInstance, &params);
+ 
+@@ -2142,7 +2145,72 @@
+   return XR_SUCCESS;
+ }
+ 
+-BOOL CDECL wineopenxr_init_registry(void)
++/* GE: SteamVR's xrCreateInstance launches SteamVR when it isn't running.
++ * DXVK, vkd3d-proton and wineboot query wineopenxr in every process,
++ * including Steam's d3ddriverquery64 probe at Steam startup, so probing
++ * SteamVR there starts it with Steam and with every non-VR game.
++ *
++ * Like Valve's Proton, only probe SteamVR once vrclient's background check
++ * has found it running; vrclient sets is_hmd_present only then. Other
++ * runtimes are probed as before. A game's own xrCreateInstance still
++ * probes, since that game wants VR. */
++static BOOL steamvr_probe_allowed(void)
++{
++    DWORD type, size, value;
++    unsigned int i;
++    BOOL ret = FALSE;
++    HKEY vr_key;
++
++    if (!wine_openxr_unix_init_once() || !g_runtime_is_steamvr)
++        return TRUE;
++
++    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Wine\\VR", 0, KEY_READ, &vr_key))
++    {
++        call_vrclient_vrclient_init_registry();
++        if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Wine\\VR", 0, KEY_READ, &vr_key))
++            goto done;
++    }
++
++    /* vrclient's check runs on a thread; wait while it is still in progress. */
++    for (i = 0; i < 200; ++i) /* 200 * 50ms = 10s */
++    {
++        size = sizeof(value);
++        if (!RegQueryValueExA(vr_key, "is_hmd_present", NULL, &type, (BYTE *)&value, &size))
++        {
++            ret = TRUE;
++            break;
++        }
++        size = sizeof(value);
++        if (RegQueryValueExA(vr_key, "state", NULL, &type, (BYTE *)&value, &size) ||
++            type != REG_DWORD || value)
++            break;
++        Sleep(50);
++    }
++    RegCloseKey(vr_key);
++
++done:
++    if (!ret) TRACE("SteamVR is not running, not probing it.\n");
++    return ret;
++}
++
++static void set_xr_unavailable(void)
++{
++    DWORD type, size, state;
++    HKEY vr_key;
++
++    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Wine\\XR", 0, NULL,
++                        REG_OPTION_VOLATILE, KEY_ALL_ACCESS, NULL, &vr_key, NULL))
++        return;
++    size = sizeof(state);
++    if (RegQueryValueExA(vr_key, "state", NULL, &type, (BYTE *)&state, &size))
++    {
++        state = ~0u;
++        RegSetValueExA(vr_key, "state", 0, REG_DWORD, (BYTE *)&state, sizeof(state));
++    }
++    RegCloseKey(vr_key);
++}
++
++static BOOL init_registry(BOOL from_application)
+ {
+     char *xr_inst_ext, *xr_dev_ext;
+     uint32_t vid, pid;
+@@ -2151,6 +2219,14 @@
+     DWORD state;
+ 
+     static void *init;
++
++    if (!from_application && !steamvr_probe_allowed())
++    {
++        /* Don't wait for the XR cache in get_vulkan_extensions(). */
++        set_xr_unavailable();
++        return FALSE;
++    }
++
+     if (InterlockedCompareExchangePointer(&init, (void *)1, NULL))
+         return TRUE;
+ 
+@@ -2190,6 +2266,11 @@
+     return TRUE;
+ }
+ 
++BOOL CDECL wineopenxr_init_registry(void)
++{
++    return init_registry(FALSE);
++}
++
+ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, void *reserved)
+ {
+     switch (reason)
+--- a/openxr_loader.h
++++ b/openxr_loader.h
+@@ -42,6 +42,7 @@
+   HMODULE winevulkan;
+   UINT64 create_instance_callback;
+   UINT64 create_device_callback;
++  UINT32 runtime_is_steamvr;
+ };
+ 
+ struct is_available_instance_function_openxr_params {
