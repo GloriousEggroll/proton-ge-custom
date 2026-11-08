@@ -711,6 +711,8 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/winebus-expose-bluetooth-dualshock4-as-usb.patch"
     apply_patch "../patches/wine-hotfixes/pending/winepulse-bluetooth-dualshock4-audio.patch"
     apply_patch "../patches/wine-hotfixes/pending/winedmo-disable-d3d11-aware-for-phantom-blade-zero.patch"
+    # FlatOut 2 (#939): XInput deadlocked when first called with the loader lock held
+    apply_patch "../patches/wine-hotfixes/pending/xinput-dont-wait-for-update-thread-under-loader-lock.patch"
     # Le Mans Ultimate VR loads a .cur cursor through D3DX (#944)
     apply_patch "../patches/wine-hotfixes/pending/d3dx-cur-ico-loading-for-le-mans-ultimate.patch"
     apply_patch "../patches/wine-hotfixes/pending/d3dx-cur-ico-bounds-and-cursor-alpha-for-le-mans-ultimate.patch"
