@@ -696,6 +696,10 @@ apply_all_in_dir() {
     # https://github.com/GloriousEggroll/proton-ge-custom/issues/937
     apply_patch "../patches/wine-hotfixes/pending/winewayland-use-steam-app-id-as-app-id.patch"
 
+    # https://github.com/ValveSoftware/Proton/issues/9994
+    echo "WINE: -HOTFIX- Use the exe name as WM_CLASS/app ID when SteamAppId is 0 or default (umu)"
+    apply_patch "../patches/wine-hotfixes/pending/winex11-winewayland-use-exe-name-for-non-steam-app-ids.patch"
+
     # https://github.com/GloriousEggroll/proton-ge-custom/issues/877
     apply_patch "../patches/wine-hotfixes/pending/win32u-winewayland-add-focus-debug-channel.patch"
     # AION 2 (#877): deactivate when the host focus loss cannot set the desktop foreground
