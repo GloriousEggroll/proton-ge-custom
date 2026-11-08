@@ -1,0 +1,122 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] winex11.drv: Add optional WINE_CURSOR_SCALE to enlarge X cursors
+
+Games that draw their cursors for a low-DPI desktop (e.g. Stronghold
+Crusader HD, 32x32 cursors) look tiny on high-resolution or fractionally
+scaled displays, and no Windows-side setting scales them.
+
+Resize each Xcursor frame (bilinear, premultiplied ARGB) by
+WINE_CURSOR_SCALE (0.25 <= value <= 8, default 1.0 = unchanged), scaling
+the hotspot accordingly.
+---
+diff --git a/dlls/winex11.drv/mouse.c b/dlls/winex11.drv/mouse.c
+index c4ee7a7..759227e 100644
+--- a/dlls/winex11.drv/mouse.c
++++ b/dlls/winex11.drv/mouse.c
+@@ -737,6 +737,90 @@ cleanup:
+     return ret;
+ }
+ 
++/***********************************************************************
++ *              get_cursor_scale
++ *
++ * Optional per-app scale for X cursors, set through WINE_CURSOR_SCALE.
++ * Games that draw their cursors for a low-DPI desktop look tiny on
++ * high-resolution or fractionally scaled displays.
++ */
++static double get_cursor_scale(void)
++{
++    static double scale = -1;
++    const char *env;
++    char *end;
++
++    if (scale >= 0) return scale;
++    scale = 1.0;
++    if ((env = getenv( "WINE_CURSOR_SCALE" )))
++    {
++        double value = strtod( env, &end );
++        if (end != env && value >= 0.25 && value <= 8.0) scale = value;
++    }
++    return scale;
++}
++
++/***********************************************************************
++ *              scale_xcursor_image
++ *
++ * Resize a (premultiplied ARGB) XcursorImage with bilinear filtering.
++ * Destroys the source image and returns the new one, or returns the
++ * source image unchanged if the new one cannot be created.
++ */
++static XcursorImage *scale_xcursor_image( XcursorImage *src, double scale )
++{
++    int width = max( 1, (int)(src->width * scale + 0.5) );
++    int height = max( 1, (int)(src->height * scale + 0.5) );
++    XcursorImage *dst;
++    int x, y, c;
++
++    width = min( width, 512 );
++    height = min( height, 512 );
++    if (width == src->width && height == src->height) return src;
++    if (!(dst = pXcursorImageCreate( width, height ))) return src;
++
++    dst->xhot = min( width - 1, (int)(src->xhot * scale + 0.5) );
++    dst->yhot = min( height - 1, (int)(src->yhot * scale + 0.5) );
++    dst->delay = src->delay;
++
++    for (y = 0; y < height; y++)
++    {
++        double sy = (y + 0.5) * src->height / height - 0.5;
++        int y0 = (int)floor( sy ), y1 = y0 + 1;
++        double fy = sy - y0;
++
++        y0 = max( 0, min( y0, (int)src->height - 1 ));
++        y1 = max( 0, min( y1, (int)src->height - 1 ));
++
++        for (x = 0; x < width; x++)
++        {
++            double sx = (x + 0.5) * src->width / width - 0.5;
++            int x0 = (int)floor( sx ), x1 = x0 + 1;
++            double fx = sx - x0;
++            XcursorPixel out = 0;
++
++            x0 = max( 0, min( x0, (int)src->width - 1 ));
++            x1 = max( 0, min( x1, (int)src->width - 1 ));
++
++            for (c = 0; c < 32; c += 8)
++            {
++                double p00 = (src->pixels[y0 * src->width + x0] >> c) & 0xff;
++                double p10 = (src->pixels[y0 * src->width + x1] >> c) & 0xff;
++                double p01 = (src->pixels[y1 * src->width + x0] >> c) & 0xff;
++                double p11 = (src->pixels[y1 * src->width + x1] >> c) & 0xff;
++                double top = p00 + (p10 - p00) * fx, bottom = p01 + (p11 - p01) * fx;
++                int value = (int)(top + (bottom - top) * fy + 0.5);
++
++                out |= (XcursorPixel)min( 255, max( 0, value )) << c;
++            }
++            dst->pixels[y * width + x] = out;
++        }
++    }
++
++    pXcursorImageDestroy( src );
++    return dst;
++}
++
+ /***********************************************************************
+  *              create_xcursor_cursor
+  *
+@@ -752,6 +836,7 @@ static Cursor create_xcursor_cursor( HDC hdc, const ICONINFOEXW *iinfo, HANDLE i
+     XcursorImages *images;
+     XcursorImage **imgs;
+     Cursor cursor = 0;
++    double cursor_scale = get_cursor_scale();
+ 
+     /* Retrieve the number of frames to render */
+     if (!NtUserGetCursorFrameInfo(icon, 0, &delay_jiffies, &nFrames)) return 0;
+@@ -804,6 +889,7 @@ static Cursor create_xcursor_cursor( HDC hdc, const ICONINFOEXW *iinfo, HANDLE i
+                                         hbmMask, mask_bits, mask_size,
+                                         width, height, i );
+         if (!imgs[i]) goto cleanup;
++        if (cursor_scale != 1.0) imgs[i] = scale_xcursor_image( imgs[i], cursor_scale );
+     }
+ 
+     /* Build an X cursor out of all of the frames */
