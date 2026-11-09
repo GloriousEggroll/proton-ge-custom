@@ -17,7 +17,7 @@ keeps the old behaviour.
 | Variable | Effect | Set for 40970 |
 |---|---|---|
 | `WINE_DDRAW_MAXGAMETICKS` | Limits `IDirectDrawSurface::Flip` to this many ticks per second (1 - 1000) | `60` |
-| `WINE_CURSOR_SCALE` | Scales X cursors (0.25 - 8, bilinear, hotspot scaled) | `2.0`, only if the display is at least 1440 pixels tall |
+| `WINE_CURSOR_SCALE` | Scales X cursors (0.25 - 8, bilinear, hotspot scaled) | `2.5`, only if the display is at least 1440 pixels tall |
 
 The display height is read from `/sys/class/drm` (preferred mode of the first
 connected display). If it cannot be read, the cursor size is left alone.
