@@ -94,6 +94,10 @@ apply_all_in_dir() {
     echo "DISCORD: -DISCORD RPC BRIDGE- patch steam/umu helpers"
     apply_all_in_dir "patches/discordrpc/helpers"
 
+    # Ubisoft games stayed "Running" in Steam after quitting: https://github.com/ValveSoftware/Proton/pull/10356
+    echo "STEAM_HELPER: close Ubisoft Connect after the game exits"
+    apply_all_in_dir "patches/steam_helper"
+
     git checkout -- \
         lsteamclient/Makefile.in \
         lsteamclient/gen_wrapper.py \
