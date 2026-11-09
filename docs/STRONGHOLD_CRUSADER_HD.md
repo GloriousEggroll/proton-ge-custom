@@ -8,14 +8,19 @@ Stronghold Crusader HD under Proton has two cursor problems on modern displays:
   accelerated or scaled, so it feels much faster than the desktop pointer
   (cnc-ddraw works around this with its mouse sensitivity setting).
 
-Both are fixed with two opt-in Wine settings, enabled by default only for this
-game through its protonfixes entry (`gamefixes-steam/40970.py`). Every other
-game keeps the old behaviour.
+Both are fixed with two opt-in Wine settings, enabled only for this game through
+its protonfixes entry (`gamefixes-steam/40970.py`). Every other game keeps the old
+behaviour.
 
-| Variable | Effect | Default for 40970 |
+| Variable | Effect | Set for 40970 |
 |---|---|---|
-| `WINE_CURSOR_SCALE` | Scales X cursors (0.25 - 8, bilinear, hotspot scaled) | `2.0` |
-| `WINE_RAW_MOUSE_SCALE` | Scales raw mouse deltas (0 - 16, sub-pixel remainder kept) | `0.6` |
+| `WINE_RAW_MOUSE_SCALE` | A number (0 - 16) multiplies raw mouse deltas; `accel` sends the same accelerated motion as the desktop pointer | `accel` |
+| `WINE_CURSOR_SCALE` | Scales X cursors (0.25 - 8, bilinear, hotspot scaled) | `2.0`, only if the display is at least 1440 pixels tall |
+
+`accel` is used instead of a fixed number because the ratio between raw and
+accelerated motion depends on the compositor, the pointer speed and the display
+scale. The display height is read from `/sys/class/drm` (preferred mode of the
+first connected display); if it cannot be read, the cursor size is left alone.
 
 If you set either variable yourself in the Steam launch options, your value is
 used instead:
