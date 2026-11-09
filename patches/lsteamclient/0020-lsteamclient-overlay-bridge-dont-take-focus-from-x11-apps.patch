@@ -1,0 +1,103 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] lsteamclient: overlay_bridge: Don't take X11 focus from other applications.
+
+The early focus proxy runs before a Wine-Wayland process has a surface. It
+checked X11 focus every 50 ms and took it back from any other window. If no
+game window ever took over, as with a launcher, XWayland applications such as
+the Steam client lost X11 focus about 30 ms after every click and couldn't be
+typed in.
+
+Keep holding focus against the compositor resetting it, but leave it alone
+when it's on a normal application window. Compositors hold X11 focus on an
+override-redirect helper window, or on nothing, while a native Wayland window
+has keyboard focus, so those cases still take it.
+
+https://github.com/GloriousEggroll/proton-ge-custom/issues/950
+---
+--- a/lsteamclient/overlay_bridge/src/focus_proxy.c
++++ b/lsteamclient/overlay_bridge/src/focus_proxy.c
+@@ -21,6 +21,7 @@
+ 
+ #include <X11/Xatom.h>
+ #include <X11/Xlib.h>
++#include <X11/Xlibint.h>
+ #include <X11/Xutil.h>
+ 
+ enum proxy_thread_state
+@@ -153,6 +154,43 @@
+     return stop;
+ }
+ 
++/* Any window can close between the focus query and looking at it, and the
++ * default Xlib error handler would then exit the process. XSetErrorHandler is
++ * process-wide, so handle errors on this private connection only. */
++static int ignore_x11_error(Display *display, xError *error, XExtCodes *codes,
++                            int *ret_code)
++{
++    (void)display;
++    (void)error;
++    (void)codes;
++    *ret_code = 0;
++    return 1;
++}
++
++/* Returns whether X11 focus is on a normal application window, such as the
++ * Steam client. Compositors hold X11 focus on an override-redirect helper
++ * window, or on nothing, while a native Wayland window has keyboard focus. */
++static int focus_is_on_x11_app(Display *display, Window focus)
++{
++    Window root = DefaultRootWindow(display), query_root, parent, *children;
++    XWindowAttributes attributes;
++    unsigned int count;
++
++    if (focus == None || focus == PointerRoot || focus == root) return 0;
++
++    for (;;)
++    {
++        if (!XQueryTree(display, focus, &query_root, &parent, &children, &count))
++            return 1;
++        if (children) XFree(children);
++        if (parent == root || parent == None) break;
++        focus = parent;
++    }
++
++    if (!XGetWindowAttributes(display, focus, &attributes)) return 1;
++    return !attributes.override_redirect;
++}
++
+ static void *run_focus_proxy(void *arg)
+ {
+     struct direct_xlib xlib;
+@@ -165,6 +203,7 @@
+     Window current_focus;
+     Window window;
+     Atom owner_atom;
++    XExtCodes *codes;
+     int revert_to;
+     int owns_selection = 0;
+ 
+@@ -179,6 +218,12 @@
+         return NULL;
+     if (!(display = xlib.open_display(display_name)))
+         return NULL;
++    if (!(codes = XAddExtension(display)))
++    {
++        xlib.close_display(display);
++        return NULL;
++    }
++    XESetError(display, codes->extension, ignore_x11_error);
+ 
+     snprintf(window_class, sizeof(window_class), "steam_app_%s", appid);
+     window = ge_overlay_create_x11_focus_window(display, window_class);
+@@ -215,7 +260,10 @@
+         if (XGetSelectionOwner(display, owner_atom) != window) break;
+ 
+         XGetInputFocus(display, &current_focus, &revert_to);
+-        if (current_focus != window)
++        /* Hold the target against the compositor resetting focus, but leave
++         * it alone when the user has moved focus to another X11 application.
++         * https://github.com/GloriousEggroll/proton-ge-custom/issues/950 */
++        if (current_focus != window && !focus_is_on_x11_app(display, current_focus))
+         {
+             XSetInputFocus(display, window, RevertToParent, CurrentTime);
+             XFlush(display);

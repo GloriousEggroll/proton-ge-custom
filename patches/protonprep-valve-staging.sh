@@ -100,6 +100,7 @@ apply_all_in_dir() {
 
     git checkout -- \
         lsteamclient/Makefile.in \
+        lsteamclient/overlay_bridge/src/focus_proxy.c \
         lsteamclient/gen_wrapper.py \
         lsteamclient/steam_input_manual.c \
         lsteamclient/steam_matchmaking_manual.c \
