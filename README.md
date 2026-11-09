@@ -688,7 +688,7 @@ Without HIDRAW access, Wine retains its normal SDL fallback, which does not prov
 |                      | `WAYLANDDRV_PRIMARY_MONITOR`   | Specify primary monitor where the value is something like `eDP-1`. Requires the Wayland driver. |
 |                      | `PROTON_ENABLE_MEDIACONV`      | Enable media converter for winegstreamer. This is not needed for winedmo, since the mediaconverter implementation of the codecs doesn't override the underlying implementation. |
 |                      | `WAYLANDDRV_RAWINPUT`          | A value of 0 disables unaccelerated input and uses accelerated input. Any positive real number (like 0.5) adjusts the sensitivity of rawinput. Requires the Wayland driver. |
-|                      | `PROTON_KEEP_UBISOFT_LAUNCHER` | Don't close Ubisoft Connect after the game exits. By default, GE-Proton closes it once no Ubisoft Connect window is showing, so Steam no longer shows the game as running. When launching through umu, it also stays open if Ubisoft Connect itself is what you launched. |
+|                      | `PROTON_KEEP_UBISOFT_LAUNCHER` | Don't close Ubisoft Connect after the game exits. By default, GE-Proton closes it once no Ubisoft Connect window is showing, so Steam no longer shows the game as running. It also stays open if Ubisoft Connect itself is what you launched, for example when added to Steam as a non-Steam game. |
 | `lowlatencylayer`    | `LOW_LATENCY_LAYER`            | Enables [low_latency_layer](https://github.com/Korthos-Software/low_latency_layer). |
 
 ## Credits
