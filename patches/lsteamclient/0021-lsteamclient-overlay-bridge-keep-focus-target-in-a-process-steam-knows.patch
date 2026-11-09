@@ -1,0 +1,238 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] lsteamclient: overlay_bridge: Keep the focus target in a process Steam knows.
+
+Before a game window exists, the early focus proxy gives Steam Input a target.
+The first process with a display driver always won that, which is explorer.exe,
+but Wine removes Steam's overlay from explorer.exe, so Steam doesn't know that
+process. With only a launcher open, the controller did nothing in Wayland mode.
+
+Only run the proxy in processes with the overlay loaded, and not in Proton's
+steam.exe and umu.exe stubs. Other processes now wait instead of giving up, as
+the first owner can be a launcher stub that exits right away, and the launcher
+can take the target back when a game exits.
+
+Taking the target no longer moves focus away from another X11 application, as
+this can now happen at any time rather than only at startup.
+
+Reported with the cause identified by Zethraxxur.
+https://github.com/GloriousEggroll/proton-ge-custom/issues/950
+---
+--- a/lsteamclient/overlay_bridge/src/focus_proxy.c
++++ b/lsteamclient/overlay_bridge/src/focus_proxy.c
+@@ -11,11 +11,13 @@
+ #include "x11_focus.h"
+ 
+ #include <dlfcn.h>
++#include <fcntl.h>
+ #include <pthread.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <strings.h>
+ #include <time.h>
+ #include <unistd.h>
+ 
+@@ -133,6 +135,40 @@
+     return winedebug && strstr(winedebug, "+waylanddrv");
+ }
+ 
++/* Steam identifies the focused game through the process that owns the focused
++ * window, and only knows processes that load its overlay. Wine removes the
++ * overlay from explorer.exe, and Proton's stubs aren't the game. */
++static int process_known_to_steam(void)
++{
++    static const char *const stubs[] = {"steam.exe", "umu.exe"};
++    char cmdline[4096], *arg, *name;
++    unsigned int i, index;
++    Dl_info info;
++    ssize_t size;
++    int fd;
++
++    if (!dladdr((void *)XCheckIfEvent, &info) || !info.dli_fname ||
++        !strstr(info.dli_fname, "gameoverlayrenderer"))
++        return 0;
++
++    if ((fd = open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC)) < 0) return 1;
++    size = read(fd, cmdline, sizeof(cmdline) - 1);
++    close(fd);
++    if (size <= 0) return 1;
++    cmdline[size] = 0;
++
++    /* The executable follows the loader and preloader. */
++    for (arg = cmdline, index = 0; arg < cmdline + size && index < 3; arg += strlen(arg) + 1, index++)
++    {
++        name = arg;
++        if (strrchr(name, '\\')) name = strrchr(name, '\\') + 1;
++        if (strrchr(name, '/')) name = strrchr(name, '/') + 1;
++        for (i = 0; i < sizeof(stubs) / sizeof(*stubs); i++)
++            if (!strcasecmp(name, stubs[i])) return 0;
++    }
++    return 1;
++}
++
+ static void init_proxy_config(void)
+ {
+     const char *appid = getenv("SteamAppId");
+@@ -141,7 +177,8 @@
+     proxy_enabled = env_enabled("WINE_WAYLAND_STEAM_OVERLAY_LAYER", 0) &&
+                     !env_enabled("DISABLE_WINE_WAYLAND_STEAM_OVERLAY_LAYER", 0) &&
+                     !env_enabled("PROTON_NO_STEAMINPUT", 0) &&
+-                    appid && appid[0] && display && display[0];
++                    appid && appid[0] && display && display[0] &&
++                    process_known_to_steam();
+ }
+ 
+ static int proxy_should_stop(void)
+@@ -191,6 +228,30 @@
+     return !attributes.override_redirect;
+ }
+ 
++/* Hold the per-game target until another process takes it or the proxy stops. */
++static void hold_focus_target(Display *display, Window window, Atom owner_atom)
++{
++    struct timespec sleep_time = {0, 50 * 1000 * 1000};
++    Window current_focus;
++    int revert_to;
++
++    while (!proxy_should_stop())
++    {
++        if (XGetSelectionOwner(display, owner_atom) != window) break;
++
++        XGetInputFocus(display, &current_focus, &revert_to);
++        /* Hold the target against the compositor resetting focus, but leave
++         * it alone when the user has moved focus to another X11 application.
++         * https://github.com/GloriousEggroll/proton-ge-custom/issues/950 */
++        if (current_focus != window && !focus_is_on_x11_app(display, current_focus))
++        {
++            XSetInputFocus(display, window, RevertToParent, CurrentTime);
++            XFlush(display);
++        }
++        nanosleep(&sleep_time, NULL);
++    }
++}
++
+ static void *run_focus_proxy(void *arg)
+ {
+     struct direct_xlib xlib;
+@@ -200,12 +261,13 @@
+     char owner_selection[160];
+     char window_class[128];
+     Display *display;
++    XExtCodes *codes;
+     Window current_focus;
+     Window window;
+     Atom owner_atom;
+-    XExtCodes *codes;
+     int revert_to;
+-    int owns_selection = 0;
++    int owns_selection;
++    unsigned int waited;
+ 
+     (void)arg;
+     XInitThreads();
+@@ -226,63 +288,60 @@
+     XESetError(display, codes->extension, ignore_x11_error);
+ 
+     snprintf(window_class, sizeof(window_class), "steam_app_%s", appid);
+-    window = ge_overlay_create_x11_focus_window(display, window_class);
+-    if (!window)
+-    {
+-        xlib.close_display(display);
+-        return NULL;
+-    }
+-
+     snprintf(owner_selection, sizeof(owner_selection),
+              "_WINE_WAYLAND_STEAM_FOCUS_%s", appid);
+     owner_atom = XInternAtom(display, owner_selection, False);
+ 
+-    /* Every Wine process creates an instance. Only bootstrap focus when no
+-     * process in this app already owns the per-game target. A focused Wayland
+-     * surface is still allowed to transfer this selection later. */
+-    XGrabServer(display);
+-    if (XGetSelectionOwner(display, owner_atom) == None)
++    /* Every Wine process creates an instance, but one process owns the target
++     * at a time. A focused Wayland surface can take it at any time. The others
++     * wait, as the owner can be a launcher stub that exits right away. */
++    while (!proxy_should_stop())
+     {
+-        XSetSelectionOwner(display, owner_atom, window, CurrentTime);
+-        XSetInputFocus(display, window, RevertToParent, CurrentTime);
+-        XSync(display, False);
+-        owns_selection = XGetSelectionOwner(display, owner_atom) == window;
+-    }
+-    XUngrabServer(display);
+-    XSync(display, False);
++        if (XGetSelectionOwner(display, owner_atom) != None)
++        {
++            /* There can be many waiting processes, so check once a second. */
++            for (waited = 0; waited < 20 && !proxy_should_stop(); waited++)
++                nanosleep(&sleep_time, NULL);
++            continue;
++        }
+ 
+-    if (owns_selection && debug_enabled())
+-        fprintf(stderr, "steam-overlay-wayland: in-process focus proxy owns %#lx\n",
+-                window);
++        if (!(window = ge_overlay_create_x11_focus_window(display, window_class)))
++            break;
+ 
+-    while (owns_selection && !proxy_should_stop())
+-    {
+-        if (XGetSelectionOwner(display, owner_atom) != window) break;
++        owns_selection = 0;
++        XGrabServer(display);
++        if (XGetSelectionOwner(display, owner_atom) == None)
++        {
++            XSetSelectionOwner(display, owner_atom, window, CurrentTime);
++            XGetInputFocus(display, &current_focus, &revert_to);
++            if (!focus_is_on_x11_app(display, current_focus))
++                XSetInputFocus(display, window, RevertToParent, CurrentTime);
++            XSync(display, False);
++            owns_selection = XGetSelectionOwner(display, owner_atom) == window;
++        }
++        XUngrabServer(display);
++        XSync(display, False);
+ 
+-        XGetInputFocus(display, &current_focus, &revert_to);
+-        /* Hold the target against the compositor resetting focus, but leave
+-         * it alone when the user has moved focus to another X11 application.
+-         * https://github.com/GloriousEggroll/proton-ge-custom/issues/950 */
+-        if (current_focus != window && !focus_is_on_x11_app(display, current_focus))
++        if (owns_selection)
+         {
+-            XSetInputFocus(display, window, RevertToParent, CurrentTime);
+-            XFlush(display);
++            if (debug_enabled())
++                fprintf(stderr, "steam-overlay-wayland: in-process focus proxy owns %#lx\n",
++                        window);
++            hold_focus_target(display, window, owner_atom);
++            if (XGetSelectionOwner(display, owner_atom) == window)
++                XSetSelectionOwner(display, owner_atom, None, CurrentTime);
++            XGetInputFocus(display, &current_focus, &revert_to);
++            if (current_focus == window)
++                XSetInputFocus(display, PointerRoot, RevertToPointerRoot, CurrentTime);
++            if (debug_enabled())
++                fputs("steam-overlay-wayland: in-process focus proxy released ownership\n",
++                      stderr);
+         }
+-        nanosleep(&sleep_time, NULL);
++        ge_overlay_destroy_x11_focus_window(display, window);
++        XSync(display, False);
+     }
+ 
+-    if (XGetSelectionOwner(display, owner_atom) == window)
+-        XSetSelectionOwner(display, owner_atom, None, CurrentTime);
+-    XGetInputFocus(display, &current_focus, &revert_to);
+-    if (current_focus == window)
+-        XSetInputFocus(display, PointerRoot, RevertToPointerRoot, CurrentTime);
+-    ge_overlay_destroy_x11_focus_window(display, window);
+-    XSync(display, False);
+     xlib.close_display(display);
+-
+-    if (owns_selection && debug_enabled())
+-        fputs("steam-overlay-wayland: in-process focus proxy released ownership\n",
+-              stderr);
+     return NULL;
+ }
+ 
