@@ -49,6 +49,7 @@
 	- [flibitijibibo (Ethan Lee)](#flibitijibibo-ethan-lee)
 	- [simmons-public (Chris Simmons)](#simmons-public-chris-simmons)
 	- [wine-staging maintainers](#wine-staging-maintainers)
+	- [S. Christian Collins](#s-christian-collins)
 	- [Reporters](#reporters)
 	- [Patrons](#patrons)
 - [Donations](#donations)
@@ -689,6 +690,8 @@ Without HIDRAW access, Wine retains its normal SDL fallback, which does not prov
 |                      | `PROTON_ENABLE_MEDIACONV`      | Enable media converter for winegstreamer. This is not needed for winedmo, since the mediaconverter implementation of the codecs doesn't override the underlying implementation. |
 |                      | `WAYLANDDRV_RAWINPUT`          | A value of 0 disables unaccelerated input and uses accelerated input. Any positive real number (like 0.5) adjusts the sensitivity of rawinput. Requires the Wayland driver. |
 |                      | `PROTON_KEEP_UBISOFT_LAUNCHER` | Don't close Ubisoft Connect after the game exits. By default, GE-Proton closes it once no Ubisoft Connect window is showing, so Steam no longer shows the game as running. It also stays open if Ubisoft Connect itself is what you launched, for example when added to Steam as a non-Steam game. |
+|                      | `PROTON_NO_MIDI_SYNTH`         | Disables the built-in MIDI synth, used for MIDI music when the host has no MIDI device or synth of its own. |
+|                      | `PROTON_MIDI_SOUNDFONT`        | Absolute path to an uncompressed `.sf2` sound font for the built-in MIDI synth. Defaults to the bundled GeneralUser GS. `.sf3` files aren't supported. |
 | `lowlatencylayer`    | `LOW_LATENCY_LAYER`            | Enables [low_latency_layer](https://github.com/Korthos-Software/low_latency_layer). |
 
 ## Credits
@@ -748,6 +751,10 @@ Chris is the creator of the original 'protonfixes' project. The portions of 'pro
 I also of course need to thank the wine-staging maintainers: Alistair Leslie-Hughes, Zebediah Figura and Paul Gofman
 
 They have contributed many patches to staging, far beyond what I have done, as well as kept up with regular rebasing. A lot of times when bug reports come to me, if it has to do with staging I end up testing and relaying information to these guys in order to get issues resolved.
+
+### S. Christian Collins
+
+The built-in MIDI synth uses his [GeneralUser GS](https://www.schristiancollins.com/generaluser.php) sound font. Its license is in `soundfonts/GeneralUser-GS-LICENSE.txt`.
 
 ### Reporters
 
