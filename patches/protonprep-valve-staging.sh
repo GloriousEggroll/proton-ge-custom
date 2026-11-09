@@ -354,9 +354,9 @@ apply_all_in_dir() {
     echo "WINE: -GAME FIXES- restore Return to Krondor text bitmap readback"
     apply_patch "../patches/game-patches/return-to-krondor-text-bitmap-readback.patch"
 
-    # Stronghold Crusader HD: cursor too fast, raw mouse deltas (enabled via protonfixes 40970)
-    echo "WINE: -GAME FIXES- add optional WINE_RAW_MOUSE_SCALE for raw mouse deltas"
-    apply_patch "../patches/game-patches/winex11-raw-mouse-scale.patch"
+    # Stronghold Crusader HD: cursor and scrolling too fast on high refresh rate displays (enabled via protonfixes 40970)
+    echo "WINE: -GAME FIXES- add optional WINE_DDRAW_MAXGAMETICKS to limit the DirectDraw game tick rate"
+    apply_patch "../patches/game-patches/ddraw-max-game-ticks.patch"
 
     # Stronghold Crusader HD: tiny cursor on high-resolution displays (enabled via protonfixes 40970)
     echo "WINE: -GAME FIXES- add optional WINE_CURSOR_SCALE to enlarge X cursors"

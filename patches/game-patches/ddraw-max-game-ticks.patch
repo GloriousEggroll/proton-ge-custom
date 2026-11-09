@@ -1,0 +1,106 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] ddraw: Add optional WINE_DDRAW_MAXGAMETICKS to limit the game tick rate
+
+Old games often tie their speed (and their cursor and scrolling speed) to the
+60 Hz vertical blank of the displays they were written for. Wine's DirectDraw
+presents at the real refresh rate and WaitForVerticalBlank returns at once, so
+on a 144 or 240 Hz display such a game runs several times too fast.
+
+Limit IDirectDrawSurface::Flip to WINE_DDRAW_MAXGAMETICKS ticks per second
+(1 - 1000), sleeping outside of the wined3d lock. This is the equivalent of the
+"maxgameticks" setting of cnc-ddraw. Unset or invalid values leave the
+behaviour unchanged.
+---
+diff --git a/dlls/ddraw/ddraw.c b/dlls/ddraw/ddraw.c
+index 5d748b0..859d8b0 100644
+--- a/dlls/ddraw/ddraw.c
++++ b/dlls/ddraw/ddraw.c
+@@ -2189,6 +2189,62 @@ static HRESULT WINAPI ddraw1_FlipToGDISurface(IDirectDraw *iface)
+     return ddraw7_FlipToGDISurface(&ddraw->IDirectDraw7_iface);
+ }
+ 
++/* Optional game tick limiter, set through WINE_DDRAW_MAXGAMETICKS (1 - 1000 ticks per second).
++ * Old games often tie their speed (and their cursor and scrolling speed) to the 60 Hz
++ * vertical blank of the displays they were written for. Wine's DirectDraw presents at the
++ * real refresh rate, so on a 144 or 240 Hz display such a game runs several times too fast.
++ * This is the equivalent of the "maxgameticks" setting of cnc-ddraw. */
++void ddraw_limit_game_ticks(void)
++{
++    static LONG state; /* 0: not read yet, 1: disabled, 2: enabled */
++    static LONGLONG period, next_tick;
++    LARGE_INTEGER now;
++    LONGLONG next;
++    char buffer[16];
++    DWORD len;
++    int rate;
++
++    if (!state)
++    {
++        LARGE_INTEGER frequency;
++
++        len = GetEnvironmentVariableA( "WINE_DDRAW_MAXGAMETICKS", buffer, sizeof(buffer) );
++        rate = 0;
++        if (len && len < sizeof(buffer))
++        {
++            const char *p;
++
++            for (p = buffer; *p >= '0' && *p <= '9' && rate <= 1000; ++p) rate = rate * 10 + *p - '0';
++            if (*p) rate = 0;
++        }
++        if (rate >= 1 && rate <= 1000)
++        {
++            QueryPerformanceFrequency( &frequency );
++            period = frequency.QuadPart / rate;
++            InterlockedExchange( &state, 2 );
++        }
++        else InterlockedExchange( &state, 1 );
++    }
++    if (state != 2) return;
++
++    QueryPerformanceCounter( &now );
++    next = InterlockedCompareExchange64( &next_tick, 0, 0 );
++    if (!next || now.QuadPart > next + 2 * period) next = now.QuadPart; /* first tick, or too far behind */
++
++    while (now.QuadPart < next)
++    {
++        LARGE_INTEGER frequency;
++        LONGLONG ms;
++
++        QueryPerformanceFrequency( &frequency );
++        ms = (next - now.QuadPart) * 1000 / frequency.QuadPart;
++        Sleep( ms > 1 ? ms - 1 : 0 );
++        QueryPerformanceCounter( &now );
++    }
++
++    InterlockedExchange64( &next_tick, next + period );
++}
++
+ /*****************************************************************************
+  * IDirectDraw7::WaitForVerticalBlank
+  *
+diff --git a/dlls/ddraw/ddraw_private.h b/dlls/ddraw/ddraw_private.h
+index f19a95f..d7e4ff8 100644
+--- a/dlls/ddraw/ddraw_private.h
++++ b/dlls/ddraw/ddraw_private.h
+@@ -147,6 +147,7 @@ HRESULT ddraw_init(struct ddraw *ddraw, DWORD flags, enum wined3d_device_type de
+ void ddraw_d3dcaps1_from_7(D3DDEVICEDESC *caps1, D3DDEVICEDESC7 *caps7);
+ HRESULT ddraw_get_d3dcaps(const struct ddraw *ddraw, D3DDEVICEDESC7 *caps);
+ void ddraw_update_lost_surfaces(struct ddraw *ddraw);
++void ddraw_limit_game_ticks(void);
+ 
+ static inline void ddraw_set_swapchain_window(struct ddraw *ddraw, HWND window)
+ {
+diff --git a/dlls/ddraw/surface.c b/dlls/ddraw/surface.c
+index ca24be2..1e6939a 100644
+--- a/dlls/ddraw/surface.c
++++ b/dlls/ddraw/surface.c
+@@ -1431,6 +1431,9 @@ static HRESULT WINAPI DECLSPEC_HOTPATCH ddraw_surface1_Flip(IDirectDrawSurface *
+     if (ddraw_surface_is_lost(dst_impl))
+         return DDERR_SURFACELOST;
+ 
++    /* Wait outside of the wined3d lock. */
++    ddraw_limit_game_ticks();
++
+     wined3d_mutex_lock();
+ 
+     if ((dst_impl->surface_desc.ddsCaps.dwCaps & DDSCAPS_PRIMARYSURFACE)
