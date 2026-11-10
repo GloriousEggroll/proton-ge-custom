@@ -729,6 +729,8 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/dinput-find-hotplugged-devices-for-le-mans-ultimate.patch"
     # RPG Maker games and others: MIDI music was silent without a user-run synth (#949)
     apply_patch "../patches/wine-hotfixes/pending/winemidisynth-add-software-synth-for-midi-output.patch"
+    # PROTON_NO_XIM=1: games get every key press, dead keys included, and dead keys combine like Windows
+    apply_patch "../patches/wine-hotfixes/pending/winex11-no-xim-windows-dead-keys.patch"
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
