@@ -1,0 +1,345 @@
+From: Daniel Tortosa Marangoni <47564279+dtmarangoni@users.noreply.github.com>
+Subject: [PATCH] winex11: Skip the X input method and combine dead keys like
+ Windows with WINE_NO_XIM=1.
+
+With a keyboard layout that has dead keys, the X input method consumes the
+dead key while it waits for the next key, and X11DRV_ProcessEvents drops
+every event the input method filters. Games then never get WM_KEYDOWN for
+` ' ^ ~ and similar keys, so they can't be bound, and the key pressed right
+after them arrives only as composed text. UseXIM=N brings the key presses
+back, but then nothing combines dead keys: X11DRV_ToUnicodeEx has a FIXME
+for it.
+
+WINE_NO_XIM=1, which the proton script sets for PROTON_NO_XIM=1, turns the
+input method off for the run and makes ToUnicodeEx combine dead keys the
+way Windows does. A dead key gives its accent as a dead character
+(WM_DEADCHAR), and the next key gives the accented letter, both characters
+when they don't combine, or the accent alone for a space.
+MapVirtualKey(MAPVK_VK_TO_CHAR) sets the top bit for dead keys. The
+combinations are those of Microsoft's keyboard layouts for Latin letters
+(https://learn.microsoft.com/globalization/keyboards), with the letters
+only some of them combine: ç on US-International and Latin American, the
+extra acute letters and Ÿ of the Central European layouts, and the Welsh
+letters and Ÿ of UK Extended. Dead keys of other scripts, such as the
+Greek tonos, give the accent and the letter separately.
+
+Without the variable nothing changes, so input methods for Chinese,
+Japanese and Korean keep working as before.
+
+This patch was written with an AI assistant. It is meant for GE-Proton
+only and should not be sent to Wine, which doesn't accept such code.
+
+---
+diff --git a/dlls/winex11.drv/keyboard.c b/dlls/winex11.drv/keyboard.c
+index 2c29abc083..01e423f905 100644
+--- a/dlls/winex11.drv/keyboard.c
++++ b/dlls/winex11.drv/keyboard.c
+@@ -105,6 +105,19 @@ static WORD keyc2scan[256] =
+ 
+ static int NumLockMask, ScrollLockMask, AltGrMask; /* mask in the XKeyEvent state */
+ 
++/* Layouts whose Windows versions combine more letters with some dead keys
++ * than the others (see dead_key_extras) */
++enum dead_key_layout
++{
++    DEAD_KEYS_DEFAULT,
++    DEAD_KEYS_CEDILLA,        /* US-International, Latin American */
++    DEAD_KEYS_CENTRAL_EUROPE, /* Czech, Slovak, Polish, Hungarian, Croatian, Slovenian */
++    DEAD_KEYS_UK,             /* United Kingdom, as Windows' UK Extended layout */
++};
++
++static BOOL dead_keys_ascii;                  /* ' and " are the acute and diaeresis dead characters */
++static enum dead_key_layout layout_dead_keys; /* which dead_key_extras the layout has */
++
+ static pthread_mutex_t kbd_mutex = PTHREAD_MUTEX_INITIALIZER;
+ 
+ static char KEYBOARD_MapDeadKeysym(KeySym keysym);
+@@ -1910,6 +1923,39 @@ void X11DRV_InitKeyboard( Display *display )
+ 	keyc2scan[keyc]=scan++;
+       }
+ 
++    /* Windows' US-International layout uses ' and " for its acute and diaeresis
++     * dead keys and combines the acute accent with c into ç. us(intl) is detected
++     * as a United States layout, like layouts that have no table here, so it is
++     * told apart by the dead acute on its ' key. The Latin American layout shares
++     * its LCID with the Spanish one, so it is told apart by its keys. */
++    dead_keys_ascii = FALSE;
++    switch (main_key_tab[kbd_layout].lcid)
++    {
++    case 0x0409: /* United States */
++        for (keyc = min_keycode; keyc <= max_keycode; keyc++)
++        {
++            if ((keyc2vkey[keyc] & 0xff) != VK_OEM_7) continue;
++            dead_keys_ascii = XkbKeycodeToKeysym( display, keyc, 0, 0 ) == XK_dead_acute;
++            break;
++        }
++        layout_dead_keys = dead_keys_ascii ? DEAD_KEYS_CEDILLA : DEAD_KEYS_DEFAULT;
++        break;
++    case 0x0405: /* Czech */
++    case 0x040e: /* Hungarian */
++    case 0x0415: /* Polish */
++    case 0x041a: /* Croatian */
++    case 0x041b: /* Slovak */
++    case 0x0424: /* Slovenian */
++        layout_dead_keys = DEAD_KEYS_CENTRAL_EUROPE;
++        break;
++    case 0x0809: /* United Kingdom */
++        layout_dead_keys = DEAD_KEYS_UK;
++        break;
++    default:
++        layout_dead_keys = lkey == &main_key_LA ? DEAD_KEYS_CEDILLA : DEAD_KEYS_DEFAULT;
++        break;
++    }
++
+     pthread_mutex_unlock( &kbd_mutex );
+ }
+ 
+@@ -2048,6 +2094,163 @@ SHORT X11DRV_VkKeyScanEx( WCHAR wChar, HKL hkl )
+     return ret;
+ }
+ 
++/* Dead keys combined the way Windows does, with windows_dead_keys. The tables
++ * are those of Microsoft's keyboard layouts (learn.microsoft.com/globalization/
++ * keyboards): the first five rows have the letters that all Western European
++ * layouts combine, and the other accents merge the Central European layouts.
++ * dead_key_extras adds the letters that only some layouts combine. A dead key
++ * followed by a space gives its dead character. */
++static const struct dead_key
++{
++    KeySym keysym;
++    WCHAR dead_char;       /* spacing character for the accent */
++    const WCHAR *bases;    /* the letters it combines with */
++    const WCHAR *composed; /* the combined letters, in the same order */
++} dead_keys[] =
++{
++    /* à À è È ì Ì ò Ò ù Ù */
++    { XK_dead_grave, '`', u"aAeEiIoOuU",
++      u"\x00e0\x00c0\x00e8\x00c8\x00ec\x00cc\x00f2\x00d2\x00f9\x00d9" },
++    /* á Á é É í Í ó Ó ú Ú ý Ý */
++    { XK_dead_acute, 0x00b4, u"aAeEiIoOuUyY",
++      u"\x00e1\x00c1\x00e9\x00c9\x00ed\x00cd\x00f3\x00d3\x00fa\x00da\x00fd\x00dd" },
++    /* â Â ê Ê î Î ô Ô û Û */
++    { XK_dead_circumflex, '^', u"aAeEiIoOuU",
++      u"\x00e2\x00c2\x00ea\x00ca\x00ee\x00ce\x00f4\x00d4\x00fb\x00db" },
++    /* ã Ã ñ Ñ õ Õ */
++    { XK_dead_tilde, '~', u"aAnNoO",
++      u"\x00e3\x00c3\x00f1\x00d1\x00f5\x00d5" },
++    /* ä Ä ë Ë ï Ï ö Ö ü Ü ÿ */
++    { XK_dead_diaeresis, 0x00a8, u"aAeEiIoOuUy",
++      u"\x00e4\x00c4\x00eb\x00cb\x00ef\x00cf\x00f6\x00d6\x00fc\x00dc\x00ff" },
++    /* ç Ç ģ Ģ ķ Ķ ļ Ļ ņ Ņ ŗ Ŗ ş Ş ţ Ţ */
++    { XK_dead_cedilla, 0x00b8, u"cCgGkKlLnNrRsStT",
++      u"\x00e7\x00c7\x0123\x0122\x0137\x0136\x013c\x013b\x0146\x0145\x0157\x0156\x015f\x015e\x0163\x0162" },
++    /* å Å ů Ů */
++    { XK_dead_abovering, 0x00b0, u"aAuU",
++      u"\x00e5\x00c5\x016f\x016e" },
++    /* č Č ď Ď ě Ě ľ Ľ ň Ň ř Ř š Š ť Ť ž Ž */
++    { XK_dead_caron, 0x02c7, u"cCdDeElLnNrRsStTzZ",
++      u"\x010d\x010c\x010f\x010e\x011b\x011a\x013e\x013d\x0148\x0147\x0159\x0158\x0161\x0160\x0165\x0164\x017e\x017d" },
++    /* ă Ă ğ Ğ */
++    { XK_dead_breve, 0x02d8, u"aAgG",
++      u"\x0103\x0102\x011f\x011e" },
++    /* ė Ė ı İ ż Ż */
++    { XK_dead_abovedot, 0x02d9, u"eEiIzZ",
++      u"\x0117\x0116\x0131\x0130\x017c\x017b" },
++    /* ą Ą ę Ę į Į ų Ų */
++    { XK_dead_ogonek, 0x02db, u"aAeEiIuU",
++      u"\x0105\x0104\x0119\x0118\x012f\x012e\x0173\x0172" },
++    /* ő Ő ű Ű */
++    { XK_dead_doubleacute, 0x02dd, u"oOuU",
++      u"\x0151\x0150\x0171\x0170" },
++};
++
++/* Letters that only some layouts combine, for layout_dead_keys */
++static const struct dead_key_extra
++{
++    enum dead_key_layout layout;
++    KeySym keysym;
++    const WCHAR *bases;
++    const WCHAR *composed;
++} dead_key_extras[] =
++{
++    /* ç Ç */
++    { DEAD_KEYS_CEDILLA, XK_dead_acute, u"cC", u"\x00e7\x00c7" },
++    /* ć Ć ĺ Ĺ ń Ń ŕ Ŕ ś Ś ź Ź */
++    { DEAD_KEYS_CENTRAL_EUROPE, XK_dead_acute, u"cClLnNrRsSzZ",
++      u"\x0107\x0106\x013a\x0139\x0144\x0143\x0155\x0154\x015b\x015a\x017a\x0179" },
++    /* Ÿ */
++    { DEAD_KEYS_CENTRAL_EUROPE, XK_dead_diaeresis, u"Y", u"\x0178" },
++    /* ẁ Ẁ ỳ Ỳ */
++    { DEAD_KEYS_UK, XK_dead_grave, u"wWyY", u"\x1e81\x1e80\x1ef3\x1ef2" },
++    /* ẃ Ẃ */
++    { DEAD_KEYS_UK, XK_dead_acute, u"wW", u"\x1e83\x1e82" },
++    /* ŵ Ŵ ŷ Ŷ */
++    { DEAD_KEYS_UK, XK_dead_circumflex, u"wWyY", u"\x0175\x0174\x0177\x0176" },
++    /* ẅ Ẅ Ÿ */
++    { DEAD_KEYS_UK, XK_dead_diaeresis, u"wWY", u"\x1e85\x1e84\x0178" },
++};
++
++static const struct dead_key *find_dead_key( KeySym keysym )
++{
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(dead_keys); i++)
++        if (dead_keys[i].keysym == keysym) return &dead_keys[i];
++    return NULL;
++}
++
++static WCHAR dead_key_char( const struct dead_key *dead )
++{
++    if (dead_keys_ascii && dead->keysym == XK_dead_acute) return '\'';
++    if (dead_keys_ascii && dead->keysym == XK_dead_diaeresis) return '"';
++    return dead->dead_char;
++}
++
++static WCHAR combine_dead_key( const struct dead_key *dead, WCHAR ch )
++{
++    const WCHAR *base;
++    unsigned int i;
++
++    if (ch == ' ') return dead_key_char( dead );
++    if (!ch) return 0;
++    for (i = 0; i < ARRAY_SIZE(dead_key_extras); i++)
++    {
++        const struct dead_key_extra *extra = &dead_key_extras[i];
++
++        if (extra->layout == layout_dead_keys && extra->keysym == dead->keysym &&
++            (base = wcschr( extra->bases, ch )))
++            return extra->composed[base - extra->bases];
++    }
++    if ((base = wcschr( dead->bases, ch ))) return dead->composed[base - dead->bases];
++    return 0;
++}
++
++/* Applies the pending dead key to the ret characters in buffer that the key
++ * gives on its own, or makes the key the pending one if it is a dead key.
++ * Returns the ToUnicodeEx result. kbd_mutex must be held. */
++static INT translate_dead_key( KeySym keysym, UINT state, WCHAR *buffer, int size, INT ret, UINT flags )
++{
++    struct x11drv_thread_data *data = x11drv_thread_data();
++    const struct dead_key *dead = find_dead_key( keysym ), *pending = find_dead_key( data->dead_key );
++    BOOL keep_state = flags & 0x4; /* "keyboard state is not changed" */
++    WCHAR ch;
++
++    if (size < 1 || (!dead && (!pending || ret <= 0))) return ret;
++    TRACE_(key)( "keysym %#lx, pending dead key %#lx\n", keysym, data->dead_key );
++
++    if (dead)
++    {
++        /* like in Windows layouts, Ctrl + dead key gives nothing */
++        if (state & ControlMask) return 0;
++        if (!pending)
++        {
++            buffer[0] = dead_key_char( dead );
++            if (!keep_state) data->dead_key = keysym;
++            return -1;
++        }
++        /* two dead keys don't combine: both characters */
++        if (!keep_state) data->dead_key = 0;
++        buffer[0] = dead_key_char( pending );
++        if (size < 2) return 1;
++        buffer[1] = dead_key_char( dead );
++        return 2;
++    }
++
++    if (!keep_state) data->dead_key = 0;
++    if (ret == 1 && (ch = combine_dead_key( pending, buffer[0] )))
++    {
++        buffer[0] = ch;
++        return 1;
++    }
++    /* they don't combine: the dead character, then the key's own characters */
++    if (ret > size - 1) ret = size - 1;
++    memmove( buffer + 1, buffer, ret * sizeof(WCHAR) );
++    buffer[0] = dead_key_char( pending );
++    return ret + 1;
++}
++
+ /***********************************************************************
+  *		MapVirtualKeyEx (X11DRV.@)
+  */
+@@ -2127,6 +2330,7 @@ UINT X11DRV_MapVirtualKeyEx( UINT wCode, UINT wMapType, HKL hkl )
+              * - hence we use the lock mask to ensure this happens.
+              */
+             /* let's do vkey -> keycode -> (XLookupString) ansi char */
++            const struct dead_key *dead;
+             XKeyEvent e;
+             KeySym keysym;
+             int len;
+@@ -2172,7 +2376,10 @@ UINT X11DRV_MapVirtualKeyEx( UINT wCode, UINT wMapType, HKL hkl )
+             TRACE("Found keycode %u\n",e.keycode);
+ 
+             len = XLookupString(&e, s, sizeof(s), &keysym, NULL);
+-            if (len)
++            /* dead keys have the top bit set */
++            if (windows_dead_keys && (dead = find_dead_key( keysym )))
++                ret = 0x80000000 | dead_key_char( dead );
++            else if (len)
+             {
+                 WCHAR wch;
+                 if (ntdll_umbstowcs( s, len, &wch, 1 )) ret = RtlUpcaseUnicodeChar( wch );
+@@ -2688,6 +2895,8 @@ INT X11DRV_ToUnicodeEx( UINT virtKey, UINT scanCode, const BYTE *lpKeyState,
+     }
+ 
+ found:
++    if (windows_dead_keys) ret = translate_dead_key( keysym, e.state, bufW, bufW_size, ret, flags );
++
+     if (buf != lpChar)
+         free( lpChar );
+ 
+diff --git a/dlls/winex11.drv/x11drv.h b/dlls/winex11.drv/x11drv.h
+index 5fc004bf73..742af20880 100644
+--- a/dlls/winex11.drv/x11drv.h
++++ b/dlls/winex11.drv/x11drv.h
+@@ -412,6 +412,7 @@ struct x11drv_thread_data
+     XIM      xim;                  /* input method */
+     HWND     last_xic_hwnd;        /* last xic window */
+     XFontSet font_set;             /* international text drawing font set */
++    KeySym   dead_key;             /* dead key waiting for the next key, with windows_dead_keys */
+     Window   selection_wnd;        /* window used for selection interactions */
+     unsigned long warp_serial;     /* serial number of last pointer warp request */
+     Window   clip_window;          /* window used for cursor clipping */
+@@ -481,6 +482,7 @@ extern BOOL use_system_cursors;
+ extern BOOL grab_fullscreen;
+ extern int keyboard_layout;
+ extern BOOL keyboard_scancode_detect;
++extern BOOL windows_dead_keys;
+ extern BOOL usexcomposite;
+ extern BOOL use_xfixes;
+ extern BOOL managed_mode;
+diff --git a/dlls/winex11.drv/x11drv_main.c b/dlls/winex11.drv/x11drv_main.c
+index c3f9daa2c8..0be9a7979a 100644
+--- a/dlls/winex11.drv/x11drv_main.c
++++ b/dlls/winex11.drv/x11drv_main.c
+@@ -77,6 +77,7 @@ BOOL use_system_cursors = TRUE;
+ BOOL grab_fullscreen = FALSE;
+ int keyboard_layout = -1;
+ BOOL keyboard_scancode_detect = FALSE;
++BOOL windows_dead_keys = FALSE;
+ BOOL managed_mode = TRUE;
+ BOOL private_color_map = FALSE;
+ int primary_monitor = 0;
+@@ -529,6 +530,7 @@ static void setup_options(void)
+     static const WCHAR x11driverW[] = {'\\','X','1','1',' ','D','r','i','v','e','r',0};
+     WCHAR buffer[MAX_PATH+16], *p, *appname;
+     HKEY hkey, appkey = 0;
++    const char *env;
+     DWORD len;
+ 
+     /* @@ Wine registry key: HKCU\Software\Wine\X11 Driver */
+@@ -624,6 +626,15 @@ static void setup_options(void)
+ 
+     NtClose( appkey );
+     NtClose( hkey );
++
++    /* Set by PROTON_NO_XIM=1. Without the X input method every key press reaches
++     * the application, dead keys included, and ToUnicodeEx combines dead keys the
++     * way Windows does. */
++    if ((env = getenv( "WINE_NO_XIM" )) && atoi( env ))
++    {
++        use_xim = FALSE;
++        windows_dead_keys = TRUE;
++    }
+ }
+ 
+ #ifdef SONAME_LIBXCOMPOSITE
