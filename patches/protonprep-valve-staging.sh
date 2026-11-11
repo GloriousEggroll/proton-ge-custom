@@ -714,6 +714,8 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/win32u-deactivate-window-when-host-focus-loss-fails.patch"
     # niri/Smithay offer xdg-decoration version 1, which got no server-side decorations (#955)
     apply_patch "../patches/wine-hotfixes/pending/winewayland-bind-xdg-decoration-manager-version-1.patch"
+    # Balatro (#957): the pointer jumped to the top left corner when an early cursor lock ended
+    apply_patch "../patches/wine-hotfixes/pending/winewayland-dont-hint-an-unknown-cursor-position-to-a-locked-pointer.patch"
 
     # PROTON_PREFER_SDL / Steam Deck: Sony pads were dropped by both hidraw and SDL
     apply_patch "../patches/wine-hotfixes/pending/winebus-sdl-keep-sony-pads-when-hidraw-is-disabled.patch"
