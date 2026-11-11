@@ -712,6 +712,8 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/win32u-winewayland-add-focus-debug-channel.patch"
     # AION 2 (#877): deactivate when the host focus loss cannot set the desktop foreground
     apply_patch "../patches/wine-hotfixes/pending/win32u-deactivate-window-when-host-focus-loss-fails.patch"
+    # niri/Smithay offer xdg-decoration version 1, which got no server-side decorations (#955)
+    apply_patch "../patches/wine-hotfixes/pending/winewayland-bind-xdg-decoration-manager-version-1.patch"
 
     # PROTON_PREFER_SDL / Steam Deck: Sony pads were dropped by both hidraw and SDL
     apply_patch "../patches/wine-hotfixes/pending/winebus-sdl-keep-sony-pads-when-hidraw-is-disabled.patch"
