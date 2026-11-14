@@ -735,6 +735,9 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/winemidisynth-add-software-synth-for-midi-output.patch"
     # PROTON_NO_XIM=1: games get every key press, dead keys included, and dead keys combine like Windows
     apply_patch "../patches/wine-hotfixes/pending/winex11-no-xim-windows-dead-keys.patch"
+    # Warhammer Survivors: the picture froze after Alt+Tab in exclusive fullscreen, the presentation owner went idle
+    echo "WINE: -WAYLAND- win32u, winewayland: promote a retired presenter once the owner stops presenting (frozen picture after Alt+Tab)"
+    apply_patch "../patches/wine-hotfixes/pending/winewayland-promote-retired-presenter-when-owner-stops-presenting.patch"
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
