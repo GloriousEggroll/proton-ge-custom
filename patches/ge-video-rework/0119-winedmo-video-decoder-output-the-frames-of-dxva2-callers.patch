@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Alexandre Derumier <aderumier@gmail.com>
+Date: Sat, 14 Nov 2026 09:30:00 +0100
+Subject: [PATCH] winedmo: Output the frames of DXVA2 callers in the video
+ decoder.
+
+Two problems kept a Media Foundation caller driving the video decoder
+itself with a Direct3D 9 device manager from getting any frame:
+
+- With a device manager, Windows' DXVA decoders provide their output
+  samples (their Direct3D surfaces), and callers pass no sample to
+  ProcessOutput; the decoder refused a NULL sample (E_INVALIDARG) since
+  a D3D9 manager clears both MFT_OUTPUT_STREAM_PROVIDES_SAMPLES and
+  MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES. A caller passing no sample now
+  gets one from the allocator, as with PROVIDES_SAMPLES.
+
+- On a no-op output format change (the first frame), ProcessOutput
+  returned MF_E_TRANSFORM_NEED_MORE_INPUT while the frame stayed pending
+  in the unix transform: the next ProcessInput then failed with
+  MF_E_NOTACCEPTING. The frame is now output by the same call.
+
+Game impacted: KanColle Arcade (Sega Nu): its VC-1 WMV movies (attract
+opening, in-game) stayed black with their sound playing. Its player
+feeds ProcessInput and asks for output after each accepted sample; it
+dropped every refused sample and never asked for output again.
+---
+--- a/dlls/winedmo/video_decoder.c
++++ b/dlls/winedmo/video_decoder.c
+@@ -133,6 +133,7 @@
+ 
+     IMFVideoSampleAllocatorEx *allocator;
+     BOOL allocator_initialized;
++    BOOL d3d_manager;
+     IMFTransform *copier;
+     IMFMediaBuffer *temp_buffer;
+ 
+@@ -1136,6 +1137,7 @@
+             return hr;
+ 
+         uninit_allocator(decoder);
++        decoder->d3d_manager = !!param;
+         decoder->output_info.dwFlags |= MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES;
+         decoder->output_info.dwFlags &= ~MFT_OUTPUT_STREAM_PROVIDES_SAMPLES;
+         if (param)
+@@ -1493,6 +1495,7 @@
+     INT64 pts, dur;
+     INT64 output_pts, output_dur;
+     DWORD out_flags;
++    BOOL provide;
+     NTSTATUS ntstatus;
+     HRESULT hr;
+ 
+@@ -1505,7 +1508,11 @@
+         return MF_E_TRANSFORM_TYPE_NOT_SET;
+ 
+     *status = samples->dwStatus = 0;
+-    if (!(sample = samples->pSample) && !(decoder->output_info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES))
++    /* With a device manager, a caller passing no sample gets one from the allocator (Windows'
++     * DXVA decoders provide their Direct3D surfaces). */
++    provide = (decoder->output_info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES)
++            || (!samples->pSample && decoder->d3d_manager);
++    if (!(sample = samples->pSample) && !provide)
+         return E_INVALIDARG;
+     provided_sample = sample;
+ 
+@@ -1516,7 +1523,7 @@
+     if (FAILED(hr = MFCalculateImageSize(&subtype, frame_size >> 32, (UINT32)frame_size, &sample_size)))
+         return hr;
+ 
+-    if (decoder->output_info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES)
++    if (provide)
+     {
+         if (FAILED(hr = create_decoder_output_sample(decoder, &subtype, frame_size, sample_size, &sample)))
+             return hr;
+@@ -1557,10 +1564,16 @@
+             goto done;
+         }
+ 
++        /* The decoder still holds the frame: output it now. Returning NEED_MORE_INPUT with
++         * the frame pending makes the next ProcessInput fail with MF_E_NOTACCEPTING, and
++         * callers dropping the refused samples without asking for output again (KanColle
++         * Arcade's movie player) never get a frame. */
+         TRACE("Ignoring no-op decoder output format change.\n");
+-        samples->dwStatus = MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE;
+-        hr = MF_E_TRANSFORM_NEED_MORE_INPUT;
+-        goto done;
++        if (buffer)
++            IMFMediaBuffer_Release(buffer);
++        if (decode_sample)
++            IMFSample_Release(decode_sample);
++        return transform_ProcessOutput(iface, flags, count, samples, status);
+     }
+ 
+     if (!ntstatus)
+@@ -1620,7 +1633,7 @@
+     if (buffer)
+         IMFMediaBuffer_Release(buffer);
+ 
+-    if (decoder->output_info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES)
++    if (provide)
+     {
+         if (hr == S_OK && FAILED(hr = output_sample(decoder, &samples->pSample, sample)))
+             ERR("Failed to output sample, hr %#lx.\n", hr);
