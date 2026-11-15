@@ -735,6 +735,9 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/winemidisynth-add-software-synth-for-midi-output.patch"
     # PROTON_NO_XIM=1: games get every key press, dead keys included, and dead keys combine like Windows
     apply_patch "../patches/wine-hotfixes/pending/winex11-no-xim-windows-dead-keys.patch"
+    # Assetto Corsa + Custom Shaders Patch: CSP checks its signed dwrite.dll with CryptSIPVerifyIndirectData;
+    # the stub made online servers (No Hesi scores, Setup Exchange) reject Linux clients
+    apply_patch "../patches/wine-hotfixes/pending/wintrust-implement-cryptsipverifyindirectdata.patch"
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
