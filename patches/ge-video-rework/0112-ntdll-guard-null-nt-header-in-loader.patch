@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ozark-Proton <ozark-proton@localhost>
+Date: Sat, 14 Nov 2026 10:55:00 -0600
+Subject: [PATCH] ntdll: fail cleanly when a mapped image has no readable NT header.
+
+An image section that NtMapViewOfSection maps successfully can still have
+unreadable NT headers in the fresh view. RtlImageNtHeader returns NULL then,
+and both loader paths below deref it: page fault on read of FFFFFFFFFFFFFFFF
+inside load_native_dll.
+
+Observed with Bodycam (UE5, appid 2406770): its game-folder nvngx.dll is
+mapped, RtlImageNtHeader fails, and find_existing_module crashed instead of
+failing the load.
+
+Two guards, both defensive:
+
+- find_existing_module: keep the get_modref() fast path first, so a module
+  that is already registered is still returned when its header is unreadable
+  in this view, then read the header once and return NULL if absent. Guarding
+  before get_modref would have rejected an already-loaded module.
+- convert_to_pe64: check the header before deriving the section table and the
+  copy sizes from it. The former code initialized those from nt at declaration
+  time, so the 32/64-bit check that follows could never run on a NULL header.
+
+Scope: defensive only. Why this file's headers read as invalid in-game is
+still unknown; that needs a follow-up, not these guards.
+
+diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
+index 52b6e70585c..ca513d2891b 100644
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -2507,12 +2507,16 @@ static BOOL convert_to_pe64( HMODULE module, const SECTION_IMAGE_INFORMATION *in
+     IMAGE_OPTIONAL_HEADER32 hdr32 = { IMAGE_NT_OPTIONAL_HDR32_MAGIC };
+     IMAGE_OPTIONAL_HEADER64 hdr64 = { IMAGE_NT_OPTIONAL_HDR64_MAGIC };
+     IMAGE_NT_HEADERS *nt = RtlImageNtHeader( module );
+-    IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION( nt );
+-    SIZE_T hdr_size = min( sizeof(hdr32), nt->FileHeader.SizeOfOptionalHeader );
+-    SIZE_T size = min( nt->OptionalHeader.SizeOfHeaders, nt->OptionalHeader.SizeOfImage );
++    IMAGE_SECTION_HEADER *sec;
++    SIZE_T hdr_size, size;
+     void *addr = module;
+     ULONG i, old_prot;
+ 
++    if (!nt) return FALSE;  /* unreadable header: cannot convert, fail the load */
++    sec = IMAGE_FIRST_SECTION( nt );
++    hdr_size = min( sizeof(hdr32), nt->FileHeader.SizeOfOptionalHeader );
++    size = min( nt->OptionalHeader.SizeOfHeaders, nt->OptionalHeader.SizeOfImage );
++
+     if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC) return TRUE;  /* already 64-bit */
+     if (NtCurrentTeb()->WowTebOffset) return TRUE;  /* no need to convert */
+     if (!info->ImageContainsCode) return TRUE;  /* no need to convert */
+@@ -2922,9 +2926,10 @@ static WINE_MODREF *find_existing_module( HMODULE module )
+     WINE_MODREF *wm;
+     LIST_ENTRY *mark, *entry;
+     LDR_DATA_TABLE_ENTRY *mod;
+-    IMAGE_NT_HEADERS *nt = RtlImageNtHeader( module );
++    IMAGE_NT_HEADERS *nt;
+ 
+     if ((wm = get_modref( module ))) return wm;
++    if (!(nt = RtlImageNtHeader( module ))) return NULL;
+ 
+     mark = &NtCurrentTeb()->Peb->LdrData->InMemoryOrderModuleList;
+     for (entry = mark->Flink; entry != mark; entry = entry->Flink)
