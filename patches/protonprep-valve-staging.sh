@@ -735,6 +735,8 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/winemidisynth-add-software-synth-for-midi-output.patch"
     # PROTON_NO_XIM=1: games get every key press, dead keys included, and dead keys combine like Windows
     apply_patch "../patches/wine-hotfixes/pending/winex11-no-xim-windows-dead-keys.patch"
+    # WritePrivateProfileStringA: values over 32766 characters failed and freed an uninitialized buffer
+    apply_patch "../patches/wine-hotfixes/pending/kernel32-write-profile-string-a-allow-values-over-32k.patch"
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f

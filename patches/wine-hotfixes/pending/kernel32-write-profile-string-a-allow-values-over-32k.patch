@@ -1,0 +1,85 @@
+From: Tag Howard <tag@jthoward.dev>
+Subject: [PATCH] kernel32: Allow WritePrivateProfileStringA values longer than 32766 characters.
+
+WritePrivateProfileStringA converted the value to a UNICODE_STRING, which
+cannot hold more than 32767 WCHARs. A longer value made the conversion
+fail, and its uninitialized result was passed to WritePrivateProfileStringW
+and freed. Convert the value with MultiByteToWideChar instead.
+---
+diff --git a/dlls/kernel32/profile.c b/dlls/kernel32/profile.c
+index 15663b2c..e25cab96 100644
+--- a/dlls/kernel32/profile.c
++++ b/dlls/kernel32/profile.c
+@@ -1709,23 +1709,29 @@ BOOL WINAPI WritePrivateProfileStringW( LPCWSTR section, LPCWSTR entry,
+ BOOL WINAPI DECLSPEC_HOTPATCH WritePrivateProfileStringA( LPCSTR section, LPCSTR entry,
+                                                           LPCSTR string, LPCSTR filename )
+ {
+-    UNICODE_STRING sectionW, entryW, stringW, filenameW;
+-    BOOL ret;
++    UNICODE_STRING sectionW, entryW, filenameW;
++    WCHAR *stringW = NULL;
++    BOOL ret = FALSE;
+ 
+     if (section) RtlCreateUnicodeStringFromAsciiz(&sectionW, section);
+     else sectionW.Buffer = NULL;
+     if (entry) RtlCreateUnicodeStringFromAsciiz(&entryW, entry);
+     else entryW.Buffer = NULL;
+-    if (string) RtlCreateUnicodeStringFromAsciiz(&stringW, string);
+-    else stringW.Buffer = NULL;
++    if (string)
++    {
++        int len = MultiByteToWideChar( CP_ACP, 0, string, -1, NULL, 0 );
++        if ((stringW = HeapAlloc( GetProcessHeap(), 0, len * sizeof(WCHAR) )))
++            MultiByteToWideChar( CP_ACP, 0, string, -1, stringW, len );
++    }
+     if (filename) RtlCreateUnicodeStringFromAsciiz(&filenameW, filename);
+     else filenameW.Buffer = NULL;
+ 
+-    ret = WritePrivateProfileStringW(sectionW.Buffer, entryW.Buffer,
+-                                     stringW.Buffer, filenameW.Buffer);
++    if (!string || stringW)
++        ret = WritePrivateProfileStringW(sectionW.Buffer, entryW.Buffer,
++                                         stringW, filenameW.Buffer);
+     RtlFreeUnicodeString(&sectionW);
+     RtlFreeUnicodeString(&entryW);
+-    RtlFreeUnicodeString(&stringW);
++    HeapFree( GetProcessHeap(), 0, stringW );
+     RtlFreeUnicodeString(&filenameW);
+     return ret;
+ }
+diff --git a/dlls/kernel32/tests/profile.c b/dlls/kernel32/tests/profile.c
+index b98b6819..32af46c9 100644
+--- a/dlls/kernel32/tests/profile.c
++++ b/dlls/kernel32/tests/profile.c
+@@ -924,7 +924,9 @@ static void test_WritePrivateProfileString(void)
+     LPCSTR data;
+     CHAR path[MAX_PATH];
+     CHAR temp[MAX_PATH];
++    CHAR *long_value, *long_buf;
+     HANDLE file;
++    DWORD len;
+ 
+     GetTempPathA(MAX_PATH, temp);
+     GetTempFileNameA(temp, "wine", 0, path);
+@@ -1112,6 +1114,21 @@ static void test_WritePrivateProfileString(void)
+     todo_wine
+     ok( check_binary_file_data(path, data, 59), "File doesn't match\n");
+     DeleteFileA(path);
++
++    /* value longer than a UNICODE_STRING can hold */
++    long_value = HeapAlloc(GetProcessHeap(), 0, 65001);
++    long_buf = HeapAlloc(GetProcessHeap(), 0, 65002);
++    memset(long_value, 'a', 65000);
++    long_value[65000] = 0;
++    GetTempFileNameA(temp, "wine", 0, path);
++    ret = WritePrivateProfileStringA("App", "key", long_value, path);
++    ok(ret == TRUE, "Expected TRUE, got %d, le=%lu\n", ret, GetLastError());
++    len = GetPrivateProfileStringA("App", "key", "", long_buf, 65002, path);
++    ok(len == 65000, "Expected 65000, got %lu\n", len);
++    ok(!strcmp(long_buf, long_value), "Value doesn't match\n");
++    DeleteFileA(path);
++    HeapFree(GetProcessHeap(), 0, long_buf);
++    HeapFree(GetProcessHeap(), 0, long_value);
+ }
+ 
+ static void test_profile_struct(void)
