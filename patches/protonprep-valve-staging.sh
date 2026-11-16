@@ -754,6 +754,8 @@ apply_all_in_dir() {
     # Assetto Corsa + Custom Shaders Patch: CSP checks its signed dwrite.dll with CryptSIPVerifyIndirectData;
     # the stub made online servers (No Hesi scores, Setup Exchange) reject Linux clients
     apply_patch "../patches/wine-hotfixes/pending/wintrust-implement-cryptsipverifyindirectdata.patch"
+    # WritePrivateProfileStringA: values over 32766 characters failed and freed an uninitialized buffer
+    apply_patch "../patches/wine-hotfixes/pending/kernel32-write-profile-string-a-allow-values-over-32k.patch"
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
