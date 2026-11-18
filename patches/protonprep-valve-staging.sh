@@ -739,6 +739,8 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/win32u-dont-send-wm-inputlangchange-for-an-unchanged-layout.patch"
     # Arc Raiders: no null host swapchain in vkSetLatencySleepModeNV for managed swapchains (#891)
     apply_patch "../patches/wine-hotfixes/pending/win32u-skip-vksetlatencysleepmodenv-for-managed-swapchains.patch"
+    # EarthX 2: show the presenter that keeps presenting when the owner goes idle (#960)
+    apply_patch "../patches/wine-hotfixes/pending/winewayland-hand-presentation-to-a-presenting-background-surface.patch"
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
