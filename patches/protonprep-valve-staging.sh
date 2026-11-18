@@ -735,6 +735,8 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/winemidisynth-add-software-synth-for-midi-output.patch"
     # PROTON_NO_XIM=1: games get every key press, dead keys included, and dead keys combine like Windows
     apply_patch "../patches/wine-hotfixes/pending/winex11-no-xim-windows-dead-keys.patch"
+    # ETQW: no WM_INPUTLANGCHANGE at startup when the layout is unchanged (#629)
+    apply_patch "../patches/wine-hotfixes/pending/win32u-dont-send-wm-inputlangchange-for-an-unchanged-layout.patch"
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
