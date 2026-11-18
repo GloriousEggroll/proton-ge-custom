@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Alexandre Derumier <aderumier@gmail.com>
+Date: Wed, 18 Nov 2026 22:45:00 +0100
+Subject: [PATCH] evr: Notify the presenter's clock state sink when the filter
+ runs and pauses.
+
+The DirectShow EVR never called the presenter's IMFClockStateSink. A
+custom presenter that waits for its clock to start before it presents
+frames, or before it reports its state, never left the stopped state.
+
+Game impacted: Veggie Blast (UNIS, its .NET host) plays its intro movie
+through a WPF MediaElement: WPF's EVR presenter reports the started
+clock to its state engine, which waits for it before it raises
+MediaOpened; the intro window only learnt that the movie was open when
+it ended.
+
+Call OnClockPause when the filter pauses (from stopped or running) and
+OnClockStart when it runs.
+---
+diff --git a/dlls/evr/evr.c b/dlls/evr/evr.c
+index 7fb9fe15..0744dacf 100644
+--- a/dlls/evr/evr.c
++++ b/dlls/evr/evr.c
+@@ -496,6 +496,23 @@ static HRESULT evr_query_accept(struct strmbase_renderer *iface, const AM_MEDIA_
+     return hr;
+ }
+ 
++/* The presenter's clock state follows the filter's (a custom presenter, e.g. WPF's, waits for
++ * its clock to start before it shows frames). */
++static void evr_notify_clock_state(struct evr *filter, BOOL running)
++{
++    IMFClockStateSink *sink;
++
++    if (!filter->presenter || FAILED(IMFVideoPresenter_QueryInterface(filter->presenter,
++            &IID_IMFClockStateSink, (void **)&sink)))
++        return;
++
++    if (running)
++        IMFClockStateSink_OnClockStart(sink, MFGetSystemTime(), PRESENTATION_CURRENT_POSITION);
++    else
++        IMFClockStateSink_OnClockPause(sink, MFGetSystemTime());
++    IMFClockStateSink_Release(sink);
++}
++
+ /* FIXME: errors should be propagated from init/start/stop handlers. */
+ static void evr_init_stream(struct strmbase_renderer *iface)
+ {
+@@ -505,6 +522,7 @@ static void evr_init_stream(struct strmbase_renderer *iface)
+ 
+     if (SUCCEEDED(IMFTransform_ProcessMessage(filter->mixer, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)))
+         IMFVideoPresenter_ProcessMessage(filter->presenter, MFVP_MESSAGE_BEGINSTREAMING, 0);
++    evr_notify_clock_state(filter, FALSE);
+ }
+ 
+ static void evr_start_stream(struct strmbase_renderer *iface)
+@@ -512,7 +530,10 @@ static void evr_start_stream(struct strmbase_renderer *iface)
+     struct evr *filter = impl_from_strmbase_renderer(iface);
+ 
+     if (filter->mixer)
++    {
+         IMFTransform_ProcessMessage(filter->mixer, MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
++        evr_notify_clock_state(filter, TRUE);
++    }
+ }
+ 
+ static void evr_stop_stream(struct strmbase_renderer *iface)
+@@ -521,6 +542,8 @@ static void evr_stop_stream(struct strmbase_renderer *iface)
+ 
+     if (!filter->mixer) return;
+ 
++    evr_notify_clock_state(filter, FALSE);
++
+     if (SUCCEEDED(IMFTransform_ProcessMessage(filter->mixer, MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0)))
+     {
+         if (SUCCEEDED(IMFVideoPresenter_ProcessMessage(filter->presenter, MFVP_MESSAGE_ENDSTREAMING, 0)))
