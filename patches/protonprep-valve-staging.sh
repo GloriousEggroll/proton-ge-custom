@@ -737,6 +737,8 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/winex11-no-xim-windows-dead-keys.patch"
     # ETQW: no WM_INPUTLANGCHANGE at startup when the layout is unchanged (#629)
     apply_patch "../patches/wine-hotfixes/pending/win32u-dont-send-wm-inputlangchange-for-an-unchanged-layout.patch"
+    # Arc Raiders: no null host swapchain in vkSetLatencySleepModeNV for managed swapchains (#891)
+    apply_patch "../patches/wine-hotfixes/pending/win32u-skip-vksetlatencysleepmodenv-for-managed-swapchains.patch"
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
