@@ -743,6 +743,8 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/winewayland-hand-presentation-to-a-presenting-background-surface.patch"
     # HDR: Steam overlay and MangoHud see the real colorspace of pass-through HDR swapchains
     apply_patch "../patches/wine-hotfixes/pending/win32u-let-host-layers-see-the-hdr-colorspace-of-pass-through-swapchains.patch"
+    # PROTON_STREAMLINE_UPGRADE: list newer Streamline plugins the game does not ship (#964)
+    apply_patch "../patches/wine-hotfixes/pending/kernelbase-ntdll-list-upgraded-streamline-plugins-the-game-does-not-ship.patch"
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
