@@ -745,6 +745,11 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/win32u-let-host-layers-see-the-hdr-colorspace-of-pass-through-swapchains.patch"
     # PROTON_STREAMLINE_UPGRADE: list newer Streamline plugins the game does not ship (#964)
     apply_patch "../patches/wine-hotfixes/pending/kernelbase-ntdll-list-upgraded-streamline-plugins-the-game-does-not-ship.patch"
+    # Stronghold Crusader HD: cursor and scrolling too fast on high refresh rate displays (enabled via protonfixes 40970)
+    # Applied after the video playback rework, which changes the same ddraw files.
+    apply_patch "../patches/game-patches/ddraw-max-game-ticks.patch"
+    # Stronghold Crusader HD: tiny cursor on high-resolution displays (enabled via protonfixes 40970)
+    apply_patch "../patches/game-patches/winex11-cursor-scale.patch"
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
