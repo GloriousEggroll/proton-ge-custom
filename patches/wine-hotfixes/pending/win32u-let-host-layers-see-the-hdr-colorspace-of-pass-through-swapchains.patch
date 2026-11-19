@@ -1,0 +1,207 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] win32u: Let host layers see the HDR colorspace of pass-through swapchains.
+
+With the compositor's Windows HDR image descriptions (windows_bt2100,
+windows_scrgb), winewayland creates HDR10 and scRGB swapchains on the host
+as PASS_THROUGH so the driver attaches no image description of its own.
+Host layers such as the Steam overlay and MangoHud then see PASS_THROUGH
+and draw SDR colors into the HDR image, which looks oversaturated.
+
+GE-Proton ships VK_LAYER_GE_hdr_colorspace, and Proton adds it to the
+explicit layer path and sets WINE_HDR_COLORSPACE_LAYER=1. Enable it on
+the host instance when it is available. Layers the application enables
+sit below every implicit layer, closest to the driver, so it is under
+the Steam overlay and MangoHud.
+
+When the driver would get PASS_THROUGH for an HDR10 or scRGB swapchain
+and the host lists that colorspace for the format, create the host
+swapchain with the real colorspace and call the layer's
+vkSetNextSwapchainHostColorSpaceGE() right before, so the layer hands
+the driver PASS_THROUGH. The layers above see the real colorspace and
+convert what they draw. If a layer above does not forward the function,
+nothing changes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/include/wine/vulkan_driver.h b/include/wine/vulkan_driver.h
+--- a/include/wine/vulkan_driver.h
++++ b/include/wine/vulkan_driver.h
+@@ -234,6 +234,8 @@
+     VkQueueFamilyProperties *queue_props;
+     BOOL low_latency_enabled;
+     BOOL release_swapchain_images; /* swapchainMaintenance1 enabled for presents to hidden windows */
++    /* VK_LAYER_GE_hdr_colorspace: colorspace the driver gets for the next swapchain created on this thread */
++    void (VKAPI_PTR *p_vkSetNextSwapchainHostColorSpaceGE)( VkDevice device, VkColorSpaceKHR color_space );
+ 
+     pthread_t signaller_thread;
+     pthread_mutex_t signaller_mutex;
+diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -151,6 +151,7 @@
+ 
+     BOOL nvidia_wayland;            /* host instance uses Wayland WSI with the NVIDIA proprietary driver */
+     BOOL nvidia_wayland_surface;    /* a host Wayland surface was created on this instance */
++    BOOL hdr_colorspace_layer;      /* VK_LAYER_GE_hdr_colorspace is enabled on the host instance */
+ };
+ 
+ static struct instance *instance_from_handle( VkInstance handle )
+@@ -1498,6 +1499,37 @@
+     if (next > str) add_instance_extension( str, next - str, extensions );
+ }
+ 
++static const char hdr_colorspace_layer_name[] = "VK_LAYER_GE_hdr_colorspace";
++
++/* GE-Proton ships VK_LAYER_GE_hdr_colorspace and Proton adds it to the explicit
++ * layer path. Enabling it here puts it below all implicit layers, closest to the
++ * driver, so host layers such as the Steam overlay and MangoHud see the real HDR
++ * colorspace of a swapchain the driver creates as PASS_THROUGH. */
++static BOOL hdr_colorspace_layer_available(void)
++{
++    static int available = -1;
++    PFN_vkEnumerateInstanceLayerProperties p_vkEnumerateInstanceLayerProperties;
++    VkLayerProperties *layers;
++    uint32_t i, count = 0;
++    const char *env;
++    int found = 0;
++
++    if (available != -1) return available;
++
++    if ((env = getenv( "WINE_HDR_COLORSPACE_LAYER" )) && atoi( env ) &&
++        (p_vkEnumerateInstanceLayerProperties = (void *)p_vkGetInstanceProcAddr( NULL, "vkEnumerateInstanceLayerProperties" )) &&
++        !p_vkEnumerateInstanceLayerProperties( &count, NULL ) && count &&
++        (layers = calloc( count, sizeof(*layers) )))
++    {
++        if (!p_vkEnumerateInstanceLayerProperties( &count, layers ))
++            for (i = 0; i < count && !found; i++) found = !strcmp( layers[i].layerName, hdr_colorspace_layer_name );
++        free( layers );
++    }
++
++    TRACE( "%s %s\n", hdr_colorspace_layer_name, found ? "available" : "not available" );
++    return available = found;
++}
++
+ static VkResult win32u_vkCreateInstance( const VkInstanceCreateInfo *client_create_info, const VkAllocationCallbacks *allocator,
+                                          VkInstance *client_instance_ptr )
+ {
+@@ -1529,6 +1561,14 @@
+     pthread_key_create(&instance->obj.transient_object_handle, free);
+ 
+     if ((res = convert_instance_create_info( &pool, create_info, instance ))) goto failed;
++    if (hdr_colorspace_layer_available())
++    {
++        static const char *layer_names[] = {hdr_colorspace_layer_name};
++
++        create_info->enabledLayerCount = 1;
++        create_info->ppEnabledLayerNames = layer_names;
++        instance->hdr_colorspace_layer = TRUE;
++    }
+     if ((callback_info = pop_next_struct( (VkBaseOutStructure **)&create_info->pNext, VK_STRUCTURE_TYPE_CREATE_INFO_WINE_INSTANCE_CALLBACK )))
+     {
+         PFN_vkCreateInstanceCallbackWINE callback = (void *)(UINT_PTR)callback_info->native_create_callback;
+@@ -1898,6 +1938,11 @@
+     ALL_VK_DEVICE_FUNCS
+ #undef USE_VK_FUNC
+ 
++    /* NULL if a layer above doesn't forward unknown names, then HDR keeps the old path. */
++    if (CONTAINING_RECORD( instance, struct instance, obj )->hdr_colorspace_layer)
++        device->p_vkSetNextSwapchainHostColorSpaceGE =
++            (void *)p_vkGetDeviceProcAddr( device->host.device, "vkSetNextSwapchainHostColorSpaceGE" );
++
+     for (i = 0; i < create_info->queueCreateInfoCount; i++) init_device_queues( device, create_info->pQueueCreateInfos + i, client_device );
+     instance->p_vkGetPhysicalDeviceQueueFamilyProperties( physical_device->host.physical_device, &props_count, device->queue_props );
+ 
+@@ -5136,23 +5181,13 @@
+     return !wcsicmp( name, doom_eternalW ) || !wcsicmp( name, doom_dark_agesW );
+ }
+ 
+-/* Host layers such as MangoHud and the Steam overlay only see the host swapchain
+- * colorspace, and draw SDR colors into a pass-through HDR swapchain. Keep a native
+- * HDR10/scRGB colorspace when the host can present it, and only fall back to the
+- * driver's colorspace mapping when it can't. Only with WINE_WAYLAND_HDR_NATIVE=1:
+- * the Windows image descriptions used otherwise match how Windows shows HDR. */
+-static BOOL prefer_native_hdr_colorspace( struct vulkan_physical_device *physical_device, struct surface *surface,
++static BOOL host_surface_supports_format( struct vulkan_physical_device *physical_device, struct surface *surface,
+                                           VkFormat format, VkColorSpaceKHR color_space )
+ {
+     struct vulkan_instance *instance = physical_device->instance;
+     VkSurfaceFormatKHR *formats;
+     uint32_t i, count = 0;
+     BOOL found = FALSE;
+-    const char *env;
+-
+-    if (color_space != VK_COLOR_SPACE_HDR10_ST2084_EXT && color_space != VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT)
+-        return FALSE;
+-    if (!(env = getenv( "WINE_WAYLAND_HDR_NATIVE" )) || !atoi( env )) return FALSE;
+ 
+     if (instance->p_vkGetPhysicalDeviceSurfaceFormatsKHR( physical_device->host.physical_device,
+                                                           surface->obj.host.surface, &count, NULL ) || !count)
+@@ -5167,10 +5202,27 @@
+     }
+     free( formats );
+ 
+-    TRACE( "format %u colorspace %u native %u\n", format, color_space, found );
++    TRACE( "format %u colorspace %u supported %u\n", format, color_space, found );
+     return found;
+ }
+ 
++/* Host layers such as MangoHud and the Steam overlay only see the host swapchain
++ * colorspace, and draw SDR colors into a pass-through HDR swapchain. Keep a native
++ * HDR10/scRGB colorspace when the host can present it, and only fall back to the
++ * driver's colorspace mapping when it can't. Only with WINE_WAYLAND_HDR_NATIVE=1:
++ * the Windows image descriptions used otherwise match how Windows shows HDR, and
++ * VK_LAYER_GE_hdr_colorspace lets host layers see the real colorspace with them. */
++static BOOL prefer_native_hdr_colorspace( struct vulkan_physical_device *physical_device, struct surface *surface,
++                                          VkFormat format, VkColorSpaceKHR color_space )
++{
++    const char *env;
++
++    if (color_space != VK_COLOR_SPACE_HDR10_ST2084_EXT && color_space != VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT)
++        return FALSE;
++    if (!(env = getenv( "WINE_WAYLAND_HDR_NATIVE" )) || !atoi( env )) return FALSE;
++    return host_surface_supports_format( physical_device, surface, format, color_space );
++}
++
+ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwapchainCreateInfoKHR *create_info,
+                                              const VkAllocationCallbacks *allocator, VkSwapchainKHR *ret )
+ {
+@@ -5186,7 +5238,7 @@
+     VkSwapchainKHR host_swapchain;
+     uint32_t format_count = 0;
+     VkSurfaceFormatKHR *formats;
+-    BOOL presentation_owner, native_hdr;
++    BOOL presentation_owner, native_hdr, hdr_layer_override;
+     RECT client_rect;
+     VkResult res;
+     BOOL lite;
+@@ -5315,6 +5367,21 @@
+     }
+     else if (!native_hdr) driver_funcs->p_vulkan_map_colorspace( create_info->imageColorSpace, surface->client );
+ 
++    /* The driver gets PASS_THROUGH and the surface a Windows HDR description. Let
++     * host layers above the driver see the real colorspace, if the host can
++     * present it, so they convert what they draw into the HDR image. */
++    hdr_layer_override = device->p_vkSetNextSwapchainHostColorSpaceGE &&
++                         (create_info->imageColorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT ||
++                          create_info->imageColorSpace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT) &&
++                         create_info_host.imageColorSpace == VK_COLOR_SPACE_PASS_THROUGH_EXT &&
++                         host_surface_supports_format( physical_device, surface, create_info_host.imageFormat,
++                                                       create_info->imageColorSpace );
++    if (hdr_layer_override)
++    {
++        TRACE( "host layers see colorspace %u, driver gets PASS_THROUGH\n", create_info->imageColorSpace );
++        create_info_host.imageColorSpace = create_info->imageColorSpace;
++    }
++
+     InterlockedIncrement( &surface->client->busy_ref );
+     client_surface_update( surface->client );
+ 
+@@ -5411,6 +5478,8 @@
+      * succeeded, so keep this narrow bootstrap state separate from busy_ref;
+      * locally retired background swapchains must remain detached. */
+     begin_native_client_swapchain_create( surface->client );
++    if (hdr_layer_override)
++        device->p_vkSetNextSwapchainHostColorSpaceGE( device->host.device, VK_COLOR_SPACE_PASS_THROUGH_EXT );
+     if ((res = device->p_vkCreateSwapchainKHR( device->host.device, &create_info_host, NULL, &host_swapchain )))
+     {
+         InterlockedDecrement( &surface->client->busy_ref );
