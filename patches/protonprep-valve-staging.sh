@@ -748,6 +748,9 @@ apply_all_in_dir() {
     apply_patch "../patches/game-patches/ddraw-max-game-ticks.patch"
     # Stronghold Crusader HD: tiny cursor on high-resolution displays (enabled via protonfixes 40970)
     apply_patch "../patches/game-patches/winex11-cursor-scale.patch"
+    # Warhammer Survivors: the picture froze after Alt+Tab in exclusive fullscreen, the presentation owner went idle
+    echo "WINE: -WAYLAND- win32u, winewayland: promote a retired presenter once the owner stops presenting (frozen picture after Alt+Tab)"
+    apply_patch "../patches/wine-hotfixes/pending/winewayland-promote-retired-presenter-when-owner-stops-presenting.patch"
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f

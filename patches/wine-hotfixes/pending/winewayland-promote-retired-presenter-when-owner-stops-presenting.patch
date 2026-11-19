@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jason Eggleston <eggnet@gmail.com>
+Date: Sat, 14 Nov 2026 11:02:53 -0800
+Subject: [PATCH] win32u, winewayland: Promote a retired presenter once the
+ owner stops presenting.
+
+Windows shows whatever was presented last to a window. The presenter
+coordination of em-fixups 0026/0027 makes the newest active client surface
+the presentation owner and backs older Vulkan presenters with local images
+whose frames are discarded. That keeps two live presenters from taking the
+window from each other, but when the owner stops presenting while a retired
+presenter keeps presenting, the window shows the owner's last frame forever
+and the application seems to ignore all input.
+
+Warhammer Survivors (Unity 6, D3D11 through DXVK) does this in exclusive
+fullscreen on Alt+Tab: a second presenter appears, presents one frame when the
+window comes back and then stays idle, while the game keeps rendering to a
+swapchain it recreated on its original surface, which gets retired. Wine's
+X11 driver has no presentation owner and shows the live frames.
+
+Let win32u report the presents of locally retired swapchains to the driver
+too. When a retired presenter presents and the owner has not presented for
+500 ms, move the retired presenter to the newest position and recompute the
+owner: the ownership change invalidates its swapchain, which the application
+then recreates on host WSI. Presenters that all keep presenting keep the
+existing creation-order behavior.
+
+Making ownership follow activation order instead would also fix this case, but
+each recreation of an older presenter's swapchain would then take the window
+back, and two live presenters would invalidate each other in turn.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/win32u/vulkan.c                   |  5 ++-
+ dlls/winewayland.drv/wayland_surface.c | 51 +++++++++++++++++++++++++-
+ dlls/winewayland.drv/waylanddrv.h      |  3 ++
+ 3 files changed, 57 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+index c50a6b371ac..d14443a91dc 100644
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -6720,7 +6720,10 @@ host_present_done:
+         struct surface *surface = swapchain->surface;
+         RECT client_rect;
+ 
+-        if (!swapchain->managed || !swapchain->managed->discard)
++        /* A locally retired presenter discards its frames, but the driver still
++         * needs to know that it presents: it may be the presenter the application
++         * uses now, after the presentation owner went quiet. */
++        if (!swapchain->managed || !swapchain->managed->discard || swapchain_res >= VK_SUCCESS)
+             client_surface_present( surface->client );
+ 
+         if (swapchain->managed) continue; /* managed already set its own result */
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index f2073c32404..3814987f5ee 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -4739,7 +4739,9 @@ static BOOL wayland_client_surface_is_presentation_candidate(
+ }
+ 
+ /* Presentation ownership follows graphics-surface creation order. Replacement
+- * flip-model presenters are newer than the legacy presenter they supersede. */
++ * flip-model presenters are newer than the legacy presenter they supersede.
++ * A locally retired presenter that keeps presenting after the owner stopped
++ * is moved to the newest position, see wayland_client_surface_present_retired(). */
+ static BOOL wayland_client_surface_set_owner(struct wayland_win_data *data,
+                                              struct wayland_client_surface *surface)
+ {
+@@ -4758,6 +4760,7 @@ static BOOL wayland_client_surface_set_owner(struct wayland_win_data *data,
+     if (surface)
+     {
+         InterlockedExchange(&surface->client.presentation_owner, TRUE);
++        WriteRelease(&surface->last_present_time, NtGetTickCount());
+         if (ReadAcquire(&surface->client.active_ref))
+             client_surface_invalidate_presentation(&surface->client);
+     }
+@@ -4998,6 +5001,42 @@ static BOOL wayland_client_surface_is_hwnd_dmabuf_producer(struct wayland_client
+     return TRUE;
+ }
+ 
++/* How long the presentation owner must have stopped presenting before a
++ * locally retired presenter that still presents takes the window over. */
++#define RETIRED_PRESENTER_PROMOTE_MS 500
++
++/* Windows shows whatever was presented last to a window. Creation order keeps
++ * two presenters that both present from taking the window from each other, but
++ * once the owner stops presenting, a retired presenter that still presents is
++ * the one the application uses now. Unity games coming back to exclusive
++ * fullscreen, for example, leave behind a newer swapchain that presented a
++ * single frame and keep rendering to a swapchain they recreated on the older
++ * surface, which was retired: the window would show that single frame forever.
++ * Moving the retired presenter to the newest position makes it the owner; the
++ * ownership change invalidates its swapchain, which the application then
++ * recreates on host WSI. */
++static void wayland_client_surface_present_retired(struct wayland_client_surface *surface)
++{
++    struct wayland_client_surface *owner;
++    struct client_attach_info info;
++    struct wayland_win_data *data;
++    DWORD idle;
++
++    get_client_attach_info(surface->client.hwnd, &info);
++    if (!info.visible) return;
++    if (!(data = wayland_win_data_get(surface->client.hwnd))) return;
++
++    if ((owner = data->client_surface) && owner != surface && !list_empty(&surface->hwnd_entry) &&
++        (idle = NtGetTickCount() - (DWORD)ReadAcquire(&owner->last_present_time)) >= RETIRED_PRESENTER_PROMOTE_MS)
++    {
++        TRACE("hwnd=%p promoting retired presenter %s, owner %s idle for %u ms\n", data->hwnd,
++              debugstr_client_surface(&surface->client), debugstr_client_surface(&owner->client), (UINT)idle);
++        wayland_client_surface_register_latest(data, surface);
++        wayland_client_surface_update_owner(data, &info);
++    }
++    wayland_win_data_release(data);
++}
++
+ static void wayland_client_surface_present(struct client_surface *client, HDC hdc)
+ {
+     struct wayland_client_surface *surface = impl_from_client_surface(client);
+@@ -5014,6 +5053,16 @@ static void wayland_client_surface_present(struct client_surface *client, HDC hd
+         return;
+     }
+ 
++    if (ReadAcquire(&client->presentation_owner))
++        WriteRelease(&surface->last_present_time, NtGetTickCount());
++    else if (!ReadAcquire(&client->native_ref))
++    {
++        /* win32u also reports the frames that a locally retired presenter
++         * discarded: nothing to show for them. */
++        wayland_client_surface_present_retired(surface);
++        return;
++    }
++
+     surface->has_presented = TRUE;
+     wayland_client_surface_update(client);
+     ensure_window_surface_contents(toplevel);
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index f3af6772977..3acd0edf406 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -467,6 +467,9 @@ struct wayland_client_surface
+     /* if true then the client surface has an alpha channel controlling transparency */
+     BOOL has_alpha;
+     BOOL has_presented;
++    /* tick count of the last frame presented as presentation owner, or of
++     * when the surface became the owner */
++    LONG last_present_time;
+     struct wayland_visual_constraint visual_constraint;
+ };
+ 
