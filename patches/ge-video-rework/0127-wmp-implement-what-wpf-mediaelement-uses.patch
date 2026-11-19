@@ -1,0 +1,491 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Alexandre Derumier <aderumier@gmail.com>
+Date: Wed, 18 Nov 2026 22:45:00 +0100
+Subject: [PATCH] wmp: Implement what WPF's MediaElement uses.
+
+WPF's MediaPlayer / MediaElement drive the Windows Media Player control
+from their own state engine (WpfGfx core/av): every call that fails
+ends its state arc and raises MediaFailed, and it waits for player
+events before it raises MediaOpened.
+
+Game impacted: Veggie Blast (UNIS, its .NET host) plays its intro movie
+(a MediaElement) and its music (a MediaPlayer): the movie failed with
+"The method or operation is not implemented" and the music never
+started.
+
+- IWMPSettings::put_volume / put_balance: a graph without an audio
+  stream (the intro movie) answers E_NOTIMPL from IBasicAudio; that is
+  not an error (play() returned E_NOTIMPL).
+- IWMPControls::get_isAvailable: answer "play", "pause" and "stop" (any
+  media), other items not available instead of E_NOTIMPL.
+- IWMPControls::pause: open the graph if needed and pause it,
+  wmppsPaused.
+- IWMPPlayer4::get_openState / get_playState: the last states sent.
+- IWMPSettings rate (IMediaSeeking::SetRate) and balance (IBasicAudio),
+  applied when the graph is opened too.
+- IWMPControls::put_currentPosition: send PositionChange once the
+  position is set. WPF opens media by playing, pausing and seeking to
+  0, and waits for this event to finish opening.
+- Before rendering the file, ask the client site (IServiceProvider) for
+  IWMPGraphCreation and call GraphCreationPreRender / PostRender: WPF
+  adds its own EVR, with its presenter, to the graph there.
+
+The graph is now opened by open_graph(), shared by play() and pause();
+the duration is read once the graph is opened.
+---
+diff --git a/dlls/wmp/player.c b/dlls/wmp/player.c
+index 583f5847..ccc7ec8c 100644
+--- a/dlls/wmp/player.c
++++ b/dlls/wmp/player.c
+@@ -42,9 +42,33 @@ static void update_state(WindowsMediaPlayer *wmp, LONG type, LONG state)
+     V_VT(params) = VT_UI4;
+     V_UI4(params) = state;
+ 
++    if (type == DISPID_WMPCOREEVENT_OPENSTATECHANGE)
++        wmp->open_state = state;
++    else if (type == DISPID_WMPCOREEVENT_PLAYSTATECHANGE)
++        wmp->play_state = state;
++
+     call_sink(wmp->wmpocx, type, &dispparams);
+ }
+ 
++static void position_changed(WindowsMediaPlayer *wmp, double old_position, double new_position)
++{
++    DISPPARAMS dispparams;
++    VARIANTARG params[2];
++
++    dispparams.cArgs = 2;
++    dispparams.cNamedArgs = 0;
++    dispparams.rgdispidNamedArgs = NULL;
++    dispparams.rgvarg = params;
++
++    /* arguments in reverse order: oldPosition, newPosition */
++    V_VT(&params[1]) = VT_R8;
++    V_R8(&params[1]) = old_position;
++    V_VT(&params[0]) = VT_R8;
++    V_R8(&params[0]) = new_position;
++
++    call_sink(wmp->wmpocx, DISPID_WMPCOREEVENT_POSITIONCHANGE, &dispparams);
++}
++
+ static inline WMPPlaylist *impl_from_IWMPPlaylist(IWMPPlaylist *iface)
+ {
+     return CONTAINING_RECORD(iface, WMPPlaylist, IWMPPlaylist_iface);
+@@ -172,15 +196,21 @@ static HRESULT WINAPI WMPPlayer4_put_URL(IWMPPlayer4 *iface, BSTR url)
+ static HRESULT WINAPI WMPPlayer4_get_openState(IWMPPlayer4 *iface, WMPOpenState *pwmpos)
+ {
+     WindowsMediaPlayer *This = impl_from_IWMPPlayer4(iface);
+-    FIXME("(%p)->(%p)\n", This, pwmpos);
+-    return E_NOTIMPL;
++    TRACE("(%p)->(%p)\n", This, pwmpos);
++    if (!pwmpos)
++        return E_POINTER;
++    *pwmpos = This->open_state;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI WMPPlayer4_get_playState(IWMPPlayer4 *iface, WMPPlayState *pwmpps)
+ {
+     WindowsMediaPlayer *This = impl_from_IWMPPlayer4(iface);
+-    FIXME("(%p)->(%p)\n", This, pwmpps);
+-    return E_NOTIMPL;
++    TRACE("(%p)->(%p)\n", This, pwmpps);
++    if (!pwmpps)
++        return E_POINTER;
++    *pwmpps = This->play_state;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI WMPPlayer4_get_controls(IWMPPlayer4 *iface, IWMPControls **ppControl)
+@@ -945,29 +975,50 @@ static HRESULT WINAPI WMPSettings_put_playCount(IWMPSettings *iface, LONG v)
+ static HRESULT WINAPI WMPSettings_get_rate(IWMPSettings *iface, double *p)
+ {
+     WindowsMediaPlayer *This = impl_from_IWMPSettings(iface);
+-    FIXME("(%p)->(%p)\n", This, p);
+-    return E_NOTIMPL;
++    TRACE("(%p)->(%p)\n", This, p);
++    if (!p)
++        return E_POINTER;
++    *p = This->rate;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI WMPSettings_put_rate(IWMPSettings *iface, double v)
+ {
+     WindowsMediaPlayer *This = impl_from_IWMPSettings(iface);
+-    FIXME("(%p)->(%lf)\n", This, v);
+-    return E_NOTIMPL;
++    TRACE("(%p)->(%lf)\n", This, v);
++    if (v <= 0.0)
++        return E_INVALIDARG;
++    This->rate = v;
++    if (!This->media_seeking)
++        return S_OK;
++    return IMediaSeeking_SetRate(This->media_seeking, v);
+ }
+ 
+ static HRESULT WINAPI WMPSettings_get_balance(IWMPSettings *iface, LONG *p)
+ {
+     WindowsMediaPlayer *This = impl_from_IWMPSettings(iface);
+-    FIXME("(%p)->(%p)\n", This, p);
+-    return E_NOTIMPL;
++    TRACE("(%p)->(%p)\n", This, p);
++    if (!p)
++        return E_POINTER;
++    *p = This->balance;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI WMPSettings_put_balance(IWMPSettings *iface, LONG v)
+ {
+     WindowsMediaPlayer *This = impl_from_IWMPSettings(iface);
+-    FIXME("(%p)->(%ld)\n", This, v);
+-    return E_NOTIMPL;
++    HRESULT hres;
++    TRACE("(%p)->(%ld)\n", This, v);
++    if (v < -100 || v > 100)
++        return E_INVALIDARG;
++    This->balance = v;
++    if (!This->basic_audio)
++        return S_OK;
++    /* IBasicAudio - [-10000, 10000], wmp - [-100, 100] */
++    hres = IBasicAudio_put_Balance(This->basic_audio, v * 100);
++    if (hres == E_NOTIMPL) /* no audio stream */
++        hres = S_OK;
++    return hres;
+ }
+ 
+ static HRESULT WINAPI WMPSettings_get_volume(IWMPSettings *iface, LONG *p)
+@@ -983,6 +1034,7 @@ static HRESULT WINAPI WMPSettings_get_volume(IWMPSettings *iface, LONG *p)
+ static HRESULT WINAPI WMPSettings_put_volume(IWMPSettings *iface, LONG v)
+ {
+     WindowsMediaPlayer *This = impl_from_IWMPSettings(iface);
++    HRESULT hres;
+     TRACE("(%p)->(%ld)\n", This, v);
+     This->volume = v;
+     if (!This->filter_graph)
+@@ -993,7 +1045,10 @@ static HRESULT WINAPI WMPSettings_put_volume(IWMPSettings *iface, LONG v)
+     if (!This->basic_audio)
+         return S_FALSE;
+ 
+-    return IBasicAudio_put_Volume(This->basic_audio, v);
++    hres = IBasicAudio_put_Volume(This->basic_audio, v);
++    if (hres == E_NOTIMPL) /* no audio stream */
++        hres = S_OK;
++    return hres;
+ }
+ 
+ static HRESULT WINAPI WMPSettings_getMode(IWMPSettings *iface, BSTR mode, VARIANT_BOOL *p)
+@@ -1445,21 +1500,138 @@ static HRESULT WINAPI WMPControls_get_isAvailable(IWMPControls *iface, BSTR bstr
+ {
+     WindowsMediaPlayer *This = impl_from_IWMPControls(iface);
+     TRACE("(%p)->(%s %p)\n", This, debugstr_w(bstrItem), pIsAvailable);
+-    if (!This->filter_graph) {
++    if (!pIsAvailable)
++        return E_POINTER;
++    if (!bstrItem)
++        return E_INVALIDARG;
++    if (!wcsicmp(L"play", bstrItem) || !wcsicmp(L"pause", bstrItem) || !wcsicmp(L"stop", bstrItem)) {
++        *pIsAvailable = This->media ? VARIANT_TRUE : VARIANT_FALSE;
++    } else if (!This->filter_graph) {
+         *pIsAvailable = VARIANT_FALSE;
+-    } else if (wcscmp(L"currentPosition", bstrItem) == 0) {
++    } else if (!wcsicmp(L"currentPosition", bstrItem)) {
+         DWORD capabilities;
+         IMediaSeeking_GetCapabilities(This->media_seeking, &capabilities);
+         *pIsAvailable = (capabilities & AM_SEEKING_CanSeekAbsolute) ?
+             VARIANT_TRUE : VARIANT_FALSE;
+     } else {
+         FIXME("%s not implemented\n", debugstr_w(bstrItem));
+-        return E_NOTIMPL;
++        *pIsAvailable = VARIANT_FALSE;
+     }
+ 
+     return S_OK;
+ }
+ 
++/* The host's IWMPGraphCreation, from its client site: it adds its own filters (e.g. its video
++ * renderer) to the graph before it is rendered. */
++static IWMPGraphCreation *get_graph_creation(WindowsMediaPlayer *This)
++{
++    IWMPGraphCreation *graph_creation = NULL;
++    IServiceProvider *provider;
++
++    if (!This->client_site)
++        return NULL;
++    if (SUCCEEDED(IOleClientSite_QueryInterface(This->client_site, &IID_IServiceProvider, (void **)&provider))) {
++        if (FAILED(IServiceProvider_QueryService(provider, &IID_IWMPGraphCreation, &IID_IWMPGraphCreation,
++                (void **)&graph_creation)))
++            graph_creation = NULL;
++        IServiceProvider_Release(provider);
++    }
++    return graph_creation;
++}
++
++static HRESULT open_graph(WindowsMediaPlayer *This)
++{
++    IWMPGraphCreation *graph_creation;
++    HRESULT hres;
++
++    hres = CoCreateInstance(&CLSID_FilterGraph,
++            NULL,
++            CLSCTX_INPROC_SERVER,
++            &IID_IGraphBuilder,
++            (void **)&This->filter_graph);
++    update_state(This, DISPID_WMPCOREEVENT_OPENSTATECHANGE, wmposOpeningUnknownURL);
++
++    graph_creation = SUCCEEDED(hres) ? get_graph_creation(This) : NULL;
++    if (graph_creation) {
++        hres = IWMPGraphCreation_GraphCreationPreRender(graph_creation, (IUnknown *)This->filter_graph, NULL);
++        TRACE("GraphCreationPreRender returned %#lx\n", hres);
++    }
++    if (SUCCEEDED(hres))
++        hres = IGraphBuilder_RenderFile(This->filter_graph, This->media->url, NULL);
++    if (SUCCEEDED(hres) && graph_creation)
++        IWMPGraphCreation_GraphCreationPostRender(graph_creation, (IUnknown *)This->filter_graph);
++    if (graph_creation)
++        IWMPGraphCreation_Release(graph_creation);
++    if (SUCCEEDED(hres))
++        update_state(This, DISPID_WMPCOREEVENT_OPENSTATECHANGE, wmposMediaOpen);
++    if (SUCCEEDED(hres))
++        hres = IGraphBuilder_QueryInterface(This->filter_graph, &IID_IMediaControl,
++                (void**)&This->media_control);
++    if (SUCCEEDED(hres))
++        hres = IGraphBuilder_QueryInterface(This->filter_graph, &IID_IMediaSeeking,
++                (void**)&This->media_seeking);
++    if (SUCCEEDED(hres))
++        hres = IMediaSeeking_SetTimeFormat(This->media_seeking, &TIME_FORMAT_MEDIA_TIME);
++    if (SUCCEEDED(hres))
++        hres = IGraphBuilder_QueryInterface(This->filter_graph, &IID_IMediaEvent,
++                (void**)&This->media_event);
++    if (SUCCEEDED(hres))
++    {
++        IMediaEventEx *media_event_ex = NULL;
++        hres = IGraphBuilder_QueryInterface(This->filter_graph, &IID_IMediaEventEx,
++                (void**)&media_event_ex);
++        if (SUCCEEDED(hres)) {
++            hres = IMediaEventEx_SetNotifyWindow(media_event_ex, (OAHWND)This->msg_window,
++                    WM_WMPEVENT, (LONG_PTR)This);
++            IMediaEventEx_Release(media_event_ex);
++        }
++    }
++    if (SUCCEEDED(hres))
++        hres = IGraphBuilder_QueryInterface(This->filter_graph, &IID_IBasicAudio, (void**)&This->basic_audio);
++    if (SUCCEEDED(hres))
++        hres = IWMPSettings_put_volume(&This->IWMPSettings_iface, This->volume);
++    if (SUCCEEDED(hres) && This->balance)
++        IBasicAudio_put_Balance(This->basic_audio, This->balance * 100);
++    if (SUCCEEDED(hres) && This->rate != 1.0)
++        IMediaSeeking_SetRate(This->media_seeking, This->rate);
++    if (SUCCEEDED(hres)) {
++        LONGLONG duration;
++        if (SUCCEEDED(IMediaSeeking_GetDuration(This->media_seeking, &duration)))
++            This->media->duration = (DOUBLE)duration / 10000000.0f;
++    }
++
++    if (FAILED(hres))
++    {
++        if (This->filter_graph)
++        {
++            IGraphBuilder_Release(This->filter_graph);
++            This->filter_graph = NULL;
++        }
++        if (This->media_control)
++        {
++            IMediaControl_Release(This->media_control);
++            This->media_control = NULL;
++        }
++        if (This->media_seeking)
++        {
++            IMediaSeeking_Release(This->media_seeking);
++            This->media_seeking = NULL;
++        }
++        if (This->media_event)
++        {
++            IMediaEvent_Release(This->media_event);
++            This->media_event = NULL;
++        }
++        if (This->basic_audio)
++        {
++            IBasicAudio_Release(This->basic_audio);
++            This->basic_audio = NULL;
++        }
++    }
++
++    return hres;
++}
++
+ static HRESULT WINAPI WMPControls_play(IWMPControls *iface)
+ {
+     HRESULT hres = S_OK;
+@@ -1471,74 +1643,8 @@ static HRESULT WINAPI WMPControls_play(IWMPControls *iface)
+         return NS_S_WMPCORE_COMMAND_NOT_AVAILABLE;
+     }
+ 
+-    if (!This->filter_graph) {
+-        hres = CoCreateInstance(&CLSID_FilterGraph,
+-                NULL,
+-                CLSCTX_INPROC_SERVER,
+-                &IID_IGraphBuilder,
+-                (void **)&This->filter_graph);
+-        update_state(This, DISPID_WMPCOREEVENT_OPENSTATECHANGE, wmposOpeningUnknownURL);
+-
+-        if (SUCCEEDED(hres))
+-            hres = IGraphBuilder_RenderFile(This->filter_graph, This->media->url, NULL);
+-        if (SUCCEEDED(hres))
+-            update_state(This, DISPID_WMPCOREEVENT_OPENSTATECHANGE, wmposMediaOpen);
+-        if (SUCCEEDED(hres))
+-            hres = IGraphBuilder_QueryInterface(This->filter_graph, &IID_IMediaControl,
+-                    (void**)&This->media_control);
+-        if (SUCCEEDED(hres))
+-            hres = IGraphBuilder_QueryInterface(This->filter_graph, &IID_IMediaSeeking,
+-                    (void**)&This->media_seeking);
+-        if (SUCCEEDED(hres))
+-            hres = IMediaSeeking_SetTimeFormat(This->media_seeking, &TIME_FORMAT_MEDIA_TIME);
+-        if (SUCCEEDED(hres))
+-            hres = IGraphBuilder_QueryInterface(This->filter_graph, &IID_IMediaEvent,
+-                    (void**)&This->media_event);
+-        if (SUCCEEDED(hres))
+-        {
+-            IMediaEventEx *media_event_ex = NULL;
+-            hres = IGraphBuilder_QueryInterface(This->filter_graph, &IID_IMediaEventEx,
+-                    (void**)&media_event_ex);
+-            if (SUCCEEDED(hres)) {
+-                hres = IMediaEventEx_SetNotifyWindow(media_event_ex, (OAHWND)This->msg_window,
+-                        WM_WMPEVENT, (LONG_PTR)This);
+-                IMediaEventEx_Release(media_event_ex);
+-            }
+-        }
+-        if (SUCCEEDED(hres))
+-            hres = IGraphBuilder_QueryInterface(This->filter_graph, &IID_IBasicAudio, (void**)&This->basic_audio);
+-        if (SUCCEEDED(hres))
+-            hres = IWMPSettings_put_volume(&This->IWMPSettings_iface, This->volume);
+-
+-        if (FAILED(hres))
+-        {
+-            if (This->filter_graph)
+-            {
+-                IGraphBuilder_Release(This->filter_graph);
+-                This->filter_graph = NULL;
+-            }
+-            if (This->media_control)
+-            {
+-                IMediaControl_Release(This->media_control);
+-                This->media_control = NULL;
+-            }
+-            if (This->media_seeking)
+-            {
+-                IMediaSeeking_Release(This->media_seeking);
+-                This->media_seeking = NULL;
+-            }
+-            if (This->media_event)
+-            {
+-                IMediaEvent_Release(This->media_event);
+-                This->media_event = NULL;
+-            }
+-            if (This->basic_audio)
+-            {
+-                IBasicAudio_Release(This->basic_audio);
+-                This->basic_audio = NULL;
+-            }
+-        }
+-    }
++    if (!This->filter_graph)
++        hres = open_graph(This);
+ 
+     update_state(This, DISPID_WMPCOREEVENT_PLAYSTATECHANGE, wmppsTransitioning);
+ 
+@@ -1550,10 +1656,7 @@ static HRESULT WINAPI WMPControls_play(IWMPControls *iface)
+     }
+ 
+     if (SUCCEEDED(hres)) {
+-        LONGLONG duration;
+         update_state(This, DISPID_WMPCOREEVENT_PLAYSTATECHANGE, wmppsPlaying);
+-        if (SUCCEEDED(IMediaSeeking_GetDuration(This->media_seeking, &duration)))
+-            This->media->duration = (DOUBLE)duration / 10000000.0f;
+     } else {
+         update_state(This, DISPID_WMPCOREEVENT_PLAYSTATECHANGE, wmppsUndefined);
+     }
+@@ -1596,9 +1699,27 @@ static HRESULT WINAPI WMPControls_stop(IWMPControls *iface)
+ 
+ static HRESULT WINAPI WMPControls_pause(IWMPControls *iface)
+ {
++    HRESULT hres = S_OK;
+     WindowsMediaPlayer *This = impl_from_IWMPControls(iface);
+-    FIXME("(%p)\n", This);
+-    return E_NOTIMPL;
++
++    TRACE("(%p)\n", This);
++
++    if (!This->media)
++        return NS_S_WMPCORE_COMMAND_NOT_AVAILABLE;
++
++    if (!This->filter_graph)
++        hres = open_graph(This);
++
++    if (SUCCEEDED(hres))
++        hres = IMediaControl_Pause(This->media_control);
++
++    if (hres == S_FALSE)
++        hres = S_OK; /* the graph is transitioning */
++
++    if (SUCCEEDED(hres))
++        update_state(This, DISPID_WMPCOREEVENT_PLAYSTATECHANGE, wmppsPaused);
++
++    return hres;
+ }
+ 
+ static HRESULT WINAPI WMPControls_fastForward(IWMPControls *iface)
+@@ -1633,16 +1754,19 @@ static HRESULT WINAPI WMPControls_get_currentPosition(IWMPControls *iface, DOUBL
+ 
+ static HRESULT WINAPI WMPControls_put_currentPosition(IWMPControls *iface, DOUBLE dCurrentPosition)
+ {
+-    LONGLONG Current;
++    LONGLONG Current, old = 0;
+     HRESULT hres;
+     WindowsMediaPlayer *This = impl_from_IWMPControls(iface);
+     TRACE("(%p)->(%f)\n", This, dCurrentPosition);
+     if (!This->media_seeking)
+         return S_FALSE;
+ 
++    IMediaSeeking_GetCurrentPosition(This->media_seeking, &old);
+     Current = 10000000 * dCurrentPosition;
+     hres = IMediaSeeking_SetPositions(This->media_seeking, &Current,
+             AM_SEEKING_AbsolutePositioning, NULL, AM_SEEKING_NoPositioning);
++    if (SUCCEEDED(hres))
++        position_changed(This, (DOUBLE)old / 10000000.0, dCurrentPosition);
+ 
+     return hres;
+ }
+@@ -2274,6 +2398,7 @@ BOOL init_player(WindowsMediaPlayer *wmp)
+     wmp->invoke_urls = VARIANT_TRUE;
+     wmp->auto_start = VARIANT_TRUE;
+     wmp->volume = 100;
++    wmp->rate = 1.0;
+     return TRUE;
+ }
+ 
+diff --git a/dlls/wmp/wmp_private.h b/dlls/wmp/wmp_private.h
+index b5e580d9..37ecdbc5 100644
+--- a/dlls/wmp/wmp_private.h
++++ b/dlls/wmp/wmp_private.h
+@@ -22,6 +22,7 @@
+ #include "ole2.h"
+ #include "dshow.h"
+ #include "wmp.h"
++#include "wmpservices.h"
+ 
+ #define TID_LIST \
+     XIID(NULL) \
+@@ -94,6 +95,11 @@ struct WindowsMediaPlayer {
+     VARIANT_BOOL invoke_urls;
+     VARIANT_BOOL enable_error_dialogs;
+     LONG volume;
++    LONG balance;
++    double rate;
++
++    WMPOpenState open_state;
++    WMPPlayState play_state;
+ 
+     ConnectionPoint *wmpocx;
+ 

@@ -1,0 +1,143 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Alexandre Derumier <aderumier@gmail.com>
+Date: Thu, 19 Nov 2026 19:00:00 +0100
+Subject: [PATCH] evr: Notify the presenter's clock state sink when the filter
+ runs, pauses and stops.
+
+The DirectShow EVR never called the presenter's IMFClockStateSink. A
+custom presenter that waits for its clock to start before it presents
+frames, or before it reports its state, never left the stopped state.
+
+Game impacted: Veggie Blast (UNIS, its .NET host) plays its intro movie
+through a WPF MediaElement: WPF's EVR presenter reports the started
+clock to its state engine, which waits for it before it raises
+MediaOpened; the intro window only learnt that the movie was open when
+it ended.
+
+Call OnClockPause when the filter pauses (from stopped or running),
+OnClockStart when it runs and OnClockStop when it stops (from paused or
+running): a presenter left paused refuses InitServicePointers(), which
+the EVR calls on every connect (Wine's default presenter returns
+MF_E_INVALIDREQUEST). strmbase's renderer gets a renderer_cleanup_stream
+op for the stop, called from renderer_cleanup_stream().
+---
+diff --git a/dlls/evr/evr.c b/dlls/evr/evr.c
+index 7fb9fe15..97bdad20 100644
+--- a/dlls/evr/evr.c
++++ b/dlls/evr/evr.c
+@@ -496,6 +496,38 @@ static HRESULT evr_query_accept(struct strmbase_renderer *iface, const AM_MEDIA_
+     return hr;
+ }
+ 
++enum evr_clock_state
++{
++    EVR_CLOCK_STOPPED,
++    EVR_CLOCK_PAUSED,
++    EVR_CLOCK_RUNNING,
++};
++
++/* The presenter's clock state follows the filter's (a custom presenter, e.g. WPF's, waits for
++ * its clock to start before it shows frames). */
++static void evr_notify_clock_state(struct evr *filter, enum evr_clock_state state)
++{
++    IMFClockStateSink *sink;
++
++    if (!filter->presenter || FAILED(IMFVideoPresenter_QueryInterface(filter->presenter,
++            &IID_IMFClockStateSink, (void **)&sink)))
++        return;
++
++    switch (state)
++    {
++        case EVR_CLOCK_STOPPED:
++            IMFClockStateSink_OnClockStop(sink, MFGetSystemTime());
++            break;
++        case EVR_CLOCK_PAUSED:
++            IMFClockStateSink_OnClockPause(sink, MFGetSystemTime());
++            break;
++        case EVR_CLOCK_RUNNING:
++            IMFClockStateSink_OnClockStart(sink, MFGetSystemTime(), PRESENTATION_CURRENT_POSITION);
++            break;
++    }
++    IMFClockStateSink_Release(sink);
++}
++
+ /* FIXME: errors should be propagated from init/start/stop handlers. */
+ static void evr_init_stream(struct strmbase_renderer *iface)
+ {
+@@ -505,6 +537,7 @@ static void evr_init_stream(struct strmbase_renderer *iface)
+ 
+     if (SUCCEEDED(IMFTransform_ProcessMessage(filter->mixer, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)))
+         IMFVideoPresenter_ProcessMessage(filter->presenter, MFVP_MESSAGE_BEGINSTREAMING, 0);
++    evr_notify_clock_state(filter, EVR_CLOCK_PAUSED);
+ }
+ 
+ static void evr_start_stream(struct strmbase_renderer *iface)
+@@ -512,7 +545,10 @@ static void evr_start_stream(struct strmbase_renderer *iface)
+     struct evr *filter = impl_from_strmbase_renderer(iface);
+ 
+     if (filter->mixer)
++    {
+         IMFTransform_ProcessMessage(filter->mixer, MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
++        evr_notify_clock_state(filter, EVR_CLOCK_RUNNING);
++    }
+ }
+ 
+ static void evr_stop_stream(struct strmbase_renderer *iface)
+@@ -521,6 +557,8 @@ static void evr_stop_stream(struct strmbase_renderer *iface)
+ 
+     if (!filter->mixer) return;
+ 
++    evr_notify_clock_state(filter, EVR_CLOCK_PAUSED);
++
+     if (SUCCEEDED(IMFTransform_ProcessMessage(filter->mixer, MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0)))
+     {
+         if (SUCCEEDED(IMFVideoPresenter_ProcessMessage(filter->presenter, MFVP_MESSAGE_ENDSTREAMING, 0)))
+@@ -528,6 +566,15 @@ static void evr_stop_stream(struct strmbase_renderer *iface)
+     }
+ }
+ 
++static void evr_cleanup_stream(struct strmbase_renderer *iface)
++{
++    struct evr *filter = impl_from_strmbase_renderer(iface);
++
++    /* the filter's state is still the one it is stopped from */
++    if (filter->mixer && filter->renderer.filter.state != State_Stopped)
++        evr_notify_clock_state(filter, EVR_CLOCK_STOPPED);
++}
++
+ static const struct strmbase_renderer_ops renderer_ops =
+ {
+     .renderer_query_accept = evr_query_accept,
+@@ -539,6 +586,7 @@ static const struct strmbase_renderer_ops renderer_ops =
+     .renderer_init_stream = evr_init_stream,
+     .renderer_start_stream = evr_start_stream,
+     .renderer_stop_stream = evr_stop_stream,
++    .renderer_cleanup_stream = evr_cleanup_stream,
+ };
+ 
+ static struct evr *impl_from_IEVRFilterConfig(IEVRFilterConfig *iface)
+diff --git a/include/wine/strmbase.h b/include/wine/strmbase.h
+index dff690d4..542a7549 100644
+--- a/include/wine/strmbase.h
++++ b/include/wine/strmbase.h
+@@ -297,6 +297,7 @@ struct strmbase_renderer_ops
+     void (*renderer_init_stream)(struct strmbase_renderer *iface);
+     void (*renderer_start_stream)(struct strmbase_renderer *iface);
+     void (*renderer_stop_stream)(struct strmbase_renderer *iface);
++    void (*renderer_cleanup_stream)(struct strmbase_renderer *iface);
+     HRESULT (*renderer_connect)(struct strmbase_renderer *iface, const AM_MEDIA_TYPE *mt);
+     void (*renderer_disconnect)(struct strmbase_renderer *iface);
+     void (*renderer_destroy)(struct strmbase_renderer *iface);
+diff --git a/libs/strmbase/renderer.c b/libs/strmbase/renderer.c
+index b788d028..223c9b6a 100644
+--- a/libs/strmbase/renderer.c
++++ b/libs/strmbase/renderer.c
+@@ -285,6 +285,8 @@ static HRESULT renderer_cleanup_stream(struct strmbase_filter *iface)
+     strmbase_passthrough_invalidate_time(&filter->passthrough);
+     SetEvent(filter->state_event);
+     SetEvent(filter->flush_event);
++    if (filter->ops->renderer_cleanup_stream)
++        filter->ops->renderer_cleanup_stream(filter);
+ 
+     return S_OK;
+ }
