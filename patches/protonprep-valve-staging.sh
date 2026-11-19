@@ -767,6 +767,8 @@ apply_all_in_dir() {
 
     popd
 
+    # GTA III/VC/SA (Wine-Wayland): DirectShow intro videos drawn with GDI into a child window with a pixel format were cut out, window looked minimized (#958)
+    apply_patch "../patches/wine-hotfixes/pending/win32u-keep-gdi-drawn-into-child-windows-that-have-a-pixel-format.patch"
 
 
 ### END PROTON-GE ADDITIONAL CUSTOM PATCHES ###
