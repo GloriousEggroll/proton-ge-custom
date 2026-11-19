@@ -751,6 +751,9 @@ apply_all_in_dir() {
     # Warhammer Survivors: the picture froze after Alt+Tab in exclusive fullscreen, the presentation owner went idle
     echo "WINE: -WAYLAND- win32u, winewayland: promote a retired presenter once the owner stops presenting (frozen picture after Alt+Tab)"
     apply_patch "../patches/wine-hotfixes/pending/winewayland-promote-retired-presenter-when-owner-stops-presenting.patch"
+    # Assetto Corsa + Custom Shaders Patch: CSP checks its signed dwrite.dll with CryptSIPVerifyIndirectData;
+    # the stub made online servers (No Hesi scores, Setup Exchange) reject Linux clients
+    apply_patch "../patches/wine-hotfixes/pending/wintrust-implement-cryptsipverifyindirectdata.patch"
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
