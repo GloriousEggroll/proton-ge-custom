@@ -758,6 +758,8 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/kernel32-write-profile-string-a-allow-values-over-32k.patch"
     # Layered overlay DIRECT mode: input shape never updated for windows reaching past the screen (#752)
     apply_patch "../patches/wine-hotfixes/pending/winex11-read-the-direct-layered-overlay-shape-from-the-toplevel-pixmap.patch"
+    # TriggerHeart EXELICA ENHANCED: LoadAccelerators in the message loop used up the user handles (abort in win32u)
+    apply_patch "../patches/wine-hotfixes/pending/user32-cache-accelerator-tables.patch"
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
