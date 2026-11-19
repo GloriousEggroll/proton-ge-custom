@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Alexandre Derumier <aderumier@gmail.com>
+Date: Mon, 9 Nov 2026 08:30:00 +0100
+Subject: [PATCH] qasf/dmowrapper: Apply the media type of the downstream
+ allocator's samples.
+
+A downstream allocator can ask for another output format by returning it
+from the sample's GetMediaType() (a dynamic format change).
+amstream's DirectDraw stream connects with the decoder's bottom-up RGB type
+after checking that the decoder accepts the top-down one, then asks for the
+top-down type this way, since its samples are DirectDraw surfaces. The
+wrapper ignored it and the DMO kept writing bottom-up frames: videos played
+through IAMMultiMediaStream were upside down (Burning Striker's intro).
+
+Set the sample's media type as the DMO's output type and keep it as the
+pin's type.
+
+winedmo's video decoder recreated its decoder on every SetOutputType().
+The change comes while the movie plays, so a decoder that had already
+been given input (normally the keyframe) would lose it, and each new
+DirectDraw sample used for the first time would reset it again. When the
+decoder is running and only the row order changes (or nothing), change
+its output format in place with winedmo_transform_set_output_format(),
+as the Media Foundation path does, and keep the new type for the flip in
+ProcessOutput().
+---
+ dlls/qasf/dmowrapper.c        | 20 ++++++++++++++++++--
+ dlls/winedmo/video_decoder.c  | 45 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 63 insertions(+), 2 deletions(-)
+
+--- a/dlls/qasf/dmowrapper.c
++++ b/dlls/qasf/dmowrapper.c
+@@ -225,8 +225,9 @@
+     }
+ }
+ 
+-static HRESULT get_output_samples(struct dmo_wrapper *filter)
++static HRESULT get_output_samples(struct dmo_wrapper *filter, IMediaObject *dmo)
+ {
++    AM_MEDIA_TYPE *mt;
+     HRESULT hr;
+     DWORD i;
+ 
+@@ -241,6 +242,21 @@
+                 release_output_samples(filter);
+                 return hr;
+             }
++            /* The downstream allocator may ask for another format (e.g. amstream's
++             * DirectDraw stream wants top-down RGB): switch the DMO's output to it. */
++            if (IMediaSample_GetMediaType(filter->sources[i].buffer.sample, &mt) == S_OK && mt)
++            {
++                TRACE("Source %lu: dynamic format change.\n", i);
++                strmbase_dump_media_type(mt);
++                if (SUCCEEDED(hr = IMediaObject_SetOutputType(dmo, i, mt, 0)))
++                {
++                    FreeMediaType(&filter->sources[i].pin.pin.mt);
++                    CopyMediaType(&filter->sources[i].pin.pin.mt, mt);
++                }
++                else
++                    WARN("Failed to set output type %lu, hr %#lx.\n", i, hr);
++                DeleteMediaType(mt);
++            }
+             filter->buffers[i].pBuffer = &filter->sources[i].buffer.IMediaBuffer_iface;
+             filter->sources[i].buffer.len = 0;
+             IMediaSample_SetActualDataLength(filter->sources[i].buffer.sample, 0);
+@@ -278,7 +294,7 @@
+ 
+     do
+     {
+-        if (FAILED(hr = get_output_samples(filter)))
++        if (FAILED(hr = get_output_samples(filter, dmo)))
+             return hr;
+ 
+         hr = IMediaObject_ProcessOutput(dmo, DMO_PROCESS_OUTPUT_DISCARD_WHEN_NO_BUFFER,
+--- a/dlls/winedmo/video_decoder.c
++++ b/dlls/winedmo/video_decoder.c
+@@ -1888,6 +1888,33 @@
+     return S_OK;
+ }
+ 
++/* Same subtype and frame size, the row order (sign of biHeight) aside. */
++static BOOL dmo_output_type_same_frames(const DMO_MEDIA_TYPE *a, const DMO_MEDIA_TYPE *b)
++{
++    const BITMAPINFOHEADER *ha, *hb;
++
++    if (!IsEqualGUID(&a->majortype, &b->majortype) || !IsEqualGUID(&a->subtype, &b->subtype)
++            || !IsEqualGUID(&a->formattype, &b->formattype) || !a->pbFormat || !b->pbFormat)
++        return FALSE;
++    if (IsEqualGUID(&a->formattype, &FORMAT_VideoInfo)
++            && a->cbFormat >= sizeof(VIDEOINFOHEADER) && b->cbFormat >= sizeof(VIDEOINFOHEADER))
++    {
++        ha = &((const VIDEOINFOHEADER *)a->pbFormat)->bmiHeader;
++        hb = &((const VIDEOINFOHEADER *)b->pbFormat)->bmiHeader;
++    }
++    else if (IsEqualGUID(&a->formattype, &FORMAT_VideoInfo2)
++            && a->cbFormat >= sizeof(VIDEOINFOHEADER2) && b->cbFormat >= sizeof(VIDEOINFOHEADER2))
++    {
++        ha = &((const VIDEOINFOHEADER2 *)a->pbFormat)->bmiHeader;
++        hb = &((const VIDEOINFOHEADER2 *)b->pbFormat)->bmiHeader;
++    }
++    else
++        return FALSE;
++
++    return ha->biWidth == hb->biWidth && abs(ha->biHeight) == abs(hb->biHeight)
++            && ha->biBitCount == hb->biBitCount && ha->biCompression == hb->biCompression;
++}
++
+ static HRESULT WINAPI media_object_SetOutputType(IMediaObject *iface, DWORD index,
+         const DMO_MEDIA_TYPE *type, DWORD flags)
+ {
+@@ -1937,6 +1964,24 @@
+     if (flags & DMO_SET_TYPEF_TEST_ONLY)
+         return S_OK;
+ 
++    /* A running decoder already holds input (e.g. the keyframe): when only the
++     * row order changes, as for a dynamic format change from a DirectDraw
++     * sample, change its output format in place. */
++    if (decoder->winedmo_transform.handle && dmo_output_type_same_frames(&decoder->dmo_output_type, type))
++    {
++        union winedmo_format *output_fmt;
++        UINT32 output_size;
++
++        if (FAILED(hr = create_mfvideoformat_from_dmo(type, &output_fmt, &output_size)))
++            return hr;
++        winedmo_transform_set_output_format(decoder->winedmo_transform, output_fmt, output_size);
++        free(output_fmt);
++
++        FreeMediaType(&decoder->dmo_output_type);
++        CopyMediaType(&decoder->dmo_output_type, type);
++        return S_OK;
++    }
++
+     FreeMediaType(&decoder->dmo_output_type);
+     CopyMediaType(&decoder->dmo_output_type, type);
+ 
+-- 
+2.47.0
