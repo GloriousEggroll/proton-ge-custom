@@ -756,6 +756,8 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/wintrust-implement-cryptsipverifyindirectdata.patch"
     # WritePrivateProfileStringA: values over 32766 characters failed and freed an uninitialized buffer
     apply_patch "../patches/wine-hotfixes/pending/kernel32-write-profile-string-a-allow-values-over-32k.patch"
+    # Layered overlay DIRECT mode: input shape never updated for windows reaching past the screen (#752)
+    apply_patch "../patches/wine-hotfixes/pending/winex11-read-the-direct-layered-overlay-shape-from-the-toplevel-pixmap.patch"
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
