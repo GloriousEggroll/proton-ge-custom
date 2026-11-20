@@ -18,6 +18,12 @@ read to its real size, and read it with XGetImage too when MIT-SHM
 can't be used, never the on-screen window. Blocks past the part that
 could be read count as transparent.
 
+Keep MIT-SHM for the clamped read by sizing the shared image to the part
+that is read. Falling back to XGetImage there copied the whole window
+over the X socket on the present path about every 32 ms, which dropped
+the 1% lows from 192 to 44 fps. The pixmap is checked with XGetGeometry,
+which waits for its reply, so no separate XSync is needed.
+
 Fixes the WINE_LAYERED_OVERLAY_DIRECT mode added with
 https://github.com/GloriousEggroll/proton-ge-custom/pull/897.
 
@@ -41,7 +47,7 @@ diff --git a/dlls/winex11.drv/init.c b/dlls/winex11.drv/init.c
      /* SHAPE mode clips the bounding region (visual); ALPHA mode sets the INPUT region
         (mouse click-through on transparent areas) while the ARGB visual handles the
         transparency. Input-shape changes don't repaint, so this adds click-through
-@@ -721,9 +724,47 @@
+@@ -721,9 +724,49 @@
      }
      if (!surface->shape_age) return TRUE;
  
@@ -60,12 +66,13 @@ diff --git a/dlls/winex11.drv/init.c b/dlls/winex11.drv/init.c
 +        int px, py;
 +        BOOL failed;
 +
++        /* XGetGeometry waits for its reply, so an error from naming the pixmap has been
++           delivered by the time it returns; no separate XSync is needed. */
 +        X11DRV_expect_error( gdi_display, overlay_getimage_error, NULL );
 +        direct_pixmap = pXCompositeNameWindowPixmap( gdi_display, window );
 +        if (direct_pixmap && !XGetGeometry( gdi_display, direct_pixmap, &root, &px, &py,
 +                                            &pixmap_width, &pixmap_height, &border, &depth ))
 +            pixmap_width = pixmap_height = 0;
-+        XSync( gdi_display, False );
 +        failed = X11DRV_check_error();
 +
 +        direct_x = surface->changes.x;
@@ -84,13 +91,14 @@ diff --git a/dlls/winex11.drv/init.c b/dlls/winex11.drv/init.c
      /* MIT-SHM avoids copying the whole image over the X socket */
  #ifdef HAVE_LIBXXSHM
 -    if (!surface->shm_broken && ensure_shm_image( surface, width, height ))
-+    /* XShmGetImage reads the whole image: use it only when the full rect can be read */
-+    if (!surface->shm_broken && read_width == width && read_height == height &&
-+        ensure_shm_image( surface, width, height ))
++    /* XShmGetImage reads as much as the image holds, so size it to the part that can be
++       read. Falling back to XGetImage here copies the whole window over the X socket on
++       the present path, which made frame times spike. */
++    if (!surface->shm_broken && ensure_shm_image( surface, read_width, read_height ))
      {
          Drawable drawable = surface->window;
          Pixmap pixmap = 0;
-@@ -737,12 +778,12 @@
+@@ -737,12 +780,12 @@
             redirected pixmap holds the same pixels and has no on-screen check, so read that. */
          if (usexcomposite && surface->client.offscreen)
              drawable = pixmap = pXCompositeNameWindowPixmap( gdi_display, surface->window );
@@ -108,7 +116,7 @@ diff --git a/dlls/winex11.drv/init.c b/dlls/winex11.drv/init.c
          }
  #endif
          got = XShmGetImage( gdi_display, drawable, surface->shm_image, src_x, src_y, AllPlanes );
-@@ -765,14 +806,19 @@
+@@ -765,14 +808,19 @@
          /* The window can't always be read (not viewable, or reaching past the screen), and an
             unhandled BadMatch here would kill the process. Skip this sample instead. */
          X11DRV_expect_error( gdi_display, overlay_getimage_error, NULL );
@@ -130,7 +138,7 @@ diff --git a/dlls/winex11.drv/init.c b/dlls/winex11.drv/init.c
  
      direct = image_is_native_32bpp( image );
  
-@@ -793,21 +839,22 @@
+@@ -793,21 +841,22 @@
              unsigned int xx, yy;
              BOOL visible = FALSE;
  
