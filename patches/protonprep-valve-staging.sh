@@ -65,18 +65,18 @@ apply_all_in_dir() {
     git clean -xdf
     popd
 
-    pushd protonfixes
-    git reset --hard HEAD
-    git clean -xdf
-    echo "PROTONFIXES: apply GE protonfixes patches"
-    apply_all_in_dir "../patches/protonfixes/"
-    popd
-
     pushd wineopenxr
     git checkout .
     git clean -xdf
     echo "WINEOPENXR: patch wineopenxr so it can be built as part of wine"
     apply_all_in_dir "../patches/wineopenxr/"
+    popd
+
+    pushd piper
+    git reset --hard HEAD
+    git clean -xdf
+    echo "PIPER: take the prebuilt onnxruntime from NuGet, the GitHub release downloads are gone"
+    apply_all_in_dir "../patches/piper/"
     popd
 
     pushd vklayers/low_latency_layer
@@ -760,6 +760,8 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/winex11-read-the-direct-layered-overlay-shape-from-the-toplevel-pixmap.patch"
     # TriggerHeart EXELICA ENHANCED: LoadAccelerators in the message loop used up the user handles (abort in win32u)
     apply_patch "../patches/wine-hotfixes/pending/user32-cache-accelerator-tables.patch"
+    # GTA III/VC/SA (Wine-Wayland): DirectShow intro videos drawn with GDI into a child window with a pixel format were cut out, window looked minimized (#958)
+    apply_patch "../patches/wine-hotfixes/pending/win32u-keep-gdi-drawn-into-child-windows-that-have-a-pixel-format.patch"
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
@@ -767,8 +769,6 @@ apply_all_in_dir() {
 
     popd
 
-    # GTA III/VC/SA (Wine-Wayland): DirectShow intro videos drawn with GDI into a child window with a pixel format were cut out, window looked minimized (#958)
-    apply_patch "../patches/wine-hotfixes/pending/win32u-keep-gdi-drawn-into-child-windows-that-have-a-pixel-format.patch"
 
 
 ### END PROTON-GE ADDITIONAL CUSTOM PATCHES ###
