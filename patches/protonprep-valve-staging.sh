@@ -755,6 +755,8 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/kernelbase-read-own-loader-list-directly-through-real-process-handles.patch"
     # Battlefield 4 (Wine-Wayland): alt-tab and applying settings added a decoration to a mapped toplevel, a protocol error that killed the game
     apply_patch "../patches/wine-hotfixes/pending/winewayland-recreate-the-toplevel-role-when-adding-server-side-decorations.patch"
+    # Chromium/NW.js/WebView2 games lost Tahoma in DirectWrite (browser stack overflow, black window): backport of upstream wine 5ba6d469
+    apply_patch "../patches/wine-hotfixes/pending/win32u-dont-count-not-external-fonts-as-external-font-duplicates.patch"
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
