@@ -751,6 +751,8 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/user32-cache-accelerator-tables.patch"
     # GTA III/VC/SA (Wine-Wayland): DirectShow intro videos drawn with GDI into a child window with a pixel format were cut out, window looked minimized (#958)
     apply_patch "../patches/wine-hotfixes/pending/win32u-keep-gdi-drawn-into-child-windows-that-have-a-pixel-format.patch"
+    # Battlefield 4: PunkBuster's module scans through a real handle to its own process stalled the game every few seconds (#984)
+    apply_patch "../patches/wine-hotfixes/pending/kernelbase-read-own-loader-list-directly-through-real-process-handles.patch"
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
