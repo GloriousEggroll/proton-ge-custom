@@ -758,6 +758,11 @@ apply_all_in_dir() {
     # Chromium/NW.js/WebView2 games lost Tahoma in DirectWrite (browser stack overflow, black window): backport of upstream wine 5ba6d469
     apply_patch "../patches/wine-hotfixes/pending/win32u-dont-count-not-external-fonts-as-external-font-duplicates.patch"
 
+    # https://github.com/GloriousEggroll/proton-ge-custom/issues/692
+    # winepipewire.drv by M0n7y5 from CachyOS/wine-cachyos, adapted to this mmdevapi. Opt-in with PROTON_USE_PIPEWIRE=1.
+    echo "WINE: -PIPEWIRE- add winepipewire.drv"
+    apply_all_in_dir "../patches/wine-hotfixes/winepipewire/"
+
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
     ./tools/make_requests

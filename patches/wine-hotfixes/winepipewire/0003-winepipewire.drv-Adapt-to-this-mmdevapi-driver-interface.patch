@@ -1,0 +1,285 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Sat, 21 Nov 2026 00:00:00 -0500
+Subject: [PATCH] winepipewire.drv: Adapt to this mmdevapi driver interface.
+
+M0n7y5's driver targets the newer mmdevapi in which drivers are plain
+unixlibs started with main_loop_start/main_loop_stop and pace their own
+streams. This tree still loads audio drivers as PE modules, runs one
+blocking main_loop call and a timer_loop thread per stream, and GE's
+DualSense patches extend some of the parameter structs.
+
+- Build a PE module, like winepulse.drv.
+- main_loop starts the PipeWire thread loop and signals the event.
+  The loop is never stopped, as with the original driver at detach, so
+  main_loop_stop goes away.
+- timer_loop returns at once; the driver's period timers already pace
+  and signal the streams. release_stream reaps that thread.
+- Match the 32-bit release_stream, get_endpoint_ids, create_stream,
+  is_format_supported and get_mix_format layouts of this mmdevapi.
+- Define create_unix_thread(), which newer mmdevapi/unixlib.h provides.
+- Ignore -Wvla around the SPA headers, the Wine build uses -Werror.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/dlls/winepipewire.drv/Makefile.in b/dlls/winepipewire.drv/Makefile.in
+--- a/dlls/winepipewire.drv/Makefile.in
++++ b/dlls/winepipewire.drv/Makefile.in
+@@ -1,4 +1,6 @@
++MODULE    = winepipewire.drv
+ UNIXLIB   = winepipewire.so
++IMPORTS   = dxguid uuid winmm user32 advapi32 ole32
+ UNIX_LIBS    = $(PIPEWIRE_LIBS) $(PTHREAD_LIBS) $(UDEV_LIBS)
+ UNIX_CFLAGS  = $(PIPEWIRE_CFLAGS) $(UDEV_CFLAGS)
+ 
+diff --git a/dlls/winepipewire.drv/pipewire.c b/dlls/winepipewire.drv/pipewire.c
+--- a/dlls/winepipewire.drv/pipewire.c
++++ b/dlls/winepipewire.drv/pipewire.c
+@@ -60,12 +60,16 @@
+ #include <sys/random.h>
+ #include <sys/resource.h>
+ 
++/* The SPA headers use VLAs, which the Wine build turns into errors. */
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wvla"
+ #include <pipewire/pipewire.h>
+ #include <pipewire/extensions/metadata.h>
+ #include <spa/param/param.h>
+ #include <spa/param/props.h>
+ #include <spa/param/audio/format-utils.h>
+ #include <spa/utils/json.h>
++#pragma GCC diagnostic pop
+ 
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+@@ -83,6 +87,23 @@
+ 
+ #include "../mmdevapi/unixlib.h"
+ 
++/* Provided by mmdevapi/unixlib.h in newer Wine. */
++static inline NTSTATUS create_unix_thread( HANDLE *handle, const WCHAR *name,
++                                           void (*entry)(void *), void *param )
++{
++    DWORD priority = THREAD_PRIORITY_TIME_CRITICAL;
++    THREAD_NAME_INFORMATION info;
++    NTSTATUS status;
++
++    if (!(status = PsCreateSystemThread( handle, THREAD_ALL_ACCESS, NULL, 0, NULL, entry, param )))
++    {
++        RtlInitUnicodeString( &info.ThreadName, name );
++        NtSetInformationThread( *handle, ThreadNameInformation, &info, sizeof(info) );
++        NtSetInformationThread( *handle, ThreadBasePriority, &priority, sizeof(priority) );
++    }
++    return status;
++}
++
+ #ifdef HAVE_LIBUDEV_H
+ #include <libudev.h>
+ #endif
+@@ -1022,36 +1043,21 @@
+     return STATUS_SUCCESS;
+ }
+ 
+-static NTSTATUS pipewire_main_loop_stop(void *args)
++/* This mmdevapi runs main_loop once on its own thread and waits for the
++ * event. The PipeWire loop has its own thread, so start it and return. */
++static NTSTATUS pipewire_main_loop(void *args)
++{
++    struct main_loop_params *params = args;
++
++    pipewire_main_loop_start(NULL);
++    NtSetEvent(params->event, NULL);
++    return STATUS_SUCCESS;
++}
++
++/* mmdevapi starts a timer_loop thread per stream; the period timers above
++ * already pace and signal the streams, so there is nothing to do here. */
++static NTSTATUS pipewire_timer_loop(void *args)
+ {
+-    pthread_mutex_lock(&pw_init_mutex);
+-    if (pw_loop_global)
+-    {
+-        pw_thread_loop_lock(pw_loop_global);
+-        if (pw_core_global)
+-        {
+-            if (core_listener_added)
+-            {
+-                spa_hook_remove(&core_listener);
+-                core_listener_added = FALSE;
+-            }
+-            pw_core_disconnect(pw_core_global);
+-            pw_core_global = NULL;
+-        }
+-        pw_thread_loop_unlock(pw_loop_global);
+-        pw_thread_loop_stop(pw_loop_global);
+-        if (pw_ctx)
+-        {
+-            pw_context_destroy(pw_ctx);
+-            pw_ctx = NULL;
+-        }
+-        pw_thread_loop_destroy(pw_loop_global);
+-        pw_loop_global = NULL;
+-    }
+-    /* Inside the mutex: a concurrent main_loop_start would otherwise be in
+-     * pw_thread_loop_new/pw_context_new while this unloads the SPA plugins. */
+-    pw_deinit();
+-    pthread_mutex_unlock(&pw_init_mutex);
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -3200,6 +3206,13 @@
+     struct pipewire_stream *stream = handle_get_stream(params->stream);
+     struct pipewire_period *dead_period = NULL;
+ 
++    if (params->timer_thread)
++    {
++        /* pipewire_timer_loop() returns at once, so this does not block. */
++        NtWaitForSingleObject(params->timer_thread, FALSE, NULL);
++        NtClose(params->timer_thread);
++    }
++
+     pw_thread_loop_lock(pw_loop_global);
+     TRACE("stream %p.\n", stream);
+     {
+@@ -4380,14 +4393,14 @@
+ {
+     pipewire_process_attach,
+     pipewire_process_detach,
+-    pipewire_main_loop_start,
+-    pipewire_main_loop_stop,
++    pipewire_main_loop,
+     pipewire_get_endpoint_ids,
+     pipewire_create_stream,
+     pipewire_release_stream,
+     pipewire_start,
+     pipewire_stop,
+     pipewire_reset,
++    pipewire_timer_loop,
+     pipewire_get_render_buffer,
+     pipewire_release_render_buffer,
+     pipewire_get_capture_buffer,
+@@ -4443,18 +4456,26 @@
+         HRESULT result;
+         unsigned int num;
+         unsigned int default_idx;
++        BOOL delta;
++        unsigned int num_removed;
++        BOOL more_data;
+     } *params32 = args;
+     struct get_endpoint_ids_params params =
+     {
+         .flow = params32->flow,
+         .endpoints = ULongToPtr(params32->endpoints),
+-        .size = params32->size
++        .size = params32->size,
++        .delta = params32->delta,
++        .more_data = params32->more_data
+     };
+     pipewire_get_endpoint_ids(&params);
+     params32->size = params.size;
+     params32->result = params.result;
+     params32->num = params.num;
+     params32->default_idx = params.default_idx;
++    params32->delta = params.delta;
++    params32->num_removed = params.num_removed;
++    params32->more_data = params.more_data;
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -4473,6 +4494,7 @@
+         HRESULT result;
+         PTR32 channel_count;
+         PTR32 stream;
++        BOOL sony_windows_audio_mode;
+     } *params32 = args;
+     struct create_stream_params params =
+     {
+@@ -4485,23 +4507,39 @@
+         .period = params32->period,
+         .fmt = ULongToPtr(params32->fmt),
+         .channel_count = ULongToPtr(params32->channel_count),
+-        .stream = ULongToPtr(params32->stream)
++        .stream = ULongToPtr(params32->stream),
++        .sony_windows_audio_mode = params32->sony_windows_audio_mode
+     };
+     pipewire_create_stream(&params);
+     params32->result = params.result;
+     return STATUS_SUCCESS;
+ }
+ 
++static NTSTATUS pipewire_wow64_main_loop(void *args)
++{
++    struct
++    {
++        PTR32 event;
++    } *params32 = args;
++    struct main_loop_params params =
++    {
++        .event = ULongToHandle(params32->event)
++    };
++    return pipewire_main_loop(&params);
++}
++
+ static NTSTATUS pipewire_wow64_release_stream(void *args)
+ {
+     struct
+     {
+         stream_handle stream;
++        PTR32 timer_thread;
+         HRESULT result;
+     } *params32 = args;
+     struct release_stream_params params =
+     {
+         .stream = params32->stream,
++        .timer_thread = ULongToHandle(params32->timer_thread)
+     };
+     pipewire_release_stream(&params);
+     params32->result = params.result;
+@@ -4567,6 +4605,7 @@
+         AUDCLNT_SHAREMODE share;
+         PTR32 fmt_in;
+         HRESULT result;
++        BOOL sony_windows_audio_mode;
+     } *params32 = args;
+     struct is_format_supported_params params =
+     {
+@@ -4574,6 +4613,7 @@
+         .flow = params32->flow,
+         .share = params32->share,
+         .fmt_in = ULongToPtr(params32->fmt_in),
++        .sony_windows_audio_mode = params32->sony_windows_audio_mode
+     };
+     pipewire_is_format_supported(&params);
+     params32->result = params.result;
+@@ -4613,12 +4653,14 @@
+         EDataFlow flow;
+         PTR32 fmt;
+         HRESULT result;
++        BOOL sony_windows_audio_mode;
+     } *params32 = args;
+     struct get_mix_format_params params =
+     {
+         .device = ULongToPtr(params32->device),
+         .flow = params32->flow,
+         .fmt = ULongToPtr(params32->fmt),
++        .sony_windows_audio_mode = params32->sony_windows_audio_mode
+     };
+     pipewire_get_mix_format(&params);
+     params32->result = params.result;
+@@ -4873,14 +4915,14 @@
+ {
+     pipewire_wow64_process_attach,
+     pipewire_process_detach,
+-    pipewire_main_loop_start,
+-    pipewire_main_loop_stop,
++    pipewire_wow64_main_loop,
+     pipewire_wow64_get_endpoint_ids,
+     pipewire_wow64_create_stream,
+     pipewire_wow64_release_stream,
+     pipewire_start,
+     pipewire_stop,
+     pipewire_reset,
++    pipewire_timer_loop,
+     pipewire_wow64_get_render_buffer,
+     pipewire_release_render_buffer,
+     pipewire_wow64_get_capture_buffer,
