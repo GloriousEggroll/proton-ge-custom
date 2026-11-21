@@ -757,6 +757,8 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/winewayland-recreate-the-toplevel-role-when-adding-server-side-decorations.patch"
     # Chromium/NW.js/WebView2 games lost Tahoma in DirectWrite (browser stack overflow, black window): backport of upstream wine 5ba6d469
     apply_patch "../patches/wine-hotfixes/pending/win32u-dont-count-not-external-fonts-as-external-font-duplicates.patch"
+    # HORGIHUGH: GetPrivateProfileString("", ...) must read the "[]" section, not the keys before the first header
+    apply_patch "../patches/wine-hotfixes/pending/kernel32-profile-empty-section-name.patch"
 
     # https://github.com/GloriousEggroll/proton-ge-custom/issues/692
     # winepipewire.drv by M0n7y5 from CachyOS/wine-cachyos, adapted to this mmdevapi. Opt-in with PROTON_USE_PIPEWIRE=1.
