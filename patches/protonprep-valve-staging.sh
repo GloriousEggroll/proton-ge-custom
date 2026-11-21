@@ -759,6 +759,8 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/win32u-dont-count-not-external-fonts-as-external-font-duplicates.patch"
     # HORGIHUGH: GetPrivateProfileString("", ...) must read the "[]" section, not the keys before the first header
     apply_patch "../patches/wine-hotfixes/pending/kernel32-profile-empty-section-name.patch"
+    # Battle.net/Chromium (Wine-Wayland): a restarted GPU process kept showing the dead one's last frame until a resize (#952)
+    apply_patch "../patches/wine-hotfixes/pending/win32u-winewayland-wined3d-make-hwnd-dmabuf-producer-ids-unique-across-processes.patch"
 
     # https://github.com/GloriousEggroll/proton-ge-custom/issues/692
     # winepipewire.drv by M0n7y5 from CachyOS/wine-cachyos, adapted to this mmdevapi. Opt-in with PROTON_USE_PIPEWIRE=1.

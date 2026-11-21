@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Sat, 21 Nov 2026 00:00:00 -0500
+Subject: [PATCH] win32u, winewayland, wined3d: Make HWND dmabuf producer ids
+ unique across processes.
+
+Producer ids came from a per-process counter, so the first producer of
+every process got id 1. The consumer keeps the stable slots of a producer
+cached under (producer id, ring generation, slot, layout). When a
+producer process died and its replacement drew into the same window, its
+first swapchain had the same id, generation and layout as the dead one:
+every frame hit the dead producer's cached wl_buffers and the window kept
+showing the last frame of the dead process. Only a resize, which creates
+a new swapchain with the next id, brought the window back. Stale release
+records left in the channel for the dead producer could also match the
+replacement's slots.
+
+Chromium restarts its GPU process after a GPU fault or crash (Battle.net
+launcher with hardware acceleration, Wine-Wayland): the launcher window
+froze until it was resized. It recovered by itself only when the dead GPU
+process had happened to create more swapchains than the new one.
+
+Put the process id in the high 32 bits of every producer id.
+
+https://github.com/GloriousEggroll/proton-ge-custom/issues/952
+---
+diff -ruN a/dlls/win32u/dce.c b/dlls/win32u/dce.c
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -222,8 +222,9 @@
+         return FALSE;
+     }
+ 
+-    producer_id = InterlockedIncrement64( &foreign_gdi_next_producer_id );
+-    if (!producer_id) producer_id = InterlockedIncrement64( &foreign_gdi_next_producer_id );
++    /* Unique across processes, see managed_swapchain_create(). */
++    producer_id = ((UINT64)GetCurrentProcessId() << 32) |
++                  (UINT32)InterlockedIncrement64( &foreign_gdi_next_producer_id );
+     surface->producer_unique_id = producer_id;
+     surface->ring_generation++;
+     if (!surface->ring_generation) surface->ring_generation++;
+diff -ruN a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -4688,9 +4688,10 @@
+     managed->extents = create_info->imageExtent;
+     managed->usage = usage;
+     managed->next_release_token = 0;
+-    managed->producer_unique_id = InterlockedIncrement64( &managed_next_producer_id );
+-    if (!managed->producer_unique_id)
+-        managed->producer_unique_id = InterlockedIncrement64( &managed_next_producer_id );
++    /* Unique across processes: the consumer keeps a dead producer's slots cached
++     * under its id, and a replacement process must not reuse it. */
++    managed->producer_unique_id = ((UINT64)GetCurrentProcessId() << 32) |
++                                  (UINT32)InterlockedIncrement64( &managed_next_producer_id );
+     managed->ring_generation = 1;
+ 
+     status = hwnd_dmabuf_set_pending( managed->hwnd, TRUE );
+diff -ruN a/dlls/wined3d/swapchain.c b/dlls/wined3d/swapchain.c
+--- a/dlls/wined3d/swapchain.c
++++ b/dlls/wined3d/swapchain.c
+@@ -953,9 +953,10 @@
+         return FALSE;
+     }
+ 
+-    producer_id = InterlockedIncrement64(&wined3d_gl_hwnd_dmabuf_next_producer_id);
+-    if (!producer_id)
+-        producer_id = InterlockedIncrement64(&wined3d_gl_hwnd_dmabuf_next_producer_id);
++    /* Unique across processes: the consumer keeps a dead producer's slots
++     * cached under its id, and a replacement process must not reuse it. */
++    producer_id = ((UINT64)GetCurrentProcessId() << 32)
++            | (UINT32)InterlockedIncrement64(&wined3d_gl_hwnd_dmabuf_next_producer_id);
+ 
+     ring->channel_fd = channel_fd;
+     ring->channel_hwnd = hwnd;
+diff -ruN a/dlls/winewayland.drv/window_surface.c b/dlls/winewayland.drv/window_surface.c
+--- a/dlls/winewayland.drv/window_surface.c
++++ b/dlls/winewayland.drv/window_surface.c
+@@ -241,8 +241,10 @@
+         return FALSE;
+     }
+ 
+-    producer_id = InterlockedIncrement64(&gdi_overlay_next_producer_id);
+-    if (!producer_id) producer_id = InterlockedIncrement64(&gdi_overlay_next_producer_id);
++    /* Unique across processes: the consumer keeps a dead producer's slots
++     * cached under its id, and a replacement process must not reuse it. */
++    producer_id = ((UINT64)GetCurrentProcessId() << 32) |
++                  (UINT32)InterlockedIncrement64(&gdi_overlay_next_producer_id);
+     producer->producer_unique_id = producer_id;
+     producer->channel_fd = fd;
+     TRACE("gdi_overlay hwnd=%p opened producer channel fd=%d producer=%s\n",
