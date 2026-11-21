@@ -759,6 +759,15 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/win32u-dont-count-not-external-fonts-as-external-font-duplicates.patch"
     # HORGIHUGH: GetPrivateProfileString("", ...) must read the "[]" section, not the keys before the first header
     apply_patch "../patches/wine-hotfixes/pending/kernel32-profile-empty-section-name.patch"
+    # The Witcher 3: InternetGetConnectedState enumerated all network adapters about 10 times a second while signed in to a CDPR account (periodic stutter)
+    # https://bugs.winehq.org/show_bug.cgi?id=60465
+    # By Erhan Bilgili, from nanomatters/wine-salkim (Wineland), LGPL-2.1+. The wininet cache needs the nsiproxy link/route notifications.
+    # https://github.com/nanomatters/wine-salkim/commit/cca95f22ea5b2ab546a84a72626781467f4b677c
+    echo "WINE: -GAME FIXES- nsiproxy.sys: notify interface and route changes (needed by the wininet connectivity cache)"
+    apply_patch "../patches/wine-hotfixes/pending/nsiproxy-notify-link-and-route-changes.patch"
+    # https://github.com/nanomatters/wine-salkim/commit/fd5c36a6aa68d785e5c0aaabd210053760c61a9d
+    echo "WINE: -GAME FIXES- wininet: cache InternetGetConnectedState until the network changes (Witcher 3 stutter, wine bug 60465)"
+    apply_patch "../patches/wine-hotfixes/pending/wininet-cache-connectivity-until-network-state-changes.patch"
 
     # https://github.com/GloriousEggroll/proton-ge-custom/issues/692
     # winepipewire.drv by M0n7y5 from CachyOS/wine-cachyos, adapted to this mmdevapi. Opt-in with PROTON_USE_PIPEWIRE=1.
