@@ -1,0 +1,723 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Sat, 21 Nov 2026 00:00:00 -0500
+Subject: [PATCH] winepipewire.drv: Report endpoint hotplug to mmdevapi.
+
+GE's mmdevapi (JS Deck's hotplug support from xzn/proton-ds5-haptic,
+reworked for the DualSense patches) asks the driver for endpoint deltas
+from an update thread, which winepulse.drv answers. Implement the same
+protocol here, so devices plugged in while a game runs show up and
+IMMNotificationClient callbacks fire.
+
+A registry listener on the main loop flags Audio/Sink and Audio/Source
+node changes (a sink also wakes capture, for its monitor endpoint). The
+delta call waits up to a second like winepulse, lets a burst of node
+changes settle for 200 ms, takes a fresh probe and diffs it against the
+endpoints mmdevapi has: added entries first, then removed ones, and
+more_data when the other flow has pending changes. Endpoints that
+survive keep their index and container id; their format and name are
+refreshed. The default endpoints are never removed.
+
+The probe in test_connect is split out so the refresh can reuse it.
+WINEPIPEWIRE_HOTPLUG=0 turns the watcher off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/dlls/winepipewire.drv/pipewire.c b/dlls/winepipewire.drv/pipewire.c
+--- a/dlls/winepipewire.drv/pipewire.c
++++ b/dlls/winepipewire.drv/pipewire.c
+@@ -1676,12 +1676,16 @@
+     }
+ }
+ 
+-static void build_device_cache(struct probe *p)
++/* Fills render and capture with the probed endpoints, numbering them from
++ * *index.  The default endpoints are only added on the first probe; later
++ * hotplug probes keep the original ones. */
++static void build_device_cache(struct probe *p, struct list *render, struct list *capture,
++                               UINT *next_index, BOOL add_defaults)
+ {
+     struct probe_node *pn;
+     uint32_t rate = p->clock_rate ? p->clock_rate : 48000;
+     REFERENCE_TIME min_period = 30000, def_period = 100000;
+-    UINT index = 0;
++    UINT index = *next_index;
+ 
+     /* clock.force-quantum pins the graph cycle, so it is both floor and
+      * ceiling: advertising less makes clients size buffers the graph cannot
+@@ -1713,7 +1717,7 @@
+ 
+     LIST_FOR_EACH_ENTRY(pn, &p->nodes, struct probe_node, entry)
+     {
+-        struct list *list = (pn->flow == eRender) ? &g_render_devices : &g_capture_devices;
++        struct list *list = (pn->flow == eRender) ? render : capture;
+         EndpointFormFactor form = (pn->flow == eRender) ? Speakers : Microphone;
+         uint32_t channels = pn->have_format ? pn->channels : 2;
+         UINT mask = pn->have_format ? positions_to_mask(pn->position, pn->channels)
+@@ -1733,7 +1737,7 @@
+             WCHAR *mon = monitor_name_from(dev->display);
+             if (mon)
+             {
+-                struct pw_phys_device *md = add_device(&g_capture_devices, pn->node_name, mon,
++                struct pw_phys_device *md = add_device(capture, pn->node_name, mon,
+                                                        LineLevel, rate, channels, mask,
+                                                        def_period, min_period);
+                 fill_device_path_info(md, p, pn, index++);
+@@ -1741,10 +1745,14 @@
+         }
+     }
+ 
+-    add_default_device(&g_render_devices, Speakers, g_default_sink, rate, def_period,
+-                       min_period, index++);
+-    add_default_device(&g_capture_devices, Microphone, g_default_source, rate, def_period,
+-                       min_period, index++);
++    if (add_defaults)
++    {
++        add_default_device(render, Speakers, g_default_sink, rate, def_period,
++                           min_period, index++);
++        add_default_device(capture, Microphone, g_default_source, rate, def_period,
++                           min_period, index++);
++    }
++    *next_index = index;
+ }
+ 
+ static void probe_teardown(struct probe *p)
+@@ -1800,148 +1808,539 @@
+     }
+ }
+ 
+-static NTSTATUS pipewire_test_connect(void *args)
++static void free_probe(struct probe *p)
+ {
+-    struct test_connect_params *params = args;
+-    struct probe p;
+     struct probe_node *pn, *next;
+     struct probe_device *pd, *pdnext;
+-    BOOL failed;
+-
+-    pthread_mutex_lock(&device_lists_mutex);
+-    free_device_lists();
+-    list_init(&g_render_devices);
+-    list_init(&g_capture_devices);
+-    g_default_sink[0] = g_default_source[0] = '\0';
+-    pthread_mutex_unlock(&device_lists_mutex);
+ 
+-    params->priority = Priority_Unavailable;
++    LIST_FOR_EACH_ENTRY_SAFE(pn, next, &p->nodes, struct probe_node, entry)
++    {
++        list_remove(&pn->entry);
++        free(pn->node_name);
++        free(pn->display);
++        free(pn->nick);
++        free(pn);
++    }
++    LIST_FOR_EACH_ENTRY_SAFE(pd, pdnext, &p->devices, struct probe_device, entry)
++    {
++        list_remove(&pd->entry);
++        free(pd->sysfs_path);
++        free(pd);
++    }
++}
+ 
+-    memset(&p, 0, sizeof(p));
+-    list_init(&p.nodes);
+-    list_init(&p.devices);
++/* Takes a snapshot of the graph on a private loop and connection.  Returns
++ * FALSE if no daemon could be queried; free_probe() must be called either
++ * way. */
++static BOOL run_probe(struct probe *p)
++{
++    memset(p, 0, sizeof(*p));
++    list_init(&p->nodes);
++    list_init(&p->devices);
+ 
+-    if (!(p.loop = pw_thread_loop_new("winepipewire-probe", NULL)))
++    if (!(p->loop = pw_thread_loop_new("winepipewire-probe", NULL)))
+     {
+         ERR("Failed to create PipeWire probe loop; SPA plugins may be missing "
+             "(set SPA_PLUGIN_DIR to the directory containing spa-0.2).\n");
+-        return STATUS_SUCCESS;
++        return FALSE;
+     }
+-    if (!(p.context = pw_context_new(pw_thread_loop_get_loop(p.loop), NULL, 0)))
++    if (!(p->context = pw_context_new(pw_thread_loop_get_loop(p->loop), NULL, 0)))
+     {
+         ERR("Failed to create PipeWire probe context\n");
+-        pw_thread_loop_destroy(p.loop);
+-        return STATUS_SUCCESS;
++        pw_thread_loop_destroy(p->loop);
++        return FALSE;
+     }
+ 
+-    if (pw_thread_loop_start(p.loop) < 0)
++    if (pw_thread_loop_start(p->loop) < 0)
+     {
+         ERR("Failed to start PipeWire probe loop\n");
+-        pw_context_destroy(p.context);
+-        pw_thread_loop_destroy(p.loop);
+-        return STATUS_SUCCESS;
++        pw_context_destroy(p->context);
++        pw_thread_loop_destroy(p->loop);
++        return FALSE;
+     }
+-    pw_thread_loop_lock(p.loop);
++    pw_thread_loop_lock(p->loop);
+ 
+-    if (!(p.core = pw_context_connect(p.context, NULL, 0)))
++    if (!(p->core = pw_context_connect(p->context, NULL, 0)))
+     {
+         WARN("pw_context_connect failed during probe.\n");
+-        pw_thread_loop_unlock(p.loop);
+-        pw_thread_loop_stop(p.loop);
+-        pw_context_destroy(p.context);
+-        pw_thread_loop_destroy(p.loop);
+-        return STATUS_SUCCESS;
++        pw_thread_loop_unlock(p->loop);
++        pw_thread_loop_stop(p->loop);
++        pw_context_destroy(p->context);
++        pw_thread_loop_destroy(p->loop);
++        return FALSE;
+     }
+ 
+-    pw_core_add_listener(p.core, &p.core_listener, &probe_core_events, &p);
+-    p.registry = pw_core_get_registry(p.core, PW_VERSION_REGISTRY, 0);
+-    if (p.registry)
+-        pw_registry_add_listener(p.registry, &p.registry_listener, &probe_registry_events, &p);
++    pw_core_add_listener(p->core, &p->core_listener, &probe_core_events, p);
++    p->registry = pw_core_get_registry(p->core, PW_VERSION_REGISTRY, 0);
++    if (p->registry)
++        pw_registry_add_listener(p->registry, &p->registry_listener, &probe_registry_events, p);
+ 
+     /* First round-trip: globals emitted, nodes/metadata bound, enum_params
+      * issued.  Second: the param events and metadata properties land. */
+-    probe_roundtrip(&p);
+-    probe_roundtrip(&p);
++    probe_roundtrip(p);
++    probe_roundtrip(p);
+ 
+-    probe_teardown(&p);
+-    pw_thread_loop_unlock(p.loop);
+-    pw_thread_loop_stop(p.loop);
+-    pw_context_destroy(p.context);
+-    pw_thread_loop_destroy(p.loop);
++    probe_teardown(p);
++    pw_thread_loop_unlock(p->loop);
++    pw_thread_loop_stop(p->loop);
++    pw_context_destroy(p->context);
++    pw_thread_loop_destroy(p->loop);
+ 
+     /* The cap is enforced on the probe thread, which cannot log. */
+-    if (p.truncated)
++    if (p->truncated)
+         WARN("More than %u audio globals in the graph; the rest were ignored.\n",
+              PROBE_MAX_GLOBALS);
+-    if (p.timed_out)
++    if (p->timed_out)
+         WARN("PipeWire probe timed out; the device list may be incomplete.\n");
+ 
+-    failed = p.core_error && list_empty(&p.nodes);
+-    if (failed)
++    if (p->core_error && list_empty(&p->nodes))
++    {
+         WARN("PipeWire core reported an error during the probe\n");
++        return FALSE;
++    }
++    return TRUE;
++}
++
++static UINT g_next_index; /* device_lists_mutex */
++
++static NTSTATUS pipewire_test_connect(void *args)
++{
++    struct test_connect_params *params = args;
++    struct probe p;
++    UINT index = 0;
++
++    pthread_mutex_lock(&device_lists_mutex);
++    free_device_lists();
++    list_init(&g_render_devices);
++    list_init(&g_capture_devices);
++    g_default_sink[0] = g_default_source[0] = '\0';
++    pthread_mutex_unlock(&device_lists_mutex);
++
++    params->priority = Priority_Unavailable;
++
++    if (!run_probe(&p))
++    {
++        free_probe(&p);
++        return STATUS_SUCCESS;
++    }
++
++    /* The pw loop is fully stopped: safe to do Wine string conversion. */
++    pthread_mutex_lock(&device_lists_mutex);
++    build_device_cache(&p, &g_render_devices, &g_capture_devices, &index, TRUE);
++    g_next_index = index;
++    TRACE("probe for %s: %u sinks default=%s, %u sources default=%s, rate=%u\n",
++          debugstr_w(params->name), list_count(&g_render_devices), debugstr_a(g_default_sink),
++          list_count(&g_capture_devices), debugstr_a(g_default_source), p.clock_rate);
++    pthread_mutex_unlock(&device_lists_mutex);
++
++    free_probe(&p);
++    params->priority = Priority_Preferred;
++    return STATUS_SUCCESS;
++}
++
++/* Endpoint hotplug.
++ *
++ * mmdevapi's update thread calls get_endpoint_ids with delta set and expects
++ * the endpoints added and removed since the last call, waiting about a second
++ * when nothing changed.  A registry listener on the main loop flags sink and
++ * source node changes; the delta call then takes a fresh probe and diffs it
++ * against what mmdevapi has been given.  Entries that survive keep their
++ * index and container id. */
++
++#define HP_RENDER  1
++#define HP_CAPTURE 2
++
++static pthread_mutex_t hp_mutex = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t hp_cond = PTHREAD_COND_INITIALIZER;
++static unsigned int hp_events; /* hp_mutex */
++
++/* Main loop thread only, apart from the setup under the loop lock. */
++static struct pw_core *hp_core;
++static struct pw_registry *hp_registry;
++static struct spa_hook hp_core_listener, hp_registry_listener;
++static int hp_sync_seq;
++static BOOL hp_ready;
++struct hp_node { uint32_t id; unsigned int mask; };
++static struct hp_node *hp_nodes;
++static unsigned int hp_node_count, hp_node_size;
++
++/* Not yet returned to mmdevapi; device_lists_mutex. */
++static struct list g_render_added = LIST_INIT(g_render_added);
++static struct list g_render_removed = LIST_INIT(g_render_removed);
++static struct list g_capture_added = LIST_INIT(g_capture_added);
++static struct list g_capture_removed = LIST_INIT(g_capture_removed);
++
++/* Runs on the main loop thread: no Wine calls. */
++static void hp_signal(unsigned int mask)
++{
++    pthread_mutex_lock(&hp_mutex);
++    hp_events |= mask;
++    pthread_cond_broadcast(&hp_cond);
++    pthread_mutex_unlock(&hp_mutex);
++}
++
++static void on_hp_global(void *data, uint32_t id, uint32_t permissions, const char *type,
++                         uint32_t version, const struct spa_dict *props)
++{
++    const char *media_class;
++    unsigned int mask;
++
++    if (!type || !props || strcmp(type, PW_TYPE_INTERFACE_Node))
++        return;
++    if (!(media_class = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS)))
++        return;
++    /* The classes the probe takes; a sink also has a monitor capture endpoint. */
++    if (!strcmp(media_class, "Audio/Sink"))
++        mask = HP_RENDER | HP_CAPTURE;
++    else if (!strcmp(media_class, "Audio/Source"))
++        mask = HP_CAPTURE;
+     else
++        return;
++
++    if (hp_node_count == hp_node_size && hp_node_size < PROBE_MAX_GLOBALS)
+     {
+-        /* The pw loop is fully stopped: safe to do Wine string conversion. */
+-        pthread_mutex_lock(&device_lists_mutex);
+-        build_device_cache(&p);
+-        TRACE("probe for %s: %u sinks default=%s, %u sources default=%s, rate=%u\n",
+-              debugstr_w(params->name), list_count(&g_render_devices), debugstr_a(g_default_sink),
+-              list_count(&g_capture_devices), debugstr_a(g_default_source), p.clock_rate);
+-        pthread_mutex_unlock(&device_lists_mutex);
++        unsigned int size = hp_node_size ? hp_node_size * 2 : 32;
++        struct hp_node *nodes = realloc(hp_nodes, size * sizeof(*nodes));
++
++        if (nodes)
++        {
++            hp_nodes = nodes;
++            hp_node_size = size;
++        }
++    }
++    if (hp_node_count < hp_node_size)
++    {
++        hp_nodes[hp_node_count].id = id;
++        hp_nodes[hp_node_count].mask = mask;
++        hp_node_count++;
+     }
++    if (hp_ready)
++        hp_signal(mask);
++}
++
++static void on_hp_global_remove(void *data, uint32_t id)
++{
++    unsigned int i;
+ 
+-    LIST_FOR_EACH_ENTRY_SAFE(pn, next, &p.nodes, struct probe_node, entry)
++    for (i = 0; i < hp_node_count; i++)
+     {
+-        list_remove(&pn->entry);
+-        free(pn->node_name);
+-        free(pn->display);
+-        free(pn->nick);
+-        free(pn);
++        if (hp_nodes[i].id != id)
++            continue;
++        if (hp_ready)
++            hp_signal(hp_nodes[i].mask);
++        hp_nodes[i] = hp_nodes[--hp_node_count];
++        return;
+     }
+-    LIST_FOR_EACH_ENTRY_SAFE(pd, pdnext, &p.devices, struct probe_device, entry)
++}
++
++static const struct pw_registry_events hp_registry_events =
++{
++    PW_VERSION_REGISTRY_EVENTS,
++    .global = on_hp_global,
++    .global_remove = on_hp_global_remove,
++};
++
++static void on_hp_core_done(void *data, uint32_t id, int seq)
++{
++    if (id != PW_ID_CORE || seq != hp_sync_seq || hp_ready)
++        return;
++    /* The registry has replayed the existing globals.  Compare once against
++     * the startup probe, in case a device came or went in between. */
++    hp_ready = TRUE;
++    hp_signal(HP_RENDER | HP_CAPTURE);
++}
++
++static const struct pw_core_events hp_core_events =
++{
++    PW_VERSION_CORE_EVENTS,
++    .done = on_hp_core_done,
++};
++
++static BOOL hp_start_watch(void)
++{
++    static int enabled = -1;
++    BOOL ret;
++
++    if (enabled == -1)
+     {
+-        list_remove(&pd->entry);
+-        free(pd->sysfs_path);
+-        free(pd);
++        const char *env = getenv("WINEPIPEWIRE_HOTPLUG");
++
++        enabled = !(env && !strcmp(env, "0"));
++        if (!enabled)
++            TRACE("endpoint hotplug disabled by WINEPIPEWIRE_HOTPLUG=0\n");
+     }
++    if (!enabled)
++        return FALSE;
+ 
+-    if (failed)
+-        return STATUS_SUCCESS;
++    pipewire_main_loop_start(NULL);
++    if (!pw_loop_global)
++        return FALSE;
+ 
+-    params->priority = Priority_Preferred;
+-    return STATUS_SUCCESS;
++    pw_thread_loop_lock(pw_loop_global);
++    if (!hp_core && pw_ctx && (hp_core = pw_context_connect(pw_ctx, NULL, 0)))
++    {
++        pw_core_add_listener(hp_core, &hp_core_listener, &hp_core_events, NULL);
++        if ((hp_registry = pw_core_get_registry(hp_core, PW_VERSION_REGISTRY, 0)))
++            pw_registry_add_listener(hp_registry, &hp_registry_listener, &hp_registry_events, NULL);
++        hp_sync_seq = pw_core_sync(hp_core, PW_ID_CORE, 0);
++    }
++    ret = hp_registry != NULL;
++    pw_thread_loop_unlock(pw_loop_global);
++
++    if (!ret)
++        WARN("Could not watch the PipeWire registry; audio endpoint hotplug is disabled.\n");
++    return ret;
+ }
+ 
+-static NTSTATUS pipewire_get_endpoint_ids(void *args)
++static struct pw_phys_device *find_device_in(struct list *list, const char *name)
+ {
+-    struct get_endpoint_ids_params *params = args;
+-    struct list *list = (params->flow == eRender) ? &g_render_devices : &g_capture_devices;
+-    struct endpoint *endpoint = params->endpoints;
+-    size_t len, name_len, needed;
+-    unsigned int offset;
+     struct pw_phys_device *dev;
+ 
+-    pthread_mutex_lock(&device_lists_mutex);
+-    params->num = list_count(list);
+-    offset = needed = params->num * sizeof(*params->endpoints);
++    LIST_FOR_EACH_ENTRY(dev, list, struct pw_phys_device, entry)
++        if (!strcmp(dev->pw_name, name))
++            return dev;
++    return NULL;
++}
++
++static void free_device(struct pw_phys_device *dev)
++{
++    list_remove(&dev->entry);
++    free(dev->display);
++    free(dev);
++}
++
++static struct pw_phys_device *dup_device(const struct pw_phys_device *dev)
++{
++    size_t size = offsetof(struct pw_phys_device, pw_name) + strlen(dev->pw_name) + 1;
++    struct pw_phys_device *copy;
++
++    if (!(copy = malloc(size)))
++        return NULL;
++    memcpy(copy, dev, size);
++    if (!(copy->display = malloc((lstrlenW(dev->display) + 1) * sizeof(WCHAR))))
++    {
++        free(copy);
++        return NULL;
++    }
++    memcpy(copy->display, dev->display, (lstrlenW(dev->display) + 1) * sizeof(WCHAR));
++    return copy;
++}
++
++/* Recomputes the pending changes of one flow from a fresh probe.  cur is what
++ * mmdevapi has; fresh is consumed.  Called with device_lists_mutex held. */
++static void diff_devices(struct list *cur, struct list *fresh, struct list *added,
++                         struct list *removed)
++{
++    struct pw_phys_device *dev, *next, *old;
++
++    LIST_FOR_EACH_ENTRY_SAFE(dev, next, added, struct pw_phys_device, entry)
++        free_device(dev);
++    LIST_FOR_EACH_ENTRY_SAFE(dev, next, removed, struct pw_phys_device, entry)
++        free_device(dev);
++
++    LIST_FOR_EACH_ENTRY(old, cur, struct pw_phys_device, entry)
++    {
++        /* The default endpoints stay for the life of the process. */
++        if (!old->pw_name[0] || find_device_in(fresh, old->pw_name))
++            continue;
++        if ((dev = dup_device(old)))
++            list_add_tail(removed, &dev->entry);
++    }
++
++    LIST_FOR_EACH_ENTRY_SAFE(dev, next, fresh, struct pw_phys_device, entry)
++    {
++        list_remove(&dev->entry);
++        if (!(old = find_device_in(cur, dev->pw_name)))
++        {
++            list_add_tail(added, &dev->entry);
++            continue;
++        }
++        /* Same node name: it may have come back with another profile or
++         * description.  Keep the index and container id mmdevapi knows. */
++        old->form = dev->form;
++        old->fmt = dev->fmt;
++        old->channel_mask = dev->channel_mask;
++        old->def_period = dev->def_period;
++        old->min_period = dev->min_period;
++        free(old->display);
++        old->display = dev->display;
++        free(dev);
++    }
++}
++
++static void hp_refresh(void)
++{
++    struct list render = LIST_INIT(render), capture = LIST_INIT(capture);
++    struct pw_phys_device *dev, *next;
++    struct probe p;
++    UINT index;
++
++    if (run_probe(&p))
++    {
++        pthread_mutex_lock(&device_lists_mutex);
++        index = g_next_index;
++        build_device_cache(&p, &render, &capture, &index, FALSE);
++        g_next_index = index;
++        diff_devices(&g_render_devices, &render, &g_render_added, &g_render_removed);
++        diff_devices(&g_capture_devices, &capture, &g_capture_added, &g_capture_removed);
++        TRACE("render +%u -%u, capture +%u -%u\n",
++              list_count(&g_render_added), list_count(&g_render_removed),
++              list_count(&g_capture_added), list_count(&g_capture_removed));
++        pthread_mutex_unlock(&device_lists_mutex);
++    }
++    free_probe(&p);
++
++    LIST_FOR_EACH_ENTRY_SAFE(dev, next, &render, struct pw_phys_device, entry)
++        free_device(dev);
++    LIST_FOR_EACH_ENTRY_SAFE(dev, next, &capture, struct pw_phys_device, entry)
++        free_device(dev);
++}
++
++static BOOL endpoints_fit(struct list *list, size_t *needed, unsigned int size)
++{
++    struct pw_phys_device *dev;
++
++    LIST_FOR_EACH_ENTRY(dev, list, struct pw_phys_device, entry)
++        *needed += (lstrlenW(dev->display) + 1) * sizeof(WCHAR) + ((strlen(dev->pw_name) + 2) & ~1);
++    return *needed <= size;
++}
++
++static void write_endpoints(struct list *list, struct endpoint **endpoint, unsigned int *offset,
++                            struct endpoint *base)
++{
++    struct pw_phys_device *dev;
++    size_t name_len, len;
+ 
+     LIST_FOR_EACH_ENTRY(dev, list, struct pw_phys_device, entry)
+     {
+         name_len = lstrlenW(dev->display) + 1;
+         len = strlen(dev->pw_name) + 1;
+-        needed += name_len * sizeof(WCHAR) + ((len + 1) & ~1);
++        (*endpoint)->name = *offset;
++        memcpy((char *)base + *offset, dev->display, name_len * sizeof(WCHAR));
++        *offset += name_len * sizeof(WCHAR);
++        (*endpoint)->device = *offset;
++        memcpy((char *)base + *offset, dev->pw_name, len);
++        *offset += (len + 1) & ~1;
++        (*endpoint)++;
++    }
++}
++
++static void get_endpoint_ids_delta(struct get_endpoint_ids_params *params)
++{
++    unsigned int mask = params->flow == eRender ? HP_RENDER : HP_CAPTURE;
++    unsigned int other = (HP_RENDER | HP_CAPTURE) & ~mask;
++    struct list *cur = params->flow == eRender ? &g_render_devices : &g_capture_devices;
++    struct list *added = params->flow == eRender ? &g_render_added : &g_capture_added;
++    struct list *removed = params->flow == eRender ? &g_render_removed : &g_capture_removed;
++    struct list *other_added = params->flow == eRender ? &g_capture_added : &g_render_added;
++    struct list *other_removed = params->flow == eRender ? &g_capture_removed : &g_render_removed;
++    struct endpoint *endpoint = params->endpoints;
++    struct pw_phys_device *dev, *next, *old;
++    unsigned int events, offset;
++    struct timespec deadline;
++    BOOL pending, other_pending;
++    size_t needed;
++
++    params->num = params->num_removed = 0;
++    params->more_data = FALSE;
++    params->default_idx = -1;
++    params->result = S_OK;
++
++    pthread_mutex_lock(&device_lists_mutex);
++    pending = !list_empty(added) || !list_empty(removed);
++    other_pending = !list_empty(other_added) || !list_empty(other_removed);
++    pthread_mutex_unlock(&device_lists_mutex);
++
++    if (!pending)
++    {
++        if (other_pending)
++        {
++            params->more_data = TRUE;
++            return;
++        }
+ 
+-        if (needed <= params->size)
++        clock_gettime(CLOCK_REALTIME, &deadline);
++        deadline.tv_sec += 1;
++        pthread_mutex_lock(&hp_mutex);
++        while (!(hp_events & (mask | other)))
++            if (pthread_cond_timedwait(&hp_cond, &hp_mutex, &deadline) == ETIMEDOUT)
++                break;
++        events = hp_events;
++        pthread_mutex_unlock(&hp_mutex);
++
++        if (!(events & mask))
+         {
+-            endpoint->name = offset;
+-            memcpy((char *)params->endpoints + offset, dev->display, name_len * sizeof(WCHAR));
+-            offset += name_len * sizeof(WCHAR);
+-            endpoint->device = offset;
+-            memcpy((char *)params->endpoints + offset, dev->pw_name, len);
+-            offset += (len + 1) & ~1;
+-            endpoint++;
++            params->more_data = !!(events & other);
++            return;
+         }
++
++        /* A card coming up adds its nodes one by one; let them settle. */
++        usleep(200000);
++        pthread_mutex_lock(&hp_mutex);
++        hp_events = 0; /* one probe covers both flows */
++        pthread_mutex_unlock(&hp_mutex);
++        hp_refresh();
+     }
++
++    pthread_mutex_lock(&device_lists_mutex);
++    params->num = list_count(added);
++    params->num_removed = list_count(removed);
++    offset = needed = (params->num + params->num_removed) * sizeof(*params->endpoints);
++    if (!endpoints_fit(added, &needed, params->size) || !endpoints_fit(removed, &needed, params->size))
++    {
++        pthread_mutex_unlock(&device_lists_mutex);
++        params->num = params->num_removed = 0;
++        params->size = needed;
++        params->result = HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
++        return;
++    }
++    write_endpoints(added, &endpoint, &offset, params->endpoints);
++    write_endpoints(removed, &endpoint, &offset, params->endpoints);
++
++    LIST_FOR_EACH_ENTRY_SAFE(dev, next, added, struct pw_phys_device, entry)
++    {
++        TRACE("added %s %s\n", debugstr_w(dev->display), debugstr_a(dev->pw_name));
++        list_remove(&dev->entry);
++        list_add_tail(cur, &dev->entry);
++    }
++    LIST_FOR_EACH_ENTRY_SAFE(dev, next, removed, struct pw_phys_device, entry)
++    {
++        TRACE("removed %s %s\n", debugstr_w(dev->display), debugstr_a(dev->pw_name));
++        if ((old = find_device_in(cur, dev->pw_name)))
++            free_device(old);
++        free_device(dev);
++    }
++    params->more_data = !list_empty(other_added) || !list_empty(other_removed);
++    pthread_mutex_unlock(&device_lists_mutex);
++
++    if (!params->more_data)
++    {
++        pthread_mutex_lock(&hp_mutex);
++        params->more_data = !!(hp_events & other);
++        pthread_mutex_unlock(&hp_mutex);
++    }
++}
++
++static NTSTATUS pipewire_get_endpoint_ids(void *args)
++{
++    struct get_endpoint_ids_params *params = args;
++    struct list *list = (params->flow == eRender) ? &g_render_devices : &g_capture_devices;
++    struct endpoint *endpoint = params->endpoints;
++    unsigned int offset;
++    size_t needed;
++
++    if (params->delta)
++    {
++        get_endpoint_ids_delta(params);
++        return STATUS_SUCCESS;
++    }
++
++    pthread_mutex_lock(&device_lists_mutex);
++    params->num = list_count(list);
++    params->num_removed = 0;
++    offset = needed = params->num * sizeof(*params->endpoints);
++    if (endpoints_fit(list, &needed, params->size))
++        write_endpoints(list, &endpoint, &offset, params->endpoints);
+     pthread_mutex_unlock(&device_lists_mutex);
+     params->default_idx = 0;
+ 
+@@ -1949,9 +2348,11 @@
+     {
+         params->size = needed;
+         params->result = HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
++        return STATUS_SUCCESS;
+     }
+-    else
+-        params->result = S_OK;
++    params->result = S_OK;
++    /* Tells mmdevapi to start its update thread. */
++    params->delta = hp_start_watch();
+     return STATUS_SUCCESS;
+ }
+ 
