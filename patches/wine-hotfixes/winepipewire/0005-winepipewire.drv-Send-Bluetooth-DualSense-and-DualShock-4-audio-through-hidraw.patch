@@ -1,0 +1,2630 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Sat, 21 Nov 2026 00:00:00 -0500
+Subject: [PATCH] winepipewire.drv: Send Bluetooth DualSense and DualShock 4
+ audio through hidraw.
+
+Port GE's winepulse.drv Bluetooth controller audio ("send DualSense
+haptics and speaker audio to Bluetooth controllers" and "send DualShock 4
+audio to and from Bluetooth controllers") to the PipeWire driver.
+
+A Bluetooth Sony controller has no USB audio function, so there is no
+node for its speaker, haptics or headset microphone. When winebus
+presents it as USB, expose the same synthetic endpoints as winepulse,
+with the same device strings and the container ID winebus gives the
+controller, and bridge them through hidraw:
+
+- DualSense: a 48 kHz four-channel endpoint; haptics resampled to 3 kHz
+  and speaker or headphone audio encoded as Opus, in reports 0x32/0x36.
+  Packet layout and resampling follow DS5Dongle and vDS (MIT).
+- DualShock 4: a stereo 32 kHz speaker, SBC encoded in report 0x17, and
+  the mono 16 kHz headset microphone. Layouts follow DS4Dongle (MPL-2.0).
+
+The codec, mixer and report code moves to bluetooth.c unchanged apart
+from the stream fields. These streams have no PipeWire stream: like in
+winepulse they keep a local ring that mmdevapi's timer_loop thread drains
+in real time into the per-controller mixer (or fills from the decoded
+microphone), signalling the client each period. The unix calls dispatch
+to them by a tag bit in the stream handle.
+
+The hotplug watcher also re-probes when the set of hidraw devices
+changes, since a Bluetooth controller adds no PipeWire node; winepulse
+only picked these endpoints up when some other device changed.
+
+PROTON_DUALSENSE_BT_HAPTICS=0, PROTON_DUALSHOCK4_BT_AUDIO=0 and the
+*_BT_AS_USB and Steam Input conditions apply as in winepulse.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/dlls/winepipewire.drv/Makefile.in b/dlls/winepipewire.drv/Makefile.in
+--- a/dlls/winepipewire.drv/Makefile.in
++++ b/dlls/winepipewire.drv/Makefile.in
+@@ -5,4 +5,5 @@
+ UNIX_CFLAGS  = $(PIPEWIRE_CFLAGS) $(UDEV_CFLAGS)
+ 
+ SOURCES = \
++	bluetooth.c \
+ 	pipewire.c
+diff --git a/dlls/winepipewire.drv/bluetooth.c b/dlls/winepipewire.drv/bluetooth.c
+new file mode 100644
+--- /dev/null
++++ b/dlls/winepipewire.drv/bluetooth.c
+@@ -0,0 +1,1959 @@
++/*
++ * Bluetooth DualSense and DualShock 4 audio for winepipewire.drv
++ *
++ * Copyright 2026 GloriousEggroll
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/* Ported from winepulse.drv. Bluetooth Sony controllers have no USB audio
++ * function, so there is no PipeWire node for their speaker, haptics or
++ * headset microphone. When winebus presents them as USB (Steam Input
++ * disabled) we expose synthetic endpoints with the controller's container
++ * ID and bridge them through hidraw, paced in real time:
++ *
++ * - DualSense: a 48 kHz four-channel endpoint. Channels 3 and 4 (haptics)
++ *   are resampled to 3 kHz, channels 1 and 2 (speaker or headphones) are
++ *   Opus encoded, in output reports 0x32/0x36. Packet layout and resampling
++ *   follow DS5Dongle (https://github.com/awalol/DS5Dongle) and vDS
++ *   (https://github.com/hurryman2212/vds), both MIT licensed.
++ * - DualShock 4: a stereo 32 kHz speaker, SBC encoded in output report
++ *   0x17, and the mono 16 kHz headset microphone, decoded from input
++ *   reports 0x12-0x19. Layouts follow DS4Dongle
++ *   (https://github.com/snipem/DS4Dongle), whose audio code is MPL-2.0.
++ *
++ * libopus and libsbc are loaded at runtime. */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#include "config.h"
++
++#include <stdarg.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <dirent.h>
++#include <dlfcn.h>
++#include <limits.h>
++#include <pthread.h>
++#include <time.h>
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "winternl.h"
++
++#include "mmdeviceapi.h"
++#include "audioclient.h"
++
++#include "wine/debug.h"
++#include "wine/list.h"
++#include "wine/unixlib.h"
++
++#include "../mmdevapi/unixlib.h"
++#include "bluetooth.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(pipewire);
++
++#define BT_PULSE_PREFIX "wine_bluetooth.Sony_Interactive_Entertainment_"
++#define BT_DUALSENSE_HAPTIC_REPORT_ID 0x32
++#define BT_DUALSENSE_HAPTIC_REPORT_SIZE 142
++#define BT_DUALSENSE_HAPTIC_DECIMATION 16 /* 48 kHz to 3 kHz */
++
++#define SPEAKER_FL 0x1
++#define SPEAKER_FR 0x2
++#define SPEAKER_FC 0x4
++#define SPEAKER_BL 0x10
++#define SPEAKER_BR 0x20
++
++enum bt_format { BT_FORMAT_S16, BT_FORMAT_S32, BT_FORMAT_F32 };
++
++struct bt_dualsense_mixer;
++
++struct bt_stream
++{
++    EDataFlow dataflow;
++    DWORD flags;
++    enum bt_format format;
++    UINT32 rate, channels, frame_size;
++    REFERENCE_TIME period;
++    UINT32 period_frames, period_bytes, bufsize_frames, real_bufsize_bytes;
++    BYTE *local_buffer, *tmp_buffer;
++    UINT32 tmp_buffer_bytes;
++    BOOL tmp_in_use;
++    /* Ring: pa_offs_bytes is the read offset, held_bytes the fill. */
++    UINT32 pa_offs_bytes, held_bytes;
++    UINT32 getbuf_last;
++    UINT64 played_frames;  /* render: sent to the controller */
++    UINT64 read_frames;    /* capture: released by the client */
++    BOOL started, please_quit, discont;
++    HANDLE event;
++    /* Bluetooth state, as in winepulse. */
++    BOOL hid_haptics;
++    int hid_fd;
++    UINT64 hid_start_time, hid_consumed;
++    struct bt_dualsense_mixer *hid_mixer;
++    UINT32 hid_phase;
++    INT32 hid_prev[2];
++    UINT64 hid_mic_pos;
++    BOOL hid_mic_buffering;
++};
++
++/* Guards the mixers and the Bluetooth streams. */
++static pthread_mutex_t bt_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static UINT64 bt_now(void)
++{
++    struct timespec ts;
++
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (UINT64)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
++}
++
++static int16_t float_to_s16(float sample)
++{
++    if (sample > 1.0f) sample = 1.0f;
++    else if (sample < -1.0f) sample = -1.0f;
++
++    return sample < 0.0f ? sample * 32768.0f : sample * 32767.0f;
++}
++
++static void bt_advance(struct bt_stream *stream, UINT32 frames, UINT32 frame_size)
++{
++    UINT32 bytes = frames * frame_size;
++
++    if (bytes > stream->held_bytes)
++        bytes = stream->held_bytes;
++    stream->pa_offs_bytes = (stream->pa_offs_bytes + bytes) % stream->real_bufsize_bytes;
++    stream->held_bytes -= bytes;
++    stream->played_frames += bytes / frame_size;
++}
++
++/* Takes the next capture period, dropping the oldest one when the client
++ * fell behind, as winepulse's packet list does. */
++static BYTE *bt_capture_packet(struct bt_stream *stream)
++{
++    UINT32 write_offs;
++
++    if (stream->held_bytes + stream->period_bytes > stream->real_bufsize_bytes)
++    {
++        stream->pa_offs_bytes = (stream->pa_offs_bytes + stream->period_bytes) % stream->real_bufsize_bytes;
++        stream->held_bytes -= stream->period_bytes;
++        stream->read_frames += stream->period_frames;
++        stream->discont = TRUE;
++    }
++    write_offs = (stream->pa_offs_bytes + stream->held_bytes) % stream->real_bufsize_bytes;
++    stream->held_bytes += stream->period_bytes;
++    return stream->local_buffer + write_offs;
++}
++
++static UINT32 bt_dualsense_crc32(UINT32 crc, const BYTE *data, SIZE_T size)
++{
++    unsigned int bit;
++
++    while (size--)
++    {
++        crc ^= *data++;
++        for (bit = 0; bit < 8; ++bit)
++            crc = (crc >> 1) ^ (0xedb88320 & -(crc & 1));
++    }
++    return crc;
++}
++
++/* The controller speaker takes Opus over Bluetooth: one 10 ms, 200 byte
++ * CBR frame per haptics chunk, as in vDS and DS5Dongle. libopus is loaded
++ * at runtime; without it only haptics are sent. */
++#define BT_DUALSENSE_SPEAKER_REPORT_ID 0x36
++#define BT_DUALSENSE_SPEAKER_REPORT_SIZE 398
++#define BT_DUALSENSE_SPEAKER_WINDOW_FRAMES 512
++#define BT_DUALSENSE_SPEAKER_OPUS_FRAMES 480
++#define BT_DUALSENSE_SPEAKER_OPUS_SIZE 200
++#define BT_DUALSENSE_OPUS_APPLICATION_RESTRICTED_LOWDELAY 2051
++#define BT_DUALSENSE_OPUS_SET_BITRATE_REQUEST 4002
++#define BT_DUALSENSE_OPUS_SET_VBR_REQUEST 4006
++#define BT_DUALSENSE_OPUS_SET_COMPLEXITY_REQUEST 4010
++
++static void *(*p_opus_encoder_create)(int32_t, int, int, int *);
++static int (*p_opus_encoder_ctl)(void *, int, ...);
++static int32_t (*p_opus_encode)(void *, const int16_t *, int, unsigned char *, int32_t);
++static void (*p_opus_encoder_destroy)(void *);
++static pthread_once_t bt_dualsense_opus_once = PTHREAD_ONCE_INIT;
++
++static void bt_dualsense_load_opus(void)
++{
++    void *handle;
++
++    if (!(handle = dlopen("libopus.so.0", RTLD_NOW)))
++    {
++        WARN("libopus not found, Bluetooth DualSense speaker audio is disabled.\n");
++        return;
++    }
++    p_opus_encoder_create = dlsym(handle, "opus_encoder_create");
++    p_opus_encoder_ctl = dlsym(handle, "opus_encoder_ctl");
++    p_opus_encode = dlsym(handle, "opus_encode");
++    p_opus_encoder_destroy = dlsym(handle, "opus_encoder_destroy");
++    if (!p_opus_encoder_create || !p_opus_encoder_ctl || !p_opus_encode || !p_opus_encoder_destroy)
++    {
++        WARN("libopus is missing symbols, Bluetooth DualSense speaker audio is disabled.\n");
++        p_opus_encoder_create = NULL;
++        dlclose(handle);
++    }
++}
++
++static void *bt_dualsense_create_opus_encoder(void)
++{
++    void *encoder;
++    int err = 0;
++
++    pthread_once(&bt_dualsense_opus_once, bt_dualsense_load_opus);
++    if (!p_opus_encoder_create)
++        return NULL;
++    if (!(encoder = p_opus_encoder_create(48000, 2, BT_DUALSENSE_OPUS_APPLICATION_RESTRICTED_LOWDELAY, &err)) || err)
++    {
++        WARN("opus_encoder_create failed: %d\n", err);
++        return NULL;
++    }
++    p_opus_encoder_ctl(encoder, BT_DUALSENSE_OPUS_SET_VBR_REQUEST, (int32_t)0);
++    p_opus_encoder_ctl(encoder, BT_DUALSENSE_OPUS_SET_COMPLEXITY_REQUEST, (int32_t)0);
++    p_opus_encoder_ctl(encoder, BT_DUALSENSE_OPUS_SET_BITRATE_REQUEST, (int32_t)(BT_DUALSENSE_SPEAKER_OPUS_SIZE * 8 * 100));
++    return encoder;
++}
++
++/* Games may open several streams on the controller endpoint (Assassin's
++ * Creed Shadows opens two). Each controller gets one mixer that sums the
++ * streams on a shared real-time clock and sends one report sequence, with
++ * one Opus encoder and one set of counters; independent senders would
++ * interleave two Opus streams and double the Bluetooth traffic. Streams
++ * write up to BT_DUALSENSE_MIX_LEAD frames ahead of the clock, chunks are
++ * sent BT_DUALSENSE_MIX_SEND_AHEAD frames ahead, so every stream gets to add
++ * its samples before a chunk goes out. */
++#define BT_DUALSENSE_MIX_RING 8192
++#define BT_DUALSENSE_MIX_LEAD 1536
++#define BT_DUALSENSE_MIX_SEND_AHEAD 512
++
++/* The DualShock 4 speaker takes SBC over Bluetooth: 32 kHz dual channel,
++ * 16 blocks, 8 subbands, loudness allocation, bitpool 25, which gives 112 byte
++ * frames of 128 samples, four per output report #0x17 (16 ms), as DS4Dongle
++ * sends them. libsbc is loaded at runtime; without it no speaker audio is
++ * sent. */
++#define BT_DUALSHOCK4_RATE 32000
++#define BT_DUALSHOCK4_AUDIO_REPORT_ID 0x17
++#define BT_DUALSHOCK4_AUDIO_REPORT_SIZE 462
++#define BT_DUALSHOCK4_SBC_FRAME_SAMPLES 128
++#define BT_DUALSHOCK4_SBC_FRAME_SIZE 112
++#define BT_DUALSHOCK4_SBC_FRAMES_PER_REPORT 4
++#define BT_DUALSHOCK4_AUDIO_TARGET_SPEAKER 0x02
++#define BT_DUALSHOCK4_AUDIO_TARGET_HEADSET 0x24
++#define BT_DUALSHOCK4_OUTPUT_REPORT_ID 0x11
++#define BT_DUALSHOCK4_OUTPUT_REPORT_SIZE 78
++#define BT_DUALSHOCK4_VOLUME 0x50
++#define BT_DUALSHOCK4_MIC_VOLUME 0x40
++
++/* Headset microphone, as found by DS4Dongle: with output report byte 2 bit 2
++ * set, the controller sends one input report #0x12 to #0x19 per output report
++ * it receives, carrying the #0x11 state block and SBC frames (16 kHz mono,
++ * 16 blocks, 8 subbands, loudness, bitpool 29: 66 byte frames of 128 samples,
++ * 8 ms) after it. It only offers the microphone with a headset plugged in. */
++#define BT_DUALSHOCK4_MIC_RATE 16000
++#define BT_DUALSHOCK4_MIC_FRAME_SIZE 66
++#define BT_DUALSHOCK4_MIC_FRAME_SAMPLES 128
++#define BT_DUALSHOCK4_MIC_SCAN_OFFSET 74
++#define BT_DUALSHOCK4_MIC_INTERVAL_US 8000
++#define BT_DUALSHOCK4_MIC_RING 8192
++#define BT_DUALSHOCK4_MIC_JITTER 768 /* 48 ms */
++#define BT_DUALSHOCK4_STATUS_HEADSET 0x20
++#define BT_DUALSHOCK4_STATUS_MIC 0x40
++
++/* struct sbc_struct from sbc/sbc.h. */
++struct bt_sbc
++{
++    unsigned long flags;
++    uint8_t frequency;
++    uint8_t blocks;
++    uint8_t subbands;
++    uint8_t mode;
++    uint8_t allocation;
++    uint8_t bitpool;
++    uint8_t endian;
++    void *priv;
++    void *priv_alloc_base;
++};
++
++static int (*p_sbc_init)(struct bt_sbc *, unsigned long);
++static ssize_t (*p_sbc_encode)(struct bt_sbc *, const void *, size_t, void *, size_t, ssize_t *);
++static ssize_t (*p_sbc_decode)(struct bt_sbc *, const void *, size_t, void *, size_t, size_t *);
++static void (*p_sbc_finish)(struct bt_sbc *);
++static pthread_once_t bt_dualshock4_sbc_once = PTHREAD_ONCE_INIT;
++
++static void bt_dualshock4_load_sbc(void)
++{
++    void *handle;
++
++    if (!(handle = dlopen("libsbc.so.1", RTLD_NOW)))
++    {
++        WARN("libsbc not found, Bluetooth DualShock 4 speaker audio is disabled.\n");
++        return;
++    }
++    p_sbc_init = dlsym(handle, "sbc_init");
++    p_sbc_encode = dlsym(handle, "sbc_encode");
++    p_sbc_finish = dlsym(handle, "sbc_finish");
++    p_sbc_decode = dlsym(handle, "sbc_decode");
++    if (!p_sbc_init || !p_sbc_encode || !p_sbc_finish || !p_sbc_decode)
++    {
++        WARN("libsbc is missing symbols, Bluetooth DualShock 4 speaker audio is disabled.\n");
++        p_sbc_init = NULL;
++        dlclose(handle);
++    }
++}
++
++static struct bt_sbc *bt_dualshock4_create_sbc(void)
++{
++    struct bt_sbc *sbc;
++
++    pthread_once(&bt_dualshock4_sbc_once, bt_dualshock4_load_sbc);
++    if (!p_sbc_init || !(sbc = calloc(1, sizeof(*sbc))))
++        return NULL;
++    if (p_sbc_init(sbc, 0) < 0)
++    {
++        WARN("sbc_init failed.\n");
++        free(sbc);
++        return NULL;
++    }
++    sbc->frequency = 0x01;  /* SBC_FREQ_32000 */
++    sbc->blocks = 0x03;     /* SBC_BLK_16 */
++    sbc->subbands = 0x01;   /* SBC_SB_8 */
++    sbc->mode = 0x01;       /* SBC_MODE_DUAL_CHANNEL */
++    sbc->allocation = 0x00; /* SBC_AM_LOUDNESS */
++    sbc->bitpool = 25;
++    sbc->endian = 0x00;     /* SBC_LE */
++    return sbc;
++}
++
++static void bt_dualshock4_destroy_sbc(struct bt_sbc *sbc)
++{
++    if (!sbc) return;
++    p_sbc_finish(sbc);
++    free(sbc);
++}
++
++struct bt_dualsense_mixer
++{
++    struct list entry;
++    char *path;
++    int fd;
++    LONG refs;
++    void *opus;
++    UINT64 start_time;
++    UINT64 sent;
++    BYTE seq, counter;
++    UINT32 silent_chunks, spk_idle_chunks;
++    BOOL headphones;
++    UINT64 stat_time;
++    UINT32 stat_speaker, stat_haptics, stat_skipped, stat_signal, stat_eagain, stat_rebase;
++    /* DualShock 4: 32 kHz stereo speaker audio, SBC encoded. */
++    BOOL dualshock4;
++    UINT32 rate;
++    struct bt_sbc *sbc;
++    UINT16 sbc_frames;
++    UINT64 volume_time;
++    /* DualShock 4 headset microphone. */
++    BOOL mic_present;
++    LONG capture_streams;
++    struct bt_sbc *mic_sbc;
++    UINT64 output_time;
++    UINT64 mic_written;
++    UINT32 stat_mic_frames, stat_mic_underruns;
++    UINT64 mic_stat_time;
++    int16_t mic_ring[BT_DUALSHOCK4_MIC_RING];
++    INT32 ring[BT_DUALSENSE_MIX_RING][4];
++};
++
++static struct list bt_dualsense_mixers = LIST_INIT(bt_dualsense_mixers);
++
++static UINT64 bt_dualsense_mixer_clock(struct bt_dualsense_mixer *mixer)
++{
++    return (bt_now() - mixer->start_time) * mixer->rate / 1000000;
++}
++
++static void bt_haptic_close(struct bt_stream *stream)
++{
++    struct bt_dualsense_mixer *mixer = stream->hid_mixer;
++
++    stream->hid_fd = -1;
++    stream->hid_mixer = NULL;
++    if (mixer && stream->dataflow == eCapture) --mixer->capture_streams;
++    if (!mixer || --mixer->refs) return;
++
++    list_remove(&mixer->entry);
++    close(mixer->fd);
++    if (mixer->opus) p_opus_encoder_destroy(mixer->opus);
++    bt_dualshock4_destroy_sbc(mixer->sbc);
++    bt_dualshock4_destroy_sbc(mixer->mic_sbc);
++    free(mixer->path);
++    free(mixer);
++}
++
++static HRESULT bt_mixer_connect(struct bt_stream *stream, const char *hidraw, BOOL dualshock4)
++{
++    struct bt_dualsense_mixer *mixer;
++
++
++    /* DualShock 4 streams are resampled, and use the first two channels. */
++    if (dualshock4 ? (stream->format != BT_FORMAT_F32 && stream->format != BT_FORMAT_S16 &&
++                      stream->format != BT_FORMAT_S32) || stream->rate < 8000 || stream->rate > 192000
++                   : (stream->format != BT_FORMAT_F32 && stream->format != BT_FORMAT_S16) ||
++                      stream->channels != 4 || stream->rate != 48000)
++    {
++        WARN("Unsupported format %u Hz, %u channels for Bluetooth %s audio.\n", stream->rate,
++                stream->channels, dualshock4 ? "DualShock 4" : "DualSense");
++        return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
++    }
++
++    LIST_FOR_EACH_ENTRY(mixer, &bt_dualsense_mixers, struct bt_dualsense_mixer, entry)
++    {
++        if (!strcmp(mixer->path, hidraw) && mixer->dualshock4 == dualshock4)
++        {
++            mixer->refs++;
++            goto done;
++        }
++    }
++
++    if (!(mixer = calloc(1, sizeof(*mixer))) || !(mixer->path = strdup(hidraw)))
++    {
++        free(mixer);
++        return E_OUTOFMEMORY;
++    }
++    /* Opened for reading too, to follow the headphone jack state. */
++    if ((mixer->fd = open(hidraw, O_RDWR | O_NONBLOCK | O_CLOEXEC)) < 0)
++    {
++        WARN("Unable to open %s for Bluetooth DualSense haptics: %s\n", hidraw, strerror(errno));
++        free(mixer->path);
++        free(mixer);
++        return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
++    }
++    mixer->refs = 1;
++    mixer->start_time = bt_now();
++    mixer->dualshock4 = dualshock4;
++    if (dualshock4)
++    {
++        mixer->rate = BT_DUALSHOCK4_RATE;
++        mixer->sbc = bt_dualshock4_create_sbc();
++        if (mixer->sbc && (mixer->mic_sbc = calloc(1, sizeof(*mixer->mic_sbc))) &&
++                p_sbc_init(mixer->mic_sbc, 0) < 0)
++        {
++            free(mixer->mic_sbc);
++            mixer->mic_sbc = NULL;
++        }
++        TRACE("Sending DualShock 4 speaker audio to Bluetooth controller %s%s.\n", hidraw,
++                mixer->sbc ? "" : " (no SBC encoder, silent)");
++    }
++    else
++    {
++        mixer->rate = 48000;
++        mixer->opus = bt_dualsense_create_opus_encoder();
++        TRACE("Sending DualSense haptics%s to Bluetooth controller %s.\n",
++                mixer->opus ? " and speaker audio" : "", hidraw);
++    }
++    list_add_tail(&bt_dualsense_mixers, &mixer->entry);
++
++done:
++    if (stream->dataflow == eCapture) mixer->capture_streams++;
++    stream->hid_haptics = TRUE;
++    stream->hid_mixer = mixer;
++    stream->hid_fd = mixer->fd;
++    stream->hid_start_time = 0;
++    stream->hid_consumed = 0;
++    TRACE("Mixing stream %p into Bluetooth %s %s (%d streams).\n", stream,
++            dualshock4 ? "DualShock 4" : "DualSense", hidraw, (int)mixer->refs);
++    return S_OK;
++}
++
++static void bt_dualsense_set_crc(BYTE *report, SIZE_T size)
++{
++    static const BYTE seed = 0xa2;
++    UINT32 crc;
++
++    crc = bt_dualsense_crc32(0xffffffff, &seed, 1);
++    crc = ~bt_dualsense_crc32(crc, report, size - 4);
++    report[size - 4] = crc;
++    report[size - 3] = crc >> 8;
++    report[size - 2] = crc >> 16;
++    report[size - 1] = crc >> 24;
++}
++
++static void bt_dualsense_update_jack(struct bt_dualsense_mixer *mixer)
++{
++    BYTE buf[128];
++    ssize_t len;
++
++    /* Bluetooth report 0x31 holds the USB input report from byte 2, the
++     * jack state is USB byte 54, bit 0 headphones. */
++    while ((len = read(mixer->fd, buf, sizeof(buf))) > 0)
++    {
++        if (buf[0] == 0x31 && len >= 56 && (buf[1] & 0x0f) == 0x01 && mixer->headphones != (buf[55] & 1))
++        {
++            mixer->headphones = buf[55] & 1;
++            TRACE("Bluetooth DualSense %s: headphones %s (status %#x).\n", mixer->path,
++                    mixer->headphones ? "plugged" : "unplugged", buf[55]);
++        }
++    }
++}
++
++static BOOL bt_dualsense_encode_speaker(struct bt_dualsense_mixer *mixer,
++        const int16_t (*src)[4], BYTE *out)
++{
++    int16_t pcm[BT_DUALSENSE_SPEAKER_OPUS_FRAMES * 2];
++    UINT32 i, c;
++    int32_t len;
++
++    /* 512 frames per haptics chunk, 480 per Opus frame. */
++    for (i = 0; i < BT_DUALSENSE_SPEAKER_OPUS_FRAMES; ++i)
++    {
++        UINT32 num = i * BT_DUALSENSE_SPEAKER_WINDOW_FRAMES;
++        UINT32 pos = num / BT_DUALSENSE_SPEAKER_OPUS_FRAMES, frac = num % BT_DUALSENSE_SPEAKER_OPUS_FRAMES;
++        UINT32 next = min(pos + 1, BT_DUALSENSE_SPEAKER_WINDOW_FRAMES - 1);
++
++        for (c = 0; c < 2; ++c)
++            pcm[i * 2 + c] = ((INT32)src[pos][c] * (INT32)(BT_DUALSENSE_SPEAKER_OPUS_FRAMES - frac) +
++                    (INT32)src[next][c] * (INT32)frac) / BT_DUALSENSE_SPEAKER_OPUS_FRAMES;
++    }
++
++    len = p_opus_encode(mixer->opus, pcm, BT_DUALSENSE_SPEAKER_OPUS_FRAMES, out, BT_DUALSENSE_SPEAKER_OPUS_SIZE);
++    if (len < 0)
++    {
++        WARN("opus_encode failed: %d\n", (int)len);
++        return FALSE;
++    }
++    return TRUE;
++}
++
++static void bt_dualsense_send_chunk(struct bt_dualsense_mixer *mixer, const int16_t (*pcm)[4])
++{
++    BYTE report[BT_DUALSENSE_SPEAKER_REPORT_SIZE] = {0};
++    INT8 haptics[64];
++    BOOL silent = TRUE, speaker = FALSE, spk_signal = FALSE;
++    SIZE_T size;
++    UINT32 i, j, c;
++
++    for (i = 0; i < BT_DUALSENSE_SPEAKER_WINDOW_FRAMES; ++i)
++        spk_signal |= pcm[i][0] || pcm[i][1];
++    mixer->stat_signal += spk_signal;
++
++    /* Channels 3 and 4: 48 kHz to 3 kHz, 8-bit. */
++    for (i = 0; i < sizeof(haptics) / 2; ++i)
++    {
++        for (c = 0; c < 2; ++c)
++        {
++            INT32 sum = 0;
++
++            for (j = 0; j < BT_DUALSENSE_HAPTIC_DECIMATION; ++j)
++                sum += pcm[i * BT_DUALSENSE_HAPTIC_DECIMATION + j][2 + c];
++            haptics[i * 2 + c] = max(-128, min(127, sum / BT_DUALSENSE_HAPTIC_DECIMATION / 256));
++            silent &= !haptics[i * 2 + c];
++        }
++    }
++
++    if (mixer->opus)
++    {
++        /* Keep the speaker going a little past the last sound so the Opus
++         * decoder flushes its tail. */
++        if (spk_signal)
++            mixer->spk_idle_chunks = 0;
++        else if (mixer->spk_idle_chunks < 16)
++            ++mixer->spk_idle_chunks;
++        speaker = mixer->spk_idle_chunks < 16;
++    }
++
++    /* Keep sending a few silent chunks so the actuators settle, then stop
++     * until the game plays haptics again. */
++    if (silent && !speaker && ++mixer->silent_chunks > 4)
++    {
++        mixer->stat_skipped++;
++        return;
++    }
++    if (!silent)
++        mixer->silent_chunks = 0;
++
++    if (speaker)
++    {
++        bt_dualsense_update_jack(mixer);
++        if (!bt_dualsense_encode_speaker(mixer, pcm, report + 144))
++            speaker = FALSE;
++    }
++
++    if (speaker)
++    {
++        BYTE *state = report + 13;
++
++        /* Haptics and speaker report with an embedded state block, layout
++         * from vDS. Over USB the controller routes its audio function to
++         * the speaker by itself; over Bluetooth the output path and volume
++         * must be set, so select them with every speaker report. */
++        size = BT_DUALSENSE_SPEAKER_REPORT_SIZE;
++        report[0] = BT_DUALSENSE_SPEAKER_REPORT_ID;
++        report[1] = (mixer->seq++ & 0x0f) << 4;
++        report[2] = 0x91;
++        report[3] = 7;
++        report[4] = 0xfe;
++        report[5] = report[6] = report[7] = report[8] = report[9] = 64;
++        report[10] = mixer->counter++;
++        report[11] = 0x90;
++        report[12] = 63;
++        state[1] = 0x80; /* allow audio control 2 */
++        state[37] = 0x01; /* audio control 2 */
++        if (mixer->headphones)
++        {
++            state[0] = 0x80 | 0x10; /* allow audio control, headphone volume */
++            state[4] = 0x7f; /* headphone volume */
++            state[7] = 0x08; /* headphone output, automatic mic select */
++        }
++        else
++        {
++            state[0] = 0x80 | 0x20; /* allow audio control, speaker volume */
++            state[5] = 0x64; /* speaker volume */
++            state[7] = 0x39; /* speaker output, internal mic */
++        }
++        report[76] = 0x92;
++        report[77] = sizeof(haptics);
++        memcpy(report + 78, haptics, sizeof(haptics));
++        report[142] = mixer->headphones ? 0x96 : 0x93;
++        report[143] = BT_DUALSENSE_SPEAKER_OPUS_SIZE;
++    }
++    else
++    {
++        size = BT_DUALSENSE_HAPTIC_REPORT_SIZE;
++        report[0] = BT_DUALSENSE_HAPTIC_REPORT_ID;
++        report[1] = (mixer->seq++ & 0x0f) << 4;
++        report[2] = 0x91;
++        report[3] = 4;
++        report[4] = 0x66;
++        report[5] = 48;
++        report[6] = 48;
++        report[7] = mixer->counter++;
++        report[8] = 0x92;
++        report[9] = sizeof(haptics);
++        memcpy(report + 10, haptics, sizeof(haptics));
++    }
++    bt_dualsense_set_crc(report, size);
++
++    if (speaker) mixer->stat_speaker++;
++    else mixer->stat_haptics++;
++    if (write(mixer->fd, report, size) < 0)
++    {
++        if (errno == EAGAIN) mixer->stat_eagain++;
++        else WARN("Bluetooth DualSense haptics write failed: %s\n", strerror(errno));
++    }
++}
++
++static void bt_dualshock4_decode_mic(struct bt_dualsense_mixer *mixer, const BYTE *buf, ssize_t len)
++{
++    int16_t pcm[BT_DUALSHOCK4_MIC_FRAME_SAMPLES];
++    size_t written;
++    ssize_t i;
++    UINT32 j;
++
++    for (i = BT_DUALSHOCK4_MIC_SCAN_OFFSET; i + BT_DUALSHOCK4_MIC_FRAME_SIZE <= len - 4; ++i)
++    {
++        /* Match the whole frame header, a lone sync byte also occurs in the
++         * frame data and would desynchronize the decoder. */
++        if (buf[i] != 0x9c || buf[i + 1] != 0x31 || buf[i + 2] != 0x1d)
++            continue;
++        written = 0;
++        if (p_sbc_decode(mixer->mic_sbc, buf + i, BT_DUALSHOCK4_MIC_FRAME_SIZE, pcm, sizeof(pcm), &written) > 0 &&
++                written == sizeof(pcm))
++        {
++            for (j = 0; j < BT_DUALSHOCK4_MIC_FRAME_SAMPLES; ++j)
++                mixer->mic_ring[(mixer->mic_written + j) % BT_DUALSHOCK4_MIC_RING] = pcm[j];
++            mixer->mic_written += BT_DUALSHOCK4_MIC_FRAME_SAMPLES;
++            mixer->stat_mic_frames++;
++        }
++        i += BT_DUALSHOCK4_MIC_FRAME_SIZE - 1;
++    }
++}
++
++/* Reads the controller's input reports: the headset jack and microphone
++ * state from the status byte, USB byte 30, and microphone audio. */
++static void bt_dualshock4_read_input(struct bt_dualsense_mixer *mixer)
++{
++    BYTE buf[640];
++    ssize_t len;
++
++    while ((len = read(mixer->fd, buf, sizeof(buf))) > 0)
++    {
++        BYTE status;
++
++        if (buf[0] < 0x11 || buf[0] > 0x19 || len < 33)
++            continue;
++        status = buf[32];
++        if (mixer->headphones != !!(status & BT_DUALSHOCK4_STATUS_HEADSET) ||
++                mixer->mic_present != !!(status & BT_DUALSHOCK4_STATUS_MIC))
++        {
++            mixer->headphones = !!(status & BT_DUALSHOCK4_STATUS_HEADSET);
++            mixer->mic_present = !!(status & BT_DUALSHOCK4_STATUS_MIC);
++            TRACE("Bluetooth DualShock 4 %s: headset %s, microphone %s (status %#x).\n", mixer->path,
++                    mixer->headphones ? "plugged" : "unplugged", mixer->mic_present ? "present" : "absent", status);
++        }
++        if (buf[0] != 0x11 && mixer->mic_sbc && mixer->capture_streams)
++            bt_dualshock4_decode_mic(mixer, buf, len);
++    }
++}
++
++/* Output report byte 2: always set bit 5, bit 2 enables the microphone.
++ * winebus sets it the same way, from the same status bit. */
++static BYTE bt_dualshock4_audio_control(struct bt_dualsense_mixer *mixer)
++{
++    return 0x20 | (mixer->mic_present ? 0x04 : 0);
++}
++
++static void bt_dualshock4_write(struct bt_dualsense_mixer *mixer, BYTE *report, SIZE_T size)
++{
++    bt_dualsense_set_crc(report, size);
++    if (write(mixer->fd, report, size) < 0)
++    {
++        if (errno == EAGAIN) mixer->stat_eagain++;
++        else WARN("Bluetooth DualShock 4 write failed: %s\n", strerror(errno));
++    }
++    mixer->output_time = bt_now();
++}
++
++/* Speaker, headset and microphone volume: output report #0x11 with only the
++ * volume fields marked valid, so lightbar and rumble state are left alone.
++ * Resent every second while audio plays, games may change it through their
++ * own output reports. */
++static void bt_dualshock4_send_volume(struct bt_dualsense_mixer *mixer)
++{
++    BYTE report[BT_DUALSHOCK4_OUTPUT_REPORT_SIZE] = {0};
++
++    if (mixer->volume_time && bt_now() - mixer->volume_time < 1000000)
++        return;
++    report[0] = BT_DUALSHOCK4_OUTPUT_REPORT_ID;
++    report[1] = 0xc0; /* HID, CRC */
++    report[2] = bt_dualshock4_audio_control(mixer);
++    report[3] = 0x10 | 0x20 | 0x40 | 0x80; /* headset left, headset right, microphone, speaker volume */
++    report[21] = report[22] = report[24] = BT_DUALSHOCK4_VOLUME;
++    report[23] = BT_DUALSHOCK4_MIC_VOLUME;
++    bt_dualshock4_write(mixer, report, sizeof(report));
++    mixer->volume_time = bt_now();
++}
++
++/* The controller sends one microphone report per output report, so while
++ * the microphone is captured, send a no-op output report whenever 8 ms, one
++ * microphone frame, passed without one. */
++static void bt_dualshock4_clock_mic(struct bt_dualsense_mixer *mixer)
++{
++    BYTE report[BT_DUALSHOCK4_OUTPUT_REPORT_SIZE] = {0};
++    UINT64 now = bt_now();
++    UINT32 count = 0;
++
++    if (!mixer->mic_present || !mixer->capture_streams)
++        return;
++    bt_dualshock4_send_volume(mixer);
++    if (now - mixer->output_time > 4 * BT_DUALSHOCK4_MIC_INTERVAL_US)
++        mixer->output_time = now - BT_DUALSHOCK4_MIC_INTERVAL_US;
++    while (now - mixer->output_time >= BT_DUALSHOCK4_MIC_INTERVAL_US && count++ < 4)
++    {
++        memset(report, 0, sizeof(report));
++        report[0] = BT_DUALSHOCK4_OUTPUT_REPORT_ID;
++        report[1] = 0xc0;
++        report[2] = bt_dualshock4_audio_control(mixer);
++        bt_dualshock4_write(mixer, report, sizeof(report));
++        mixer->output_time += BT_DUALSHOCK4_MIC_INTERVAL_US;
++    }
++}
++
++static void bt_dualshock4_send_chunk(struct bt_dualsense_mixer *mixer, const int16_t (*pcm)[4])
++{
++    BYTE report[BT_DUALSHOCK4_AUDIO_REPORT_SIZE] = {0};
++    int16_t block[BT_DUALSHOCK4_SBC_FRAME_SAMPLES * 2];
++    BOOL signal = FALSE;
++    ssize_t consumed, written;
++    UINT32 i, f;
++
++    for (i = 0; i < BT_DUALSENSE_SPEAKER_WINDOW_FRAMES; ++i)
++        signal |= pcm[i][0] || pcm[i][1];
++    mixer->stat_signal += signal;
++
++    /* Keep going a little past the last sound so the decoder flushes its
++     * tail, then stop until the game plays audio again. */
++    if (signal)
++        mixer->spk_idle_chunks = 0;
++    else if (mixer->spk_idle_chunks < 16)
++        ++mixer->spk_idle_chunks;
++    if (!mixer->sbc || mixer->spk_idle_chunks >= 16)
++    {
++        mixer->stat_skipped++;
++        return;
++    }
++
++    bt_dualshock4_read_input(mixer);
++    bt_dualshock4_send_volume(mixer);
++
++    report[0] = BT_DUALSHOCK4_AUDIO_REPORT_ID;
++    report[1] = 0x40;
++    report[2] = 0x80 | bt_dualshock4_audio_control(mixer); /* enable audio */
++    report[3] = mixer->sbc_frames;
++    report[4] = mixer->sbc_frames >> 8;
++    report[5] = mixer->headphones ? BT_DUALSHOCK4_AUDIO_TARGET_HEADSET : BT_DUALSHOCK4_AUDIO_TARGET_SPEAKER;
++    for (f = 0; f < BT_DUALSHOCK4_SBC_FRAMES_PER_REPORT; ++f)
++    {
++        for (i = 0; i < BT_DUALSHOCK4_SBC_FRAME_SAMPLES; ++i)
++        {
++            block[i * 2] = pcm[f * BT_DUALSHOCK4_SBC_FRAME_SAMPLES + i][0];
++            block[i * 2 + 1] = pcm[f * BT_DUALSHOCK4_SBC_FRAME_SAMPLES + i][1];
++        }
++        written = 0;
++        consumed = p_sbc_encode(mixer->sbc, block, sizeof(block),
++                report + 6 + f * BT_DUALSHOCK4_SBC_FRAME_SIZE, BT_DUALSHOCK4_SBC_FRAME_SIZE, &written);
++        if (consumed != sizeof(block) || written != BT_DUALSHOCK4_SBC_FRAME_SIZE)
++        {
++            WARN("sbc_encode failed: %d, %d bytes.\n", (int)consumed, (int)written);
++            return;
++        }
++    }
++    mixer->sbc_frames += BT_DUALSHOCK4_SBC_FRAMES_PER_REPORT;
++    mixer->stat_speaker++;
++    bt_dualshock4_write(mixer, report, sizeof(report));
++}
++
++static void bt_dualsense_mixer_skip_stale(struct bt_dualsense_mixer *mixer, UINT64 clock)
++{
++    /* Nothing was written for a while, drop what is stale. */
++    if (clock + BT_DUALSENSE_MIX_SEND_AHEAD > mixer->sent + BT_DUALSENSE_MIX_RING / 2)
++    {
++        memset(mixer->ring, 0, sizeof(mixer->ring));
++        mixer->sent = clock / BT_DUALSENSE_SPEAKER_WINDOW_FRAMES * BT_DUALSENSE_SPEAKER_WINDOW_FRAMES;
++    }
++}
++
++static void bt_dualsense_mixer_send(struct bt_dualsense_mixer *mixer, UINT64 clock)
++{
++    int16_t pcm[BT_DUALSENSE_SPEAKER_WINDOW_FRAMES][4];
++    UINT32 i, c;
++
++    while (mixer->sent + BT_DUALSENSE_SPEAKER_WINDOW_FRAMES <= clock + BT_DUALSENSE_MIX_SEND_AHEAD)
++    {
++        for (i = 0; i < BT_DUALSENSE_SPEAKER_WINDOW_FRAMES; ++i)
++        {
++            INT32 *frame = mixer->ring[(mixer->sent + i) % BT_DUALSENSE_MIX_RING];
++
++            for (c = 0; c < 4; ++c)
++                pcm[i][c] = max(-32768, min(32767, frame[c]));
++            memset(frame, 0, sizeof(mixer->ring[0]));
++        }
++        mixer->sent += BT_DUALSENSE_SPEAKER_WINDOW_FRAMES;
++        if (mixer->dualshock4)
++            bt_dualshock4_send_chunk(mixer, (const int16_t (*)[4])pcm);
++        else
++            bt_dualsense_send_chunk(mixer, (const int16_t (*)[4])pcm);
++    }
++
++    if (TRACE_ON(pipewire) && bt_now() - mixer->stat_time >= 1000000)
++    {
++        TRACE("Bluetooth DualSense %s: %u speaker, %u haptics, %u skipped reports, %u chunks with speaker signal, "
++                "%u writes dropped, %u stream rebases, %d streams.\n", mixer->path, mixer->stat_speaker,
++                mixer->stat_haptics, mixer->stat_skipped, mixer->stat_signal, mixer->stat_eagain,
++                mixer->stat_rebase, (int)mixer->refs);
++        mixer->stat_speaker = mixer->stat_haptics = mixer->stat_skipped = 0;
++        mixer->stat_signal = mixer->stat_eagain = mixer->stat_rebase = 0;
++        mixer->stat_time = bt_now();
++    }
++}
++
++/* Source sample of a DualShock 4 stream as 16-bit, mono streams play on both
++ * channels and others use their first two. */
++static INT32 bt_dualshock4_sample(const struct bt_stream *stream, const BYTE *src, UINT32 frame, UINT32 c)
++{
++    UINT32 index = frame * stream->channels + (stream->channels == 1 ? 0 : c);
++
++    switch (stream->format)
++    {
++    case BT_FORMAT_F32: return float_to_s16(((const float *)src)[index]);
++    case BT_FORMAT_S32: return ((const int32_t *)src)[index] >> 16;
++    default: return ((const int16_t *)src)[index];
++    }
++}
++
++/* Like bt_haptic_write(), resampling the stream to the controller's
++ * 32 kHz with linear interpolation. */
++static void bt_ds4_render(struct bt_stream *stream, UINT32 held_frames, UINT32 frame_size)
++{
++    struct bt_dualsense_mixer *mixer = stream->hid_mixer;
++    UINT32 contiguous_frames, avail, in = 0, c;
++    UINT64 clock, target;
++    const BYTE *src;
++
++    clock = bt_dualsense_mixer_clock(mixer);
++    bt_dualsense_mixer_skip_stale(mixer, clock);
++    if (!stream->hid_start_time || stream->hid_consumed < mixer->sent)
++    {
++        /* Started, or fell behind: don't send the missed time in a burst. */
++        if (stream->hid_start_time) mixer->stat_rebase++;
++        stream->hid_start_time = 1;
++        stream->hid_consumed = max(mixer->sent, clock + BT_DUALSENSE_MIX_SEND_AHEAD);
++        stream->hid_phase = BT_DUALSHOCK4_RATE;
++        stream->hid_prev[0] = stream->hid_prev[1] = 0;
++    }
++
++    target = min(clock + BT_DUALSENSE_MIX_LEAD, mixer->sent + BT_DUALSENSE_MIX_RING);
++    contiguous_frames = (stream->real_bufsize_bytes - stream->pa_offs_bytes) / frame_size;
++    avail = min(held_frames, contiguous_frames);
++    src = stream->local_buffer + stream->pa_offs_bytes;
++
++    while (stream->hid_consumed < target)
++    {
++        INT32 *frame;
++
++        while (stream->hid_phase >= BT_DUALSHOCK4_RATE && in < avail)
++        {
++            for (c = 0; c < 2; ++c)
++                stream->hid_prev[c] = bt_dualshock4_sample(stream, src, in, c);
++            ++in;
++            stream->hid_phase -= BT_DUALSHOCK4_RATE;
++        }
++        if (in >= avail)
++            break;
++
++        frame = mixer->ring[stream->hid_consumed % BT_DUALSENSE_MIX_RING];
++        for (c = 0; c < 2; ++c)
++        {
++            INT32 next = bt_dualshock4_sample(stream, src, in, c);
++
++            frame[c] += stream->hid_prev[c] +
++                    (INT32)((INT64)(next - stream->hid_prev[c]) * stream->hid_phase / BT_DUALSHOCK4_RATE);
++        }
++        stream->hid_consumed++;
++        stream->hid_phase += stream->rate;
++    }
++    if (in)
++        bt_advance(stream, in, frame_size);
++
++    bt_dualsense_mixer_send(mixer, clock);
++}
++
++/* Bluetooth DualShock 4 headset microphone capture: there is no device
++ * clock either, so produce packets in real time from the decoded 16 kHz
++ * audio, resampled to the stream rate, with a jitter reserve since the
++ * controller sends it in bursts. */
++static void bt_ds4_capture(struct bt_stream *stream)
++{
++    struct bt_dualsense_mixer *mixer = stream->hid_mixer;
++    UINT32 frame_size = stream->frame_size, period_frames = stream->period_bytes / frame_size;
++    UINT32 rate = stream->rate, i, c, underrun;
++    UINT64 now = bt_now();
++    UINT64 due;
++    BYTE *dst;
++
++    if (!mixer || !period_frames)
++        return;
++    bt_dualshock4_read_input(mixer);
++    bt_dualshock4_clock_mic(mixer);
++
++    if (!stream->hid_start_time)
++    {
++        stream->hid_start_time = now;
++        stream->hid_consumed = 0;
++        stream->hid_mic_pos = mixer->mic_written;
++        stream->hid_mic_buffering = TRUE;
++        stream->hid_phase = 0;
++    }
++
++    due = (now - stream->hid_start_time) * rate / 1000000;
++    while (due >= stream->hid_consumed + period_frames)
++    {
++        if (!(dst = bt_capture_packet(stream)))
++            return;
++        underrun = 0;
++        for (i = 0; i < period_frames; ++i)
++        {
++            INT32 value = 0;
++
++            /* Keep the latency bounded after a burst. */
++            if (mixer->mic_written > stream->hid_mic_pos + 3 * BT_DUALSHOCK4_MIC_JITTER)
++            {
++                stream->hid_mic_pos = mixer->mic_written - BT_DUALSHOCK4_MIC_JITTER;
++                stream->hid_phase = 0;
++            }
++            if (stream->hid_mic_buffering && mixer->mic_written >= stream->hid_mic_pos + BT_DUALSHOCK4_MIC_JITTER)
++                stream->hid_mic_buffering = FALSE;
++            if (!stream->hid_mic_buffering && stream->hid_mic_pos + 1 < mixer->mic_written)
++            {
++                INT32 a = mixer->mic_ring[stream->hid_mic_pos % BT_DUALSHOCK4_MIC_RING];
++                INT32 b = mixer->mic_ring[(stream->hid_mic_pos + 1) % BT_DUALSHOCK4_MIC_RING];
++
++                value = a + (INT32)((INT64)(b - a) * stream->hid_phase / rate);
++                stream->hid_phase += BT_DUALSHOCK4_MIC_RATE;
++                while (stream->hid_phase >= rate)
++                {
++                    stream->hid_mic_pos++;
++                    stream->hid_phase -= rate;
++                }
++            }
++            else if (!stream->hid_mic_buffering)
++            {
++                /* Ran dry, refill the jitter reserve. */
++                stream->hid_mic_buffering = TRUE;
++                underrun = 1;
++            }
++
++            for (c = 0; c < stream->channels; ++c)
++            {
++                UINT32 index = i * stream->channels + c;
++
++                switch (stream->format)
++                {
++                case BT_FORMAT_F32: ((float *)dst)[index] = value / 32768.0f; break;
++                case BT_FORMAT_S32: ((int32_t *)dst)[index] = value * 65536; break;
++                default: ((int16_t *)dst)[index] = value; break;
++                }
++            }
++        }
++        mixer->stat_mic_underruns += underrun;
++        stream->hid_consumed += period_frames;
++    }
++
++    if (TRACE_ON(pipewire) && now - mixer->mic_stat_time >= 1000000)
++    {
++        TRACE("Bluetooth DualShock 4 %s: microphone %s, %u frames, %u underruns, %d capture streams.\n",
++                mixer->path, mixer->mic_present ? "present" : "absent", mixer->stat_mic_frames,
++                mixer->stat_mic_underruns, (int)mixer->capture_streams);
++        mixer->stat_mic_frames = mixer->stat_mic_underruns = 0;
++        mixer->mic_stat_time = now;
++    }
++}
++
++static void bt_haptic_write(struct bt_stream *stream, UINT32 held_frames, UINT32 frame_size)
++{
++    struct bt_dualsense_mixer *mixer = stream->hid_mixer;
++    UINT32 frames, contiguous_frames, i, c;
++    UINT64 clock, target, pos;
++    const BYTE *src;
++
++    if (!mixer)
++        return;
++    if (mixer->dualshock4)
++    {
++        bt_ds4_render(stream, held_frames, frame_size);
++        return;
++    }
++
++    /* There is no device clock, consume the buffer in real time, ahead of
++     * the mixer clock. hid_consumed is the stream's position on it. */
++    clock = bt_dualsense_mixer_clock(mixer);
++    bt_dualsense_mixer_skip_stale(mixer, clock);
++    target = clock + BT_DUALSENSE_MIX_LEAD;
++    if (!stream->hid_start_time || stream->hid_consumed < mixer->sent)
++    {
++        /* Started, or fell behind: don't send the missed time in a burst. */
++        if (stream->hid_start_time) mixer->stat_rebase++;
++        stream->hid_start_time = 1;
++        stream->hid_consumed = max(mixer->sent, clock + BT_DUALSENSE_MIX_SEND_AHEAD);
++    }
++
++    if (target > stream->hid_consumed)
++    {
++        contiguous_frames = (stream->real_bufsize_bytes - stream->pa_offs_bytes) / frame_size;
++        frames = min(min((UINT32)(target - stream->hid_consumed), held_frames), contiguous_frames);
++        frames = min(frames, (UINT32)(mixer->sent + BT_DUALSENSE_MIX_RING - stream->hid_consumed));
++        src = stream->local_buffer + stream->pa_offs_bytes;
++
++        for (i = 0, pos = stream->hid_consumed; i < frames; ++i, ++pos)
++        {
++            INT32 *frame = mixer->ring[pos % BT_DUALSENSE_MIX_RING];
++
++            for (c = 0; c < 4; ++c)
++            {
++                if (stream->format == BT_FORMAT_F32)
++                    frame[c] += float_to_s16(((const float *)src)[i * 4 + c]);
++                else
++                    frame[c] += ((const int16_t *)src)[i * 4 + c];
++            }
++        }
++        if (frames)
++        {
++            stream->hid_consumed += frames;
++            bt_advance(stream, frames, frame_size);
++        }
++    }
++
++    bt_dualsense_mixer_send(mixer, clock);
++}
++
++/* Endpoints. */
++
++static BOOL steam_virtual_gamepad_present(void)
++{
++    char path[PATH_MAX], value[16];
++    struct dirent *entry;
++    BOOL found = FALSE;
++    DIR *dir;
++    FILE *f;
++
++    if (!(dir = opendir("/sys/class/input")))
++        return FALSE;
++    while (!found && (entry = readdir(dir)))
++    {
++        if (strncmp(entry->d_name, "input", 5))
++            continue;
++        snprintf(path, sizeof(path), "/sys/class/input/%s/id/vendor", entry->d_name);
++        if (!(f = fopen(path, "r")))
++            continue;
++        found = fgets(value, sizeof(value), f) && !strncmp(value, "28de", 4);
++        fclose(f);
++        if (!found)
++            continue;
++        snprintf(path, sizeof(path), "/sys/class/input/%s/id/product", entry->d_name);
++        found = FALSE;
++        if (!(f = fopen(path, "r")))
++            continue;
++        found = fgets(value, sizeof(value), f) && !strncmp(value, "11ff", 4);
++        fclose(f);
++    }
++    closedir(dir);
++    return found;
++}
++
++/* Both match the conditions under which winebus presents the controller as USB. */
++static BOOL bt_dualsense_haptics_enabled(void)
++{
++    const char *env;
++
++    if ((env = getenv("PROTON_DUALSENSE_BT_AS_USB")) && !strcmp(env, "0"))
++        return FALSE;
++    if ((env = getenv("PROTON_DUALSENSE_BT_HAPTICS")) && !strcmp(env, "0"))
++        return FALSE;
++    if ((env = getenv("PROTON_EMULATE_STEAMINPUT")) && atoi(env))
++        return FALSE;
++    if ((env = getenv("PROTON_NO_STEAMINPUT")) && !strcmp(env, "1"))
++        return TRUE;
++    return !steam_virtual_gamepad_present();
++}
++
++static BOOL bt_dualshock4_audio_enabled(void)
++{
++    const char *env;
++
++    if ((env = getenv("PROTON_DUALSHOCK4_BT_AS_USB")) && !strcmp(env, "0"))
++        return FALSE;
++    if ((env = getenv("PROTON_DUALSHOCK4_BT_AUDIO")) && !strcmp(env, "0"))
++        return FALSE;
++    if ((env = getenv("PROTON_EMULATE_STEAMINPUT")) && atoi(env))
++        return FALSE;
++    if ((env = getenv("PROTON_NO_STEAMINPUT")) && !strcmp(env, "1"))
++        return TRUE;
++    return !steam_virtual_gamepad_present();
++}
++
++/* Must match set_bluetooth_dualsense_container_id() in winebus. */
++static GUID bt_container_id(USHORT pid, const unsigned int *mac)
++{
++    GUID guid = {0};
++    unsigned int i;
++
++    guid.Data1 = MAKELONG(0x054c, pid);
++    guid.Data2 = 0x4254;
++    guid.Data3 = (mac[0] << 8) | mac[1];
++    for (i = 0; i < 4; ++i) guid.Data4[i] = mac[i + 2];
++    return guid;
++}
++
++static LONG windows_names_latched;
++
++void bt_latch_windows_names(void)
++{
++    InterlockedExchange(&windows_names_latched, 1);
++}
++
++/* As winepulse's use_windows_sony_controller_names(). */
++static BOOL use_windows_sony_controller_names(void)
++{
++    const char *env = getenv("PROTON_SONY_WINDOWS_DEVICE_NAMES");
++
++    if (env && env[0] == '1' && !env[1])
++        return TRUE;
++    if ((env = getenv("PROTON_DEATH_STRANDING_CONTROLLER_EFFECTS")) && env[0] == '1' && !env[1])
++        return TRUE;
++    return InterlockedCompareExchange(&windows_names_latched, 0, 0);
++}
++
++/* winepulse gives a Bluetooth DualSense endpoint a fresh id each time the
++ * controller appears, so games treat a reconnected controller as a new
++ * device: "#wine-dualsense-hotplug-<n>", or "#wine-sony-hotplug-<container>"
++ * with Windows device names.  Keep the id while the controller stays. */
++struct bt_endpoint_id
++{
++    struct list entry;
++    char base[160];
++    char *id;
++    BOOL seen;
++};
++
++static struct list bt_endpoint_ids = LIST_INIT(bt_endpoint_ids);
++static unsigned int bt_endpoint_generation;
++static pthread_mutex_t bt_ids_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static const char *bt_dualsense_endpoint_id(const char *base, const GUID *container)
++{
++    struct bt_endpoint_id *entry;
++    char id[256];
++
++    LIST_FOR_EACH_ENTRY(entry, &bt_endpoint_ids, struct bt_endpoint_id, entry)
++    {
++        if (!strcmp(entry->base, base))
++        {
++            entry->seen = TRUE;
++            return entry->id;
++        }
++    }
++
++    if (!use_windows_sony_controller_names())
++        snprintf(id, sizeof(id), "%s#wine-dualsense-hotplug-%u", base, ++bt_endpoint_generation);
++    else
++        snprintf(id, sizeof(id),
++                 "%s#wine-sony-hotplug-%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
++                 base, (unsigned int)container->Data1, container->Data2, container->Data3,
++                 container->Data4[0], container->Data4[1], container->Data4[2], container->Data4[3],
++                 container->Data4[4], container->Data4[5], container->Data4[6], container->Data4[7]);
++
++    if (!(entry = calloc(1, sizeof(*entry))) || !(entry->id = strdup(id)))
++    {
++        free(entry);
++        return NULL;
++    }
++    lstrcpynA(entry->base, base, sizeof(entry->base));
++    entry->seen = TRUE;
++    list_add_tail(&bt_endpoint_ids, &entry->entry);
++    return entry->id;
++}
++
++struct bt_controller
++{
++    char hidraw[PATH_MAX];
++    unsigned int pid, mac[6];
++};
++
++/* Calls callback for each Bluetooth Sony controller; returns FALSE if it
++ * asked to stop. */
++static void bt_enum_controllers(BOOL (*callback)(const struct bt_controller *, void *), void *context)
++{
++    char path[PATH_MAX], line[256];
++    struct bt_controller c;
++    struct dirent *entry;
++    DIR *dir;
++    FILE *f;
++
++    if (!(dir = opendir("/sys/class/hidraw")))
++        return;
++    while ((entry = readdir(dir)))
++    {
++        unsigned int bus = 0, vid = 0;
++        BOOL have_mac = FALSE;
++
++        if (strncmp(entry->d_name, "hidraw", 6))
++            continue;
++        snprintf(path, sizeof(path), "/sys/class/hidraw/%s/device/uevent", entry->d_name);
++        if (!(f = fopen(path, "r")))
++            continue;
++        c.pid = 0;
++        while (fgets(line, sizeof(line), f))
++        {
++            if (!strncmp(line, "HID_ID=", 7))
++                sscanf(line + 7, "%x:%x:%x", &bus, &vid, &c.pid);
++            else if (!strncmp(line, "HID_UNIQ=", 9))
++                have_mac = sscanf(line + 9, "%x:%x:%x:%x:%x:%x", &c.mac[0], &c.mac[1], &c.mac[2],
++                                  &c.mac[3], &c.mac[4], &c.mac[5]) == 6;
++        }
++        fclose(f);
++
++        if (bus != 0x0005 || vid != 0x054c || !have_mac)
++            continue;
++        if (c.pid != 0x0ce6 && c.pid != 0x0df2 && c.pid != 0x05c4 && c.pid != 0x09cc)
++            continue;
++        snprintf(c.hidraw, sizeof(c.hidraw), "/dev/%s", entry->d_name);
++        if (!callback(&c, context))
++            break;
++    }
++    closedir(dir);
++}
++
++static BOOL is_dualshock4(unsigned int pid)
++{
++    return pid == 0x05c4 || pid == 0x09cc;
++}
++
++/* The device string without the hotplug suffix. */
++static void bt_base_name(const struct bt_controller *c, EDataFlow flow, char *buf, size_t size)
++{
++    if (is_dualshock4(c->pid))
++        snprintf(buf, size, "%sWireless_Controller.%04x.%02x%02x%02x%02x%02x%02x%s", BT_PULSE_PREFIX,
++                 c->pid, c->mac[0], c->mac[1], c->mac[2], c->mac[3], c->mac[4], c->mac[5],
++                 flow == eRender ? "" : ".mic");
++    else
++        snprintf(buf, size, "%s%s.%02x%02x%02x%02x%02x%02x", BT_PULSE_PREFIX,
++                 c->pid == 0x0df2 ? "DualSense_Edge_Wireless_Controller" : "DualSense_Wireless_Controller",
++                 c->mac[0], c->mac[1], c->mac[2], c->mac[3], c->mac[4], c->mac[5]);
++}
++
++struct enum_context
++{
++    bt_endpoint_cb callback;
++    void *context;
++    BOOL dualsense, dualshock4;
++};
++
++static BOOL enum_controller(const struct bt_controller *c, void *arg)
++{
++    struct enum_context *ctx = arg;
++    struct bt_endpoint ep = {0};
++    char base[160];
++
++    ep.vendor_id = 0x054c;
++    ep.product_id = c->pid;
++    ep.container_id = bt_container_id(c->pid, c->mac);
++
++    if (!is_dualshock4(c->pid))
++    {
++        if (!ctx->dualsense)
++            return TRUE;
++        bt_base_name(c, eRender, base, sizeof(base));
++        if (!(ep.name = bt_dualsense_endpoint_id(base, &ep.container_id)))
++            return TRUE;
++        ep.display = c->pid == 0x0df2 ? "DualSense Edge Wireless Controller" : "DualSense Wireless Controller";
++        ep.flow = eRender;
++        ep.form = Speakers;
++        ep.rate = 48000;
++        ep.channels = 4;
++        ep.channel_mask = SPEAKER_FL | SPEAKER_FR | SPEAKER_BL | SPEAKER_BR;
++        ctx->callback(&ep, ctx->context);
++        TRACE("Bluetooth DualSense haptics endpoint %s for %s.\n", debugstr_a(ep.name), c->hidraw);
++        return TRUE;
++    }
++
++    if (!ctx->dualshock4)
++        return TRUE;
++    /* Like the wired controller: a stereo 32 kHz speaker and a mono 16 kHz
++     * headset microphone. */
++    ep.display = "Wireless Controller";
++    bt_base_name(c, eRender, base, sizeof(base));
++    ep.name = base;
++    ep.flow = eRender;
++    ep.form = Speakers;
++    ep.rate = 32000;
++    ep.channels = 2;
++    ep.channel_mask = SPEAKER_FL | SPEAKER_FR;
++    ctx->callback(&ep, ctx->context);
++
++    bt_base_name(c, eCapture, base, sizeof(base));
++    ep.name = base;
++    ep.flow = eCapture;
++    ep.form = Headset;
++    ep.rate = 16000;
++    ep.channels = 1;
++    ep.channel_mask = SPEAKER_FC;
++    ctx->callback(&ep, ctx->context);
++    TRACE("Bluetooth DualShock 4 speaker and microphone endpoints for %s.\n", c->hidraw);
++    return TRUE;
++}
++
++void bt_enum_endpoints(bt_endpoint_cb callback, void *context)
++{
++    struct enum_context ctx = { callback, context, bt_dualsense_haptics_enabled(), bt_dualshock4_audio_enabled() };
++    struct bt_endpoint_id *entry, *next;
++
++    if (!ctx.dualsense && !ctx.dualshock4)
++        return;
++
++    pthread_mutex_lock(&bt_ids_lock);
++    LIST_FOR_EACH_ENTRY(entry, &bt_endpoint_ids, struct bt_endpoint_id, entry)
++        entry->seen = FALSE;
++    bt_enum_controllers(enum_controller, &ctx);
++    /* A controller that went away gets a new id when it comes back. */
++    LIST_FOR_EACH_ENTRY_SAFE(entry, next, &bt_endpoint_ids, struct bt_endpoint_id, entry)
++    {
++        if (entry->seen)
++            continue;
++        list_remove(&entry->entry);
++        free(entry->id);
++        free(entry);
++    }
++    pthread_mutex_unlock(&bt_ids_lock);
++}
++
++/* Changes when a hidraw device comes or goes, for the hotplug watcher. */
++unsigned int bt_hidraw_signature(void)
++{
++    unsigned int sig = 2166136261u;
++    struct dirent *entry;
++    const char *p;
++    DIR *dir;
++
++    if (!(dir = opendir("/sys/class/hidraw")))
++        return 0;
++    while ((entry = readdir(dir)))
++    {
++        if (strncmp(entry->d_name, "hidraw", 6))
++            continue;
++        /* Order-independent: readdir order is not stable. */
++        {
++            unsigned int h = 2166136261u;
++
++            for (p = entry->d_name; *p; p++)
++                h = (h ^ (unsigned char)*p) * 16777619u;
++            sig += h;
++        }
++    }
++    closedir(dir);
++    return sig;
++}
++
++BOOL bt_is_device(const char *device)
++{
++    return device && !strncmp(device, BT_PULSE_PREFIX, sizeof(BT_PULSE_PREFIX) - 1);
++}
++
++struct resolve_context
++{
++    const char *device;
++    size_t len;
++    struct bt_controller found;
++    BOOL ok;
++    EDataFlow flow;
++};
++
++static BOOL resolve_controller(const struct bt_controller *c, void *arg)
++{
++    struct resolve_context *ctx = arg;
++    char base[160];
++
++    bt_base_name(c, ctx->flow, base, sizeof(base));
++    if (strlen(base) != ctx->len || strncmp(base, ctx->device, ctx->len))
++        return TRUE;
++    ctx->found = *c;
++    ctx->ok = TRUE;
++    return FALSE;
++}
++
++/* Maps an endpoint device string back to its controller. */
++static BOOL bt_resolve(const char *device, EDataFlow flow, struct bt_controller *c)
++{
++    struct resolve_context ctx = { device, 0 };
++    const char *hash = strchr(device, '#');
++
++    ctx.len = hash ? hash - device : strlen(device);
++    ctx.flow = flow;
++    bt_enum_controllers(resolve_controller, &ctx);
++    if (ctx.ok)
++        *c = ctx.found;
++    return ctx.ok;
++}
++
++static BOOL parse_format(const WAVEFORMATEX *fmt, enum bt_format *format)
++{
++    WORD tag = fmt->wFormatTag;
++
++    if (tag == WAVE_FORMAT_EXTENSIBLE && fmt->cbSize >= sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX))
++        tag = ((const WAVEFORMATEXTENSIBLE *)fmt)->SubFormat.Data1;
++    if (tag == WAVE_FORMAT_IEEE_FLOAT && fmt->wBitsPerSample == 32)
++        *format = BT_FORMAT_F32;
++    else if (tag == WAVE_FORMAT_PCM && fmt->wBitsPerSample == 16)
++        *format = BT_FORMAT_S16;
++    else if (tag == WAVE_FORMAT_PCM && fmt->wBitsPerSample == 32)
++        *format = BT_FORMAT_S32;
++    else
++        return FALSE;
++    return fmt->nChannels && fmt->nBlockAlign == fmt->nChannels * fmt->wBitsPerSample / 8;
++}
++
++/* The formats bt_mixer_connect() takes. */
++static BOOL format_usable(BOOL dualshock4, enum bt_format format, UINT32 rate, UINT32 channels)
++{
++    if (dualshock4)
++        return rate >= 8000 && rate <= 192000 && channels <= 8;
++    return (format == BT_FORMAT_F32 || format == BT_FORMAT_S16) && channels == 4 && rate == 48000;
++}
++
++HRESULT bt_is_format_supported(const char *device, EDataFlow flow, const WAVEFORMATEX *fmt)
++{
++    enum bt_format format;
++
++    if (!parse_format(fmt, &format))
++        return AUDCLNT_E_UNSUPPORTED_FORMAT;
++    if (!format_usable(strstr(device, "Interactive_Entertainment_Wireless_Controller.") != NULL,
++                       format, fmt->nSamplesPerSec, fmt->nChannels))
++        return AUDCLNT_E_UNSUPPORTED_FORMAT;
++    return S_OK;
++}
++
++/* Streams. */
++
++static struct bt_stream *bt_get_stream(stream_handle h)
++{
++    return (struct bt_stream *)(UINT_PTR)(h & ~(stream_handle)1);
++}
++
++NTSTATUS bt_create_stream(struct create_stream_params *params)
++{
++    struct bt_controller controller;
++    struct bt_stream *stream;
++    enum bt_format format;
++    UINT32 rate, frames;
++    HRESULT hr;
++
++    if (params->share == AUDCLNT_SHAREMODE_EXCLUSIVE)
++    {
++        params->result = AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED;
++        return STATUS_SUCCESS;
++    }
++    if (!parse_format(params->fmt, &format))
++    {
++        params->result = AUDCLNT_E_UNSUPPORTED_FORMAT;
++        return STATUS_SUCCESS;
++    }
++    if (!bt_resolve(params->device, params->flow, &controller))
++    {
++        WARN("Bluetooth controller for %s is gone.\n", debugstr_a(params->device));
++        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
++        return STATUS_SUCCESS;
++    }
++    if (params->flow == eCapture && !is_dualshock4(controller.pid))
++    {
++        params->result = AUDCLNT_E_ENDPOINT_CREATE_FAILED;
++        return STATUS_SUCCESS;
++    }
++
++    if (!(stream = calloc(1, sizeof(*stream))))
++    {
++        params->result = E_OUTOFMEMORY;
++        return STATUS_SUCCESS;
++    }
++    rate = params->fmt->nSamplesPerSec;
++    stream->dataflow = params->flow;
++    stream->flags = params->flags;
++    stream->format = format;
++    stream->rate = rate;
++    stream->channels = params->fmt->nChannels;
++    stream->frame_size = params->fmt->nBlockAlign;
++    stream->hid_fd = -1;
++    stream->period = params->period ? params->period : 100000;
++    stream->period_frames = (stream->period * rate + 9999999) / 10000000;
++    if (!stream->period_frames)
++        stream->period_frames = 1;
++    stream->period_bytes = stream->period_frames * stream->frame_size;
++
++    frames = (params->duration * rate + 9999999) / 10000000;
++    if (frames < 2 * stream->period_frames)
++        frames = 2 * stream->period_frames;
++    /* Capture hands out whole periods. */
++    if (params->flow == eCapture)
++        frames = (frames + stream->period_frames - 1) / stream->period_frames * stream->period_frames;
++    stream->bufsize_frames = frames;
++    stream->real_bufsize_bytes = frames * stream->frame_size;
++
++    if (!(stream->local_buffer = calloc(1, stream->real_bufsize_bytes)))
++    {
++        free(stream);
++        params->result = E_OUTOFMEMORY;
++        return STATUS_SUCCESS;
++    }
++
++    pthread_mutex_lock(&bt_lock);
++    hr = bt_mixer_connect(stream, controller.hidraw, is_dualshock4(controller.pid));
++    pthread_mutex_unlock(&bt_lock);
++
++    if (FAILED(hr))
++    {
++        free(stream->local_buffer);
++        free(stream);
++        params->result = hr;
++        return STATUS_SUCCESS;
++    }
++
++    TRACE("Bluetooth %s stream %p on %s: %u Hz, %u channels, period %u frames, buffer %u frames.\n",
++          params->flow == eRender ? "render" : "capture", stream, controller.hidraw, rate,
++          stream->channels, stream->period_frames, stream->bufsize_frames);
++    *params->channel_count = stream->channels;
++    *params->stream = (stream_handle)(UINT_PTR)stream | 1;
++    params->result = S_OK;
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS bt_release_stream(struct release_stream_params *params)
++{
++    struct bt_stream *stream = bt_get_stream(params->stream);
++
++    pthread_mutex_lock(&bt_lock);
++    stream->please_quit = TRUE;
++    pthread_mutex_unlock(&bt_lock);
++
++    if (params->timer_thread)
++    {
++        NtWaitForSingleObject(params->timer_thread, FALSE, NULL);
++        NtClose(params->timer_thread);
++    }
++
++    pthread_mutex_lock(&bt_lock);
++    bt_haptic_close(stream);
++    pthread_mutex_unlock(&bt_lock);
++
++    free(stream->local_buffer);
++    free(stream->tmp_buffer);
++    free(stream);
++    params->result = S_OK;
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS bt_timer_loop(struct timer_loop_params *params)
++{
++    struct bt_stream *stream = bt_get_stream(params->stream);
++    struct timespec next;
++    UINT64 period_ns = (UINT64)stream->period * 100;
++
++    clock_gettime(CLOCK_MONOTONIC, &next);
++    for (;;)
++    {
++        next.tv_nsec += period_ns % 1000000000;
++        next.tv_sec += period_ns / 1000000000 + next.tv_nsec / 1000000000;
++        next.tv_nsec %= 1000000000;
++        while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL) == EINTR) ;
++
++        pthread_mutex_lock(&bt_lock);
++        if (stream->please_quit)
++        {
++            pthread_mutex_unlock(&bt_lock);
++            break;
++        }
++        if (stream->started)
++        {
++            if (stream->dataflow == eRender)
++                bt_haptic_write(stream, stream->held_bytes / stream->frame_size, stream->frame_size);
++            else
++                bt_ds4_capture(stream);
++            if (stream->event)
++                NtSetEvent(stream->event, NULL);
++        }
++        pthread_mutex_unlock(&bt_lock);
++    }
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS bt_start(struct start_params *params)
++{
++    struct bt_stream *stream = bt_get_stream(params->stream);
++
++    pthread_mutex_lock(&bt_lock);
++    if ((stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) && !stream->event)
++        params->result = AUDCLNT_E_EVENTHANDLE_NOT_SET;
++    else if (stream->started)
++        params->result = AUDCLNT_E_NOT_STOPPED;
++    else
++    {
++        stream->started = TRUE;
++        stream->hid_start_time = 0;
++        params->result = S_OK;
++    }
++    pthread_mutex_unlock(&bt_lock);
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS bt_stop(struct stop_params *params)
++{
++    struct bt_stream *stream = bt_get_stream(params->stream);
++
++    pthread_mutex_lock(&bt_lock);
++    params->result = stream->started ? S_OK : S_FALSE;
++    stream->started = FALSE;
++    pthread_mutex_unlock(&bt_lock);
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS bt_reset(struct reset_params *params)
++{
++    struct bt_stream *stream = bt_get_stream(params->stream);
++
++    pthread_mutex_lock(&bt_lock);
++    if (stream->started)
++        params->result = AUDCLNT_E_NOT_STOPPED;
++    else if (stream->getbuf_last)
++        params->result = AUDCLNT_E_BUFFER_OPERATION_PENDING;
++    else
++    {
++        stream->held_bytes = 0;
++        stream->played_frames = stream->read_frames = 0;
++        stream->discont = FALSE;
++        params->result = S_OK;
++    }
++    pthread_mutex_unlock(&bt_lock);
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS bt_get_render_buffer(struct get_render_buffer_params *params)
++{
++    struct bt_stream *stream = bt_get_stream(params->stream);
++    UINT32 bytes = params->frames * stream->frame_size, write_offs;
++
++    pthread_mutex_lock(&bt_lock);
++    if (stream->getbuf_last)
++        params->result = AUDCLNT_E_OUT_OF_ORDER;
++    else if (!params->frames)
++    {
++        *params->data = NULL;
++        params->result = S_OK;
++    }
++    else if (stream->held_bytes / stream->frame_size + params->frames > stream->bufsize_frames)
++        params->result = AUDCLNT_E_BUFFER_TOO_LARGE;
++    else
++    {
++        write_offs = (stream->pa_offs_bytes + stream->held_bytes) % stream->real_bufsize_bytes;
++        if (write_offs + bytes <= stream->real_bufsize_bytes)
++        {
++            *params->data = stream->local_buffer + write_offs;
++            stream->tmp_in_use = FALSE;
++            params->result = S_OK;
++        }
++        else
++        {
++            if (stream->tmp_buffer_bytes < bytes)
++            {
++                BYTE *tmp = realloc(stream->tmp_buffer, bytes);
++
++                if (tmp)
++                {
++                    stream->tmp_buffer = tmp;
++                    stream->tmp_buffer_bytes = bytes;
++                }
++            }
++            if (stream->tmp_buffer_bytes >= bytes)
++            {
++                *params->data = stream->tmp_buffer;
++                stream->tmp_in_use = TRUE;
++                params->result = S_OK;
++            }
++            else
++                params->result = E_OUTOFMEMORY;
++        }
++        if (SUCCEEDED(params->result))
++            stream->getbuf_last = params->frames;
++    }
++    pthread_mutex_unlock(&bt_lock);
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS bt_release_render_buffer(struct release_render_buffer_params *params)
++{
++    struct bt_stream *stream = bt_get_stream(params->stream);
++    UINT32 bytes = params->written_frames * stream->frame_size, write_offs, first;
++    BYTE *buffer;
++
++    pthread_mutex_lock(&bt_lock);
++    if (!params->written_frames)
++    {
++        stream->getbuf_last = 0;
++        params->result = S_OK;
++    }
++    else if (!stream->getbuf_last)
++        params->result = AUDCLNT_E_OUT_OF_ORDER;
++    else if (params->written_frames > stream->getbuf_last)
++        params->result = AUDCLNT_E_INVALID_SIZE;
++    else
++    {
++        write_offs = (stream->pa_offs_bytes + stream->held_bytes) % stream->real_bufsize_bytes;
++        buffer = stream->tmp_in_use ? stream->tmp_buffer : stream->local_buffer + write_offs;
++        if (params->flags & AUDCLNT_BUFFERFLAGS_SILENT)
++            memset(buffer, 0, bytes);
++        if (stream->tmp_in_use)
++        {
++            first = min(bytes, stream->real_bufsize_bytes - write_offs);
++            memcpy(stream->local_buffer + write_offs, buffer, first);
++            memcpy(stream->local_buffer, buffer + first, bytes - first);
++        }
++        stream->held_bytes += bytes;
++        stream->getbuf_last = 0;
++        params->result = S_OK;
++    }
++    pthread_mutex_unlock(&bt_lock);
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS bt_get_capture_buffer(struct get_capture_buffer_params *params)
++{
++    struct bt_stream *stream = bt_get_stream(params->stream);
++    LARGE_INTEGER now, freq;
++
++    pthread_mutex_lock(&bt_lock);
++    if (stream->getbuf_last)
++    {
++        params->result = AUDCLNT_E_OUT_OF_ORDER;
++        pthread_mutex_unlock(&bt_lock);
++        return STATUS_SUCCESS;
++    }
++    if (stream->held_bytes < stream->period_bytes)
++    {
++        *params->frames = 0;
++        params->result = AUDCLNT_S_BUFFER_EMPTY;
++        pthread_mutex_unlock(&bt_lock);
++        return STATUS_SUCCESS;
++    }
++    *params->data = stream->local_buffer + stream->pa_offs_bytes;
++    *params->frames = stream->period_frames;
++    *params->flags = stream->discont ? AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY : 0;
++    stream->discont = FALSE;
++    if (params->devpos)
++        *params->devpos = stream->read_frames;
++    if (params->qpcpos)
++    {
++        /* The packet was captured as many periods ago as are queued. */
++        NtQueryPerformanceCounter(&now, &freq);
++        *params->qpcpos = (now.QuadPart - (LONGLONG)(stream->held_bytes / stream->frame_size) *
++                           freq.QuadPart / stream->rate) * 10000000 / freq.QuadPart;
++    }
++    stream->getbuf_last = stream->period_frames;
++    params->result = S_OK;
++    pthread_mutex_unlock(&bt_lock);
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS bt_release_capture_buffer(struct release_capture_buffer_params *params)
++{
++    struct bt_stream *stream = bt_get_stream(params->stream);
++
++    pthread_mutex_lock(&bt_lock);
++    if (!params->done)
++    {
++        stream->getbuf_last = 0;
++        params->result = S_OK;
++    }
++    else if (!stream->getbuf_last)
++        params->result = AUDCLNT_E_OUT_OF_ORDER;
++    else if (params->done != stream->getbuf_last)
++        params->result = AUDCLNT_E_INVALID_SIZE;
++    else
++    {
++        stream->pa_offs_bytes = (stream->pa_offs_bytes + stream->period_bytes) % stream->real_bufsize_bytes;
++        stream->held_bytes -= stream->period_bytes;
++        stream->read_frames += params->done;
++        stream->getbuf_last = 0;
++        params->result = S_OK;
++    }
++    pthread_mutex_unlock(&bt_lock);
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS bt_get_buffer_size(struct get_buffer_size_params *params)
++{
++    *params->frames = bt_get_stream(params->stream)->bufsize_frames;
++    params->result = S_OK;
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS bt_get_latency(struct get_latency_params *params)
++{
++    *params->latency = 2 * bt_get_stream(params->stream)->period;
++    params->result = S_OK;
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS bt_get_current_padding(struct get_current_padding_params *params)
++{
++    struct bt_stream *stream = bt_get_stream(params->stream);
++
++    pthread_mutex_lock(&bt_lock);
++    *params->padding = stream->held_bytes / stream->frame_size;
++    pthread_mutex_unlock(&bt_lock);
++    params->result = S_OK;
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS bt_get_next_packet_size(struct get_next_packet_size_params *params)
++{
++    struct bt_stream *stream = bt_get_stream(params->stream);
++
++    pthread_mutex_lock(&bt_lock);
++    *params->frames = stream->held_bytes >= stream->period_bytes ? stream->period_frames : 0;
++    pthread_mutex_unlock(&bt_lock);
++    params->result = S_OK;
++    return STATUS_SUCCESS;
++}
++
++/* Shared mode clocks count bytes, as on Windows and in winepulse. */
++NTSTATUS bt_get_frequency(struct get_frequency_params *params)
++{
++    struct bt_stream *stream = bt_get_stream(params->stream);
++
++    *params->freq = (UINT64)stream->rate * stream->frame_size;
++    params->result = S_OK;
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS bt_get_position(struct get_position_params *params)
++{
++    struct bt_stream *stream = bt_get_stream(params->stream);
++    LARGE_INTEGER now, freq;
++
++    pthread_mutex_lock(&bt_lock);
++    *params->pos = (stream->dataflow == eRender ? stream->played_frames : stream->read_frames) *
++                   stream->frame_size;
++    pthread_mutex_unlock(&bt_lock);
++    if (params->qpctime)
++    {
++        NtQueryPerformanceCounter(&now, &freq);
++        *params->qpctime = now.QuadPart * 10000000 / freq.QuadPart;
++    }
++    params->result = S_OK;
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS bt_set_volumes(struct set_volumes_params *params)
++{
++    /* As in winepulse, the controller audio is sent at full scale. */
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS bt_set_event_handle(struct set_event_handle_params *params)
++{
++    struct bt_stream *stream = bt_get_stream(params->stream);
++
++    pthread_mutex_lock(&bt_lock);
++    if (!(stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK))
++        params->result = AUDCLNT_E_EVENTHANDLE_NOT_EXPECTED;
++    else if (stream->event)
++        params->result = HRESULT_FROM_WIN32(ERROR_INVALID_NAME);
++    else
++    {
++        stream->event = params->event;
++        params->result = S_OK;
++    }
++    pthread_mutex_unlock(&bt_lock);
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS bt_set_sample_rate(struct set_sample_rate_params *params)
++{
++    params->result = E_NOTIMPL;
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS bt_is_started(struct is_started_params *params)
++{
++    struct bt_stream *stream = bt_get_stream(params->stream);
++
++    pthread_mutex_lock(&bt_lock);
++    params->result = stream->started ? S_OK : S_FALSE;
++    pthread_mutex_unlock(&bt_lock);
++    return STATUS_SUCCESS;
++}
+diff --git a/dlls/winepipewire.drv/bluetooth.h b/dlls/winepipewire.drv/bluetooth.h
+new file mode 100644
+--- /dev/null
++++ b/dlls/winepipewire.drv/bluetooth.h
+@@ -0,0 +1,64 @@
++/*
++ * Bluetooth DualSense and DualShock 4 audio for winepipewire.drv
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/* A Bluetooth Sony controller endpoint, for the device list. */
++struct bt_endpoint
++{
++    const char *name;     /* device string */
++    const char *display;  /* UTF-8 */
++    EDataFlow flow;
++    EndpointFormFactor form;
++    UINT32 rate, channels, channel_mask;
++    UINT16 vendor_id, product_id;
++    GUID container_id;
++};
++
++typedef void (*bt_endpoint_cb)(const struct bt_endpoint *endpoint, void *context);
++
++/* Bluetooth stream handles have the low bit set. */
++static inline BOOL bt_is_stream_handle(stream_handle h)
++{
++    return h & 1;
++}
++
++extern void bt_enum_endpoints(bt_endpoint_cb callback, void *context);
++extern unsigned int bt_hidraw_signature(void);
++extern void bt_latch_windows_names(void);
++extern BOOL bt_is_device(const char *device);
++extern HRESULT bt_is_format_supported(const char *device, EDataFlow flow, const WAVEFORMATEX *fmt);
++
++extern NTSTATUS bt_create_stream(struct create_stream_params *params);
++extern NTSTATUS bt_release_stream(struct release_stream_params *params);
++extern NTSTATUS bt_start(struct start_params *params);
++extern NTSTATUS bt_stop(struct stop_params *params);
++extern NTSTATUS bt_reset(struct reset_params *params);
++extern NTSTATUS bt_timer_loop(struct timer_loop_params *params);
++extern NTSTATUS bt_get_render_buffer(struct get_render_buffer_params *params);
++extern NTSTATUS bt_release_render_buffer(struct release_render_buffer_params *params);
++extern NTSTATUS bt_get_capture_buffer(struct get_capture_buffer_params *params);
++extern NTSTATUS bt_release_capture_buffer(struct release_capture_buffer_params *params);
++extern NTSTATUS bt_get_buffer_size(struct get_buffer_size_params *params);
++extern NTSTATUS bt_get_latency(struct get_latency_params *params);
++extern NTSTATUS bt_get_current_padding(struct get_current_padding_params *params);
++extern NTSTATUS bt_get_next_packet_size(struct get_next_packet_size_params *params);
++extern NTSTATUS bt_get_frequency(struct get_frequency_params *params);
++extern NTSTATUS bt_get_position(struct get_position_params *params);
++extern NTSTATUS bt_set_volumes(struct set_volumes_params *params);
++extern NTSTATUS bt_set_event_handle(struct set_event_handle_params *params);
++extern NTSTATUS bt_set_sample_rate(struct set_sample_rate_params *params);
++extern NTSTATUS bt_is_started(struct is_started_params *params);
+diff --git a/dlls/winepipewire.drv/pipewire.c b/dlls/winepipewire.drv/pipewire.c
+--- a/dlls/winepipewire.drv/pipewire.c
++++ b/dlls/winepipewire.drv/pipewire.c
+@@ -86,6 +86,7 @@
+ #include "wine/unixlib.h"
+ 
+ #include "../mmdevapi/unixlib.h"
++#include "bluetooth.h"
+ 
+ /* Provided by mmdevapi/unixlib.h in newer Wine. */
+ static inline NTSTATUS create_unix_thread( HANDLE *handle, const WCHAR *name,
+@@ -1056,11 +1057,20 @@
+ 
+ /* mmdevapi starts a timer_loop thread per stream; the period timers above
+  * already pace and signal the streams, so there is nothing to do here. */
+-static NTSTATUS pipewire_timer_loop(void *args)
++static NTSTATUS pipewire_timer_loop_pw(void *args)
+ {
+     return STATUS_SUCCESS;
+ }
+ 
++static NTSTATUS pipewire_timer_loop(void *args)
++{
++    struct timer_loop_params *params = args;
++
++    if (bt_is_stream_handle(params->stream))
++        return bt_timer_loop(params);
++    return pipewire_timer_loop_pw(args);
++}
++
+ /* The probe callbacks below run on the probe loop's own thread: libc, spa and
+  * pw only, never ntdll/Wine (no TRACE).  Strings stay UTF-8 until the
+  * unix-call thread converts them. */
+@@ -1676,6 +1686,29 @@
+     }
+ }
+ 
++struct bt_cache_context
++{
++    struct list *render, *capture;
++    UINT *index;
++    REFERENCE_TIME def_period, min_period;
++};
++
++static void add_bt_endpoint(const struct bt_endpoint *ep, void *arg)
++{
++    struct bt_cache_context *ctx = arg;
++    struct list *list = ep->flow == eRender ? ctx->render : ctx->capture;
++    struct pw_phys_device *dev;
++
++    if (!(dev = add_device(list, ep->name, utf8_to_wstr(ep->display), ep->form, ep->rate,
++                           ep->channels, ep->channel_mask, ctx->def_period, ctx->min_period)))
++        return;
++    dev->bus = PW_BUS_USB;
++    dev->vendor_id = ep->vendor_id;
++    dev->product_id = ep->product_id;
++    dev->index = (*ctx->index)++;
++    dev->container_id = ep->container_id;
++}
++
+ /* Fills render and capture with the probed endpoints, numbering them from
+  * *index.  The default endpoints are only added on the first probe; later
+  * hotplug probes keep the original ones. */
+@@ -1745,6 +1778,13 @@
+         }
+     }
+ 
++    /* Bluetooth Sony controllers have no PipeWire node for their audio. */
++    {
++        struct bt_cache_context ctx = { render, capture, &index, 100000, 30000 };
++
++        bt_enum_endpoints(add_bt_endpoint, &ctx);
++    }
++
+     if (add_defaults)
+     {
+         add_default_device(render, Speakers, g_default_sink, rate, def_period,
+@@ -1902,6 +1942,7 @@
+ }
+ 
+ static UINT g_next_index; /* device_lists_mutex */
++static unsigned int g_hidraw_signature;
+ 
+ static NTSTATUS pipewire_test_connect(void *args)
+ {
+@@ -1928,6 +1969,7 @@
+     pthread_mutex_lock(&device_lists_mutex);
+     build_device_cache(&p, &g_render_devices, &g_capture_devices, &index, TRUE);
+     g_next_index = index;
++    g_hidraw_signature = bt_hidraw_signature();
+     TRACE("probe for %s: %u sinks default=%s, %u sources default=%s, rate=%u\n",
+           debugstr_w(params->name), list_count(&g_render_devices), debugstr_a(g_default_sink),
+           list_count(&g_capture_devices), debugstr_a(g_default_source), p.clock_rate);
+@@ -2268,6 +2310,21 @@
+         events = hp_events;
+         pthread_mutex_unlock(&hp_mutex);
+ 
++        /* A Bluetooth controller adds no PipeWire node, only a hidraw device. */
++        if (!(events & (mask | other)))
++        {
++            unsigned int sig = bt_hidraw_signature();
++
++            if (sig != g_hidraw_signature)
++            {
++                g_hidraw_signature = sig;
++                pthread_mutex_lock(&hp_mutex);
++                hp_events |= HP_RENDER | HP_CAPTURE;
++                events = hp_events;
++                pthread_mutex_unlock(&hp_mutex);
++            }
++        }
++
+         if (!(events & mask))
+         {
+             params->more_data = !!(events & other);
+@@ -2377,7 +2434,7 @@
+     return NULL;
+ }
+ 
+-static NTSTATUS pipewire_get_mix_format(void *args)
++static NTSTATUS pipewire_get_mix_format_pw(void *args)
+ {
+     struct get_mix_format_params *params = args;
+     struct pw_phys_device *dev;
+@@ -2397,6 +2454,15 @@
+     return STATUS_SUCCESS;
+ }
+ 
++static NTSTATUS pipewire_get_mix_format(void *args)
++{
++    struct get_mix_format_params *params = args;
++
++    if (params->sony_windows_audio_mode)
++        bt_latch_windows_names();
++    return pipewire_get_mix_format_pw(args);
++}
++
+ static HRESULT get_device_period_helper(EDataFlow flow, const char *pw_name,
+                                         REFERENCE_TIME *def, REFERENCE_TIME *min)
+ {
+@@ -2672,7 +2738,7 @@
+     return S_OK;
+ }
+ 
+-static NTSTATUS pipewire_is_format_supported(void *args)
++static NTSTATUS pipewire_is_format_supported_pw(void *args)
+ {
+     struct is_format_supported_params *params = args;
+     struct spa_audio_info_raw info;
+@@ -2690,6 +2756,21 @@
+     return STATUS_SUCCESS;
+ }
+ 
++static NTSTATUS pipewire_is_format_supported(void *args)
++{
++    struct is_format_supported_params *params = args;
++
++    if (params->sony_windows_audio_mode)
++        bt_latch_windows_names();
++    if (bt_is_device(params->device))
++    {
++        params->result = params->share == AUDCLNT_SHAREMODE_EXCLUSIVE ? AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED
++                                                                     : bt_is_format_supported(params->device, params->flow, params->fmt_in);
++        return STATUS_SUCCESS;
++    }
++    return pipewire_is_format_supported_pw(args);
++}
++
+ /* vol is a caller-owned snapshot: the process callback must not re-read
+  * stream->vol, which SetVolumes mutates concurrently. */
+ static void apply_volume(const struct pipewire_stream *stream, const float *vol,
+@@ -3350,7 +3431,7 @@
+     free(stream);
+ }
+ 
+-static NTSTATUS pipewire_create_stream(void *args)
++static NTSTATUS pipewire_create_stream_pw(void *args)
+ {
+     struct create_stream_params *params = args;
+     struct pipewire_stream *stream;
+@@ -3601,7 +3682,18 @@
+     return STATUS_SUCCESS;
+ }
+ 
+-static NTSTATUS pipewire_release_stream(void *args)
++static NTSTATUS pipewire_create_stream(void *args)
++{
++    struct create_stream_params *params = args;
++
++    if (params->sony_windows_audio_mode)
++        bt_latch_windows_names();
++    if (bt_is_device(params->device))
++        return bt_create_stream(params);
++    return pipewire_create_stream_pw(args);
++}
++
++static NTSTATUS pipewire_release_stream_pw(void *args)
+ {
+     struct release_stream_params *params = args;
+     struct pipewire_stream *stream = handle_get_stream(params->stream);
+@@ -3671,6 +3763,15 @@
+     return STATUS_SUCCESS;
+ }
+ 
++static NTSTATUS pipewire_release_stream(void *args)
++{
++    struct release_stream_params *params = args;
++
++    if (bt_is_stream_handle(params->stream))
++        return bt_release_stream(params);
++    return pipewire_release_stream_pw(args);
++}
++
+ /* Claim the oldest published slot for the timer thread.  The claim exchanges
+  * the whole word, so the slot owned is exactly the one the scan chose. */
+ static struct cap_slot *cap_claim_slot(struct pipewire_stream *stream, UINT32 *out_idx,
+@@ -3954,7 +4055,7 @@
+     return S_OK;
+ }
+ 
+-static NTSTATUS pipewire_start(void *args)
++static NTSTATUS pipewire_start_pw(void *args)
+ {
+     struct start_params *params = args;
+     struct pipewire_stream *stream = handle_get_stream(params->stream);
+@@ -4011,7 +4112,16 @@
+     return STATUS_SUCCESS;
+ }
+ 
+-static NTSTATUS pipewire_stop(void *args)
++static NTSTATUS pipewire_start(void *args)
++{
++    struct start_params *params = args;
++
++    if (bt_is_stream_handle(params->stream))
++        return bt_start(params);
++    return pipewire_start_pw(args);
++}
++
++static NTSTATUS pipewire_stop_pw(void *args)
+ {
+     struct stop_params *params = args;
+     struct pipewire_stream *stream = handle_get_stream(params->stream);
+@@ -4042,6 +4152,15 @@
+     return STATUS_SUCCESS;
+ }
+ 
++static NTSTATUS pipewire_stop(void *args)
++{
++    struct stop_params *params = args;
++
++    if (bt_is_stream_handle(params->stream))
++        return bt_stop(params);
++    return pipewire_stop_pw(args);
++}
++
+ /* Run fn with the process callback excluded, from a control path holding the
+  * thread loop lock (pw_loop_locked() needs 1.6.0).  When the data loop is the
+  * thread loop, that lock already excludes the callback and fn runs inline: a
+@@ -4110,7 +4229,7 @@
+     return 0;
+ }
+ 
+-static NTSTATUS pipewire_reset(void *args)
++static NTSTATUS pipewire_reset_pw(void *args)
+ {
+     struct reset_params *params = args;
+     struct pipewire_stream *stream = handle_get_stream(params->stream);
+@@ -4189,6 +4308,15 @@
+     return STATUS_SUCCESS;
+ }
+ 
++static NTSTATUS pipewire_reset(void *args)
++{
++    struct reset_params *params = args;
++
++    if (bt_is_stream_handle(params->stream))
++        return bt_reset(params);
++    return pipewire_reset_pw(args);
++}
++
+ static BOOL alloc_tmp_buffer(struct pipewire_stream *stream, SIZE_T bytes)
+ {
+     SIZE_T size;
+@@ -4231,7 +4359,7 @@
+     return stream->held_bytes / stream->frame_size;
+ }
+ 
+-static NTSTATUS pipewire_get_render_buffer(void *args)
++static NTSTATUS pipewire_get_render_buffer_pw(void *args)
+ {
+     struct get_render_buffer_params *params = args;
+     struct pipewire_stream *stream = handle_get_stream(params->stream);
+@@ -4297,6 +4425,15 @@
+     return STATUS_SUCCESS;
+ }
+ 
++static NTSTATUS pipewire_get_render_buffer(void *args)
++{
++    struct get_render_buffer_params *params = args;
++
++    if (bt_is_stream_handle(params->stream))
++        return bt_get_render_buffer(params);
++    return pipewire_get_render_buffer_pw(args);
++}
++
+ static void pipewire_wrap_buffer(struct pipewire_stream *stream, BYTE *buffer, UINT32 written_bytes)
+ {
+     UINT32 wri_offs_bytes = (stream->lcl_offs_bytes + stream->held_bytes) %
+@@ -4314,7 +4451,7 @@
+     }
+ }
+ 
+-static NTSTATUS pipewire_release_render_buffer(void *args)
++static NTSTATUS pipewire_release_render_buffer_pw(void *args)
+ {
+     struct release_render_buffer_params *params = args;
+     struct pipewire_stream *stream = handle_get_stream(params->stream);
+@@ -4385,7 +4522,16 @@
+     return STATUS_SUCCESS;
+ }
+ 
+-static NTSTATUS pipewire_get_capture_buffer(void *args)
++static NTSTATUS pipewire_release_render_buffer(void *args)
++{
++    struct release_render_buffer_params *params = args;
++
++    if (bt_is_stream_handle(params->stream))
++        return bt_release_render_buffer(params);
++    return pipewire_release_render_buffer_pw(args);
++}
++
++static NTSTATUS pipewire_get_capture_buffer_pw(void *args)
+ {
+     struct get_capture_buffer_params *params = args;
+     struct pipewire_stream *stream = handle_get_stream(params->stream);
+@@ -4432,7 +4578,16 @@
+     return STATUS_SUCCESS;
+ }
+ 
+-static NTSTATUS pipewire_release_capture_buffer(void *args)
++static NTSTATUS pipewire_get_capture_buffer(void *args)
++{
++    struct get_capture_buffer_params *params = args;
++
++    if (bt_is_stream_handle(params->stream))
++        return bt_get_capture_buffer(params);
++    return pipewire_get_capture_buffer_pw(args);
++}
++
++static NTSTATUS pipewire_release_capture_buffer_pw(void *args)
+ {
+     struct release_capture_buffer_params *params = args;
+     struct pipewire_stream *stream = handle_get_stream(params->stream);
+@@ -4467,7 +4622,16 @@
+     return STATUS_SUCCESS;
+ }
+ 
+-static NTSTATUS pipewire_get_current_padding(void *args)
++static NTSTATUS pipewire_release_capture_buffer(void *args)
++{
++    struct release_capture_buffer_params *params = args;
++
++    if (bt_is_stream_handle(params->stream))
++        return bt_release_capture_buffer(params);
++    return pipewire_release_capture_buffer_pw(args);
++}
++
++static NTSTATUS pipewire_get_current_padding_pw(void *args)
+ {
+     struct get_current_padding_params *params = args;
+     struct pipewire_stream *stream = handle_get_stream(params->stream);
+@@ -4490,7 +4654,16 @@
+     return STATUS_SUCCESS;
+ }
+ 
+-static NTSTATUS pipewire_get_buffer_size(void *args)
++static NTSTATUS pipewire_get_current_padding(void *args)
++{
++    struct get_current_padding_params *params = args;
++
++    if (bt_is_stream_handle(params->stream))
++        return bt_get_current_padding(params);
++    return pipewire_get_current_padding_pw(args);
++}
++
++static NTSTATUS pipewire_get_buffer_size_pw(void *args)
+ {
+     struct get_buffer_size_params *params = args;
+     struct pipewire_stream *stream = handle_get_stream(params->stream);
+@@ -4505,7 +4678,16 @@
+     return STATUS_SUCCESS;
+ }
+ 
+-static NTSTATUS pipewire_get_latency(void *args)
++static NTSTATUS pipewire_get_buffer_size(void *args)
++{
++    struct get_buffer_size_params *params = args;
++
++    if (bt_is_stream_handle(params->stream))
++        return bt_get_buffer_size(params);
++    return pipewire_get_buffer_size_pw(args);
++}
++
++static NTSTATUS pipewire_get_latency_pw(void *args)
+ {
+     struct get_latency_params *params = args;
+     struct pipewire_stream *stream = handle_get_stream(params->stream);
+@@ -4526,7 +4708,16 @@
+     return STATUS_SUCCESS;
+ }
+ 
+-static NTSTATUS pipewire_get_next_packet_size(void *args)
++static NTSTATUS pipewire_get_latency(void *args)
++{
++    struct get_latency_params *params = args;
++
++    if (bt_is_stream_handle(params->stream))
++        return bt_get_latency(params);
++    return pipewire_get_latency_pw(args);
++}
++
++static NTSTATUS pipewire_get_next_packet_size_pw(void *args)
+ {
+     struct get_next_packet_size_params *params = args;
+     struct pipewire_stream *stream = handle_get_stream(params->stream);
+@@ -4548,7 +4739,16 @@
+     return STATUS_SUCCESS;
+ }
+ 
+-static NTSTATUS pipewire_get_frequency(void *args)
++static NTSTATUS pipewire_get_next_packet_size(void *args)
++{
++    struct get_next_packet_size_params *params = args;
++
++    if (bt_is_stream_handle(params->stream))
++        return bt_get_next_packet_size(params);
++    return pipewire_get_next_packet_size_pw(args);
++}
++
++static NTSTATUS pipewire_get_frequency_pw(void *args)
+ {
+     struct get_frequency_params *params = args;
+     struct pipewire_stream *stream = handle_get_stream(params->stream);
+@@ -4569,7 +4769,16 @@
+     return STATUS_SUCCESS;
+ }
+ 
+-static NTSTATUS pipewire_get_position(void *args)
++static NTSTATUS pipewire_get_frequency(void *args)
++{
++    struct get_frequency_params *params = args;
++
++    if (bt_is_stream_handle(params->stream))
++        return bt_get_frequency(params);
++    return pipewire_get_frequency_pw(args);
++}
++
++static NTSTATUS pipewire_get_position_pw(void *args)
+ {
+     struct get_position_params *params = args;
+     struct pipewire_stream *stream = handle_get_stream(params->stream);
+@@ -4604,7 +4813,16 @@
+     return STATUS_SUCCESS;
+ }
+ 
+-static NTSTATUS pipewire_set_volumes(void *args)
++static NTSTATUS pipewire_get_position(void *args)
++{
++    struct get_position_params *params = args;
++
++    if (bt_is_stream_handle(params->stream))
++        return bt_get_position(params);
++    return pipewire_get_position_pw(args);
++}
++
++static NTSTATUS pipewire_set_volumes_pw(void *args)
+ {
+     struct set_volumes_params *params = args;
+     struct pipewire_stream *stream = handle_get_stream(params->stream);
+@@ -4622,7 +4840,16 @@
+     return STATUS_SUCCESS;
+ }
+ 
+-static NTSTATUS pipewire_set_event_handle(void *args)
++static NTSTATUS pipewire_set_volumes(void *args)
++{
++    struct set_volumes_params *params = args;
++
++    if (bt_is_stream_handle(params->stream))
++        return bt_set_volumes(params);
++    return pipewire_set_volumes_pw(args);
++}
++
++static NTSTATUS pipewire_set_event_handle_pw(void *args)
+ {
+     struct set_event_handle_params *params = args;
+     struct pipewire_stream *stream = handle_get_stream(params->stream);
+@@ -4644,7 +4871,16 @@
+     return STATUS_SUCCESS;
+ }
+ 
+-static NTSTATUS pipewire_set_sample_rate(void *args)
++static NTSTATUS pipewire_set_event_handle(void *args)
++{
++    struct set_event_handle_params *params = args;
++
++    if (bt_is_stream_handle(params->stream))
++        return bt_set_event_handle(params);
++    return pipewire_set_event_handle_pw(args);
++}
++
++static NTSTATUS pipewire_set_sample_rate_pw(void *args)
+ {
+     struct set_sample_rate_params *params = args;
+     struct pipewire_stream *stream = handle_get_stream(params->stream);
+@@ -4725,7 +4961,16 @@
+     return STATUS_SUCCESS;
+ }
+ 
+-static NTSTATUS pipewire_is_started(void *args)
++static NTSTATUS pipewire_set_sample_rate(void *args)
++{
++    struct set_sample_rate_params *params = args;
++
++    if (bt_is_stream_handle(params->stream))
++        return bt_set_sample_rate(params);
++    return pipewire_set_sample_rate_pw(args);
++}
++
++static NTSTATUS pipewire_is_started_pw(void *args)
+ {
+     struct is_started_params *params = args;
+     struct pipewire_stream *stream = handle_get_stream(params->stream);
+@@ -4736,6 +4981,15 @@
+     return STATUS_SUCCESS;
+ }
+ 
++static NTSTATUS pipewire_is_started(void *args)
++{
++    struct is_started_params *params = args;
++
++    if (bt_is_stream_handle(params->stream))
++        return bt_is_started(params);
++    return pipewire_is_started_pw(args);
++}
++
+ static NTSTATUS pipewire_get_loopback_capture_device(void *args)
+ {
+     struct get_loopback_capture_device_params *params = args;
