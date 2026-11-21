@@ -682,10 +682,6 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/ntdll-free-teb-and-stacks-of-killed-threads.patch"
     apply_patch "../patches/wine-hotfixes/pending/kernel32-tests-killed-thread-stack-freed.patch"
 
-    # https://github.com/ValveSoftware/Proton/issues/7486#issuecomment-6594771550
-    echo "WINE: -PENDING- ntdll: let a thread killed during its startup exit instead of hanging (Helldivers 2 thread growth)"
-    apply_patch "../patches/wine-hotfixes/pending/ntdll-dont-keep-reply-pipe-open-during-thread-init.patch"
-
     # NtCreateThreadEx() fails with STATUS_INVALID_CID when the server drains a stale fd
     echo "WINE: -PENDING- server: keep the request's status when receive_fd() drops a stale fd (spurious thread creation failures)"
     apply_patch "../patches/wine-hotfixes/pending/server-keep-request-status-when-dropping-stale-fd.patch"
