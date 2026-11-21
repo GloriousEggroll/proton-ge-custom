@@ -761,6 +761,8 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/kernel32-profile-empty-section-name.patch"
     # Battle.net/Chromium (Wine-Wayland): a restarted GPU process kept showing the dead one's last frame until a resize (#952)
     apply_patch "../patches/wine-hotfixes/pending/win32u-winewayland-wined3d-make-hwnd-dmabuf-producer-ids-unique-across-processes.patch"
+    # WINE_VK_MANAGED_LINEAR=1: diagnostic, export cross-process Vulkan producers as linear dmabufs (#952 NVIDIA Xid faults)
+    apply_patch "../patches/wine-hotfixes/pending/win32u-add-wine-vk-managed-linear-to-export-cross-process-producers-as-linear.patch"
 
     # https://github.com/GloriousEggroll/proton-ge-custom/issues/692
     # winepipewire.drv by M0n7y5 from CachyOS/wine-cachyos, adapted to this mmdevapi. Opt-in with PROTON_USE_PIPEWIRE=1.
