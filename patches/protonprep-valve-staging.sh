@@ -72,13 +72,6 @@ apply_all_in_dir() {
     apply_all_in_dir "../patches/wineopenxr/"
     popd
 
-    pushd piper
-    git reset --hard HEAD
-    git clean -xdf
-    echo "PIPER: take the prebuilt onnxruntime from NuGet, the GitHub release downloads are gone"
-    apply_all_in_dir "../patches/piper/"
-    popd
-
     pushd vklayers/low_latency_layer
     git reset --hard HEAD
     git clean -xdf
