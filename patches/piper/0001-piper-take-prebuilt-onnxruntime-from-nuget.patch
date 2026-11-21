@@ -1,0 +1,113 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] piper: take the prebuilt onnxruntime from NuGet instead of GitHub releases
+
+piper-phonemize downloads onnxruntime-linux-<arch>-1.14.1.tgz from the releases of
+github.com/microsoft/onnxruntime while it configures. That repository went offline on
+2026-11-17 and the download now fails, leaving the build without onnxruntime_cxx_api.h.
+
+Microsoft's NuGet package Microsoft.ML.OnnxRuntime 1.14.1 is still available and holds the
+same prebuilt libraries and headers: its linux-x64 libonnxruntime.so is byte-identical to the
+one in the GitHub x64 tarball. Unpack the library for the target architecture and the headers
+from the package into the layout of the release tarball and pass it to piper-phonemize as
+ONNXRUNTIME_DIR, which stops it from downloading anything.
+
+ONNXRUNTIME_NUPKG can point at an already downloaded package; its SHA256 is checked.
+---
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6e41c83e..e54d1508 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -23,7 +23,7 @@ add_executable(piper_exe src/cpp/main.cpp)
+ add_executable(test_piper src/cpp/test.cpp)
+ 
+ # NOTE: external project prefix are shortened because of path length restrictions on Windows
+-# NOTE: onnxruntime is pulled from piper-phonemize
++# NOTE: onnxruntime is installed by piper-phonemize
+ 
+ # ---- fmt ---
+ 
+@@ -58,6 +58,75 @@ if(NOT DEFINED SPDLOG_DIR)
+   add_dependencies(test_piper spdlog_external)
+ endif()
+ 
++# ---- onnxruntime ---
++
++# piper-phonemize downloads a prebuilt onnxruntime tarball from the releases of
++# github.com/microsoft/onnxruntime, which are no longer available. Microsoft's NuGet package
++# carries the same prebuilt library and headers, so take them from there and hand the result
++# to piper-phonemize through ONNXRUNTIME_DIR.
++#
++# ONNXRUNTIME_NUPKG can point at an already downloaded package.
++
++if(NOT DEFINED ONNXRUNTIME_DIR)
++  if(NOT DEFINED ONNXRUNTIME_VERSION)
++    set(ONNXRUNTIME_VERSION "1.14.1")
++  endif()
++
++  if(NOT DEFINED ONNXRUNTIME_NUPKG_SHA256 AND ONNXRUNTIME_VERSION STREQUAL "1.14.1")
++    set(ONNXRUNTIME_NUPKG_SHA256 "3a277421efce94b5f91f4a5dc8efc1add99b4c01f547279d81098ffb4fafbb6d")
++  endif()
++
++  if(WIN32 OR APPLE)
++    message(FATAL_ERROR "onnxruntime is only taken from NuGet on Linux, set ONNXRUNTIME_DIR")
++  elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL x86_64)
++    set(ONNXRUNTIME_NUGET_RID "linux-x64")
++  elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL aarch64)
++    set(ONNXRUNTIME_NUGET_RID "linux-arm64")
++  else()
++    message(FATAL_ERROR "Unsupported architecture for onnxruntime")
++  endif()
++
++  if(NOT DEFINED ONNXRUNTIME_NUPKG)
++    set(ONNXRUNTIME_NUPKG "${CMAKE_CURRENT_BINARY_DIR}/microsoft.ml.onnxruntime.${ONNXRUNTIME_VERSION}.nupkg")
++    if(NOT EXISTS "${ONNXRUNTIME_NUPKG}")
++      set(ONNXRUNTIME_NUPKG_URL "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/${ONNXRUNTIME_VERSION}/microsoft.ml.onnxruntime.${ONNXRUNTIME_VERSION}.nupkg")
++      message("Downloading ${ONNXRUNTIME_NUPKG_URL}")
++      file(DOWNLOAD "${ONNXRUNTIME_NUPKG_URL}" "${ONNXRUNTIME_NUPKG}" STATUS ONNXRUNTIME_DOWNLOAD_STATUS)
++      list(GET ONNXRUNTIME_DOWNLOAD_STATUS 0 ONNXRUNTIME_DOWNLOAD_RESULT)
++      if(NOT ONNXRUNTIME_DOWNLOAD_RESULT EQUAL 0)
++        file(REMOVE "${ONNXRUNTIME_NUPKG}")
++        message(FATAL_ERROR "Failed to download onnxruntime: ${ONNXRUNTIME_DOWNLOAD_STATUS}")
++      endif()
++    endif()
++  endif()
++
++  if(DEFINED ONNXRUNTIME_NUPKG_SHA256)
++    file(SHA256 "${ONNXRUNTIME_NUPKG}" ONNXRUNTIME_NUPKG_ACTUAL_SHA256)
++    if(NOT ONNXRUNTIME_NUPKG_ACTUAL_SHA256 STREQUAL ONNXRUNTIME_NUPKG_SHA256)
++      message(FATAL_ERROR "${ONNXRUNTIME_NUPKG} has SHA256 ${ONNXRUNTIME_NUPKG_ACTUAL_SHA256}, expected ${ONNXRUNTIME_NUPKG_SHA256}")
++    endif()
++  endif()
++
++  # Same layout as the release tarball: include/ and lib/libonnxruntime.so[.version]
++  set(ONNXRUNTIME_DIR "${CMAKE_CURRENT_BINARY_DIR}/ort")
++  if(NOT EXISTS "${ONNXRUNTIME_DIR}/lib/libonnxruntime.so.${ONNXRUNTIME_VERSION}")
++    set(ONNXRUNTIME_NUPKG_DIR "${CMAKE_CURRENT_BINARY_DIR}/ort-nupkg")
++    file(REMOVE_RECURSE "${ONNXRUNTIME_NUPKG_DIR}" "${ONNXRUNTIME_DIR}")
++    file(ARCHIVE_EXTRACT INPUT "${ONNXRUNTIME_NUPKG}" DESTINATION "${ONNXRUNTIME_NUPKG_DIR}"
++         PATTERNS "build/native/include/*" "runtimes/${ONNXRUNTIME_NUGET_RID}/native/libonnxruntime.so")
++    if(NOT EXISTS "${ONNXRUNTIME_NUPKG_DIR}/runtimes/${ONNXRUNTIME_NUGET_RID}/native/libonnxruntime.so")
++      message(FATAL_ERROR "${ONNXRUNTIME_NUPKG} has no ${ONNXRUNTIME_NUGET_RID} libonnxruntime.so")
++    endif()
++    file(COPY "${ONNXRUNTIME_NUPKG_DIR}/build/native/include/" DESTINATION "${ONNXRUNTIME_DIR}/include")
++    file(COPY "${ONNXRUNTIME_NUPKG_DIR}/runtimes/${ONNXRUNTIME_NUGET_RID}/native/libonnxruntime.so"
++         DESTINATION "${ONNXRUNTIME_DIR}/lib"
++         FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
++    file(RENAME "${ONNXRUNTIME_DIR}/lib/libonnxruntime.so" "${ONNXRUNTIME_DIR}/lib/libonnxruntime.so.${ONNXRUNTIME_VERSION}")
++    file(CREATE_LINK "libonnxruntime.so.${ONNXRUNTIME_VERSION}" "${ONNXRUNTIME_DIR}/lib/libonnxruntime.so" SYMBOLIC)
++    file(REMOVE_RECURSE "${ONNXRUNTIME_NUPKG_DIR}")
++  endif()
++endif()
++
+ # ---- piper-phonemize ---
+ 
+ if(NOT DEFINED PIPER_PHONEMIZE_DIR)
+@@ -66,7 +135,7 @@ if(NOT DEFINED PIPER_PHONEMIZE_DIR)
+     piper_phonemize_external
+     PREFIX "${CMAKE_CURRENT_BINARY_DIR}/p"
+     URL "https://github.com/shaunren/piper-phonemize/archive/refs/heads/pic.zip"
+-    CMAKE_ARGS -DCMAKE_INSTALL_PREFIX:PATH=${PIPER_PHONEMIZE_DIR}
++    CMAKE_ARGS -DCMAKE_INSTALL_PREFIX:PATH=${PIPER_PHONEMIZE_DIR} -DONNXRUNTIME_DIR:PATH=${ONNXRUNTIME_DIR}
+   )
+   add_dependencies(piper piper_phonemize_external)
+   add_dependencies(test_piper piper_phonemize_external)
