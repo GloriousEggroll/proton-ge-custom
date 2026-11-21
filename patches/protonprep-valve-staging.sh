@@ -737,6 +737,8 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/winex11-no-xim-windows-dead-keys.patch"
     # ETQW: no WM_INPUTLANGCHANGE at startup when the layout is unchanged (#629)
     apply_patch "../patches/wine-hotfixes/pending/win32u-dont-send-wm-inputlangchange-for-an-unchanged-layout.patch"
+    # HORGIHUGH: GetPrivateProfileString("", ...) must read the "[]" section, not the keys before the first header
+    apply_patch "../patches/wine-hotfixes/pending/kernel32-profile-empty-section-name.patch"
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
