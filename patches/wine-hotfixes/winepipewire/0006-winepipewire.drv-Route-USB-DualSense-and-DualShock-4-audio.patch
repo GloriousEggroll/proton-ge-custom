@@ -1,0 +1,1283 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Sat, 21 Nov 2026 00:00:00 -0500
+Subject: [PATCH] winepipewire.drv: Route USB DualSense and DualShock 4 audio.
+
+Port GE's winepulse.drv USB Sony controller handling (the GE-Proton and
+GloriousEggroll DualSense patches) to the PipeWire driver.
+
+- Endpoint ids: mmdevapi recognises Sony endpoints by the ids winepulse
+  gives them, so use the same scheme. A DualSense or DualShock 4 speaker
+  sink takes the canonical per-model id (lowest ALSA card first), a
+  second controller of that model "#wine-sony-physical-<container>", and
+  the other endpoints "#wine-dualsense-hotplug-<n>" (fresh each time the
+  controller appears) or "#wine-sony-hotplug-<container>" with Windows
+  device names. Sink monitors are named "<sink>.monitor" as in Pulse.
+  Ids are cached while the endpoint stays, so repeated probes do not make
+  mmdevapi drop and re-add them.
+- Windows Sony audio mode: a DualSense speaker sink reports the Windows
+  four-channel 48 kHz quad mix format (DualShock 4 excluded).
+- Haptics: a 48 kHz four-channel F32/S16 render stream on a DualSense
+  endpoint goes straight to the controller's four-channel hardware node:
+  WirePlumber's split parent (api.alsa.split.name, AUX0-3) under the UCM
+  profile, or the node itself when it already has four channels (the ACP
+  4.0 profile, UCM's Direct). Channels map one to one, with no remixing.
+  winepulse needed the PipeWire ALSA plugin or raw ALSA for this, because
+  a Pulse client cannot reach the hidden split node.
+- In the modes where winepulse carries the speaker in the haptics stream
+  (PROTON_DUALSENSE_HAPTICS_PREFER_NON_EVENT, Death Stranding effects,
+  automatic Windows Sony mode), channel 1 is muted and the first speaker
+  audio on channel 2 sends winepulse's USB output report that switches
+  the controller to its internal speaker. PROTON_DUALSENSE_SPLIT_AUDIO
+  also mutes channel 1 and keeps channel 2 in the stream, which reaches
+  the same hardware channel that winepulse's private speaker stream fed.
+- Streams on a controller never fall back to other outputs. When an
+  endpoint survives a replug or a model swap, its streams follow the new
+  node: a stream that lost its target is reconnected, and a running one
+  is moved through the default metadata's target.object.
+
+Not ported: routing by the active HID controller and pairing of
+speaker-only and actuator-only streams across two controllers.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff -ruN a/dlls/winepipewire.drv/bluetooth.c b/dlls/winepipewire.drv/bluetooth.c
+--- a/dlls/winepipewire.drv/bluetooth.c
++++ b/dlls/winepipewire.drv/bluetooth.c
+@@ -1180,8 +1180,14 @@
+     InterlockedExchange(&windows_names_latched, 1);
+ }
+ 
++/* winepulse's g_sony_windows_audio_mode: mmdevapi chose Windows Sony audio. */
++BOOL bt_windows_audio_mode(void)
++{
++    return InterlockedCompareExchange(&windows_names_latched, 0, 0);
++}
++
+ /* As winepulse's use_windows_sony_controller_names(). */
+-static BOOL use_windows_sony_controller_names(void)
++BOOL bt_use_windows_names(void)
+ {
+     const char *env = getenv("PROTON_SONY_WINDOWS_DEVICE_NAMES");
+ 
+@@ -1222,7 +1228,7 @@
+         }
+     }
+ 
+-    if (!use_windows_sony_controller_names())
++    if (!bt_use_windows_names())
+         snprintf(id, sizeof(id), "%s#wine-dualsense-hotplug-%u", base, ++bt_endpoint_generation);
+     else
+         snprintf(id, sizeof(id),
+diff -ruN a/dlls/winepipewire.drv/bluetooth.h b/dlls/winepipewire.drv/bluetooth.h
+--- a/dlls/winepipewire.drv/bluetooth.h
++++ b/dlls/winepipewire.drv/bluetooth.h
+@@ -39,6 +39,8 @@
+ extern void bt_enum_endpoints(bt_endpoint_cb callback, void *context);
+ extern unsigned int bt_hidraw_signature(void);
+ extern void bt_latch_windows_names(void);
++extern BOOL bt_windows_audio_mode(void);
++extern BOOL bt_use_windows_names(void);
+ extern BOOL bt_is_device(const char *device);
+ extern HRESULT bt_is_format_supported(const char *device, EDataFlow flow, const WAVEFORMATEX *fmt);
+ 
+diff -ruN a/dlls/winepipewire.drv/pipewire.c b/dlls/winepipewire.drv/pipewire.c
+--- a/dlls/winepipewire.drv/pipewire.c
++++ b/dlls/winepipewire.drv/pipewire.c
+@@ -57,6 +57,7 @@
+ #include <unistd.h>
+ #include <fcntl.h>
+ #include <errno.h>
++#include <dirent.h>
+ #include <sys/random.h>
+ #include <sys/resource.h>
+ 
+@@ -244,6 +245,12 @@
+     struct list packet_filled_head;
+ 
+     char *device;
++    char *target;               /* node in target.object; loop lock */
++    BOOL sony;                  /* on a USB Sony controller endpoint */
++    BOOL haptic;                /* four channels to the DualSense hardware node */
++    BOOL speaker_selected;      /* the USB speaker route was set */
++    UINT64 speaker_retry_ns;    /* next attempt after a failed selection */
++    enum pw_stream_flags connect_flags;
+     struct list entry;          /* g_streams */
+     struct list period_entry;
+     struct pipewire_period *period;
+@@ -280,7 +287,20 @@
+     UINT16 vendor_id, product_id;
+     UINT index;
+     GUID container_id;
+-    char pw_name[];
++    /* The endpoint id given to mmdevapi.  It is the node name, except for USB
++     * Sony controllers, which follow winepulse's id scheme. */
++    char *pw_name;
++    /* PipeWire node.name streams target, or NULL to use pw_name (Bluetooth
++     * and the default endpoints). */
++    char *node;
++    EDataFlow flow;
++    BOOL monitor;       /* capture endpoint recording a sink */
++    BOOL sony_usb;      /* USB DualSense, DualSense Edge or DualShock 4 */
++    int alsa_card;      /* -1 if unknown */
++    /* The four-channel hardware node of a USB DualSense, which carries the
++     * actuators on channels 3 and 4, and its channel positions. */
++    char *haptic_node;
++    uint32_t haptic_pos[4];
+ };
+ 
+ struct pipewire_period
+@@ -763,29 +783,44 @@
+                                          uint32_t channels, UINT mask,
+                                          REFERENCE_TIME def_period, REFERENCE_TIME min_period)
+ {
+-    size_t len = strlen(pw_name);
+     struct pw_phys_device *dev;
+ 
+     if (!display)
+         return NULL;
+-    if (!(dev = malloc(offsetof(struct pw_phys_device, pw_name) + len + 1)))
++    if (!(dev = calloc(1, sizeof(*dev))) || !(dev->pw_name = strdup(pw_name)))
+     {
++        free(dev);
+         free(display);
+         return NULL;
+     }
++    dev->alsa_card = -1;
+     dev->display = display;
+     dev->form = form;
+     build_format(&dev->fmt, rate, channels, mask);
+     dev->channel_mask = dev->fmt.dwChannelMask;
+     dev->def_period = def_period;
+     dev->min_period = min_period;
+-    memcpy(dev->pw_name, pw_name, len + 1);
+     list_add_tail(list, &dev->entry);
+     TRACE("%s (%s) channels=%u mask=%#x\n", debugstr_w(dev->display), pw_name,
+           dev->fmt.Format.nChannels, dev->channel_mask);
+     return dev;
+ }
+ 
++static void free_device_data(struct pw_phys_device *dev)
++{
++    free(dev->display);
++    free(dev->pw_name);
++    free(dev->node);
++    free(dev->haptic_node);
++    free(dev);
++}
++
++/* Node a stream on this endpoint connects to. */
++static const char *dev_node(const struct pw_phys_device *dev)
++{
++    return dev->node ? dev->node : dev->pw_name;
++}
++
+ /* Callers hold device_lists_mutex, except process detach at exit, where a
+  * killed thread may still hold it. */
+ static void free_device_lists(void)
+@@ -798,8 +833,7 @@
+         LIST_FOR_EACH_ENTRY_SAFE(dev, next, *list, struct pw_phys_device, entry)
+         {
+             list_remove(&dev->entry);
+-            free(dev->display);
+-            free(dev);
++            free_device_data(dev);
+         }
+     } while (*(++list));
+ }
+@@ -1090,6 +1124,8 @@
+     int have_format;
+     uint32_t device_id;    /* parent device.id, or SPA_ID_INVALID */
+     enum pw_device_bus bus;
++    char *split_name;      /* api.alsa.split.name: the hidden hardware node */
++    int alsa_card;         /* api.alsa.pcm.card or api.alsa.card, else -1 */
+ };
+ 
+ /* Vendor/product ids live on the Device object, not the node.  Registry
+@@ -1160,8 +1196,35 @@
+     }
+ }
+ 
++static BOOL parse_u32(const char *value, int base, uint32_t lo, uint32_t hi, uint32_t *out);
++
++static void probe_node_alsa_props(struct probe_node *pn, const struct spa_dict *props)
++{
++    const char *split = spa_dict_lookup(props, "api.alsa.split.name");
++    const char *card = spa_dict_lookup(props, "api.alsa.pcm.card");
++    uint32_t v;
++
++    if (!card)
++        card = spa_dict_lookup(props, "api.alsa.card");
++    if (parse_u32(card, 10, 0, INT_MAX, &v))
++        pn->alsa_card = v;
++    if (split && split[0] && !pn->split_name)
++        pn->split_name = strdup(split);
++}
++
++/* The registry global carries only a few node properties; the ALSA ones
++ * arrive with the bound node's info. */
++static void on_probe_node_info(void *data, const struct pw_node_info *info)
++{
++    struct probe_node *pn = data;
++
++    if (info && info->props)
++        probe_node_alsa_props(pn, info->props);
++}
++
+ static const struct pw_node_events probe_node_events = {
+     PW_VERSION_NODE_EVENTS,
++    .info = on_probe_node_info,
+     .param = on_probe_node_param,
+ };
+ 
+@@ -1338,6 +1401,8 @@
+         if (!parse_u32(dev_id, 10, 0, SPA_ID_INVALID - 1, &pn->device_id))
+             pn->device_id = SPA_ID_INVALID;
+         pn->bus = parse_device_bus(spa_dict_lookup(props, PW_KEY_DEVICE_BUS));
++        pn->alsa_card = -1;
++        probe_node_alsa_props(pn, props);
+         /* The name cap needs UTF-16, so utf8_to_wstr_capped applies it later. */
+         pn->node_name = strdup(node_name);
+         pn->display = strdup(desc ? desc : (nick ? nick : node_name));
+@@ -1347,6 +1412,7 @@
+             free(pn->node_name);
+             free(pn->display);
+             free(pn->nick);
++            free(pn->split_name);
+             free(pn);
+             return;
+         }
+@@ -1434,6 +1500,7 @@
+         free(pn->node_name);
+         free(pn->display);
+         free(pn->nick);
++        free(pn->split_name);
+         free(pn);
+         return;
+     }
+@@ -1520,20 +1587,24 @@
+     if (match[0])
+     {
+         LIST_FOR_EACH_ENTRY(dev, list, struct pw_phys_device, entry)
+-            if (!strcmp(dev->pw_name, match)) { def_src = dev; break; }
++            if (!dev->monitor && !strcmp(dev_node(dev), match)) { def_src = dev; break; }
+     }
+-    /* calloc: the placeholder has no bus or vendor ids.  +1 for the empty
+-     * pw_name; the full struct size keeps -Warray-bounds quiet. */
+-    if (!(def = calloc(1, sizeof(*def) + 1)))
++    /* calloc: the placeholder has no bus or vendor ids. */
++    if (!(def = calloc(1, sizeof(*def))) || !(def->pw_name = strdup("")))
++    {
++        free(def);
+         return;
++    }
+     /* Burnout Paradise Remastered crashes on a device name with no space,
+      * so mirror winepulse's "PulseAudio Output" placeholder (pulse.c). */
+     if (!(def->display = utf8_to_wstr(form == Speakers ? "PipeWire Output" : "PipeWire Input")))
+     {
++        free(def->pw_name);
+         free(def);
+         return;
+     }
+-    def->pw_name[0] = '\0';
++    def->flow = form == Speakers ? eRender : eCapture;
++    def->alsa_card = -1;
+     def->form = form;
+     def->index = index;
+     def->def_period = def_period;
+@@ -1686,6 +1757,382 @@
+     }
+ }
+ 
++/* USB Sony controllers.
++ *
++ * mmdevapi recognises these endpoints by the ids winepulse gives them (see
++ * devenum.c), so this follows winepulse's scheme:
++ * - a DualSense speaker sink has one canonical id per model, which stays when
++ *   another controller of that model replaces it;
++ * - a second controller of the same model gets "#wine-sony-physical-<container>";
++ * - its other endpoints get "#wine-dualsense-hotplug-<n>", fresh each time the
++ *   controller appears, or "#wine-sony-hotplug-<container>" with Windows
++ *   device names.
++ * winepulse also had to reach the DualSense's four-channel hardware PCM, which
++ * PipeWire's UCM profile hides behind a split node, through the PipeWire ALSA
++ * plugin or raw ALSA.  Here a haptics stream targets that node directly. */
++
++#define DUALSENSE_MONO_ENDPOINT_ID \
++    "alsa_output.usb-Sony_Interactive_Entertainment_Wireless_Controller-00.HiFi__Speaker__sink"
++#define DUALSENSE_EDGE_MONO_ENDPOINT_ID \
++    "alsa_output.usb-Sony_Interactive_Entertainment_DualSense_Edge_Wireless_Controller-00.Default__Speaker__sink"
++
++static struct list g_render_added;
++
++static BOOL env_is_1(const char *name)
++{
++    const char *env = getenv(name);
++
++    return env && env[0] == '1' && !env[1];
++}
++
++static BOOL use_death_stranding_controller_effects(void)
++{
++    return env_is_1("PROTON_DEATH_STRANDING_CONTROLLER_EFFECTS");
++}
++
++/* winepulse's use_pipewire_dualsense_haptic_target(): the game's speaker
++ * audio on channel 2 of the haptics stream is kept and the controller is
++ * switched to its speaker, and channel 1 is muted. */
++static BOOL sony_haptics_carry_speaker(void)
++{
++    return env_is_1("PROTON_DUALSENSE_HAPTICS_PREFER_NON_EVENT") ||
++           use_death_stranding_controller_effects() || bt_windows_audio_mode();
++}
++
++/* PROTON_DUALSENSE_SPLIT_AUDIO.  winepulse sends channel 2 to the public
++ * speaker sink, which the UCM profile feeds into the same hardware channel, and
++ * mutes channels 1 and 2 of the raw stream.  Keeping channel 2 in the stream
++ * reaches that hardware channel directly. */
++static BOOL sony_split_audio(void)
++{
++    return env_is_1("PROTON_DUALSENSE_SPLIT_AUDIO") || use_death_stranding_controller_effects();
++}
++
++static BOOL sony_usb_product(UINT16 vendor_id, UINT16 product_id)
++{
++    return vendor_id == 0x054c && (product_id == 0x05c4 || product_id == 0x09cc ||
++                                   product_id == 0x0ce6 || product_id == 0x0df2);
++}
++
++static BOOL sony_is_dualshock(const struct pw_phys_device *dev)
++{
++    return dev->sony_usb && (dev->product_id == 0x05c4 || dev->product_id == 0x09cc);
++}
++
++static BOOL sony_is_speaker_sink(const struct pw_phys_device *dev)
++{
++    const char *node = dev_node(dev);
++
++    if (dev->flow != eRender)
++        return FALSE;
++    if (sony_is_dualshock(dev))
++        return strstr(node, "Speaker__sink") || strstr(node, "analog-stereo");
++    return strstr(node, "Speaker__sink") &&
++           (dev->sony_usb || (strstr(node, "alsa_output.usb-Sony_Interactive_Entertainment_") &&
++                              strstr(node, "Wireless_Controller")));
++}
++
++/* Windows exposes the DualSense USB audio function as one four-channel
++ * endpoint.  The UCM profile makes the speaker a mono sink, but games still
++ * write the actuators to channels 3 and 4 of that endpoint. */
++static BOOL sony_windows_quad(const struct pw_phys_device *dev)
++{
++    return bt_use_windows_names() && sony_is_speaker_sink(dev) && !sony_is_dualshock(dev);
++}
++
++static void sony_apply_windows_format(const struct pw_phys_device *dev, WAVEFORMATEXTENSIBLE *fmt)
++{
++    WAVEFORMATEX *wfx = &fmt->Format;
++
++    if (!sony_windows_quad(dev))
++        return;
++    /* Keep the probed sample type. */
++    wfx->wFormatTag = WAVE_FORMAT_EXTENSIBLE;
++    wfx->nChannels = 4;
++    wfx->nSamplesPerSec = 48000;
++    wfx->nBlockAlign = wfx->nChannels * wfx->wBitsPerSample / 8;
++    wfx->nAvgBytesPerSec = wfx->nSamplesPerSec * wfx->nBlockAlign;
++    wfx->cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
++    fmt->dwChannelMask = KSAUDIO_SPEAKER_QUAD;
++}
++
++static const char *sony_render_endpoint_base(const struct pw_phys_device *dev)
++{
++    if (dev->flow != eRender || !dev->sony_usb)
++        return NULL;
++    if (dev->product_id == 0x0df2 || strstr(dev_node(dev), "DualSense_Edge_Wireless_Controller"))
++        return DUALSENSE_EDGE_MONO_ENDPOINT_ID;
++    return DUALSENSE_MONO_ENDPOINT_ID;
++}
++
++static BOOL sony_same_physical(const struct pw_phys_device *a, const struct pw_phys_device *b)
++{
++    if (!IsEqualGUID(&a->container_id, &GUID_NULL) && !IsEqualGUID(&b->container_id, &GUID_NULL))
++        return IsEqualGUID(&a->container_id, &b->container_id);
++    return !strcmp(dev_node(a), dev_node(b));
++}
++
++static char *sony_tagged_id(const char *base, const char *tag, const GUID *g)
++{
++    char id[512];
++
++    snprintf(id, sizeof(id), "%s#wine-sony-%s-%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
++             base, tag, (unsigned int)g->Data1, g->Data2, g->Data3, g->Data4[0], g->Data4[1],
++             g->Data4[2], g->Data4[3], g->Data4[4], g->Data4[5], g->Data4[6], g->Data4[7]);
++    return strdup(id);
++}
++
++static char *sony_physical_id(const struct pw_phys_device *dev, const char *base)
++{
++    if (IsEqualGUID(&dev->container_id, &GUID_NULL))
++        return strdup(dev_node(dev));
++    return sony_tagged_id(base, "physical", &dev->container_id);
++}
++
++/* The lists a new render endpoint is compared with: the endpoints of the
++ * probe being built that precede it, then those mmdevapi has or is about to
++ * get.  device_lists_mutex is held. */
++struct sony_scope
++{
++    struct list *lists[3];
++    struct pw_phys_device *stop[3];
++};
++
++static void sony_scope_init(struct sony_scope *scope, struct list *current, struct pw_phys_device *dev)
++{
++    unsigned int n = 0;
++
++    scope->lists[n] = current;
++    scope->stop[n++] = dev;
++    if (current != &g_render_devices)
++    {
++        scope->lists[n] = &g_render_devices;
++        scope->stop[n++] = NULL;
++    }
++    if (current != &g_render_added)
++    {
++        scope->lists[n] = &g_render_added;
++        scope->stop[n++] = NULL;
++    }
++    for (; n < ARRAY_SIZE(scope->lists); n++)
++        scope->lists[n] = NULL;
++}
++
++#define SONY_SCOPE_FOR_EACH(other, scope, i) \
++    for (i = 0; i < ARRAY_SIZE((scope)->lists) && (scope)->lists[i]; i++) \
++        LIST_FOR_EACH_ENTRY(other, (scope)->lists[i], struct pw_phys_device, entry) \
++            if (other == (scope)->stop[i]) break; else
++
++static BOOL sony_assign_render_id(struct pw_phys_device *dev, struct list *current)
++{
++    struct pw_phys_device *other, *canonical = NULL;
++    const char *base = sony_render_endpoint_base(dev), *other_base;
++    struct sony_scope scope;
++    BOOL conflict = FALSE;
++    unsigned int i;
++    char *id;
++
++    sony_scope_init(&scope, current, dev);
++
++    /* An endpoint of this controller already has an id. */
++    SONY_SCOPE_FOR_EACH(other, &scope, i)
++    {
++        if ((other_base = sony_render_endpoint_base(other)) && !strcmp(other_base, base) &&
++            sony_same_physical(dev, other))
++        {
++            if (!(id = strdup(other->pw_name)))
++                return FALSE;
++            free(dev->pw_name);
++            dev->pw_name = id;
++            return TRUE;
++        }
++    }
++
++    if (!sony_is_speaker_sink(dev))
++        return FALSE;
++
++    /* The canonical id goes to the lowest ALSA card. */
++    LIST_FOR_EACH_ENTRY(other, current, struct pw_phys_device, entry)
++    {
++        if (other == dev)
++            break;
++        if ((other_base = sony_render_endpoint_base(other)) && !strcmp(other_base, base) &&
++            !strcmp(other->pw_name, base) && !sony_same_physical(dev, other))
++        {
++            canonical = other;
++            break;
++        }
++    }
++    if (canonical && dev->alsa_card >= 0 &&
++        (canonical->alsa_card < 0 || dev->alsa_card < canonical->alsa_card))
++    {
++        char *physical = sony_physical_id(canonical, base);
++
++        if (!physical || !(id = strdup(base)))
++        {
++            free(physical);
++            return TRUE;
++        }
++        TRACE("canonical Sony endpoint %s moves from ALSA card %d to card %d\n",
++              base, canonical->alsa_card, dev->alsa_card);
++        free(canonical->pw_name);
++        canonical->pw_name = physical;
++        free(dev->pw_name);
++        dev->pw_name = id;
++        return TRUE;
++    }
++
++    SONY_SCOPE_FOR_EACH(other, &scope, i)
++    {
++        if ((other_base = sony_render_endpoint_base(other)) && !strcmp(other_base, base) &&
++            !sony_same_physical(dev, other))
++            conflict = TRUE;
++    }
++    if ((id = conflict ? sony_physical_id(dev, base) : strdup(base)))
++    {
++        free(dev->pw_name);
++        dev->pw_name = id;
++    }
++    return TRUE;
++}
++
++/* Hotplug ids stay while the endpoint does: probes repeat on every graph
++ * change, and a new id would make mmdevapi drop and re-add the endpoint. */
++struct sony_hotplug_id
++{
++    struct list entry;
++    char *base;
++    EDataFlow flow;
++    char *id;
++    BOOL seen;
++};
++
++static struct list sony_hotplug_ids = LIST_INIT(sony_hotplug_ids); /* device_lists_mutex */
++static unsigned int sony_hotplug_generation;
++
++static void sony_assign_hotplug_id(struct pw_phys_device *dev)
++{
++    struct sony_hotplug_id *entry;
++    char buf[512], *id;
++
++    LIST_FOR_EACH_ENTRY(entry, &sony_hotplug_ids, struct sony_hotplug_id, entry)
++    {
++        if (entry->flow == dev->flow && !strcmp(entry->base, dev->pw_name))
++        {
++            entry->seen = TRUE;
++            if ((id = strdup(entry->id)))
++            {
++                free(dev->pw_name);
++                dev->pw_name = id;
++            }
++            return;
++        }
++    }
++
++    if (!bt_use_windows_names())
++    {
++        snprintf(buf, sizeof(buf), "%s#wine-dualsense-hotplug-%u", dev->pw_name, ++sony_hotplug_generation);
++        id = strdup(buf);
++    }
++    else
++        id = sony_tagged_id(dev->pw_name, "hotplug", &dev->container_id);
++    if (!id)
++        return;
++    if ((entry = calloc(1, sizeof(*entry))) && (entry->base = strdup(dev->pw_name)) &&
++        (entry->id = strdup(id)))
++    {
++        entry->flow = dev->flow;
++        entry->seen = TRUE;
++        list_add_tail(&sony_hotplug_ids, &entry->entry);
++    }
++    else if (entry)
++    {
++        free(entry->base);
++        free(entry);
++    }
++    free(dev->pw_name);
++    dev->pw_name = id;
++}
++
++static void sony_assign_ids(struct list *list)
++{
++    struct pw_phys_device *dev;
++
++    LIST_FOR_EACH_ENTRY(dev, list, struct pw_phys_device, entry)
++    {
++        if (!dev->sony_usb)
++            continue;
++        if (!(sony_render_endpoint_base(dev) && sony_assign_render_id(dev, list)) &&
++            !(dev->flow == eRender && !dev->haptic_node && strstr(dev_node(dev), "Speaker__sink")))
++            sony_assign_hotplug_id(dev);
++        TRACE("Sony endpoint %s on %s\n", debugstr_a(dev->pw_name), debugstr_a(dev_node(dev)));
++    }
++}
++
++/* After a probe: a controller that went away gets a new id when it returns. */
++static void sony_prune_hotplug_ids(void)
++{
++    struct sony_hotplug_id *entry, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE(entry, next, &sony_hotplug_ids, struct sony_hotplug_id, entry)
++    {
++        if (entry->seen)
++        {
++            entry->seen = FALSE;
++            continue;
++        }
++        list_remove(&entry->entry);
++        free(entry->base);
++        free(entry->id);
++        free(entry);
++    }
++}
++
++/* Fills the Sony fields of a node's endpoint.  A monitor gets the ".monitor"
++ * name mmdevapi expects from winepulse's monitor sources. */
++static void sony_fill_device(struct pw_phys_device *dev, struct probe_node *pn, BOOL monitor)
++{
++    char *name;
++
++    dev->flow = monitor ? eCapture : pn->flow;
++    dev->monitor = monitor;
++    dev->alsa_card = pn->alsa_card;
++    if (!(dev->sony_usb = dev->bus == PW_BUS_USB && sony_usb_product(dev->vendor_id, dev->product_id)))
++        return;
++    if (!(dev->node = strdup(pn->node_name)))
++    {
++        dev->sony_usb = FALSE;
++        return;
++    }
++    if (monitor && (name = malloc(strlen(pn->node_name) + sizeof(".monitor"))))
++    {
++        sprintf(name, "%s.monitor", pn->node_name);
++        free(dev->pw_name);
++        dev->pw_name = name;
++    }
++    if (monitor || dev->flow != eRender || sony_is_dualshock(dev))
++        return;
++    if (pn->split_name)
++    {
++        /* WirePlumber's split parent: api.alsa.split.hw-position. */
++        if ((dev->haptic_node = strdup(pn->split_name)))
++        {
++            dev->haptic_pos[0] = SPA_AUDIO_CHANNEL_AUX0;
++            dev->haptic_pos[1] = SPA_AUDIO_CHANNEL_AUX1;
++            dev->haptic_pos[2] = SPA_AUDIO_CHANNEL_AUX2;
++            dev->haptic_pos[3] = SPA_AUDIO_CHANNEL_AUX3;
++        }
++    }
++    else if (pn->have_format && pn->channels == 4)
++    {
++        /* The node is the hardware PCM: the ACP 4.0 profile, or UCM's Direct. */
++        if ((dev->haptic_node = strdup(pn->node_name)))
++            memcpy(dev->haptic_pos, pn->position, sizeof(dev->haptic_pos));
++    }
++    TRACE("Sony %04x endpoint %s card %d haptics %s\n", dev->product_id, pn->node_name,
++          dev->alsa_card, debugstr_a(dev->haptic_node));
++}
++
+ struct bt_cache_context
+ {
+     struct list *render, *capture;
+@@ -1705,6 +2152,7 @@
+     dev->bus = PW_BUS_USB;
+     dev->vendor_id = ep->vendor_id;
+     dev->product_id = ep->product_id;
++    dev->flow = ep->flow;
+     dev->index = (*ctx->index)++;
+     dev->container_id = ep->container_id;
+ }
+@@ -1761,6 +2209,8 @@
+         dev = add_device(list, pn->node_name, name, form, rate, channels, mask,
+                          def_period, min_period);
+         fill_device_path_info(dev, p, pn, index++);
++        if (dev)
++            sony_fill_device(dev, pn, FALSE);
+ 
+         /* PipeWire has no monitor nodes: add a LineLevel capture endpoint per
+          * sink under the sink's name, like winepulse's monitor sources.
+@@ -1774,10 +2224,16 @@
+                                                        LineLevel, rate, channels, mask,
+                                                        def_period, min_period);
+                 fill_device_path_info(md, p, pn, index++);
++                if (md)
++                    sony_fill_device(md, pn, TRUE);
+             }
+         }
+     }
+ 
++    sony_assign_ids(render);
++    sony_assign_ids(capture);
++    sony_prune_hotplug_ids();
++
+     /* Bluetooth Sony controllers have no PipeWire node for their audio. */
+     {
+         struct bt_cache_context ctx = { render, capture, &index, 100000, 30000 };
+@@ -1859,6 +2315,7 @@
+         free(pn->node_name);
+         free(pn->display);
+         free(pn->nick);
++        free(pn->split_name);
+         free(pn);
+     }
+     LIST_FOR_EACH_ENTRY_SAFE(pd, pdnext, &p->devices, struct probe_device, entry)
+@@ -2002,6 +2459,10 @@
+ static struct spa_hook hp_core_listener, hp_registry_listener;
+ static int hp_sync_seq;
+ static BOOL hp_ready;
++/* The session manager's "default" metadata, where target.object moves a
++ * stream to another node. */
++static struct pw_metadata *hp_meta;
++static uint32_t hp_meta_id = SPA_ID_INVALID;
+ struct hp_node { uint32_t id; unsigned int mask; };
+ static struct hp_node *hp_nodes;
+ static unsigned int hp_node_count, hp_node_size;
+@@ -2027,6 +2488,16 @@
+     const char *media_class;
+     unsigned int mask;
+ 
++    if (type && props && !strcmp(type, PW_TYPE_INTERFACE_Metadata))
++    {
++        const char *name = spa_dict_lookup(props, PW_KEY_METADATA_NAME);
++
++        if (!hp_meta && name && !strcmp(name, "default") &&
++            (hp_meta = pw_registry_bind(hp_registry, id, PW_TYPE_INTERFACE_Metadata,
++                                        PW_VERSION_METADATA, 0)))
++            hp_meta_id = id;
++        return;
++    }
+     if (!type || !props || strcmp(type, PW_TYPE_INTERFACE_Node))
+         return;
+     if (!(media_class = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS)))
+@@ -2064,6 +2535,14 @@
+ {
+     unsigned int i;
+ 
++    if (hp_meta && id == hp_meta_id)
++    {
++        pw_proxy_destroy((struct pw_proxy *)hp_meta);
++        hp_meta = NULL;
++        hp_meta_id = SPA_ID_INVALID;
++        return;
++    }
++
+     for (i = 0; i < hp_node_count; i++)
+     {
+         if (hp_nodes[i].id != id)
+@@ -2147,21 +2626,24 @@
+ static void free_device(struct pw_phys_device *dev)
+ {
+     list_remove(&dev->entry);
+-    free(dev->display);
+-    free(dev);
++    free_device_data(dev);
+ }
+ 
+ static struct pw_phys_device *dup_device(const struct pw_phys_device *dev)
+ {
+-    size_t size = offsetof(struct pw_phys_device, pw_name) + strlen(dev->pw_name) + 1;
+     struct pw_phys_device *copy;
+ 
+-    if (!(copy = malloc(size)))
++    if (!(copy = malloc(sizeof(*copy))))
+         return NULL;
+-    memcpy(copy, dev, size);
+-    if (!(copy->display = malloc((lstrlenW(dev->display) + 1) * sizeof(WCHAR))))
++    *copy = *dev;
++    copy->pw_name = strdup(dev->pw_name);
++    copy->node = dev->node ? strdup(dev->node) : NULL;
++    copy->haptic_node = dev->haptic_node ? strdup(dev->haptic_node) : NULL;
++    copy->display = malloc((lstrlenW(dev->display) + 1) * sizeof(WCHAR));
++    if (!copy->pw_name || !copy->display || (dev->node && !copy->node) ||
++        (dev->haptic_node && !copy->haptic_node))
+     {
+-        free(copy);
++        free_device_data(copy);
+         return NULL;
+     }
+     memcpy(copy->display, dev->display, (lstrlenW(dev->display) + 1) * sizeof(WCHAR));
+@@ -2206,7 +2688,18 @@
+         old->min_period = dev->min_period;
+         free(old->display);
+         old->display = dev->display;
+-        free(dev);
++        dev->display = NULL;
++        /* A Sony speaker endpoint keeps its id when another controller model
++         * takes it over, and its streams follow the new node. */
++        free(old->node);
++        old->node = dev->node;
++        dev->node = NULL;
++        free(old->haptic_node);
++        old->haptic_node = dev->haptic_node;
++        dev->haptic_node = NULL;
++        memcpy(old->haptic_pos, dev->haptic_pos, sizeof(old->haptic_pos));
++        old->alsa_card = dev->alsa_card;
++        free_device_data(dev);
+     }
+ }
+ 
+@@ -2267,6 +2760,131 @@
+     }
+ }
+ 
++/* A Sony speaker endpoint can stay while its node changes: another controller
++ * model took its id over, or the controller came back on another ALSA card.
++ * Move its streams the way winepulse reconnects them. */
++#define SONY_RETARGET_MAX 16
++
++struct sony_target
++{
++    char endpoint[256];
++    EDataFlow flow;
++    char node[256];
++    char haptic[256];
++};
++
++/* Called with the loop lock held.  A stream whose target went away stopped
++ * with "defined target not found"; connect it again, like winepulse's
++ * disconnect and reconnect of its controller speaker streams. */
++static BOOL sony_reconnect_stream(struct pipewire_stream *stream, const char *target)
++{
++    struct spa_dict_item item = SPA_DICT_ITEM_INIT(PW_KEY_TARGET_OBJECT, target);
++    struct spa_dict dict = SPA_DICT_INIT(&item, 1);
++    uint8_t buffer[1024];
++    struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
++    const struct spa_pod *params[1];
++    int rc;
++
++    if (!(params[0] = spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat, &stream->info)))
++        return FALSE;
++    pw_stream_disconnect(stream->pw);
++    pw_stream_update_properties(stream->pw, &dict);
++    rc = pw_stream_connect(stream->pw, stream->dataflow == eRender ? PW_DIRECTION_OUTPUT : PW_DIRECTION_INPUT,
++                           PW_ID_ANY, stream->connect_flags, params, 1);
++    if (rc < 0)
++    {
++        WARN("pw_stream_connect failed for stream %p: %d.\n", stream, rc);
++        return FALSE;
++    }
++    if (__atomic_load_n(&stream->started, __ATOMIC_ACQUIRE) && pw_stream_set_active(stream->pw, true) < 0)
++        WARN("pw_stream_set_active failed for stream %p.\n", stream);
++    return TRUE;
++}
++
++static void sony_retarget_streams(void)
++{
++    /* An endpoint that came back is still on the added lists here. */
++    static struct list *const lists[] = { &g_render_devices, &g_capture_devices,
++                                          &g_render_added, &g_capture_added };
++    struct sony_target targets[SONY_RETARGET_MAX];
++    struct pipewire_stream *stream;
++    struct pw_phys_device *dev;
++    unsigned int n = 0, i, l;
++    enum pw_stream_state state;
++    const char *want;
++    uint32_t node_id;
++    char *copy;
++
++    pthread_mutex_lock(&device_lists_mutex);
++    for (l = 0; l < ARRAY_SIZE(lists); l++)
++    {
++        LIST_FOR_EACH_ENTRY(dev, lists[l], struct pw_phys_device, entry)
++        {
++            if (!dev->sony_usb || n == SONY_RETARGET_MAX ||
++                find_device_in(&g_render_removed, dev->pw_name) ||
++                find_device_in(&g_capture_removed, dev->pw_name))
++                continue;
++            lstrcpynA(targets[n].endpoint, dev->pw_name, sizeof(targets[n].endpoint));
++            targets[n].flow = dev->flow;
++            lstrcpynA(targets[n].node, dev_node(dev), sizeof(targets[n].node));
++            lstrcpynA(targets[n].haptic, dev->haptic_node ? dev->haptic_node : "",
++                      sizeof(targets[n].haptic));
++            n++;
++        }
++    }
++    pthread_mutex_unlock(&device_lists_mutex);
++    if (!n)
++        return;
++
++    pw_thread_loop_lock(pw_loop_global);
++    LIST_FOR_EACH_ENTRY(stream, &g_streams, struct pipewire_stream, entry)
++    {
++        if (!stream->sony || !stream->pw)
++            continue;
++        for (i = 0; i < n; i++)
++            if (!strcmp(targets[i].endpoint, stream->device) &&
++                (targets[i].flow == stream->dataflow || targets[i].flow == eRender))
++                break;
++        if (i == n)
++            continue;
++        want = stream->haptic ? targets[i].haptic : targets[i].node;
++        if (!want[0])
++            continue;
++        state = pw_stream_get_state(stream->pw, NULL);
++        if (state == PW_STREAM_STATE_ERROR || state == PW_STREAM_STATE_UNCONNECTED)
++        {
++            if (!(copy = strdup(want)))
++                continue;
++            TRACE("Reconnecting stream %p on %s to %s.\n", stream, debugstr_a(stream->device),
++                  debugstr_a(want));
++            if (sony_reconnect_stream(stream, want))
++            {
++                free(stream->target);
++                stream->target = copy;
++            }
++            else
++                free(copy);
++            continue;
++        }
++        if (!strcmp(want, stream->target))
++            continue;
++        if (!hp_meta || (node_id = pw_stream_get_node_id(stream->pw)) == SPA_ID_INVALID)
++        {
++            WARN("Cannot move stream %p from %s to %s.\n", stream, debugstr_a(stream->target),
++                 debugstr_a(want));
++            continue;
++        }
++        if (!(copy = strdup(want)))
++            continue;
++        TRACE("Moving stream %p on %s from %s to %s.\n", stream, debugstr_a(stream->device),
++              debugstr_a(stream->target), debugstr_a(want));
++        pw_metadata_set_property(hp_meta, node_id, "target.object", NULL, want);
++        free(stream->target);
++        stream->target = copy;
++    }
++    pw_thread_loop_unlock(pw_loop_global);
++}
++
+ static void get_endpoint_ids_delta(struct get_endpoint_ids_params *params)
+ {
+     unsigned int mask = params->flow == eRender ? HP_RENDER : HP_CAPTURE;
+@@ -2337,6 +2955,7 @@
+         hp_events = 0; /* one probe covers both flows */
+         pthread_mutex_unlock(&hp_mutex);
+         hp_refresh();
++        sony_retarget_streams();
+     }
+ 
+     pthread_mutex_lock(&device_lists_mutex);
+@@ -2443,6 +3062,7 @@
+     if ((dev = find_device(params->flow, params->device)))
+     {
+         *params->fmt = dev->fmt;
++        sony_apply_windows_format(dev, params->fmt);
+         params->result = S_OK;
+     }
+     else
+@@ -2587,7 +3207,7 @@
+             if (dev->channel_mask)
+             {
+                 params->value->vt = VT_UI4;
+-                params->value->ulVal = dev->channel_mask;
++                params->value->ulVal = sony_windows_quad(dev) ? KSAUDIO_SPEAKER_QUAD : dev->channel_mask;
+                 params->result = S_OK;
+             }
+             else
+@@ -3231,8 +3851,8 @@
+ 
+ /* Called with the loop lock held.  The caller resolves capture_sink before
+  * taking it, as device_is_sink must not run under the loop lock. */
+-static HRESULT pipewire_stream_connect(struct pipewire_stream *stream, const char *device,
+-                                       const WCHAR *appname, BOOL capture_sink)
++static HRESULT pipewire_stream_connect(struct pipewire_stream *stream, const WCHAR *appname,
++                                       BOOL capture_sink)
+ {
+     struct pw_properties *props;
+     uint8_t buffer[1024];
+@@ -3272,8 +3892,19 @@
+                        (UINT32)period_frames, stream->info.rate);
+     /* The synthetic default endpoint has an empty name; leaving target.object
+      * unset there lets PIPEWIRE_NODE route it, as libpipewire does itself. */
+-    if (device && device[0])
+-        pw_properties_set(props, PW_KEY_TARGET_OBJECT, device);
++    if (stream->target[0])
++        pw_properties_set(props, PW_KEY_TARGET_OBJECT, stream->target);
++    /* Like winepulse's strict connects: audio for the controller never
++     * moves to the desktop's speakers when it goes away. */
++    if (stream->sony)
++        pw_properties_set(props, "node.dont-fallback", "true");
++    /* Channels map one to one onto the hardware: 1 and 2 are the speaker or
++     * headphones, 3 and 4 the actuators. */
++    if (stream->haptic)
++    {
++        pw_properties_set(props, "stream.dont-remix", "true");
++        pw_properties_set(props, "channelmix.upmix", "false");
++    }
+     if (stream->dataflow == eCapture &&
+         ((stream->flags & AUDCLNT_STREAMFLAGS_LOOPBACK) || capture_sink))
+         pw_properties_set(props, PW_KEY_STREAM_CAPTURE_SINK, "true");
+@@ -3328,6 +3959,7 @@
+                 flags |= PW_STREAM_FLAG_RT_PROCESS;
+         }
+ 
++        stream->connect_flags = flags;
+         rc = pw_stream_connect(stream->pw, dir, PW_ID_ANY, flags, params, 1);
+         if (rc < 0)
+         {
+@@ -3352,8 +3984,8 @@
+                 WARN("pw_stream_disconnect failed for stream %p: %d.\n", stream, rc);
+                 return AUDCLNT_E_ENDPOINT_CREATE_FAILED;
+             }
+-            rc = pw_stream_connect(stream->pw, dir, PW_ID_ANY,
+-                                   flags & ~PW_STREAM_FLAG_RT_PROCESS, params, 1);
++            stream->connect_flags = flags & ~PW_STREAM_FLAG_RT_PROCESS;
++            rc = pw_stream_connect(stream->pw, dir, PW_ID_ANY, stream->connect_flags, params, 1);
+             if (rc < 0)
+             {
+                 WARN("pw_stream_connect failed for stream %p: %d.\n", stream, rc);
+@@ -3428,13 +4060,49 @@
+                             MEM_RELEASE);
+     }
+     free(stream->device);
++    free(stream->target);
+     free(stream);
+ }
+ 
++struct stream_route
++{
++    char *target;
++    BOOL capture_sink;
++    BOOL sony;
++    char *haptic_node;
++    uint32_t haptic_pos[4];
++};
++
++/* Called with device_lists_mutex held. */
++static void resolve_stream_route(const struct create_stream_params *params, struct stream_route *route)
++{
++    const char *device = params->device ? params->device : "";
++    struct pw_phys_device *dev = device[0] ? find_device(params->flow, device) : NULL;
++
++    memset(route, 0, sizeof(*route));
++    if (!dev)
++    {
++        /* Not an endpoint id, such as the default sink's node name from
++         * get_loopback_capture_device. */
++        route->target = strdup(device);
++        route->capture_sink = params->flow == eCapture && device[0] && device_is_sink(device);
++        return;
++    }
++    route->target = strdup(dev_node(dev));
++    route->capture_sink = params->flow == eCapture && (dev->monitor || dev->flow == eRender);
++    route->sony = dev->sony_usb;
++    if (params->flow == eRender && dev->haptic_node)
++    {
++        route->haptic_node = strdup(dev->haptic_node);
++        memcpy(route->haptic_pos, dev->haptic_pos, sizeof(route->haptic_pos));
++    }
++}
++
+ static NTSTATUS pipewire_create_stream_pw(void *args)
+ {
+     struct create_stream_params *params = args;
+     struct pipewire_stream *stream;
++    struct stream_route route;
+     SIZE_T bufsize_bytes, size;
+     BOOL capture_sink;
+     UINT32 i;
+@@ -3460,9 +4128,15 @@
+ 
+     /* Outside the loop lock, so the two locks never nest. */
+     pthread_mutex_lock(&device_lists_mutex);
+-    capture_sink = params->flow == eCapture && params->device && params->device[0] &&
+-                   device_is_sink(params->device);
++    resolve_stream_route(params, &route);
+     pthread_mutex_unlock(&device_lists_mutex);
++    capture_sink = route.capture_sink;
++    if (!route.target)
++    {
++        free(route.haptic_node);
++        params->result = E_OUTOFMEMORY;
++        return STATUS_SUCCESS;
++    }
+ 
+     pw_thread_loop_lock(pw_loop_global);
+ 
+@@ -3470,6 +4144,7 @@
+     {
+         params->result = hr;
+         pw_thread_loop_unlock(pw_loop_global);
++        free(route.target);
+         return STATUS_SUCCESS;
+     }
+ 
+@@ -3478,10 +4153,13 @@
+         WARN("Out of memory allocating stream.\n");
+         params->result = E_OUTOFMEMORY;
+         pw_thread_loop_unlock(pw_loop_global);
++        free(route.target);
+         return STATUS_SUCCESS;
+     }
+ 
+     stream->dataflow = params->flow;
++    stream->target = route.target;
++    stream->sony = route.sony;
+     for (i = 0; i < ARRAY_SIZE(stream->vol); ++i)
+         stream->vol[i] = 1.f;
+ 
+@@ -3497,6 +4175,20 @@
+         goto exit;
+     }
+ 
++    /* winepulse's haptic candidates: 48 kHz four-channel F32 or S16 on a
++     * DualSense endpoint, which go to the hardware PCM. */
++    if (route.haptic_node && stream->dataflow == eRender && stream->info.rate == 48000 &&
++        stream->info.channels == 4 && (stream->info.format == SPA_AUDIO_FORMAT_F32_LE ||
++                                       stream->info.format == SPA_AUDIO_FORMAT_S16_LE))
++    {
++        free(stream->target);
++        stream->target = route.haptic_node;
++        route.haptic_node = NULL;
++        memcpy(stream->info.position, route.haptic_pos, sizeof(route.haptic_pos));
++        stream->haptic = TRUE;
++        TRACE("DualSense haptics stream on %s\n", debugstr_a(stream->target));
++    }
++
+     stream->def_period = params->period;
+     stream->flags = params->flags;
+     stream->share = params->share;
+@@ -3544,7 +4236,7 @@
+         stream->bufsize_frames = (SIZE_T)frames;
+     }
+ 
+-    hr = pipewire_stream_connect(stream, params->device, params->name, capture_sink);
++    hr = pipewire_stream_connect(stream, params->name, capture_sink);
+     if (FAILED(hr))
+         goto exit;
+ 
+@@ -3659,6 +4351,7 @@
+     }
+ 
+ exit:
++    free(route.haptic_node);
+     if (FAILED(params->result = hr))
+     {
+         if (stream->pw)
+@@ -4451,10 +5144,120 @@
+     }
+ }
+ 
++/* winepulse's pulse_select_dualsense_usb_speaker(): an output report that
++ * switches every USB DualSense to its internal speaker, for games whose
++ * speaker audio rides in the haptics stream. */
++static BOOL sony_select_usb_speaker(void)
++{
++    static const BYTE report[63] =
++    {
++        [0] = 0x02,  /* USB output report. */
++        [1] = 0xa0,  /* Speaker volume and audio routing are valid. */
++        [2] = 0x80,  /* Speaker pre-gain is valid. */
++        [6] = 0x64,  /* Speaker volume. */
++        [8] = 0x30,  /* Route audio to the internal speaker. */
++        [38] = 0x02, /* Speaker pre-gain. */
++    };
++    char path[PATH_MAX], line[256];
++    unsigned int bus, vid, pid;
++    BOOL found = FALSE, selected = FALSE;
++    struct dirent *entry;
++    ssize_t written;
++    DIR *dir;
++    FILE *f;
++    int fd;
++
++    if (!(dir = opendir("/sys/class/hidraw")))
++        return FALSE;
++    while ((entry = readdir(dir)))
++    {
++        if (strncmp(entry->d_name, "hidraw", 6))
++            continue;
++        snprintf(path, sizeof(path), "/sys/class/hidraw/%s/device/uevent", entry->d_name);
++        if (!(f = fopen(path, "r")))
++            continue;
++        bus = vid = pid = 0;
++        while (fgets(line, sizeof(line), f))
++            if (sscanf(line, "HID_ID=%x:%x:%x", &bus, &vid, &pid) == 3)
++                break;
++        fclose(f);
++        if (bus != 0x03 || vid != 0x054c || (pid != 0x0ce6 && pid != 0x0df2))
++            continue;
++
++        found = TRUE;
++        snprintf(path, sizeof(path), "/dev/%s", entry->d_name);
++        if ((fd = open(path, O_RDWR | O_CLOEXEC)) == -1)
++        {
++            WARN("Unable to open %s to select the DualSense USB speaker: %s.\n", path, strerror(errno));
++            continue;
++        }
++        written = write(fd, report, sizeof(report));
++        close(fd);
++        if (written == sizeof(report))
++        {
++            TRACE("Selected the USB internal speaker on Sony controller %04x at %s.\n", pid, path);
++            selected = TRUE;
++        }
++        else
++            WARN("Failed to select the USB internal speaker on Sony controller %04x at %s: "
++                 "wrote %ld of %u bytes, errno %d.\n", pid, path, (long)written,
++                 (unsigned int)sizeof(report), errno);
++    }
++    closedir(dir);
++    if (!found)
++        WARN("No USB DualSense hidraw device was found to select the internal speaker.\n");
++    return selected;
++}
++
++/* As winepulse's haptic write path.  Returns TRUE when the speaker route
++ * should be selected now. */
++static BOOL sony_haptic_prepare(struct pipewire_stream *stream, BYTE *buffer, UINT32 frames)
++{
++    BOOL carry = sony_haptics_carry_speaker(), signal = FALSE;
++    UINT32 i;
++
++    if (!carry && !sony_split_audio())
++        return FALSE;
++    if (stream->info.format == SPA_AUDIO_FORMAT_F32_LE)
++    {
++        float *s = (float *)buffer;
++
++        for (i = 0; i < frames; i++, s += 4)
++        {
++            s[0] = 0.f;
++            signal |= s[1] != 0.f;
++        }
++    }
++    else
++    {
++        INT16 *s = (INT16 *)buffer;
++
++        for (i = 0; i < frames; i++, s += 4)
++        {
++            s[0] = 0;
++            signal |= s[1] != 0;
++        }
++    }
++    if (!carry || !signal || stream->speaker_selected)
++        return FALSE;
++    {
++        struct timespec ts;
++        UINT64 now;
++
++        clock_gettime(CLOCK_MONOTONIC, &ts);
++        now = (UINT64)ts.tv_sec * 1000000000 + ts.tv_nsec;
++        if (now < stream->speaker_retry_ns)
++            return FALSE;
++        stream->speaker_retry_ns = now + 1000000000;
++    }
++    return TRUE;
++}
++
+ static NTSTATUS pipewire_release_render_buffer_pw(void *args)
+ {
+     struct release_render_buffer_params *params = args;
+     struct pipewire_stream *stream = handle_get_stream(params->stream);
++    BOOL select_speaker = FALSE;
+     UINT32 written_bytes;
+     BYTE *buffer;
+ 
+@@ -4486,6 +5289,8 @@
+     written_bytes = params->written_frames * stream->frame_size;
+     if (params->flags & AUDCLNT_BUFFERFLAGS_SILENT)
+         silence_buffer(stream->info.format, buffer, written_bytes);
++    else if (stream->haptic)
++        select_speaker = sony_haptic_prepare(stream, buffer, params->written_frames);
+ 
+     if (stream->locked < 0)
+         pipewire_wrap_buffer(stream, buffer, written_bytes);
+@@ -4518,6 +5323,8 @@
+     stream->locked = 0;
+ 
+     pw_thread_loop_unlock(pw_loop_global);
++    if (select_speaker && sony_select_usb_speaker())
++        stream->speaker_selected = TRUE;
+     params->result = S_OK;
+     return STATUS_SUCCESS;
+ }
