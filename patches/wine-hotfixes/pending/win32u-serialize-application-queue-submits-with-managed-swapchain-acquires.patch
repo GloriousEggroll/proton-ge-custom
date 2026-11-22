@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Sun, 22 Nov 2026 00:00:00 -0500
+Subject: [PATCH] win32u: Serialize application queue submits with managed
+ swapchain acquires.
+
+A managed swapchain has no host acquire, so managed_acquire() signals the
+acquire semaphore and fence with an empty vkQueueSubmit on the device's
+first queue, from whichever thread called vkAcquireNextImageKHR.  That
+queue is the application's own.  Wine's submits hold producer_device_lock,
+but the application's submits did not, and the application cannot
+synchronize with a submit it does not know about.
+
+With Battle.net in Wayland mode, Chromium's GPU process acquires on its
+main thread while DXVK submits on its dxvk-submit thread.  The Vulkan
+validation layer reported both threads in vkQueueSubmit/vkQueueSubmit2 on
+the same VkQueue at once.  NVIDIA does not protect a VkQueue against
+concurrent use, and the process gets Xid 13/69 graphics faults.
+
+Once a managed swapchain exists in the process, take producer_device_lock
+around the application's host vkQueueSubmit and vkQueueSubmit2 calls as
+well.  Processes without managed swapchains keep submitting without the
+lock, so multi-queue submitters are not serialized against each other.
+
+https://github.com/GloriousEggroll/proton-ge-custom/issues/952
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -368,6 +368,12 @@
+ 
+ /* Serializes the producer's cross-thread queue submits and device idles. */
+ static pthread_mutex_t producer_device_lock = PTHREAD_MUTEX_INITIALIZER;
++/* Set once a managed swapchain exists. From then on, the application's own
++ * submits take producer_device_lock too: managed_acquire() submits to the
++ * application's queue from the acquiring thread, which may not be the thread
++ * the application submits from, and the application has no way to
++ * synchronize with that. */
++static BOOL managed_queue_lock_needed;
+ static LONGLONG managed_next_producer_id;
+ 
+ enum wine_managed_consumer_state
+@@ -4410,6 +4416,7 @@
+     managed->usage = create_info->imageUsage;
+     managed->discard = TRUE;
+     if (device->queue_count) managed->signal_queue = device->queues[0].host.queue;
++    __atomic_store_n( &managed_queue_lock_needed, TRUE, __ATOMIC_RELEASE );
+     managed->p_vkWaitForFences = (void *)p_vkGetDeviceProcAddr(
+             device->host.device, "vkWaitForFences" );
+     managed->p_vkResetFences = (void *)p_vkGetDeviceProcAddr(
+@@ -4787,6 +4794,7 @@
+ 
+     /* Pick the signal queue (first host queue) for empty acquire-signal submits. */
+     if (device->queue_count) managed->signal_queue = device->queues[0].host.queue;
++    __atomic_store_n( &managed_queue_lock_needed, TRUE, __ATOMIC_RELEASE );
+ 
+     /* Per-frame fence to gate export on just this frame's render (see managed_present). */
+     managed->p_vkWaitForFences = (void *)p_vkGetDeviceProcAddr( device->host.device, "vkWaitForFences" );
+@@ -7215,7 +7223,14 @@
+         }
+     }
+ 
+-    res = device->p_vkQueueSubmit( queue->host.queue, count, submits, fence ? fence->host.fence : 0 );
++    if (__atomic_load_n( &managed_queue_lock_needed, __ATOMIC_ACQUIRE ))
++    {
++        pthread_mutex_lock( &producer_device_lock );
++        res = device->p_vkQueueSubmit( queue->host.queue, count, submits, fence ? fence->host.fence : 0 );
++        pthread_mutex_unlock( &producer_device_lock );
++    }
++    else
++        res = device->p_vkQueueSubmit( queue->host.queue, count, submits, fence ? fence->host.fence : 0 );
+ 
+ failed:
+     mem_free( &pool );
+@@ -7287,7 +7302,14 @@
+         }
+     }
+ 
+-    res = p_vkQueueSubmit2( queue->host.queue, count, submits, fence ? fence->host.fence : 0 );
++    if (__atomic_load_n( &managed_queue_lock_needed, __ATOMIC_ACQUIRE ))
++    {
++        pthread_mutex_lock( &producer_device_lock );
++        res = p_vkQueueSubmit2( queue->host.queue, count, submits, fence ? fence->host.fence : 0 );
++        pthread_mutex_unlock( &producer_device_lock );
++    }
++    else
++        res = p_vkQueueSubmit2( queue->host.queue, count, submits, fence ? fence->host.fence : 0 );
+ 
+ failed:
+     mem_free( &pool );

@@ -766,6 +766,8 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/win32u-add-wine-vk-managed-linear-to-export-cross-process-producers-as-linear.patch"
     # Battle.net/Chromium (Wine-Wayland): DXVK renders through sRGB views, managed producer images lacked MUTABLE_FORMAT (#952 NVIDIA Xid faults)
     apply_patch "../patches/wine-hotfixes/pending/win32u-create-managed-swapchain-images-with-the-requested-mutable-format-flags.patch"
+    # Battle.net/Chromium (Wine-Wayland): managed acquire submitted to the app queue while DXVK submitted on another thread (#952 NVIDIA Xid faults, validation THREADING ERROR)
+    apply_patch "../patches/wine-hotfixes/pending/win32u-serialize-application-queue-submits-with-managed-swapchain-acquires.patch"
     # The Witcher 3: InternetGetConnectedState enumerated all network adapters about 10 times a second while signed in to a CDPR account (periodic stutter)
     # https://bugs.winehq.org/show_bug.cgi?id=60465
     # By Erhan Bilgili, from nanomatters/wine-salkim (Wineland), LGPL-2.1+. The wininet cache needs the nsiproxy link/route notifications.
