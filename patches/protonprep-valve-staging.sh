@@ -773,6 +773,8 @@ apply_all_in_dir() {
     # https://github.com/nanomatters/wine-salkim/commit/fd5c36a6aa68d785e5c0aaabd210053760c61a9d
     echo "WINE: -GAME FIXES- wininet: cache InternetGetConnectedState until the network changes (Witcher 3 stutter, wine bug 60465)"
     apply_patch "../patches/wine-hotfixes/pending/wininet-cache-connectivity-until-network-state-changes.patch"
+    # AngelWish (disc): WMA decoder creation fails without the reader's undocumented secure channel interface; opt-in stub, PROTON_WMVCORE_AUTH_STUB=1 (#982)
+    apply_patch "../patches/wine-hotfixes/pending/wmvcore-add-opt-in-stub-for-the-undocumented-reader-secure-channel-interface.patch"
 
     # https://github.com/GloriousEggroll/proton-ge-custom/issues/692
     # winepipewire.drv by M0n7y5 from CachyOS/wine-cachyos, adapted to this mmdevapi. Opt-in with PROTON_USE_PIPEWIRE=1.
