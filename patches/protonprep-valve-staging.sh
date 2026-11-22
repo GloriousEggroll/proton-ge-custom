@@ -57,6 +57,7 @@ apply_all_in_dir() {
     git clean -xdf
     echo "VKD3D-PROTON: prevent stalled present waits from deadlocking swapchain teardown"
     echo "VKD3D-PROTON: don't map the parent process image for engine detection (EAC untrusted file, Star Citizen/Hunt)"
+    echo "VKD3D-PROTON: disable viewports not set by RSSetViewports (Assetto Corsa Rally triple screen on AMD)"
     apply_all_in_dir "../patches/vkd3d-proton/"
     popd
 

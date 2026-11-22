@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: giantorth <56210456+giantorth@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 14:51:43 -0800
+Subject: [PATCH] vkd3d: Disable viewports not set by RSSetViewports.
+
+D3D12 disables viewports and scissor rects that the last RSSetViewports
+call did not define, so primitives that select them through
+SV_ViewportArrayIndex are discarded. In Vulkan, a ViewportIndex at or
+above viewportCount is undefined, and RADV rasterizes such primitives
+with stale state left over from an earlier multi-viewport draw.
+
+Pad the dynamic viewport state up to maxViewports (at most 16) with a
+valid viewport and an empty scissor, so these primitives are discarded
+as in D3D12.
+
+Assetto Corsa Rally's triple-screen mode composites each screen with a
+draw of three instances that write SV_ViewportArrayIndex from
+SV_InstanceID while only that screen's viewport is set. On RADV, the
+right screen's pass then overwrites the centre screen.
+
+Proton: Assetto Corsa Rally (3917090)
+---
+ libs/vkd3d/command.c | 27 +++++++++++++++++++++++++--
+ 1 file changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index b1941888..430fe2a9 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -8406,10 +8406,30 @@ static void d3d12_command_list_update_dynamic_state(struct d3d12_command_list *l
+ 
+     if (dyn_state->viewport_count)
+     {
++        /* In D3D12, viewports and scissors not defined by the last RSSetViewports call
++         * are disabled, so primitives that select them via SV_ViewportArrayIndex are
++         * dropped. In Vulkan, a ViewportIndex >= viewportCount is undefined, and RADV
++         * rasterizes such primitives with stale state from an earlier multi-viewport
++         * draw. Pad the unused slots with a valid viewport and an empty scissor so
++         * those primitives are discarded, as in D3D12. */
++        const VkPhysicalDeviceLimits *vp_limits = &list->device->device_info.properties2.properties.limits;
++        uint32_t padded_count = dyn_state->viewport_count;
++
++        if (list->device->device_info.features2.features.multiViewport)
++        {
++            padded_count = max(padded_count, min(vp_limits->maxViewports,
++                    (uint32_t)D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE));
++        }
++
+         if (dyn_state->dirty_flags & VKD3D_DYNAMIC_STATE_VIEWPORT)
+         {
++            VkViewport padded_viewports[D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
++
++            for (i = 0; i < padded_count; i++)
++                padded_viewports[i] = dyn_state->viewports[i < dyn_state->viewport_count ? i : 0];
++
+             VK_CALL(vkCmdSetViewportWithCount(list->cmd.vk_command_buffer,
+-                    dyn_state->viewport_count, dyn_state->viewports));
++                    padded_count, padded_viewports));
+         }
+ 
+         if (dyn_state->dirty_flags & VKD3D_DYNAMIC_STATE_SCISSOR)
+@@ -8447,8 +8467,11 @@ static void d3d12_command_list_update_dynamic_state(struct d3d12_command_list *l
+                 clamped_scissors[i].extent.height = min(scissor->extent.height, (uint32_t)(bottom_right.y - top_left.y));
+             }
+ 
++            for (i = dyn_state->viewport_count; i < padded_count; i++)
++                memset(&clamped_scissors[i], 0, sizeof(clamped_scissors[i]));
++
+             VK_CALL(vkCmdSetScissorWithCount(list->cmd.vk_command_buffer,
+-                    dyn_state->viewport_count, clamped_scissors));
++                    padded_count, clamped_scissors));
+         }
+     }
+     else
