@@ -1,0 +1,335 @@
+From fd5c36a6aa68d785e5c0aaabd210053760c61a9d Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Sat, 10 Oct 2026 23:23:25 +0200
+Subject: [PATCH] wininet: Cache connectivity until network state changes.
+
+Watch address, route and interface changes through NSI. Reuse unchanged
+connectivity results and query directly when monitoring is unavailable.
+
+Imported without changes from nanomatters/wine-salkim (Wineland), commit
+fd5c36a6aa68d785e5c0aaabd210053760c61a9d
+https://github.com/nanomatters/wine-salkim/commit/fd5c36a6aa68d785e5c0aaabd210053760c61a9d
+License: LGPL-2.1-or-later, the same as Wine. Author: Erhan Bilgili.
+Wine bug: https://bugs.winehq.org/show_bug.cgi?id=60465
+---
+ dlls/wininet/Makefile.in    |   5 +-
+ dlls/wininet/connectivity.c | 203 ++++++++++++++++++++++++++++++++++++
+ dlls/wininet/internet.c     |  46 +-------
+ dlls/wininet/internet.h     |   2 +
+ 4 files changed, 213 insertions(+), 43 deletions(-)
+ create mode 100644 dlls/wininet/connectivity.c
+
+diff --git a/dlls/wininet/Makefile.in b/dlls/wininet/Makefile.in
+index 57db3794e369..6f544234e186 100644
+--- a/dlls/wininet/Makefile.in
++++ b/dlls/wininet/Makefile.in
+@@ -1,11 +1,12 @@
+ EXTRADEFS = -D_WININET_INTERNAL_
+ MODULE    = wininet.dll
+ IMPORTLIB = wininet
+-IMPORTS   = $(ZLIB_PE_LIBS) mpr shlwapi shell32 user32 ws2_32 advapi32
++IMPORTS   = $(ZLIB_PE_LIBS) mpr shlwapi shell32 user32 ws2_32 advapi32 uuid
+ EXTRAINCL = $(ZLIB_PE_CFLAGS)
+-DELAYIMPORTS = secur32 crypt32 cryptui dhcpcsvc iphlpapi
++DELAYIMPORTS = secur32 crypt32 cryptui dhcpcsvc iphlpapi nsi
+ 
+ SOURCES = \
++	connectivity.c \
+ 	cookie.c \
+ 	dialogs.c \
+ 	ftp.c \
+diff --git a/dlls/wininet/connectivity.c b/dlls/wininet/connectivity.c
+new file mode 100644
+index 000000000000..0e71223431a4
+--- /dev/null
++++ b/dlls/wininet/connectivity.c
+@@ -0,0 +1,203 @@
++/*
++ * Network connectivity state
++ *
++ * Copyright 2026 Erhan Bilgili
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdlib.h>
++#include "winsock2.h"
++#include "ws2ipdef.h"
++#include "windef.h"
++#include "winbase.h"
++#include "iphlpapi.h"
++#include "netiodef.h"
++#include "wininet.h"
++#include "wine/nsi.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(wininet);
++
++static SRWLOCK connectivity_lock = SRWLOCK_INIT;
++static BOOL initialized, monitoring, valid;
++static DWORD connected_state;
++
++static struct connectivity_notification
++{
++    const NPI_MODULEID *module;
++    DWORD table;
++    HANDLE device;
++    OVERLAPPED overlapped;
++    BOOL pending;
++} notifications[] =
++{
++    {&NPI_MS_IPV4_MODULEID, NSI_IP_UNICAST_TABLE},
++    {&NPI_MS_IPV6_MODULEID, NSI_IP_UNICAST_TABLE},
++    {&NPI_MS_IPV4_MODULEID, NSI_IP_FORWARD_TABLE},
++    {&NPI_MS_IPV6_MODULEID, NSI_IP_FORWARD_TABLE},
++    {&NPI_MS_NDIS_MODULEID, NSI_NDIS_IFINFO_TABLE},
++};
++
++static void stop_notifications(void)
++{
++    unsigned int i;
++    DWORD bytes;
++
++    for (i = 0; i < ARRAY_SIZE(notifications); ++i)
++    {
++        struct connectivity_notification *notification = &notifications[i];
++
++        if (notification->pending)
++        {
++            NsiCancelChangeNotification(&notification->overlapped);
++            /* Cancellation can return before the IOSB and event are updated. */
++            WaitForSingleObject(notification->overlapped.hEvent, INFINITE);
++            GetOverlappedResult(notification->device, &notification->overlapped, &bytes, FALSE);
++            notification->pending = FALSE;
++        }
++        if (notification->overlapped.hEvent) CloseHandle(notification->overlapped.hEvent);
++        notification->overlapped.hEvent = NULL;
++        /* The notification device handle belongs to NSI and is shared. */
++    }
++    monitoring = valid = FALSE;
++}
++
++static BOOL arm_notification(struct connectivity_notification *notification)
++{
++    DWORD err;
++
++    ResetEvent(notification->overlapped.hEvent);
++    err = NsiRequestChangeNotification(0, notification->module, notification->table,
++                                     &notification->overlapped, &notification->device);
++    notification->pending = !err || err == ERROR_IO_PENDING;
++    return notification->pending;
++}
++
++static void start_notifications(void)
++{
++    unsigned int i;
++
++    initialized = TRUE;
++    for (i = 0; i < ARRAY_SIZE(notifications); ++i)
++    {
++        struct connectivity_notification *notification = &notifications[i];
++
++        if (!(notification->overlapped.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL)) ||
++            !arm_notification(notification))
++        {
++            WARN("Network change monitoring unavailable, querying connectivity directly.\n");
++            stop_notifications();
++            return;
++        }
++    }
++    monitoring = TRUE;
++}
++
++static void check_notifications(void)
++{
++    unsigned int i;
++    DWORD bytes, err;
++
++    for (i = 0; i < ARRAY_SIZE(notifications); ++i)
++    {
++        struct connectivity_notification *notification = &notifications[i];
++
++        /* No server calls on the unchanged fast path. */
++        if (!HasOverlappedIoCompleted(&notification->overlapped)) continue;
++        /* IOSB publication precedes the event signal. Drain that signal before
++         * resetting the event and reusing the OVERLAPPED for another request. */
++        WaitForSingleObject(notification->overlapped.hEvent, INFINITE);
++        valid = FALSE;
++        notification->pending = FALSE;
++        err = GetOverlappedResult(notification->device, &notification->overlapped, &bytes, FALSE) ?
++              ERROR_SUCCESS : GetLastError();
++        /* The thread which issued the request may have exited. Rearming also
++         * covers any network changes while that request was cancelled. */
++        if ((err && err != ERROR_OPERATION_ABORTED) || !arm_notification(notification))
++        {
++            WARN("Network change monitoring failed, querying connectivity directly.\n");
++            stop_notifications();
++            return;
++        }
++    }
++}
++
++static DWORD query_connected_state(DWORD *status)
++{
++    IP_ADAPTER_ADDRESSES *buf, *aa;
++    ULONG size = 15000;
++    DWORD err;
++    const ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER |
++                        GAA_FLAG_SKIP_FRIENDLY_NAME | GAA_FLAG_INCLUDE_GATEWAYS;
++
++    /* Avoid enumerating all adapters just to determine the buffer size. */
++    if (!(buf = malloc(size))) return ERROR_NOT_ENOUGH_MEMORY;
++    while ((err = GetAdaptersAddresses(AF_UNSPEC, flags, NULL, buf, &size)))
++    {
++        free(buf);
++        if (err != ERROR_BUFFER_OVERFLOW)
++        {
++            if (err != ERROR_NO_DATA) return err;
++            buf = NULL;
++            break;
++        }
++        if (!(buf = malloc(size))) return ERROR_NOT_ENOUGH_MEMORY;
++    }
++
++    *status = INTERNET_RAS_INSTALLED;
++    for (aa = buf; aa; aa = aa->Next)
++    {
++        if (aa->FirstUnicastAddress) *status |= INTERNET_CONNECTION_OFFLINE;
++        if (aa->FirstGatewayAddress)
++        {
++            *status &= ~INTERNET_CONNECTION_OFFLINE;
++            *status |= INTERNET_CONNECTION_LAN;
++            break;
++        }
++    }
++    free(buf);
++    return ERROR_SUCCESS;
++}
++
++DWORD get_connected_state(DWORD *status)
++{
++    DWORD err = ERROR_SUCCESS;
++
++    AcquireSRWLockExclusive(&connectivity_lock);
++    if (!initialized) start_notifications();
++    if (monitoring) check_notifications();
++    if (!monitoring)
++    {
++        ReleaseSRWLockExclusive(&connectivity_lock);
++        return query_connected_state(status);
++    }
++    if (!valid)
++    {
++        /* All watches are armed before the snapshot. Changes during the query
++         * leave a completed watch and invalidate this snapshot on the next call. */
++        err = query_connected_state(&connected_state);
++        valid = !err && monitoring;
++    }
++    if (!err) *status = connected_state;
++    ReleaseSRWLockExclusive(&connectivity_lock);
++    return err;
++}
++
++void free_connected_state(void)
++{
++    /* No callback or worker executing Wininet code can race DLL unloading. */
++    stop_notifications();
++}
+diff --git a/dlls/wininet/internet.c b/dlls/wininet/internet.c
+index a39e55cb2c4b..515043b92105 100644
+--- a/dlls/wininet/internet.c
++++ b/dlls/wininet/internet.c
+@@ -329,6 +329,7 @@ BOOL WINAPI DllMain (HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
+             NETCON_unload();
+             free_urlcache();
+             free_cookie();
++            free_connected_state();
+ 
+             if (g_dwTlsErrIndex != TLS_OUT_OF_INDEXES)
+             {
+@@ -1562,9 +1563,7 @@ BOOL WINAPI InternetGetConnectedState(LPDWORD lpdwStatus, DWORD dwReserved)
+ BOOL WINAPI InternetGetConnectedStateExW(LPDWORD lpdwStatus, LPWSTR lpszConnectionName,
+                                          DWORD dwNameLen, DWORD dwReserved)
+ {
+-    IP_ADAPTER_ADDRESSES *buf = NULL, *aa;
+-    ULONG size = 0;
+-    DWORD status;
++    DWORD status, err;
+ 
+     TRACE("(%p, %p, %ld, 0x%08lx)\n", lpdwStatus, lpszConnectionName, dwNameLen, dwReserved);
+ 
+@@ -1575,46 +1574,11 @@ BOOL WINAPI InternetGetConnectedStateExW(LPDWORD lpdwStatus, LPWSTR lpszConnecti
+         return FALSE;
+     }
+ 
+-    for (;;)
++    if ((err = get_connected_state(&status)))
+     {
+-        ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER |
+-                      GAA_FLAG_SKIP_FRIENDLY_NAME | GAA_FLAG_INCLUDE_GATEWAYS;
+-        ULONG errcode = GetAdaptersAddresses(AF_UNSPEC, flags, NULL, buf, &size);
+-
+-        if (errcode == ERROR_SUCCESS)
+-            break;
+-        free(buf);
+-        if (errcode == ERROR_BUFFER_OVERFLOW && !(buf = malloc(size)))
+-            errcode = ERROR_NOT_ENOUGH_MEMORY;
+-        if (errcode != ERROR_BUFFER_OVERFLOW)
+-        {
+-            if (errcode != ERROR_NO_DATA)
+-            {
+-                SetLastError(errcode);
+-                return FALSE;
+-            }
+-            buf = NULL;
+-            break;
+-        }
+-    }
+-
+-    status = INTERNET_RAS_INSTALLED;
+-    for (aa = buf; aa; aa = aa->Next)
+-    {
+-        /* Connected, but not necessarily to internet */
+-        if (aa->FirstUnicastAddress)
+-            status |= INTERNET_CONNECTION_OFFLINE;
+-
+-        /* Connected to internet */
+-        if (aa->FirstGatewayAddress)
+-        {
+-            WARN("always returning LAN connection.\n");
+-            status &= ~INTERNET_CONNECTION_OFFLINE;
+-            status |= INTERNET_CONNECTION_LAN;
+-            break;
+-        }
++        SetLastError(err);
++        return FALSE;
+     }
+-    free(buf);
+ 
+     if (lpdwStatus) *lpdwStatus = status;
+ 
+diff --git a/dlls/wininet/internet.h b/dlls/wininet/internet.h
+index 3f63c8878490..d294895a24fa 100644
+--- a/dlls/wininet/internet.h
++++ b/dlls/wininet/internet.h
+@@ -438,6 +438,8 @@ static inline req_file_t *req_file_addref(req_file_t *req_file)
+ BOOL init_urlcache(void);
+ void free_urlcache(void);
+ void free_cookie(void);
++DWORD get_connected_state(DWORD *status);
++void free_connected_state(void);
+ void free_authorization_cache(void);
+ 
+ void init_winsock(void);

@@ -1,0 +1,825 @@
+From cca95f22ea5b2ab546a84a72626781467f4b677c Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Sat, 10 Oct 2026 23:23:10 +0200
+Subject: [PATCH] nsiproxy.sys: Implement interface and route change
+ notifications.
+
+Bind network monitoring before accepting subscriptions. Handle silent route
+removals, event loss and reader failures. Complete requests outside the
+queue lock and arbitrate cancellation ownership.
+
+Imported without changes from nanomatters/wine-salkim (Wineland), commit
+cca95f22ea5b2ab546a84a72626781467f4b677c
+https://github.com/nanomatters/wine-salkim/commit/cca95f22ea5b2ab546a84a72626781467f4b677c
+License: LGPL-2.1-or-later, the same as Wine. Author: Erhan Bilgili.
+Wine bug: https://bugs.winehq.org/show_bug.cgi?id=60465
+---
+ dlls/nsi/nsi.c                       |  14 +-
+ dlls/nsi/tests/nsi.c                 | 126 +++++++++++--
+ dlls/nsiproxy.sys/device.c           | 143 +++++++++++----
+ dlls/nsiproxy.sys/nsi.c              | 265 ++++++++++++++++++++-------
+ dlls/nsiproxy.sys/nsiproxy_private.h |   9 +
+ 5 files changed, 438 insertions(+), 119 deletions(-)
+
+diff --git a/dlls/nsi/nsi.c b/dlls/nsi/nsi.c
+index 14be842871a9..ee0f712fc874 100644
+--- a/dlls/nsi/nsi.c
++++ b/dlls/nsi/nsi.c
+@@ -342,7 +342,7 @@ DWORD WINAPI NsiRequestChangeNotification( DWORD unk, const NPI_MODULEID *module
+ {
+     struct nsi_request_change_notification_ex params;
+ 
+-    TRACE( "%lu %p %lu %p %p stub.\n", unk, module, table, ovr, handle );
++    TRACE( "%lu %p %lu %p %p.\n", unk, module, table, ovr, handle );
+ 
+     params.unk = unk;
+     params.module = module;
+@@ -356,8 +356,8 @@ DWORD WINAPI NsiRequestChangeNotificationEx( struct nsi_request_change_notificat
+ {
+     HANDLE device = get_nsi_device( TRUE );
+     struct nsiproxy_request_notification *in;
+-    ULONG in_size = sizeof(struct nsiproxy_get_parameter), received;
+-    OVERLAPPED overlapped, *ovr;
++    ULONG in_size = sizeof(*in), received;
++    OVERLAPPED overlapped = {0}, *ovr;
+     DWORD err = ERROR_SUCCESS;
+     DWORD len;
+ 
+@@ -375,6 +375,12 @@ DWORD WINAPI NsiRequestChangeNotificationEx( struct nsi_request_change_notificat
+     if (!(ovr = params->ovr))
+     {
+         overlapped.hEvent = CreateEventW( NULL, FALSE, FALSE, NULL );
++        if (!overlapped.hEvent)
++        {
++            err = GetLastError();
++            free( in );
++            return err;
++        }
+         ovr = &overlapped;
+     }
+     if (!DeviceIoControl( device, IOCTL_NSIPROXY_WINE_CHANGE_NOTIFICATION, in, in_size, NULL, 0, &received, ovr ))
+@@ -385,7 +391,7 @@ DWORD WINAPI NsiRequestChangeNotificationEx( struct nsi_request_change_notificat
+             err = GetOverlappedResult( device, ovr, &len, TRUE ) ? 0 : GetLastError();
+         CloseHandle( overlapped.hEvent );
+     }
+-    else if (params->handle && ovr && err == ERROR_IO_PENDING)
++    else if (params->handle && (!err || err == ERROR_IO_PENDING))
+         *params->handle = device;
+ 
+     free( in );
+diff --git a/dlls/nsi/tests/nsi.c b/dlls/nsi/tests/nsi.c
+index 29e5b30cc557..77e0eccd7a14 100644
+--- a/dlls/nsi/tests/nsi.c
++++ b/dlls/nsi/tests/nsi.c
+@@ -1117,10 +1117,29 @@ void test_change_notifications(void)
+ 
+     memset( &ovr, 0, sizeof(ovr) );
+     ovr.hEvent = CreateEventW( NULL, FALSE, FALSE, NULL );
++    ok( ovr.hEvent != NULL, "Failed to create event, error %lu.\n", GetLastError() );
++    if (!ovr.hEvent) return;
++
++    ret = NsiCancelChangeNotification( NULL );
++    ok( ret == ERROR_NOT_FOUND, "got %lu.\n", ret );
++
++    ret = NsiRequestChangeNotification( 0, &NPI_MS_NDIS_MODULEID, NSI_NDIS_INDEX_LUID_TABLE, &ovr, &handle );
++    ok( ret == ERROR_INVALID_PARAMETER, "got %lu.\n", ret );
++    if (ret == ERROR_IO_PENDING)
++    {
++        NsiCancelChangeNotification( &ovr );
++        GetOverlappedResult( handle, &ovr, &bytes, TRUE );
++    }
+ 
+     handle = (HANDLE)0xdeadbeef;
+     ret = NsiRequestChangeNotification( 0, &NPI_MS_NDIS_MODULEID, NSI_NDIS_IFINFO_TABLE, &ovr, &handle );
++    if (ret == ERROR_NOT_SUPPORTED || ret == ERROR_CALL_NOT_IMPLEMENTED)
++    {
++        win_skip( "Interface change notifications are not supported.\n" );
++        goto route;
++    }
+     ok( ret == ERROR_IO_PENDING, "got %lu.\n", ret );
++    if (ret != ERROR_IO_PENDING) goto route;
+ 
+     memset( &params, 0, sizeof(params) );
+     handle2 = (HANDLE)0xdeadbeef;
+@@ -1130,15 +1149,21 @@ void test_change_notifications(void)
+     params.ovr = &ovr2;
+     params.handle = &handle2;
+     ret = NsiRequestChangeNotificationEx( &params );
+-    ok( ret == ERROR_IO_PENDING, "got %lu.\n", ret );
++    if (ret == ERROR_NOT_SUPPORTED || ret == ERROR_CALL_NOT_IMPLEMENTED)
++        win_skip( "Interface change notifications are not supported.\n" );
++    else
++        ok( ret == ERROR_IO_PENDING, "got %lu.\n", ret );
++    if (ret != ERROR_IO_PENDING)
++    {
++        NsiCancelChangeNotification( &ovr );
++        GetOverlappedResult( handle, &ovr, &bytes, TRUE );
++        goto route;
++    }
+ 
+     ok( handle2 == handle, "got %p, %p.\n", handle, handle2 );
+     bret = GetOverlappedResult( handle, &ovr, &bytes, FALSE );
+     ok( !bret && GetLastError() == ERROR_IO_INCOMPLETE, "got bret %d, err %lu.\n", bret, GetLastError() );
+ 
+-    ret = NsiCancelChangeNotification( NULL );
+-    ok( ret == ERROR_NOT_FOUND, "got %lu.\n", ret );
+-
+     ret = NsiCancelChangeNotification( &ovr );
+     ok( !ret, "got %lu.\n", ret );
+ 
+@@ -1156,20 +1181,98 @@ void test_change_notifications(void)
+     bret = GetOverlappedResult( handle, &ovr2, &bytes, TRUE );
+     ok( !bret && GetLastError() == ERROR_OPERATION_ABORTED, "got bret %d, err %lu.\n", bret, GetLastError() );
+ 
+-    ret = NsiRequestChangeNotification( 0, &NPI_MS_NDIS_MODULEID, NSI_NDIS_INDEX_LUID_TABLE, &ovr, &handle );
+-    todo_wine ok( ret == ERROR_INVALID_PARAMETER, "got %lu.\n", ret );
+-    if (ret == ERROR_IO_PENDING)
++route:
++    ret = NsiRequestChangeNotification( 0, &NPI_MS_IPV4_MODULEID, NSI_IP_FORWARD_TABLE, &ovr, &handle );
++    if (ret == ERROR_NOT_SUPPORTED || ret == ERROR_CALL_NOT_IMPLEMENTED)
+     {
+-        NsiCancelChangeNotification( &ovr );
+-        GetOverlappedResult( handle, &ovr, &bytes, TRUE );
++        win_skip( "Route change notifications are not supported.\n" );
++        goto done;
+     }
+-
+-    ret = NsiRequestChangeNotification( 0, &NPI_MS_IPV4_MODULEID, NSI_IP_FORWARD_TABLE, &ovr, &handle );
+     ok( ret == ERROR_IO_PENDING, "got %lu.\n", ret );
++    if (ret != ERROR_IO_PENDING) goto done;
+     ret = NsiCancelChangeNotification( &ovr );
+     ok( !ret, "got %lu.\n", ret );
+     bret = GetOverlappedResult( handle, &ovr, &bytes, TRUE );
+     ok( !bret && GetLastError() == ERROR_OPERATION_ABORTED, "got bret %d, err %lu.\n", bret, GetLastError() );
++done:
++    CloseHandle( ovr.hEvent );
++}
++
++static void test_ip_change_notifications(void)
++{
++    static const struct
++    {
++        const NPI_MODULEID *module;
++        DWORD table;
++        const char *name;
++    } cases[] =
++    {
++        { &NPI_MS_IPV4_MODULEID, NSI_IP_INTERFACE_TABLE, "IPv4 interface" },
++        { &NPI_MS_IPV6_MODULEID, NSI_IP_INTERFACE_TABLE, "IPv6 interface" },
++        { &NPI_MS_IPV4_MODULEID, NSI_IP_UNICAST_TABLE, "IPv4 address" },
++        { &NPI_MS_IPV6_MODULEID, NSI_IP_UNICAST_TABLE, "IPv6 address" },
++        { &NPI_MS_IPV4_MODULEID, NSI_IP_FORWARD_TABLE, "IPv4 route" },
++        { &NPI_MS_IPV6_MODULEID, NSI_IP_FORWARD_TABLE, "IPv6 route" },
++    };
++    DWORD bytes, ret, err, registration[2];
++    HANDLE handles[2];
++    OVERLAPPED ovr[2];
++    unsigned int i, j;
++    BOOL bret;
++
++    for (i = 0; i < ARRAY_SIZE(cases); ++i)
++    {
++        winetest_push_context( "%s", cases[i].name );
++        memset( ovr, 0, sizeof(ovr) );
++        memset( handles, 0, sizeof(handles) );
++        registration[0] = registration[1] = ERROR_INVALID_PARAMETER;
++        for (j = 0; j < ARRAY_SIZE(ovr); ++j)
++            ovr[j].hEvent = CreateEventW( NULL, FALSE, FALSE, NULL );
++
++        for (j = 0; j < ARRAY_SIZE(ovr); ++j)
++        {
++            registration[j] = NsiRequestChangeNotification( 0, cases[i].module, cases[i].table,
++                                                           ovr + j, handles + j );
++            if (registration[j] == ERROR_NOT_SUPPORTED || registration[j] == ERROR_CALL_NOT_IMPLEMENTED)
++            {
++                win_skip( "Change notifications are not supported.\n" );
++                break;
++            }
++            ok( registration[j] == ERROR_IO_PENDING || !registration[j],
++                "registration %u returned %lu.\n", j, registration[j] );
++            if (registration[j] != ERROR_IO_PENDING && registration[j]) break;
++            ok( handles[j] && handles[j] != INVALID_HANDLE_VALUE, "registration %u has no handle.\n", j );
++        }
++
++        if (j == ARRAY_SIZE(ovr))
++        {
++            ok( handles[0] == handles[1], "Different device handles %p, %p.\n", handles[0], handles[1] );
++            ret = NsiCancelChangeNotification( ovr );
++            ok( !ret || ret == ERROR_NOT_FOUND, "First cancellation returned %lu.\n", ret );
++            bret = GetOverlappedResult( handles[0], ovr, &bytes, TRUE );
++            err = GetLastError();
++            /* A concurrent host change may have completed the request before cancellation. */
++            ok( bret || err == ERROR_OPERATION_ABORTED, "First result %d, error %lu.\n", bret, err );
++
++            bret = GetOverlappedResult( handles[1], ovr + 1, &bytes, FALSE );
++            err = GetLastError();
++            ok( bret || err == ERROR_IO_INCOMPLETE, "First cancellation affected second request: %d, %lu.\n", bret, err );
++        }
++
++        for (j = 0; j < ARRAY_SIZE(ovr); ++j)
++        {
++            if (registration[j] == ERROR_IO_PENDING)
++            {
++                ret = NsiCancelChangeNotification( ovr + j );
++                ok( !ret || ret == ERROR_NOT_FOUND, "Cleanup cancellation %u returned %lu.\n", j, ret );
++                bret = GetOverlappedResult( handles[j], ovr + j, &bytes, TRUE );
++                err = GetLastError();
++                ok( bret || err == ERROR_OPERATION_ABORTED, "Cleanup result %u: %d, %lu.\n", j, bret, err );
++            }
++            CloseHandle( ovr[j].hEvent );
++        }
++        winetest_pop_context();
++    }
+ }
+ 
+ START_TEST( nsi )
+@@ -1209,4 +1312,5 @@ START_TEST( nsi )
+     test_udp_tables( AF_INET6 );
+ 
+     test_change_notifications();
++    test_ip_change_notifications();
+ }
+diff --git a/dlls/nsiproxy.sys/device.c b/dlls/nsiproxy.sys/device.c
+index 28e699782505..c7e4db7f17c6 100644
+--- a/dlls/nsiproxy.sys/device.c
++++ b/dlls/nsiproxy.sys/device.c
+@@ -29,6 +29,7 @@
+ #include "winioctl.h"
+ #include "ddk/wdm.h"
+ #include "ifdef.h"
++#define __WINE_INIT_NPI_MODULEID
+ #include "netiodef.h"
+ #include "ipexport.h"
+ #include "wine/nsi.h"
+@@ -49,6 +50,8 @@ DECLARE_CRITICAL_SECTION( nsiproxy_cs );
+ 
+ #define LIST_ENTRY_INIT( list )  { .Flink = &(list), .Blink = &(list) }
+ static LIST_ENTRY notification_queue = LIST_ENTRY_INIT( notification_queue );
++static NTSTATUS notification_status = STATUS_NOT_SUPPORTED;
++static UINT notification_support;
+ 
+ struct notification_data
+ {
+@@ -70,6 +73,8 @@ enum unix_calls
+     nsi_get_all_parameters_ex,
+     nsi_get_parameter_ex,
+     nsi_get_notification,
++    nsi_init_notifications,
++    nsi_close_notifications,
+ };
+ 
+ static NTSTATUS nsiproxy_enumerate_all( IRP *irp )
+@@ -374,6 +379,7 @@ static void WINAPI change_notification_cancel( DEVICE_OBJECT *device, IRP *irp )
+     EnterCriticalSection( &nsiproxy_cs );
+     RemoveEntryList( &irp->Tail.Overlay.ListEntry );
+     free( irp->Tail.Overlay.DriverContext[0] );
++    irp->Tail.Overlay.DriverContext[0] = NULL;
+     LeaveCriticalSection( &nsiproxy_cs );
+ 
+     irp->IoStatus.Status = STATUS_CANCELLED;
+@@ -386,28 +392,58 @@ static NTSTATUS nsiproxy_change_notification( IRP *irp )
+     struct nsiproxy_request_notification *in = (struct nsiproxy_request_notification *)irp->AssociatedIrp.SystemBuffer;
+     DWORD in_len = irpsp->Parameters.DeviceIoControl.InputBufferLength;
+     struct notification_data *data;
++    UINT support;
++    NTSTATUS status;
+ 
+     TRACE( "irp %p.\n", irp );
+ 
+     if (in_len < sizeof(*in)) return STATUS_INVALID_PARAMETER;
++    if (NmrIsEqualNpiModuleId( &in->module, &NPI_MS_NDIS_MODULEID ))
++    {
++        if (in->table != NSI_NDIS_IFINFO_TABLE) return STATUS_INVALID_PARAMETER;
++        support = NSI_NOTIFICATION_INTERFACE;
++    }
++    else if (NmrIsEqualNpiModuleId( &in->module, &NPI_MS_IPV4_MODULEID ) ||
++             NmrIsEqualNpiModuleId( &in->module, &NPI_MS_IPV6_MODULEID ))
++    {
++        switch (in->table)
++        {
++        case NSI_IP_UNICAST_TABLE: support = NSI_NOTIFICATION_ADDRESS; break;
++        case NSI_IP_FORWARD_TABLE: support = NSI_NOTIFICATION_ROUTE; break;
++        case NSI_IP_INTERFACE_TABLE: support = NSI_NOTIFICATION_INTERFACE; break;
++        default: return STATUS_INVALID_PARAMETER;
++        }
++    }
++    else return STATUS_INVALID_PARAMETER;
++
+     if (!(data = calloc( 1, sizeof(*data) ))) return STATUS_NO_MEMORY;
+-    /* FIXME: validate module and table. */
++    data->module = in->module;
++    data->table = in->table;
+ 
+     EnterCriticalSection( &nsiproxy_cs );
++    status = notification_status;
++    if (!status && !(notification_support & support)) status = STATUS_NOT_SUPPORTED;
++    if (status)
++    {
++        LeaveCriticalSection( &nsiproxy_cs );
++        free( data );
++        return status;
++    }
++
++    /* Publish the queue entry before cancellation can take ownership. */
++    irp->Tail.Overlay.DriverContext[0] = data;
++    InsertTailList( &notification_queue, &irp->Tail.Overlay.ListEntry );
+     IoSetCancelRoutine( irp, change_notification_cancel );
+     if (irp->Cancel && IoSetCancelRoutine( irp, NULL ))
+     {
+         /* IRP was canceled before we set cancel routine */
+-        InitializeListHead( &irp->Tail.Overlay.ListEntry );
++        RemoveEntryList( &irp->Tail.Overlay.ListEntry );
++        irp->Tail.Overlay.DriverContext[0] = NULL;
+         LeaveCriticalSection( &nsiproxy_cs );
+         free( data );
+         return STATUS_CANCELLED;
+     }
+-    InsertTailList( &notification_queue, &irp->Tail.Overlay.ListEntry );
+     IoMarkIrpPending( irp );
+-    data->module = in->module;
+-    data->table = in->table;
+-    irp->Tail.Overlay.DriverContext[0] = data;
+     LeaveCriticalSection( &nsiproxy_cs );
+ 
+     return STATUS_PENDING;
+@@ -467,7 +503,10 @@ static int add_device( DRIVER_OBJECT *driver )
+     NTSTATUS status;
+ 
+     if (!(status = IoCreateDevice( driver, 0, &name, FILE_DEVICE_NETWORK, FILE_DEVICE_SECURE_OPEN, FALSE, &device )))
++    {
+         status = IoCreateSymbolicLink( &link, &name );
++        if (status) IoDeleteDevice( device );
++    }
+     if (status)
+     {
+         FIXME( "failed to create device error %lx\n", status );
+@@ -477,48 +516,57 @@ static int add_device( DRIVER_OBJECT *driver )
+     return 1;
+ }
+ 
++static void complete_notifications( const struct nsi_get_notification_params *params, NTSTATUS status )
++{
++    LIST_ENTRY complete = LIST_ENTRY_INIT( complete );
++    LIST_ENTRY *entry, *next;
++
++    EnterCriticalSection( &nsiproxy_cs );
++    if (status) notification_status = status;
++    for (entry = notification_queue.Flink; entry != &notification_queue; entry = next)
++    {
++        IRP *irp = CONTAINING_RECORD( entry, IRP, Tail.Overlay.ListEntry );
++        struct notification_data *data = irp->Tail.Overlay.DriverContext[0];
++
++        next = entry->Flink;
++        if (params && (!NmrIsEqualNpiModuleId( &data->module, &params->module ) || data->table != params->table))
++            continue;
++        /* A NULL return means the cancel routine already owns this IRP. */
++        if (!IoSetCancelRoutine( irp, NULL )) continue;
++
++        RemoveEntryList( entry );
++        InsertTailList( &complete, entry );
++        irp->Tail.Overlay.DriverContext[0] = NULL;
++        free( data );
++        irp->IoStatus.Status = status;
++    }
++    LeaveCriticalSection( &nsiproxy_cs );
++
++    /* Completion takes a lock which the cancellation dispatcher also holds. */
++    while (!IsListEmpty( &complete ))
++    {
++        IRP *irp = CONTAINING_RECORD( RemoveHeadList( &complete ), IRP, Tail.Overlay.ListEntry );
++        IoCompleteRequest( irp, IO_NO_INCREMENT );
++    }
++}
++
+ static DWORD WINAPI notification_thread_proc( void *arg )
+ {
+     struct nsi_get_notification_params params;
+-    LIST_ENTRY *entry, *next;
+     NTSTATUS status;
+ 
+     SetThreadDescription( GetCurrentThread(), L"wine_nsi_notification" );
+-
+     while (!(status = nsiproxy_call( nsi_get_notification, &params )))
+-    {
+-        EnterCriticalSection( &nsiproxy_cs );
+-        for (entry = notification_queue.Flink; entry != &notification_queue; entry = next)
+-        {
+-            IRP *irp = CONTAINING_RECORD( entry, IRP, Tail.Overlay.ListEntry );
+-            struct notification_data *data = irp->Tail.Overlay.DriverContext[0];
+-
+-            next = entry->Flink;
+-            if(irp->Cancel)
+-            {
+-                /* Cancel routine should care of freeing data and completing IRP. */
+-                TRACE( "irp %p canceled.\n", irp );
+-                continue;
+-            }
+-            if (!NmrIsEqualNpiModuleId( &data->module, &params.module ) || data->table != params.table)
+-                continue;
+-
+-            irp->IoStatus.Status = 0;
+-            RemoveEntryList( entry );
+-            irp->Tail.Overlay.DriverContext[0] = NULL;
+-            free( data );
+-            TRACE("completing irp %p.\n", irp);
+-            IoCompleteRequest( irp, IO_NO_INCREMENT );
+-        }
+-        LeaveCriticalSection( &nsiproxy_cs );
+-    }
++        complete_notifications( &params, STATUS_SUCCESS );
+ 
++    complete_notifications( NULL, status );
+     WARN( "nsi_get_notification failed, status %#lx.\n", status );
+     return 0;
+ }
+ 
+ NTSTATUS WINAPI DriverEntry( DRIVER_OBJECT *driver, UNICODE_STRING *path )
+ {
++    struct nsi_init_notifications_params params = {0};
+     NTSTATUS status;
+     HANDLE thread;
+ 
+@@ -529,10 +577,29 @@ NTSTATUS WINAPI DriverEntry( DRIVER_OBJECT *driver, UNICODE_STRING *path )
+ 
+     driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] = nsi_ioctl;
+ 
+-    add_device( driver );
+-
+-    thread = CreateThread( NULL, 0, notification_thread_proc, NULL, 0, NULL );
+-    CloseHandle( thread );
++    /* Bind before publishing the device. Gate subscriptions until the reader
++     * has been created and its startup status is known. */
++    status = nsiproxy_call( nsi_init_notifications, &params );
++    EnterCriticalSection( &nsiproxy_cs );
++    if (!add_device( driver ))
++    {
++        LeaveCriticalSection( &nsiproxy_cs );
++        if (!status) nsiproxy_call( nsi_close_notifications, NULL );
++        return STATUS_UNSUCCESSFUL;
++    }
++    notification_status = status;
++    notification_support = params.supported;
++    if (!notification_status)
++    {
++        thread = CreateThread( NULL, 0, notification_thread_proc, NULL, 0, NULL );
++        if (thread) CloseHandle( thread );
++        else
++        {
++            nsiproxy_call( nsi_close_notifications, NULL );
++            notification_status = STATUS_NO_MEMORY;
++        }
++    }
++    LeaveCriticalSection( &nsiproxy_cs );
+     thread = CreateThread( NULL, 0, icmp_listen_thread_proc, NULL, 0, NULL );
+     CloseHandle( thread );
+ 
+diff --git a/dlls/nsiproxy.sys/nsi.c b/dlls/nsiproxy.sys/nsi.c
+index 9e88a6736108..422e2a591385 100644
+--- a/dlls/nsiproxy.sys/nsi.c
++++ b/dlls/nsiproxy.sys/nsi.c
+@@ -25,6 +25,7 @@
+ #include <stdarg.h>
+ #include <assert.h>
+ #include <errno.h>
++#include <fcntl.h>
+ #include <unistd.h>
+ #include <sys/socket.h>
+ #include <limits.h>
+@@ -187,96 +188,184 @@ static NTSTATUS add_notification( const NPI_MODULEID *module, UINT32 table )
+ }
+ 
+ #if defined(HAVE_LINUX_RTNETLINK_H)
+-static NTSTATUS poll_events(void)
++static int netlink_fd = -1;
++
++static NTSTATUS init_events(void)
++{
++    struct sockaddr_nl addr;
++
++    if (netlink_fd != -1) return STATUS_SUCCESS;
++    if ((netlink_fd = socket( PF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE )) == -1)
++    {
++        ERR( "netlink socket creation failed, errno %d.\n", errno );
++        return STATUS_UNSUCCESSFUL;
++    }
++
++    memset( &addr, 0, sizeof(addr) );
++    addr.nl_family = AF_NETLINK;
++    addr.nl_groups = RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR |
++                     RTMGRP_IPV4_ROUTE | RTMGRP_IPV6_ROUTE;
++    if (bind( netlink_fd, (struct sockaddr *)&addr, sizeof(addr) ) == -1)
++    {
++        ERR( "bind failed, errno %d.\n", errno );
++        close( netlink_fd );
++        netlink_fd = -1;
++        return STATUS_UNSUCCESSFUL;
++    }
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS invalidate_notifications(void)
+ {
+-    static int netlink_fd = -1;
+-    char buffer[PIPE_BUF];
+-    struct nlmsghdr *nlh;
++    static const UINT tables[] = { NSI_IP_UNICAST_TABLE, NSI_IP_FORWARD_TABLE, NSI_IP_INTERFACE_TABLE };
+     NTSTATUS status;
+-    int len;
++    unsigned int i;
+ 
+-    if (netlink_fd == -1)
++    /* Lost events can affect any table, including ones absent from this datagram. */
++    if ((status = add_notification( &NPI_MS_NDIS_MODULEID, NSI_NDIS_IFINFO_TABLE ))) return status;
++    for (i = 0; i < ARRAY_SIZE(tables); ++i)
+     {
+-        struct sockaddr_nl addr;
++        if ((status = add_notification( &NPI_MS_IPV4_MODULEID, tables[i] ))) return status;
++        if ((status = add_notification( &NPI_MS_IPV6_MODULEID, tables[i] ))) return status;
++    }
++    return STATUS_SUCCESS;
++}
+ 
+-        if ((netlink_fd = socket( PF_NETLINK, SOCK_RAW, NETLINK_ROUTE )) == -1)
+-        {
+-            ERR( "netlink socket creation failed, errno %d.\n", errno );
+-            return STATUS_NOT_IMPLEMENTED;
+-        }
++static NTSTATUS process_netlink_events( const void *buffer, size_t len )
++{
++    const struct nlmsghdr *nlh = buffer;
++    const NPI_MODULEID *module;
++    NTSTATUS status;
++    unsigned int family, table;
++    size_t step;
+ 
+-        memset( &addr, 0, sizeof(addr) );
+-        addr.nl_family = AF_NETLINK;
+-        addr.nl_groups = RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR;
+-        if (bind( netlink_fd, (struct sockaddr *)&addr, sizeof(addr) ) == -1)
++    while (len)
++    {
++        if (len < sizeof(*nlh) || nlh->nlmsg_len < sizeof(*nlh) || nlh->nlmsg_len > len)
++            return invalidate_notifications();
++
++        switch (nlh->nlmsg_type)
+         {
+-            close( netlink_fd );
+-            netlink_fd = -1;
+-            ERR( "bind failed, errno %d.\n", errno );
+-            return STATUS_NOT_IMPLEMENTED;
++        case NLMSG_OVERRUN:
++            return invalidate_notifications();
++        case NLMSG_ERROR:
++            if (nlh->nlmsg_len < NLMSG_LENGTH(sizeof(struct nlmsgerr)) ||
++                ((const struct nlmsgerr *)NLMSG_DATA(nlh))->error)
++                return invalidate_notifications();
++            break;
++        case RTM_NEWLINK:
++        case RTM_DELLINK:
++            if (nlh->nlmsg_len < NLMSG_LENGTH(sizeof(struct ifinfomsg)))
++                return invalidate_notifications();
++            if ((status = add_notification( &NPI_MS_NDIS_MODULEID, NSI_NDIS_IFINFO_TABLE ))) return status;
++            if ((status = add_notification( &NPI_MS_IPV4_MODULEID, NSI_IP_INTERFACE_TABLE ))) return status;
++            if ((status = add_notification( &NPI_MS_IPV6_MODULEID, NSI_IP_INTERFACE_TABLE ))) return status;
++            /* IPv4 route flushes on link down do not emit RTM_DELROUTE. */
++            if ((status = add_notification( &NPI_MS_IPV4_MODULEID, NSI_IP_FORWARD_TABLE ))) return status;
++            if ((status = add_notification( &NPI_MS_IPV6_MODULEID, NSI_IP_FORWARD_TABLE ))) return status;
++            break;
++        case RTM_NEWADDR:
++        case RTM_DELADDR:
++            if (nlh->nlmsg_len < NLMSG_LENGTH(sizeof(struct ifaddrmsg)))
++                return invalidate_notifications();
++            family = ((const struct ifaddrmsg *)NLMSG_DATA(nlh))->ifa_family;
++            table = NSI_IP_UNICAST_TABLE;
++            goto family_notification;
++        case RTM_NEWROUTE:
++        case RTM_DELROUTE:
++            if (nlh->nlmsg_len < NLMSG_LENGTH(sizeof(struct rtmsg)))
++                return invalidate_notifications();
++            family = ((const struct rtmsg *)NLMSG_DATA(nlh))->rtm_family;
++            table = NSI_IP_FORWARD_TABLE;
++        family_notification:
++            if (family == AF_INET) module = &NPI_MS_IPV4_MODULEID;
++            else if (family == AF_INET6) module = &NPI_MS_IPV6_MODULEID;
++            else break;
++            if ((status = add_notification( module, table ))) return status;
++            /* IP interface enumeration also depends on the assigned addresses. */
++            if (table == NSI_IP_UNICAST_TABLE &&
++                (status = add_notification( module, NSI_IP_INTERFACE_TABLE ))) return status;
++            if (nlh->nlmsg_type == RTM_DELADDR &&
++                (status = add_notification( module, NSI_IP_FORWARD_TABLE ))) return status;
++            break;
+         }
++
++        if (nlh->nlmsg_len == len) break;
++        step = NLMSG_ALIGN(nlh->nlmsg_len);
++        if (step > len) return invalidate_notifications();
++        len -= step;
++        nlh = (const struct nlmsghdr *)((const char *)nlh + step);
+     }
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS poll_events(void)
++{
++    union
++    {
++        struct nlmsghdr align;
++        char data[32768];
++    } buffer;
++    NTSTATUS status;
+ 
+     while (1)
+     {
+-        len = recv( netlink_fd, buffer, sizeof(buffer), 0 );
+-        if (len <= 0)
++        struct sockaddr_nl addr;
++        struct iovec iov = { buffer.data, sizeof(buffer.data) };
++        struct msghdr msg = {0};
++        ssize_t len;
++
++        msg.msg_name = &addr;
++        msg.msg_namelen = sizeof(addr);
++        msg.msg_iov = &iov;
++        msg.msg_iovlen = 1;
++        len = recvmsg( netlink_fd, &msg, 0 );
++        if (len < 0)
+         {
+             if (errno == EINTR) continue;
+-            ERR( "error receivng, len %d, errno %d.\n", len, errno );
++            if (errno == ENOBUFS) return invalidate_notifications();
++            ERR( "error receiving netlink events, errno %d.\n", errno );
++            close( netlink_fd );
++            netlink_fd = -1;
+             return STATUS_UNSUCCESSFUL;
+         }
+-        for (nlh = (struct nlmsghdr *)buffer; NLMSG_OK(nlh, len); nlh = NLMSG_NEXT(nlh, len))
+-        {
+-            if (nlh->nlmsg_type == NLMSG_DONE) break;
+-            if (nlh->nlmsg_type == RTM_NEWADDR || nlh->nlmsg_type == RTM_DELADDR)
+-            {
+-                struct ifaddrmsg *addrmsg = (struct ifaddrmsg *)(nlh + 1);
+-                const NPI_MODULEID *module;
+-
+-                if (addrmsg->ifa_family == AF_INET)       module = &NPI_MS_IPV4_MODULEID;
+-                else if (addrmsg->ifa_family == AF_INET6) module = &NPI_MS_IPV6_MODULEID;
+-                else
+-                {
+-                    WARN( "Unknown addrmsg->ifa_family %d.\n", addrmsg->ifa_family );
+-                    continue;
+-                }
+-                if ((status = add_notification( module, NSI_IP_UNICAST_TABLE))) return status;
+-            }
+-        }
+-        if (queued_notification_count) break;
++        if (msg.msg_namelen != sizeof(addr) || addr.nl_family != AF_NETLINK || addr.nl_pid) continue;
++        if (!len || (msg.msg_flags & MSG_TRUNC)) return invalidate_notifications();
++        if ((status = process_netlink_events( buffer.data, len ))) return status;
++        if (queued_notification_count) return STATUS_SUCCESS;
+     }
+-    return STATUS_SUCCESS;
+ }
+ #elif defined(__APPLE__)
+-static NTSTATUS poll_events(void)
+-{
+-    static int sock = -1;
++static int sock = -1;
+ 
+-    if (sock == -1)
++static NTSTATUS init_events(void)
++{
++    static const struct kev_request req =
+     {
+-        static const struct kev_request req =
+-        {
+-            .vendor_code = KEV_VENDOR_APPLE,
+-            .kev_class = KEV_NETWORK_CLASS,
+-            .kev_subclass = KEV_ANY_SUBCLASS,
+-        };
++        .vendor_code = KEV_VENDOR_APPLE,
++        .kev_class = KEV_NETWORK_CLASS,
++        .kev_subclass = KEV_ANY_SUBCLASS,
++    };
+ 
+-        if ((sock = socket( PF_SYSTEM, SOCK_RAW, SYSPROTO_EVENT )) == -1)
+-        {
+-            ERR( "PF_SYSTEM socket creation failed, errno %d.\n", errno );
+-            return STATUS_NOT_IMPLEMENTED;
+-        }
++    if (sock != -1) return STATUS_SUCCESS;
++    if ((sock = socket( PF_SYSTEM, SOCK_RAW, SYSPROTO_EVENT )) == -1)
++    {
++        ERR( "PF_SYSTEM socket creation failed, errno %d.\n", errno );
++        return STATUS_UNSUCCESSFUL;
++    }
+ 
+-        if (ioctl( sock, SIOCSKEVFILT, &req ) == -1)
+-        {
+-            close( sock );
+-            sock = -1;
+-            ERR( "SIOCSKEVFILT failed, errno %d.\n", errno );
+-            return STATUS_NOT_IMPLEMENTED;
+-        }
++    if (fcntl( sock, F_SETFD, FD_CLOEXEC ) == -1 || ioctl( sock, SIOCSKEVFILT, &req ) == -1)
++    {
++        ERR( "kernel event socket setup failed, errno %d.\n", errno );
++        close( sock );
++        sock = -1;
++        return STATUS_UNSUCCESSFUL;
+     }
++    return STATUS_SUCCESS;
++}
+ 
++static NTSTATUS poll_events(void)
++{
+     while (1)
+     {
+         struct kern_event_msg msg;
+@@ -286,8 +375,10 @@ static NTSTATUS poll_events(void)
+         len = recv( sock, &msg, sizeof(msg), 0 );
+         if (len < sizeof(msg))
+         {
+-            if (errno == EINTR) continue;
++            if (len < 0 && errno == EINTR) continue;
+             ERR( "error receiving, len %d, errno %d.\n", len, errno );
++            close( sock );
++            sock = -1;
+             return STATUS_UNSUCCESSFUL;
+         }
+ 
+@@ -335,11 +426,51 @@ static NTSTATUS unix_nsi_get_notification( void *args )
+     memmove( queued_notifications, queued_notifications + 1, sizeof(*queued_notifications) * queued_notification_count );
+     return STATUS_SUCCESS;
+ }
++
++static NTSTATUS unix_nsi_init_notifications( void *args )
++{
++    struct nsi_init_notifications_params *params = args;
++    NTSTATUS status;
++
++    params->supported = 0;
++    if ((status = init_events())) return status;
++    params->supported = NSI_NOTIFICATION_ADDRESS;
++#ifdef HAVE_LINUX_RTNETLINK_H
++    params->supported |= NSI_NOTIFICATION_ROUTE | NSI_NOTIFICATION_INTERFACE;
++#endif
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS unix_nsi_close_notifications( void *args )
++{
++#ifdef HAVE_LINUX_RTNETLINK_H
++    if (netlink_fd != -1) close( netlink_fd );
++    netlink_fd = -1;
++#else
++    if (sock != -1) close( sock );
++    sock = -1;
++#endif
++    queued_notification_count = 0;
++    return STATUS_SUCCESS;
++}
+ #else
+ static NTSTATUS unix_nsi_get_notification( void *args )
+ {
+     return STATUS_NOT_IMPLEMENTED;
+ }
++
++static NTSTATUS unix_nsi_init_notifications( void *args )
++{
++    struct nsi_init_notifications_params *params = args;
++
++    params->supported = 0;
++    return STATUS_NOT_IMPLEMENTED;
++}
++
++static NTSTATUS unix_nsi_close_notifications( void *args )
++{
++    return STATUS_SUCCESS;
++}
+ #endif
+ 
+ const unixlib_entry_t __wine_unix_call_funcs[] =
+@@ -351,4 +482,6 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
+     unix_nsi_get_all_parameters_ex,
+     unix_nsi_get_parameter_ex,
+     unix_nsi_get_notification,
++    unix_nsi_init_notifications,
++    unix_nsi_close_notifications,
+ };
+diff --git a/dlls/nsiproxy.sys/nsiproxy_private.h b/dlls/nsiproxy.sys/nsiproxy_private.h
+index cd1a7508087e..ddf95f87ab02 100644
+--- a/dlls/nsiproxy.sys/nsiproxy_private.h
++++ b/dlls/nsiproxy.sys/nsiproxy_private.h
+@@ -83,3 +83,12 @@ struct nsi_get_notification_params
+     NPI_MODULEID module;
+     UINT32 table;
+ };
++
++#define NSI_NOTIFICATION_ADDRESS   0x1
++#define NSI_NOTIFICATION_ROUTE     0x2
++#define NSI_NOTIFICATION_INTERFACE 0x4
++
++struct nsi_init_notifications_params
++{
++    UINT supported;
++};
