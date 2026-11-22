@@ -1,0 +1,58 @@
+From: xlulx <92148312+xlulx@users.noreply.github.com>
+Subject: [PATCH] win32u: Skip the SNI context lookup outside tray owners.
+
+NtUserGetCursorPos() reads the cursor from shared memory without a server
+call. Since 0001, it first asks sni_get_context_menu_pos() whether a tray
+click is being placed, and that reads __wine_sni_context_time from the
+desktop window through NtUserGetProp(), which is a get_window_property
+server request. Every process pays it on every GetCursorPos(), including
+games with no tray icon and sessions with no StatusNotifierWatcher, where
+nothing is ever published.
+
+A server trace on an ARM64 handheld (gamescope session, FEX) shows two to
+three such requests per frame on the main thread of Unity games: about
+150 per second in R.E.P.O. and 100 per second in ULTRAKILL, each returning
+OBJECT_NAME_NOT_FOUND. They were the most frequent request from R.E.P.O.'s
+main thread.
+
+The context only matters to the process that places a menu at the click,
+which is the icon's owner. Shell_NotifyIconW() reaches sni_notify_icon() in
+the calling process for every message, so note that call there and skip
+the lookup in processes that never made one. Tray owners keep the current
+behaviour, and sni_should_layer_context_menu() still reads the published
+context for cross-process menus.
+
+A process that shows a menu for an icon another process added, without
+calling Shell_NotifyIcon itself, now places it at the real pointer.
+---
+diff --git a/dlls/win32u/sni.c b/dlls/win32u/sni.c
+--- a/dlls/win32u/sni.c
++++ b/dlls/win32u/sni.c
+@@ -170,6 +170,7 @@ static pthread_mutex_t sni_mutex = PTHREAD_MUTEX_INITIALIZER;
+ static DBusConnection *sni_connection; /* CONTROL connection: watcher tracking + balloons, no items */
+ static BOOL sni_available;           /* watcher present and connection up */
+ static BOOL sni_init_done;
++static LONG sni_tray_used;           /* this process has made a Shell_NotifyIcon call */
+ static int wake_pipe[2] = { -1, -1 }; /* self-pipe: wakes the pump when the connection set changes */
+ 
+ /* Wake the pump thread out of poll() so it rebuilds its connection set (a new
+@@ -604,6 +605,10 @@ BOOL sni_get_context_menu_pos( POINT *pos )
+ {
+     BOOL ret, latched;
+ 
++    /* Only a tray icon's owner places a menu at its click. Reading the
++     * published context costs a server call on every GetCursorPos. */
++    if (!ReadNoFence( &sni_tray_used )) return FALSE;
++
+     pthread_mutex_lock( &sni_mutex );
+     /* Override the cursor only while the menu is being placed. A latched (on
+      * screen) menu must see the real pointer. */
+@@ -1258,6 +1263,8 @@ LRESULT sni_notify_icon( HWND owner, UINT msg, NOTIFYICONDATAW *nid )
+     struct sni_icon *icon, *target = NULL;
+     LRESULT ret = -1;
+ 
++    InterlockedExchange( &sni_tray_used, 1 );
++
+     /* GNOME's AppIndicator host requires a D-Bus menu and already translates
+      * double-clicks into Activate. Use explorer's XEmbed path on Mutter/X11;
+      * our native-menu SNI backend cannot preserve those interactions there. */
