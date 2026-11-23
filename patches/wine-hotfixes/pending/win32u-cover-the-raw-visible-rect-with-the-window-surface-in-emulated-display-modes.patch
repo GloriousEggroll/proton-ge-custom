@@ -1,0 +1,294 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Mon, 23 Nov 2026 04:10:00 -0500
+Subject: [PATCH] win32u: Cover the raw visible rect with the window surface in emulated display modes.
+
+In an emulated display mode, map_window_rects_virt_to_raw keeps the window
+and client rects' aspect ratio, but makes a fullscreen visible rect cover
+the whole raw monitor. The window surface was still created by DPI
+scaling the virtual visible rect, so the driver surface only covered the
+scaled contents, while the driver places it at the raw visible rect's
+origin.
+
+GTA III sets 640x480 on a 3840x2160 monitor: the window is
+(480,0)-(3360,2160), the raw visible rect the whole monitor, and the
+driver surface was 2944x2304. On Wine-Wayland, the intro videos, which are
+drawn into the window surface with GDI, were shown stretched from the left
+edge of the screen, with the desktop visible on the right, until the
+game's own D3D frames covered the window.
+
+When the raw visible rect is larger than the scaled contents, create the
+driver surface for the whole raw visible rect, draw the scaled contents at
+their raw position in it, and paint the border around them black. The
+scaled surface offsets its clip, shape and self-painted regions the same
+way, and keeps the border in the clip region. Other windows are not
+affected.
+---
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -47,6 +47,7 @@
+ /* dce.c */
+ extern struct window_surface dummy_surface;
+ extern void create_window_surface( HWND hwnd, BOOL create_layered, const RECT *surface_rect, UINT monitor_dpi,
++                                   const RECT *monitor_visible, const RECT *monitor_contents,
+                                    struct window_surface **window_surface );
+ extern struct window_surface *get_driver_window_surface( struct window_surface *surface, UINT monitor_dpi );
+ extern void erase_now( HWND hwnd, UINT rdw_flags );
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -672,6 +672,7 @@
+     struct window_surface *target_surface;
+     UINT dpi_from;
+     UINT dpi_to;
++    RECT contents; /* scaled window contents in the target, empty if it has no border */
+ };
+ 
+ static struct scaled_surface *get_scaled_surface( struct window_surface *window_surface )
+@@ -679,10 +680,49 @@
+     return CONTAINING_RECORD( window_surface, struct scaled_surface, header );
+ }
+ 
++static HRGN scaled_surface_map_region( struct scaled_surface *surface, HRGN region )
++{
++    HRGN hrgn = map_dpi_region( region, surface->dpi_from, surface->dpi_to );
++    if (hrgn) NtGdiOffsetRgn( hrgn, surface->contents.left, surface->contents.top );
++    return hrgn;
++}
++
++static RECT scaled_surface_map_rect( struct scaled_surface *surface, RECT rect )
++{
++    rect = map_dpi_rect( rect, surface->dpi_from, surface->dpi_to );
++    OffsetRect( &rect, surface->contents.left, surface->contents.top );
++    return rect;
++}
++
++/* The target area around the scaled contents, e.g. the bars of a fullscreen
++ * window in an emulated display mode with a different aspect ratio. */
++static HRGN scaled_surface_create_border_region( struct scaled_surface *surface )
++{
++    const RECT *contents = &surface->contents;
++    HRGN border, inner;
++
++    if (IsRectEmpty( contents )) return 0;
++    if (!(border = NtGdiCreateRectRgn( 0, 0, surface->target_surface->rect.right,
++                                       surface->target_surface->rect.bottom ))) return 0;
++    if ((inner = NtGdiCreateRectRgn( contents->left, contents->top, contents->right, contents->bottom )))
++    {
++        NtGdiCombineRgn( border, border, inner, RGN_DIFF );
++        NtGdiDeleteObjectApp( inner );
++    }
++    return border;
++}
++
+ static void scaled_surface_set_clip( struct window_surface *window_surface, const RECT *rects, UINT count )
+ {
+     struct scaled_surface *surface = get_scaled_surface( window_surface );
+-    HRGN hrgn = map_dpi_region( window_surface->clip_region, surface->dpi_from, surface->dpi_to );
++    HRGN hrgn = scaled_surface_map_region( surface, window_surface->clip_region ), border;
++
++    /* The border isn't covered by anything in the window, keep it visible. */
++    if (hrgn && (border = scaled_surface_create_border_region( surface )))
++    {
++        NtGdiCombineRgn( hrgn, hrgn, border, RGN_OR );
++        NtGdiDeleteObjectApp( border );
++    }
+     window_surface_set_clip( surface->target_surface, hrgn );
+     if (hrgn) NtGdiDeleteObjectApp( hrgn );
+ }
+@@ -701,7 +741,7 @@
+     src.right = (src.right + 7) & ~7;
+     src.bottom = (src.bottom + 7) & ~7;
+ 
+-    dst = map_dpi_rect( src, surface->dpi_from, surface->dpi_to );
++    dst = scaled_surface_map_rect( surface, src );
+ 
+     hdc_dst = NtGdiCreateCompatibleDC( 0 );
+     hdc_src = NtGdiCreateCompatibleDC( 0 );
+@@ -720,7 +760,7 @@
+     NtGdiDeleteObjectApp( hdc_src );
+ 
+     window_surface_lock( surface->target_surface );
+-    self_painted = map_dpi_region( window_surface->self_painted_region, surface->dpi_from, surface->dpi_to );
++    self_painted = scaled_surface_map_region( surface, window_surface->self_painted_region );
+     if ((self_painted || surface->target_surface->self_painted_region) &&
+         !NtGdiEqualRgn( self_painted, surface->target_surface->self_painted_region ))
+     {
+@@ -737,7 +777,7 @@
+ 
+     if (shape_changed)
+     {
+-        HRGN hrgn = map_dpi_region( window_surface->shape_region, surface->dpi_from, surface->dpi_to );
++        HRGN hrgn = scaled_surface_map_region( surface, window_surface->shape_region );
+         window_surface_set_shape( surface->target_surface, hrgn );
+         if (hrgn) NtGdiDeleteObjectApp( hrgn );
+ 
+@@ -762,15 +802,46 @@
+     scaled_surface_destroy
+ };
+ 
+-static void scaled_surface_set_target( struct scaled_surface *surface, struct window_surface *target, UINT dpi_to )
++static void scaled_surface_set_target( struct scaled_surface *surface, struct window_surface *target, UINT dpi_to,
++                                       const RECT *contents )
+ {
++    BOOL changed = surface->target_surface != target || !EqualRect( &surface->contents, contents );
++    RECT border[4];
++    HDC hdc;
++    UINT i;
++
+     if (surface->target_surface) window_surface_release( surface->target_surface );
+     window_surface_add_ref( (surface->target_surface = target) );
+     surface->dpi_to = dpi_to;
++    surface->contents = *contents;
++
++    if (!changed || IsRectEmpty( contents )) return;
++
++    /* Nothing in the window draws the border: paint it black, and mark it
++     * painted so that it is presented rather than left transparent. */
++    contents = &surface->contents;
++    SetRect( &border[0], 0, 0, target->rect.right, contents->top );
++    SetRect( &border[1], 0, contents->bottom, target->rect.right, target->rect.bottom );
++    SetRect( &border[2], 0, contents->top, contents->left, contents->bottom );
++    SetRect( &border[3], contents->right, contents->top, target->rect.right, contents->bottom );
++
++    hdc = NtGdiCreateCompatibleDC( 0 );
++    if (hdc) NtGdiSelectBitmap( hdc, target->color_bitmap );
++    window_surface_lock( target );
++    for (i = 0; i < ARRAY_SIZE(border); i++)
++    {
++        if (IsRectEmpty( &border[i] )) continue;
++        if (hdc) NtGdiPatBlt( hdc, border[i].left, border[i].top, border[i].right - border[i].left,
++                              border[i].bottom - border[i].top, BLACKNESS );
++        window_surface_add_app_paint_rect( target, &border[i] );
++        add_bounds_rect( &target->bounds, &border[i] );
++    }
++    window_surface_unlock( target );
++    if (hdc) NtGdiDeleteObjectApp( hdc );
+ }
+ 
+ static struct window_surface *scaled_surface_create( HWND hwnd, const RECT *surface_rect, UINT dpi_from, UINT dpi_to,
+-                                                     struct window_surface *target_surface )
++                                                     const RECT *contents, struct window_surface *target_surface )
+ {
+     char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
+     BITMAPINFO *info = (BITMAPINFO *)buffer;
+@@ -790,7 +861,7 @@
+     {
+         surface = get_scaled_surface( window_surface );
+         surface->dpi_from = dpi_from;
+-        scaled_surface_set_target( surface, target_surface, dpi_to );
++        scaled_surface_set_target( surface, target_surface, dpi_to, contents );
+     }
+ 
+     return window_surface;
+@@ -808,15 +879,29 @@
+     return rect;
+ }
+ 
++/***********************************************************************
++ *           create_window_surface
++ *
++ * monitor_visible, if set, is the window's raw visible rect, relative to itself,
++ * when it is larger than the scaled visible rect (a fullscreen window in an
++ * emulated display mode with a different aspect ratio), and monitor_contents
++ * the scaled visible rect within it. The driver surface then covers the whole
++ * raw visible rect, with a black border around the scaled contents.
++ */
+ void create_window_surface( HWND hwnd, BOOL create_layered, const RECT *surface_rect, UINT monitor_dpi,
++                            const RECT *monitor_visible, const RECT *monitor_contents,
+                             struct window_surface **window_surface )
+ {
+     struct window_surface *previous, *driver_surface;
+     UINT dpi = get_dpi_for_window( hwnd );
+-    RECT monitor_rect;
++    RECT monitor_rect, contents = {0};
+ 
+-
+-    monitor_rect = get_surface_rect( map_dpi_rect( *surface_rect, dpi, monitor_dpi ) );
++    if (monitor_visible)
++    {
++        monitor_rect = get_surface_rect( *monitor_visible );
++        contents = *monitor_contents;
++    }
++    else monitor_rect = get_surface_rect( map_dpi_rect( *surface_rect, dpi, monitor_dpi ) );
+     if ((driver_surface = get_driver_window_surface( *window_surface, monitor_dpi )))
+     {
+         /* reuse the underlying driver surface only if it also matches the target monitor rect */
+@@ -835,7 +920,7 @@
+         return;
+     }
+ 
+-    if (!driver_surface || dpi == monitor_dpi)
++    if (!driver_surface || (dpi == monitor_dpi && IsRectEmpty( &contents )))
+     {
+         if (*window_surface) window_surface_release( *window_surface );
+         *window_surface = driver_surface;
+@@ -846,13 +931,13 @@
+     if ((previous = *window_surface) && previous->funcs == &scaled_surface_funcs)
+     {
+         struct scaled_surface *surface = get_scaled_surface( previous );
+-        scaled_surface_set_target( surface, driver_surface, monitor_dpi );
++        scaled_surface_set_target( surface, driver_surface, monitor_dpi, &contents );
+         window_surface_release( driver_surface );
+         return;
+     }
+     if (previous) window_surface_release( previous );
+ 
+-    *window_surface = scaled_surface_create( hwnd, surface_rect, dpi, monitor_dpi, driver_surface );
++    *window_surface = scaled_surface_create( hwnd, surface_rect, dpi, monitor_dpi, &contents, driver_surface );
+     window_surface_release( driver_surface );
+ }
+ 
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -2309,6 +2309,27 @@
+     return ret;
+ }
+ 
++/* A fullscreen visible rect covers the whole raw monitor, while the window
++ * contents keep their aspect ratio (see map_window_rects_virt_to_raw). Get the
++ * raw visible rect and where the scaled contents are in it, if they differ. */
++static BOOL get_window_surface_border( HWND hwnd, const RECT *visible, UINT raw_dpi,
++                                       RECT *monitor_visible, RECT *monitor_contents )
++{
++    struct window_rects raw = { *visible, *visible, *visible };
++    RECT scaled = map_dpi_rect( *visible, get_dpi_for_window( hwnd ), raw_dpi );
++
++    raw = map_window_rects_virt_to_raw( raw, get_thread_dpi() );
++    if (EqualRect( &raw.window, &raw.visible )) return FALSE;
++
++    *monitor_visible = raw.visible;
++    OffsetRect( monitor_visible, -raw.visible.left, -raw.visible.top );
++    SetRect( monitor_contents, raw.window.left - raw.visible.left, raw.window.top - raw.visible.top,
++             raw.window.left - raw.visible.left + scaled.right - scaled.left,
++             raw.window.top - raw.visible.top + scaled.bottom - scaled.top );
++    if (!intersect_rect( monitor_contents, monitor_contents, monitor_visible )) return FALSE;
++    return !EqualRect( monitor_contents, monitor_visible );
++}
++
+ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOOL create_layered,
+                                                   struct window_rects *rects, RECT *surface_rect )
+ {
+@@ -2318,7 +2339,8 @@
+     struct window_rects monitor_rects;
+     UINT raw_dpi, style, ex_style;
+     DWORD layered_flags;
+-    RECT dummy;
++    RECT dummy, monitor_visible, monitor_contents;
++    BOOL bordered;
+     HRGN shape;
+ 
+     style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
+@@ -2366,7 +2388,13 @@
+         new_surface = NULL;
+     }
+     else if (needs_surface)
+-        create_window_surface( hwnd, create_layered, surface_rect, raw_dpi, &new_surface );
++    {
++        bordered = !is_child && get_window_surface_border( hwnd, &rects->visible, raw_dpi,
++                                                           &monitor_visible, &monitor_contents );
++        create_window_surface( hwnd, create_layered, surface_rect, raw_dpi,
++                               bordered ? &monitor_visible : NULL, bordered ? &monitor_contents : NULL,
++                               &new_surface );
++    }
+     else if (new_surface && new_surface != &dummy_surface)
+     {
+         window_surface_release( new_surface );

@@ -781,6 +781,8 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/wininet-cache-connectivity-until-network-state-changes.patch"
     # AngelWish (disc): WMA decoder creation fails without the reader's undocumented secure channel interface; stub returning success (#982)
     apply_patch "../patches/wine-hotfixes/pending/wmvcore-add-a-stub-for-the-undocumented-reader-secure-channel-interface.patch"
+    # GTA III (Wine-Wayland): in a 4:3 emulated display mode the GDI-drawn intro videos were shifted left with the desktop showing on the right
+    apply_patch "../patches/wine-hotfixes/pending/win32u-cover-the-raw-visible-rect-with-the-window-surface-in-emulated-display-modes.patch"
 
     # https://github.com/GloriousEggroll/proton-ge-custom/issues/692
     # winepipewire.drv by M0n7y5 from CachyOS/wine-cachyos, adapted to this mmdevapi. Opt-in with PROTON_USE_PIPEWIRE=1.
