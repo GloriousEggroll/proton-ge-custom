@@ -9,6 +9,8 @@ HDR_COLORSPACE_CMAKE_ARGS = \
   -DVULKAN_HEADERS_INCLUDE_DIR=$(abspath $(SRCDIR))/Vulkan-Headers/include
 
 $(eval $(call rules-source,hdr-colorspace,$(SRCDIR)/vklayers/hdr-colorspace))
+# 32-bit games load it too: the manifest names the library without a path (#997)
+$(eval $(call rules-cmake,hdr-colorspace,i386,unix))
 $(eval $(call rules-cmake,hdr-colorspace,x86_64,unix))
 $(eval $(call rules-cmake,hdr-colorspace,aarch64,unix))
 

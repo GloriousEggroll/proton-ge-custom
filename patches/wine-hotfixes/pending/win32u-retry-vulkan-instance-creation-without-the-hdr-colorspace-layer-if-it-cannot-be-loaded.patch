@@ -1,0 +1,91 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Mon, 23 Nov 2026 04:40:00 -0500
+Subject: [PATCH] win32u: Retry Vulkan instance creation without the HDR colorspace layer if it cannot be loaded.
+
+The Vulkan loader can list VK_LAYER_GE_hdr_colorspace in a process that
+cannot load it, for example a 32-bit process when only a 64-bit build of
+the layer is available. Instance creation then fails with
+VK_ERROR_LAYER_NOT_PRESENT ("wrong bit-type"), and with it every Vulkan
+renderer, such as DXVK in a 32-bit D3D9 game on Wine-Wayland (#997).
+
+Retry without the layer when that happens, and don't request it again in
+this process.
+---
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -1511,9 +1511,11 @@
+  * layer path. Enabling it here puts it below all implicit layers, closest to the
+  * driver, so host layers such as the Steam overlay and MangoHud see the real HDR
+  * colorspace of a swapchain the driver creates as PASS_THROUGH. */
++static LONG hdr_colorspace_layer_state = -1;
++
+ static BOOL hdr_colorspace_layer_available(void)
+ {
+-    static int available = -1;
++    LONG available = ReadAcquire( &hdr_colorspace_layer_state );
+     PFN_vkEnumerateInstanceLayerProperties p_vkEnumerateInstanceLayerProperties;
+     VkLayerProperties *layers;
+     uint32_t i, count = 0;
+@@ -1533,7 +1535,8 @@
+     }
+ 
+     TRACE( "%s %s\n", hdr_colorspace_layer_name, found ? "available" : "not available" );
+-    return available = found;
++    InterlockedCompareExchange( &hdr_colorspace_layer_state, found, -1 );
++    return ReadAcquire( &hdr_colorspace_layer_state );
+ }
+ 
+ static VkResult win32u_vkCreateInstance( const VkInstanceCreateInfo *client_create_info, const VkAllocationCallbacks *allocator,
+@@ -1544,7 +1547,9 @@
+     const VkCreateInfoWineInstanceCallback *callback_info;
+     struct vulkan_physical_device *physical_devices;
+     struct mempool pool = {0};
++    const char * const *layer_names;
+     struct instance *instance;
++    uint32_t layer_count;
+     unsigned int i;
+     VkResult res;
+ 
+@@ -1567,20 +1572,36 @@
+     pthread_key_create(&instance->obj.transient_object_handle, free);
+ 
+     if ((res = convert_instance_create_info( &pool, create_info, instance ))) goto failed;
++    layer_count = create_info->enabledLayerCount;
++    layer_names = create_info->ppEnabledLayerNames;
+     if (hdr_colorspace_layer_available())
+     {
+-        static const char *layer_names[] = {hdr_colorspace_layer_name};
++        static const char *hdr_layer_names[] = {hdr_colorspace_layer_name};
+ 
+         create_info->enabledLayerCount = 1;
+-        create_info->ppEnabledLayerNames = layer_names;
++        create_info->ppEnabledLayerNames = hdr_layer_names;
+         instance->hdr_colorspace_layer = TRUE;
+     }
+-    if ((callback_info = pop_next_struct( (VkBaseOutStructure **)&create_info->pNext, VK_STRUCTURE_TYPE_CREATE_INFO_WINE_INSTANCE_CALLBACK )))
++    callback_info = pop_next_struct( (VkBaseOutStructure **)&create_info->pNext, VK_STRUCTURE_TYPE_CREATE_INFO_WINE_INSTANCE_CALLBACK );
++    for (;;)
+     {
+-        PFN_vkCreateInstanceCallbackWINE callback = (void *)(UINT_PTR)callback_info->native_create_callback;
+-        if ((res = callback( create_info, allocator, &host_instance, p_vkGetInstanceProcAddr, (void *)(UINT_PTR)callback_info->context ))) goto failed;
++        if (callback_info)
++        {
++            PFN_vkCreateInstanceCallbackWINE callback = (void *)(UINT_PTR)callback_info->native_create_callback;
++            res = callback( create_info, allocator, &host_instance, p_vkGetInstanceProcAddr, (void *)(UINT_PTR)callback_info->context );
++        }
++        else res = p_vkCreateInstance( create_info, NULL /* allocator */, &host_instance );
++        if (res != VK_ERROR_LAYER_NOT_PRESENT || !instance->hdr_colorspace_layer) break;
++
++        /* The loader lists the layer, but can't load it in this process, e.g.
++         * a 64-bit only build in a 32-bit process. Don't let it break Vulkan. */
++        WARN( "%s could not be loaded, disabling it\n", hdr_colorspace_layer_name );
++        WriteRelease( &hdr_colorspace_layer_state, 0 );
++        create_info->enabledLayerCount = layer_count;
++        create_info->ppEnabledLayerNames = layer_names;
++        instance->hdr_colorspace_layer = FALSE;
+     }
+-    else if ((res = p_vkCreateInstance( create_info, NULL /* allocator */, &host_instance ))) goto failed;
++    if (res) goto failed;
+ 
+     vulkan_object_init_ptr( &instance->obj.obj, (UINT_PTR)host_instance, &client_instance->obj );
+     instance->obj.p_insert_object = vulkan_instance_insert_object;
