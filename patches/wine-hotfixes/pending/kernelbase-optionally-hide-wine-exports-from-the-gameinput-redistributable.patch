@@ -1,0 +1,74 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Mon, 23 Nov 2026 19:00:00 -0500
+Subject: [PATCH] kernelbase: Optionally hide the Wine exports from the GameInput redistributable.
+
+GameInputRedist.dll looks up wine_get_host_version and, if present, skips
+its HID, device mux and PnP providers and only exposes XInput devices. A
+DualSense then has no identity, no haptic info and no raw report access,
+while on Windows the same redistributable drives it natively.
+
+With WINE_GAMEINPUT_HIDE_WINE=1, GetProcAddress fails for wine_* exports
+when called from GameInputRedist.dll. The check walks the caller frames, so
+other modules in the process, including anti-cheat, still see Wine. The
+per-application HideWineExports option from wine-staging is process-wide and
+cannot be scoped like this. Enabled per game through protonfixes.
+
+---
+--- a/dlls/kernelbase/loader.c
++++ b/dlls/kernelbase/loader.c
+@@ -61,6 +61,43 @@
+  ***********************************************************************/
+ 
+ 
++/* The Microsoft GameInput redistributable switches to a reduced XInput-only
++ * backend when it finds wine_get_host_version in ntdll, which loses native
++ * support for HID controllers such as the DualSense (identity, haptic info,
++ * raw reports). With WINE_GAMEINPUT_HIDE_WINE set, hide the Wine exports from
++ * that module only, so the rest of the process (e.g. anti-cheat) still sees them. */
++static BOOL hide_wine_export_from_caller( LPCSTR function )
++{
++    static const WCHAR *const modules[] = { L"GameInputRedist.dll" };
++    static int enabled = -1;
++    HMODULE self = NULL, caller;
++    WCHAR path[MAX_PATH], *name;
++    void *frames[4];
++    USHORT count, i, j;
++
++    if (strncmp( function, "wine_", 5 )) return FALSE;
++    if (enabled == -1)
++        enabled = GetEnvironmentVariableW( L"WINE_GAMEINPUT_HIDE_WINE", path, ARRAY_SIZE(path) ) && path[0] != '0';
++    if (!enabled) return FALSE;
++
++    RtlPcToFileHeader( (void *)hide_wine_export_from_caller, (void **)&self );
++    count = RtlCaptureStackBackTrace( 0, ARRAY_SIZE(frames), frames, NULL );
++    for (i = 0; i < count; i++)
++    {
++        if (!RtlPcToFileHeader( frames[i], (void **)&caller ) || caller == self) continue;
++        if (!GetModuleFileNameW( caller, path, ARRAY_SIZE(path) )) return FALSE;
++        name = wcsrchr( path, '\\' ) ? wcsrchr( path, '\\' ) + 1 : path;
++        for (j = 0; j < ARRAY_SIZE(modules); j++)
++        {
++            if (wcsicmp( name, modules[j] )) continue;
++            TRACE( "hiding %s from %s\n", debugstr_a(function), debugstr_w(name) );
++            return TRUE;
++        }
++        return FALSE;
++    }
++    return FALSE;
++}
++
+ /******************************************************************
+  *      get_proc_address
+  */
+@@ -73,6 +110,11 @@
+ 
+     if ((ULONG_PTR)function >> 16)
+     {
++        if (hide_wine_export_from_caller( function ))
++        {
++            SetLastError( ERROR_PROC_NOT_FOUND );
++            return NULL;
++        }
+         RtlInitAnsiString( &str, function );
+         if (!set_ntstatus( LdrGetProcedureAddress( module, &str, 0, (void**)&proc ))) return NULL;
+     }
