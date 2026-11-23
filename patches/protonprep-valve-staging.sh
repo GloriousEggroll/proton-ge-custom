@@ -752,6 +752,8 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/user32-cache-accelerator-tables.patch"
     # GTA III/VC/SA (Wine-Wayland): DirectShow intro videos drawn with GDI into a child window with a pixel format were cut out, window looked minimized (#958)
     apply_patch "../patches/wine-hotfixes/pending/win32u-keep-gdi-drawn-into-child-windows-that-have-a-pixel-format.patch"
+    # RuneScape (Wine-Wayland): GDI drawn into its Vulkan child window once stayed over the game after #958, fullscreen was black (#995)
+    apply_patch "../patches/wine-hotfixes/pending/win32u-clear-a-child-windows-gdi-over-self-region-when-it-presents.patch"
     # Battlefield 4: PunkBuster's module scans through a real handle to its own process stalled the game every few seconds (#984)
     apply_patch "../patches/wine-hotfixes/pending/kernelbase-read-own-loader-list-directly-through-real-process-handles.patch"
     # Battlefield 4 (Wine-Wayland): alt-tab and applying settings added a decoration to a mapped toplevel, a protocol error that killed the game

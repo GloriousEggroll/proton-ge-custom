@@ -1,0 +1,154 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Mon, 23 Nov 2026 03:30:00 -0500
+Subject: [PATCH] win32u: Clear a child window's GDI-over-self region when it
+ presents.
+
+With PROTON_ENABLE_WAYLAND=1, RuneScape in fullscreen showed a black
+window (#995): the game renders with Vulkan into a child window, and
+the main window's contents covered it except for a strip at the top.
+
+The fix for #958 tracks GDI drawn into a child window that has a pixel
+format as newer than the child's native frame (self-painted region).
+Child windows have no window surface of their own, so the region is
+kept on the toplevel's surface, but only a present on the window that
+owns the surface cleared it. A child's native frames never did, so GDI
+drawn into the child once (at an older size) stayed on top of the game.
+
+When a child window's client surface presents, remove the child's
+visible area from its toplevel's self-painted region. GDI drawn into
+the toplevel itself or into other children is kept. A child that never
+presents natively (the VMR7 video window in GTA III, #958) still keeps
+its GDI frames.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/dlls/win32u/dce.c b/dlls/win32u/dce.c
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -1277,6 +1277,82 @@
+     if (changed) window_surface_flush( surface );
+ }
+ 
++/* GDI drawn into a child window that has a pixel format is tracked on its
++ * toplevel's surface (child windows have none of their own). The child's
++ * native frame supersedes it, so drop the child's area when it presents. */
++void window_surface_clear_child_self_paint( HWND hwnd )
++{
++    struct window_surface *surface;
++    HRGN vis_rgn = 0, overlap;
++    RECT top_rect;
++    size_t size = 256;
++    NTSTATUS status;
++    BOOL pending, changed = FALSE;
++    HWND top = NtUserGetAncestor( hwnd, GA_ROOT );
++
++    if (!top || top == hwnd || !(surface = window_surface_get( top ))) return;
++
++    window_surface_lock( surface );
++    pending = !!surface->self_painted_region;
++    window_surface_unlock( surface );
++
++    while (pending)
++    {
++        RGNDATA *data = malloc( sizeof(*data) + size - 1 );
++        if (!data) break;
++
++        SERVER_START_REQ( get_visible_region )
++        {
++            req->window = wine_server_user_handle( hwnd );
++            req->flags  = 0;
++            wine_server_set_reply( req, data->Buffer, size );
++            if (!(status = wine_server_call( req )))
++            {
++                size_t reply_size = wine_server_reply_size( reply );
++                data->rdh.dwSize   = sizeof(data->rdh);
++                data->rdh.iType    = RDH_RECTANGLES;
++                data->rdh.nCount   = reply_size / sizeof(RECT);
++                data->rdh.nRgnSize = reply_size;
++                vis_rgn  = NtGdiExtCreateRegion( NULL, data->rdh.dwSize + data->rdh.nRgnSize, data );
++                top_rect = wine_server_get_rect( reply->top_rect );
++            }
++            else size = reply->total_size;
++        }
++        SERVER_END_REQ;
++        free( data );
++        if (status != STATUS_BUFFER_OVERFLOW) break;
++    }
++
++    if (vis_rgn)
++    {
++        /* same coordinates as the self-painted rects: relative to the toplevel's surface rect */
++        NtGdiOffsetRgn( vis_rgn, -top_rect.left, -top_rect.top );
++
++        window_surface_lock( surface );
++        if (surface->self_painted_region && (overlap = NtGdiCreateRectRgn( 0, 0, 0, 0 )))
++        {
++            /* GDI drawn into the toplevel itself or its other children stays */
++            if (NtGdiCombineRgn( overlap, surface->self_painted_region, vis_rgn, RGN_AND ) > NULLREGION)
++            {
++                if (NtGdiCombineRgn( surface->self_painted_region, surface->self_painted_region,
++                                     vis_rgn, RGN_DIFF ) == NULLREGION)
++                {
++                    NtGdiDeleteObjectApp( surface->self_painted_region );
++                    surface->self_painted_region = 0;
++                }
++                surface->bounds = surface->rect;
++                changed = TRUE;
++            }
++            NtGdiDeleteObjectApp( overlap );
++        }
++        window_surface_unlock( surface );
++        NtGdiDeleteObjectApp( vis_rgn );
++    }
++
++    if (changed) window_surface_flush( surface );
++    window_surface_release( surface );
++}
++
+ W32KAPI void window_surface_add_gdi_over_paint_rect( struct window_surface *surface, const RECT *rect )
+ {
+     HRGN rect_region, clipped_region, producer_region = 0, synthetic_region = 0, combined_region = 0;
+diff --git a/dlls/win32u/ntgdi_private.h b/dlls/win32u/ntgdi_private.h
+--- a/dlls/win32u/ntgdi_private.h
++++ b/dlls/win32u/ntgdi_private.h
+@@ -236,6 +236,7 @@
+ extern void dibdrv_set_window_surface( DC *dc, struct window_surface *surface, enum surface_gdi_source source );
+ extern void window_surface_add_self_paint_rect( struct window_surface *surface, const RECT *rect );
+ extern void window_surface_clear_self_paint( struct window_surface *surface );
++extern void window_surface_clear_child_self_paint( HWND hwnd );
+ 
+ /* driver.c */
+ extern const struct gdi_dc_funcs null_driver;
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -373,7 +373,7 @@
+ {
+     struct window_surface *window_surface = NULL;
+     HDC hdc = 0;
+-    HWND hwnd;
++    HWND hwnd, child = 0;
+ 
+     pthread_mutex_lock( &surfaces_lock );
+     if ((hwnd = surface->hwnd))
+@@ -382,8 +382,9 @@
+         surface->funcs->present( surface, hdc );
+         if (hdc) NtUserReleaseDC( hwnd, hdc );
+         if (!surface->offscreen && ReadAcquire( &surface->presentation_owner ) &&
+-            !user_driver->dc_funcs.pPutImage)
+-            window_surface = window_surface_get( hwnd );
++            !user_driver->dc_funcs.pPutImage &&
++            !(window_surface = window_surface_get( hwnd )))
++            child = hwnd;
+     }
+     pthread_mutex_unlock( &surfaces_lock );
+ 
+@@ -394,6 +395,7 @@
+         window_surface_clear_self_paint( window_surface );
+         window_surface_release( window_surface );
+     }
++    else if (child) window_surface_clear_child_self_paint( child );
+ }
+ 
+ void client_surface_update( struct client_surface *surface )
