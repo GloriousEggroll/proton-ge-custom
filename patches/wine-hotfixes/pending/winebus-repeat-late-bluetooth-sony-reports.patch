@@ -1,0 +1,166 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Tue, 24 Nov 2026 14:45:00 -0500
+Subject: [PATCH] winebus: Repeat late reports of Bluetooth Sony controllers presented as a wired DS4.
+
+A wired DualShock 4 reports every 4 ms. Over Bluetooth, DualShock 4 and
+DualSense reports arrive in bursts, with gaps of 30-50 ms several times a
+minute. When such a controller is presented to the game as a wired
+DualShock 4 (the DualSense-as-DS4 spoof or the Bluetooth DS4-as-USB
+presentation), libScePad in God of War (2018) releases held buttons in
+those gaps, so a held block drops and is raised again (#1003).
+
+Repeat the last controller state once a report is 6 ms late, so the game
+sees a steady stream as from a wired controller. Stop after 200 ms without
+a real report, so a held button is still released when the link drops
+before the device is removed. Audio reports are not repeated.
+PROTON_SONY_BT_STEADY_REPORTS=0 disables it.
+
+Measured on the same session: USB DualSense 250 reports/s with a longest
+gap of 22 ms; Bluetooth DualShock 4 473 gaps of 16 ms or more and 43 of
+32 ms or more in 38 s. Runtime-confirmed with a DualShock 4 and a
+DualSense over Bluetooth in God of War.
+
+https://github.com/GloriousEggroll/proton-ge-custom/issues/1003
+---
+--- a/dlls/winebus.sys/bus_udev.c
++++ b/dlls/winebus.sys/bus_udev.c
+@@ -34,6 +34,7 @@
+ #include <dirent.h>
+ #include <unistd.h>
+ #include <poll.h>
++#include <time.h>
+ #include <sys/ioctl.h>
+ #ifdef HAVE_LIBUDEV_H
+ # include <libudev.h>
+@@ -115,8 +116,40 @@
+ struct hidraw_device
+ {
+     struct base_device base;
++    /* Last controller state report, repeated while Bluetooth delivery stalls. */
++    BOOL steady_reports;
++    BYTE last_report[128];
++    int last_report_size;
++    UINT64 last_report_time;   /* last report, real or repeated */
++    UINT64 last_real_report_time;
+ };
+ 
++/* A wired DualShock 4 reports every 4 ms. Over Bluetooth the reports arrive in
++ * bursts with gaps of 30-50 ms, and libScePad releases held buttons in such
++ * gaps (God of War, #1003). Repeat the last state once a report is this late. */
++#define STEADY_REPORT_INTERVAL_MS 6
++/* Stop repeating once the controller has been silent this long, so a held
++ * button is released if the link drops before the device is removed. The
++ * longest gap seen on a live Bluetooth controller was about 50 ms. */
++#define STEADY_REPORT_MAX_SILENCE_MS 200
++
++static UINT64 monotonic_time_ms(void)
++{
++    struct timespec ts;
++
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (UINT64)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
++}
++
++/* Enabled by default; PROTON_SONY_BT_STEADY_REPORTS=0 passes Bluetooth reports
++ * through only as they arrive. */
++static BOOL steady_bluetooth_sony_reports(void)
++{
++    const char *env = getenv("PROTON_SONY_BT_STEADY_REPORTS");
++
++    return !env || strcmp(env, "0");
++}
++
+ static inline struct hidraw_device *hidraw_impl_from_unix_device(struct unix_device *iface)
+ {
+     return CONTAINING_RECORD(impl_from_unix_device(iface), struct hidraw_device, base);
+@@ -363,7 +396,49 @@
+     else if (size == 0)
+         TRACE("Failed to read report\n");
+     else
++    {
++        /* Controller state is in the basic report 0x01, the extended
++         * DualShock 4 report 0x11 and the extended DualSense report 0x31.
++         * DualSense 0x31 payload type 2 and the other DualShock 4 report
++         * IDs carry audio. */
++        if (impl->steady_reports && size <= sizeof(impl->last_report) &&
++                (buff[0] == 0x01 || buff[0] == 0x11 ||
++                (buff[0] == 0x31 && size > 1 && (buff[1] & 0x0f) != 0x02)))
++        {
++            memcpy(impl->last_report, buff, size);
++            impl->last_report_size = size;
++            impl->last_report_time = impl->last_real_report_time = monotonic_time_ms();
++        }
+         bus_event_queue_input_report(&event_queue, iface, buff, size);
++    }
++}
++
++/* Repeat the last state of Bluetooth controllers whose reports are late, and
++ * return the poll timeout until the next repeat is due (-1 for none). */
++static int hidraw_repeat_late_reports(void)
++{
++    UINT64 now = monotonic_time_ms(), due;
++    struct hidraw_device *impl;
++    int i, timeout = -1;
++
++    for (i = 2; i < poll_count; ++i)
++    {
++        if (poll_devs[i]->read_report != hidraw_device_read_report) continue;
++        impl = CONTAINING_RECORD(poll_devs[i], struct hidraw_device, base);
++        if (!impl->steady_reports || !impl->last_report_size) continue;
++        if (now - impl->last_real_report_time >= STEADY_REPORT_MAX_SILENCE_MS) continue;
++
++        if (now - impl->last_report_time >= STEADY_REPORT_INTERVAL_MS)
++        {
++            impl->last_report_time = now;
++            bus_event_queue_input_report(&event_queue, &impl->base.unix_device,
++                    impl->last_report, impl->last_report_size);
++        }
++        due = impl->last_report_time + STEADY_REPORT_INTERVAL_MS - now;
++        if (timeout < 0 || due < timeout) timeout = due;
++    }
++
++    return timeout;
+ }
+ #endif
+ 
+@@ -1689,6 +1764,13 @@
+         return STATUS_NO_MEMORY;
+     list_add_tail(&device_list, &impl->unix_device.entry);
+     impl->read_report = hidraw_device_read_report;
++    /* Only for Bluetooth controllers presented as a wired DualShock 4. */
++    if (desc.bus_type == BUS_TYPE_BLUETOOTH && (desc.spoof_dualshock4 || desc.spoof_dualshock4_usb) &&
++            steady_bluetooth_sony_reports())
++    {
++        CONTAINING_RECORD(impl, struct hidraw_device, base)->steady_reports = TRUE;
++        TRACE("repeating late Bluetooth reports of %04x:%04x.\n", desc.vid, desc.pid);
++    }
+     impl->udev_device = udev_device_ref(dev);
+     strcpy(impl->devnode, devnode);
+     impl->device_fd = fd;
+@@ -2394,7 +2476,7 @@
+     struct pollfd pfd[MAX_DEVICES];
+     struct base_device *impl;
+     char ctrl = 0;
+-    int i, count;
++    int i, count, timeout = -1;
+ 
+     /* cleanup previously returned event */
+     bus_event_cleanup(result);
+@@ -2408,9 +2490,15 @@
+         memcpy(pfd, poll_fds, poll_count * sizeof(*pfd));
+         count = poll_count;
+         close_count = 0;
++#ifdef HAVE_LINUX_HIDRAW_H
++        timeout = hidraw_repeat_late_reports();
++#endif
+         pthread_mutex_unlock(&udev_cs);
+ 
+-        while (poll(pfd, count, -1) <= 0) {}
++        /* Return any report repeated above before waiting again. */
++        if (bus_event_queue_pop(&event_queue, result)) return STATUS_PENDING;
++
++        while (poll(pfd, count, timeout) < 0) {}
+ 
+         pthread_mutex_lock(&udev_cs);
+         if (pfd[0].revents)
+--

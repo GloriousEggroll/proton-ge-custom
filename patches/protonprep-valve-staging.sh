@@ -605,6 +605,7 @@ apply_all_in_dir() {
     # https://github.com/GloriousEggroll/proton-ge-custom/issues/1003
     echo "WINE: count Bluetooth DualSense input reports for the DS4 and USB spoofs (held buttons released in God of War)"
     apply_patch "../patches/wine-hotfixes/pending/winebus-count-bluetooth-dualsense-input-reports.patch"
+    apply_patch "../patches/wine-hotfixes/pending/winebus-repeat-late-bluetooth-sony-reports.patch"
 
     echo "WINE: -HOTFIX- ntdll: skip needless wake in RtlReleaseSRWLockShared (ValveSoftware/wine#367)"
     apply_patch "../patches/wine-hotfixes/pending/ntdll-srwlock-skip-needless-shared-release-wake.patch"
