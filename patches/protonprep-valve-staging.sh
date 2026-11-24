@@ -118,13 +118,6 @@ apply_all_in_dir() {
     echo "VRCLIENT: apply build fixes"
     apply_all_in_dir "patches/vrclient"
 
-    # protonfixes is a submodule; reset it and drop files added by our patches before reapplying them.
-    git -C protonfixes checkout -- .
-    rm -f -- protonfixes/gamefixes-steam/3010850.py
-
-    echo "PROTONFIXES: apply GE-Proton game fixes"
-    apply_all_in_dir "patches/protonfixes"
-
 ### (2) WINE PATCHING ###
 
     pushd wine
@@ -798,10 +791,10 @@ apply_all_in_dir() {
     echo "WINE: -PIPEWIRE- add winepipewire.drv"
     apply_all_in_dir "../patches/wine-hotfixes/winepipewire/"
 
-    # Gears of War: E-Day: Microsoft's GameInput redistributable drives the DualSense natively once these are fixed
+    # Microsoft's GameInput redistributable (Gears of War: E-Day): HID controller identity, axes and haptic info
     echo "WINE: -GAMEINPUT- HID, cfgmgr32 and kernelbase fixes for the GameInput redistributable"
     apply_patch "../patches/wine-hotfixes/pending/kernelbase-implement-checktokenmembershipex.patch"
-    # opt-in with WINE_GAMEINPUT_HIDE_WINE=1, set by protonfixes for Gears of War: E-Day (3010850)
+    # opt-in with WINE_GAMEINPUT_HIDE_WINE=1; not enabled by default, GameInput then no longer sees Xbox controllers (no XUSB/GIP in Wine)
     apply_patch "../patches/wine-hotfixes/pending/kernelbase-optionally-hide-wine-exports-from-the-gameinput-redistributable.patch"
     apply_patch "../patches/wine-hotfixes/pending/hidclass-set-the-hid-device-interface-properties.patch"
     apply_patch "../patches/wine-hotfixes/pending/hid-fill-the-reserved-notrange-fields-of-button-and-value-caps.patch"
