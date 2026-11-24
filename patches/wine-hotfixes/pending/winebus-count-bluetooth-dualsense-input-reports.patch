@@ -1,0 +1,78 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Tue, 24 Nov 2026 13:30:00 -0500
+Subject: [PATCH] winebus: Count Bluetooth DualSense input reports ourselves.
+
+A wired DualSense increments the counter byte of its input report with
+every report. In the extended Bluetooth report #0x31 the same byte stays
+constant (the transport sequence lives in the high nibble of byte 1), so
+both translations that start from it published a frozen counter:
+
+- The DualSense-as-DualShock 4 spoof copied it into the DS4 frame counter
+  and touch packet counter. God of War (2018) then intermittently treats a
+  held button as released and pressed again over Bluetooth (#1003).
+- The Bluetooth DualSense-as-USB spoof left it in place, and its basic
+  report path left it at 0.
+
+Synthesize the counter from sony_input_seq for Bluetooth reports, as the
+basic Bluetooth DS4 path already does. USB reports keep the controller's
+own counter.
+
+Root cause found by ElectricWeasel in
+https://github.com/GloriousEggroll/proton-ge-custom/issues/1003, verified
+against their hid-recorder captures: state[6] is 1 in all 77070 Bluetooth
+reports, while the high nibble of byte 1 increments on every report.
+---
+--- a/dlls/winebus.sys/main.c
++++ b/dlls/winebus.sys/main.c
+@@ -1395,6 +1395,7 @@
+     BYTE translated[DUALSHOCK4_INPUT_REPORT_SIZE] = {0};
+     const BYTE *state;
+     DWORD sensor_timestamp;
++    BYTE sequence;
+ 
+     if (!ext->desc.spoof_dualshock4) return TRUE;
+ 
+@@ -1445,7 +1446,14 @@
+     memcpy(translated + 1, state, 4);                 /* sticks */
+     translated[5] = state[7];                        /* face buttons and hat */
+     translated[6] = state[8];                        /* shoulder and menu buttons */
+-    translated[7] = (state[9] & 0x03) | ((state[6] & 0x3f) << 2);
++    /* Over USB the DualSense counter in state[6] increments with every
++     * report. In the Bluetooth report #0x31 that byte stays constant (the
++     * transport sequence lives in the high nibble of byte 1 instead), and a
++     * frozen DS4 counter makes some games drop held buttons, so count the
++     * reports ourselves there. */
++    if (ext->desc.bus_type == BUS_TYPE_BLUETOOTH) sequence = ext->sony_input_seq++;
++    else sequence = state[6];
++    translated[7] = (state[9] & 0x03) | ((sequence & 0x3f) << 2);
+     translated[8] = state[4];                        /* left trigger */
+     translated[9] = state[5];                        /* right trigger */
+ 
+@@ -1469,7 +1477,7 @@
+     /* The packed touch point representation is shared by both generations.
+      * Publish the current DS5 contacts as one DS4 touch history sample. */
+     translated[33] = 1;
+-    translated[34] = state[6];
++    translated[34] = sequence;
+     memcpy(translated + 35, state + 32, 8);
+ 
+ done:
+@@ -1552,6 +1560,9 @@
+         if ((buf[1] & 0x0f) == 0x02) return FALSE;
+         memmove(buf + 1, buf + 2, DUALSENSE_INPUT_REPORT_USB_SIZE - 1);
+         buf[0] = DUALSENSE_INPUT_REPORT_USB;
++        /* The counter byte is constant over Bluetooth; a wired DualSense
++         * increments it with every report. */
++        buf[7] = ext->sony_input_seq++;
+         report->length = DUALSENSE_INPUT_REPORT_USB_SIZE;
+         return TRUE;
+     }
+@@ -1569,6 +1580,7 @@
+         memcpy(buf + 1, basic + 1, 4);
+         buf[5] = basic[8];
+         buf[6] = basic[9];
++        buf[7] = ext->sony_input_seq++;
+         memcpy(buf + 8, basic + 5, 3);
+         /* Mark both touch points as inactive. */
+         buf[33] = 0x80;
+--
