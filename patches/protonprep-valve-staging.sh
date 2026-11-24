@@ -806,6 +806,10 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/cfgmgr32-return-the-full-device-instance-id-for-devnodes.patch"
     apply_patch "../patches/wine-hotfixes/pending/cfgmgr32-implement-devpkey-name-for-devnodes.patch"
 
+    # https://github.com/GloriousEggroll/proton-ge-custom/issues/975
+    echo "WINE: -WAYLAND- winewayland: start toplevels at the scale of their output (borderless window clipped at fractional scaling)"
+    apply_patch "../patches/wine-hotfixes/pending/winewayland-start-toplevels-at-the-output-scale.patch"
+
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
     ./tools/make_requests
