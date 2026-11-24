@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jason Eggleston <eggnet@gmail.com>
+Date: Mon, 23 Nov 2026 19:27:00 -0800
+Subject: [PATCH] winewayland: Follow the presentation owner for the toplevel
+ carrier.
+
+Without window contents, a toplevel shows a carrier: a single opaque pixel
+while a full-size client surface covers it from above, or a transparent
+full-size buffer that lets client surfaces below it show through.
+wayland_client_surface_attach_info() chose it from the stacking of the client
+surface being attached, which was enough while a window had a single client
+surface. Since the presenter coordination of 0026 and 0027, a window can have
+several, and only its presentation owner stacks above the parent.
+client_surfaces_attach_info() attaches the native background presenters first
+and the owner last, on every present of the owner, so each attach of a
+background presenter replaced the owner's opaque carrier with a newly
+allocated transparent one, and the owner's attach put an opaque one back.
+
+Warhammer Survivors (Unity 6, D3D11 through DXVK) gets there in exclusive
+fullscreen after Alt+Tab, once the retired presenter has been promoted
+(winewayland-promote-retired-presenter-when-owner-stops-presenting.patch): the
+swapchain that owned the window while it came back stays alive and idle. Two
+3840x2160 transparent buffers were then allocated, cleared and committed on
+every frame, about 9 ms per frame, and the game dropped from 90 to 68 frames
+per second and reacted to the mouse visibly late until it quit.
+
+Choose the carrier from the toplevel's presentation owner, as
+wayland_surface_update_hwnd_dmabufs() already does, and keep the opaque
+carrier when a background presenter detaches while the owner covers the
+toplevel.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/winewayland.drv/wayland_surface.c | 24 +++++++++++++++++++++---
+ 1 file changed, 21 insertions(+), 3 deletions(-)
+
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 65fa51bf64f..b091922a0b2 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -5157,6 +5157,23 @@ static void wayland_client_surface_cancel_frame_callback(struct wayland_client_s
+     if (client->throttle) NtSetEvent(client->throttle, NULL);
+ }
+ 
++/* The carrier belongs to the toplevel surface, which all the client surfaces
++ * attached to it share. Follow the toplevel's presentation owner, as
++ * wayland_surface_update_hwnd_dmabufs() does: with several presenters on a
++ * window, a background presenter would otherwise replace the owner's opaque
++ * carrier with a transparent one on every attach, and the owner would put the
++ * opaque one back. */
++static BOOL wayland_client_surface_carrier_opaque(struct wayland_win_data *toplevel_data,
++                                                  struct wayland_surface *surface,
++                                                  struct wayland_client_surface *client,
++                                                  BOOL stack_above_parent)
++{
++    struct wayland_client_surface *owner = toplevel_data->client_surface;
++
++    if (!owner || owner == client) return stack_above_parent;
++    return owner->stack_above_parent && owner->toplevel_wl_surface == surface->wl_surface;
++}
++
+ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND toplevel)
+ {
+     struct wayland_win_data *toplevel_data;
+@@ -5185,11 +5202,12 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
+         client->toplevel = 0;
+         client->stack_above_parent = FALSE;
+ 
+-        /* An opaque carrier is only valid while its full-size client covers it. */
++        /* An opaque carrier is only valid while the owner's full-size client covers it. */
+         if (previous_toplevel && (toplevel_data = wayland_win_data_get(previous_toplevel)))
+         {
+             surface = toplevel_data->wayland_surface;
+-            if (surface && surface->carrier_attached && surface->carrier_opaque)
++            if (surface && surface->carrier_attached && surface->carrier_opaque &&
++                !wayland_client_surface_carrier_opaque(toplevel_data, surface, client, FALSE))
+                 wayland_surface_attach_transparent_carrier(surface);
+             wayland_win_data_release(toplevel_data);
+         }
+@@ -5272,7 +5290,7 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
+ 
+     if (!toplevel_data->window_contents)
+     {
+-        if (stack_above_parent)
++        if (wayland_client_surface_carrier_opaque(toplevel_data, surface, client, stack_above_parent))
+             wayland_surface_attach_opaque_carrier(surface);
+         else
+             wayland_surface_attach_transparent_carrier(surface);
