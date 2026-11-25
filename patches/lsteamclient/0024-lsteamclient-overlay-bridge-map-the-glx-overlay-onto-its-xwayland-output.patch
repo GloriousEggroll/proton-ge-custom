@@ -1,0 +1,213 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Mon, 24 Nov 2026 23:10:00 -0500
+Subject: [PATCH] lsteamclient: overlay_bridge: Map the GLX overlay onto its Xwayland output.
+
+Wine passes the overlay rect in raw monitor pixels, but Xwayland uses
+logical coordinates on scaled outputs, so the GLX overlay was too large and
+offset from the game at fractional scaling.
+
+Add ge_overlay_external_wayland_map_rect(), which maps a rect from a Wine
+monitor onto the Xwayland output whose logical size scales to the monitor's
+raw size, preferring the game surface's own scale and the closest origin, and
+scale the overlay's pointer positions to match. libXrandr is loaded on demand.
+---
+
+--- a/lsteamclient/overlay_bridge/src/steam_overlay_bridge.c
++++ b/lsteamclient/overlay_bridge/src/steam_overlay_bridge.c
+@@ -24,6 +24,7 @@
+ #include <X11/Xatom.h>
+ #include <X11/cursorfont.h>
+ #include <X11/extensions/Xfixes.h>
++#include <X11/extensions/Xrandr.h>
+ #include <X11/extensions/shape.h>
+ #include <X11/Xlib.h>
+ #include <X11/Xutil.h>
+@@ -223,6 +224,10 @@
+ static double pointer_surface_y;
+ static double pointer_scale_x = 1.0;
+ static double pointer_scale_y = 1.0;
++/* GLX overlay window size over the raw size Wine renders at (Xwayland output
++ * scale), see ge_overlay_external_wayland_map_rect(). */
++static double overlay_pointer_ratio_x = 1.0;
++static double overlay_pointer_ratio_y = 1.0;
+ static struct overlay_cursor_entry overlay_cursor_map[GE_CURSOR_MAP_SIZE];
+ static uint32_t overlay_cursor_shape = GE_STEAM_OVERLAY_CURSOR_DEFAULT;
+ static int overlay_cursor_dirty;
+@@ -438,6 +443,144 @@
+     return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+ }
+ 
++struct xwayland_output
++{
++    int x, y, width, height;
++};
++
++static pthread_mutex_t xwayland_output_mutex = PTHREAD_MUTEX_INITIALIZER;
++
++/* Find the X11 output showing a Wine monitor. Xwayland uses logical
++ * coordinates on scaled outputs, so the output whose size scales to the
++ * monitor's raw size, and whose scaled origin is the closest to the monitor's
++ * raw origin, is the one; prefer the game surface's own scale when known.
++ * libXrandr is loaded on demand. */
++static int find_xwayland_output(int32_t monitor_x, int32_t monitor_y,
++                                uint32_t monitor_width, uint32_t monitor_height,
++                                double surface_scale, struct xwayland_output *output)
++{
++    static XRRMonitorInfo *(*get_monitors)(Display *, Window, Bool, int *);
++    static void (*free_monitors)(XRRMonitorInfo *);
++    static struct xwayland_output cached;
++    static int32_t cached_key[4];
++    static uint64_t cached_time;
++    static Display *display;
++    static int loaded;
++    XRRMonitorInfo *monitors;
++    uint64_t now = monotonic_msec();
++    double best_score = -1.0;
++    int count, i, found = 0;
++
++    pthread_mutex_lock(&xwayland_output_mutex);
++    if (cached_time && now - cached_time < 1000 && cached_key[0] == monitor_x &&
++        cached_key[1] == monitor_y && cached_key[2] == (int32_t)monitor_width &&
++        cached_key[3] == (int32_t)monitor_height)
++    {
++        *output = cached;
++        pthread_mutex_unlock(&xwayland_output_mutex);
++        return 1;
++    }
++
++    if (!loaded)
++    {
++        void *module = dlopen("libXrandr.so.2", RTLD_NOW | RTLD_LOCAL);
++        const char *display_name = getenv("DISPLAY");
++
++        loaded = 1;
++        if (!display_name) display_name = getenv("GAMESCOPE_XWAYLAND_DISPLAY");
++        if (module)
++        {
++            get_monitors = (XRRMonitorInfo *(*)(Display *, Window, Bool, int *))dlsym(module, "XRRGetMonitors");
++            free_monitors = (void (*)(XRRMonitorInfo *))dlsym(module, "XRRFreeMonitors");
++        }
++        if (get_monitors && free_monitors && display_name) display = XOpenDisplay(display_name);
++        if (!display) overlay_trace("cannot query X11 outputs, overlay keeps raw coordinates\n");
++    }
++
++    if (display && (monitors = get_monitors(display, DefaultRootWindow(display), True, &count)))
++    {
++        for (i = 0; i < count; i++)
++        {
++            double scale_x, scale_y, score;
++
++            if (monitors[i].width <= 0 || monitors[i].height <= 0) continue;
++            scale_x = (double)monitor_width / monitors[i].width;
++            scale_y = (double)monitor_height / monitors[i].height;
++            if (fabs(scale_x - scale_y) > 0.01 * scale_x) continue;
++
++            score = fabs(monitors[i].x * scale_x - monitor_x) + fabs(monitors[i].y * scale_y - monitor_y);
++            if (surface_scale > 0.0) score += fabs(scale_x - surface_scale) * monitor_width;
++            if (found && score >= best_score) continue;
++
++            output->x = monitors[i].x;
++            output->y = monitors[i].y;
++            output->width = monitors[i].width;
++            output->height = monitors[i].height;
++            best_score = score;
++            found = 1;
++        }
++        free_monitors(monitors);
++    }
++
++    if (found)
++    {
++        cached = *output;
++        cached_key[0] = monitor_x;
++        cached_key[1] = monitor_y;
++        cached_key[2] = (int32_t)monitor_width;
++        cached_key[3] = (int32_t)monitor_height;
++        cached_time = now;
++    }
++    pthread_mutex_unlock(&xwayland_output_mutex);
++    return found;
++}
++
++/* Wine passes the overlay rect in raw monitor pixels. Xwayland uses logical
++ * coordinates on scaled outputs (an X11 screen of 5632x1728 for a 3840x2160
++ * output at 125% and one at 150%), so map the rect from its monitor onto the
++ * X11 output showing it. Returns 0 if there is no such output. */
++int ge_overlay_external_wayland_map_rect(int32_t monitor_x, int32_t monitor_y,
++                                         uint32_t monitor_width, uint32_t monitor_height,
++                                         int32_t *x, int32_t *y,
++                                         uint32_t *width, uint32_t *height)
++{
++    struct xwayland_output output;
++    double ratio_x, ratio_y, surface_scale;
++
++    if (!monitor_width || !monitor_height) return 0;
++
++    pthread_mutex_lock(&overlay_mutex);
++    surface_scale = pointer_scale_x != 1.0 ? pointer_scale_x : 0.0;
++    pthread_mutex_unlock(&overlay_mutex);
++
++    if (!find_xwayland_output(monitor_x, monitor_y, monitor_width, monitor_height,
++                              surface_scale, &output))
++    {
++        overlay_trace("no X11 output for raw %ux%u%+d%+d, overlay keeps raw coordinates\n",
++                      monitor_width, monitor_height, monitor_x, monitor_y);
++        return 0;
++    }
++
++    ratio_x = (double)output.width / monitor_width;
++    ratio_y = (double)output.height / monitor_height;
++    *x = output.x + (int32_t)lround((*x - monitor_x) * ratio_x);
++    *y = output.y + (int32_t)lround((*y - monitor_y) * ratio_y);
++    *width = (uint32_t)fmax(1.0, lround(*width * ratio_x));
++    *height = (uint32_t)fmax(1.0, lround(*height * ratio_y));
++
++    if (ratio_x != overlay_pointer_ratio_x || ratio_y != overlay_pointer_ratio_y)
++        overlay_trace("output %dx%d%+d%+d for raw %ux%u%+d%+d: overlay %ux%u%+d%+d\n",
++                      output.width, output.height, output.x, output.y,
++                      monitor_width, monitor_height, monitor_x, monitor_y,
++                      *width, *height, *x, *y);
++
++    pthread_mutex_lock(&overlay_mutex);
++    overlay_pointer_ratio_x = ratio_x;
++    overlay_pointer_ratio_y = ratio_y;
++    pthread_mutex_unlock(&overlay_mutex);
++    return 1;
++}
++
+ static XVisualInfo *choose_overlay_glx_visual(Display *display, int screen)
+ {
+     static const int attributes[] =
+@@ -1889,6 +2032,14 @@
+ 
+     scale_x = frame->scale_x > 0.0 ? frame->scale_x : 1.0;
+     scale_y = frame->scale_y > 0.0 ? frame->scale_y : 1.0;
++    /* The GLX overlay window is in X11 coordinates, not raw pixels. */
++    pthread_mutex_lock(&overlay_mutex);
++    if (overlay_opengl_requested)
++    {
++        scale_x *= overlay_pointer_ratio_x;
++        scale_y *= overlay_pointer_ratio_y;
++    }
++    pthread_mutex_unlock(&overlay_mutex);
+ 
+     if (frame->flags & GE_STEAM_OVERLAY_FRAME_ABSOLUTE)
+     {
+--- a/lsteamclient/overlay_bridge/include/steam_overlay_bridge.h
++++ b/lsteamclient/overlay_bridge/include/steam_overlay_bridge.h
+@@ -78,6 +78,11 @@
+     uint32_t width, uint32_t height);
+ GE_OVERLAY_API void ge_overlay_external_wayland_dispatch(
+     int32_t x, int32_t y, uint32_t width, uint32_t height);
++/* Maps a rect in raw monitor pixels onto the X11 output showing that monitor. */
++GE_OVERLAY_API int ge_overlay_external_wayland_map_rect(
++    int32_t monitor_x, int32_t monitor_y,
++    uint32_t monitor_width, uint32_t monitor_height,
++    int32_t *x, int32_t *y, uint32_t *width, uint32_t *height);
+ 
+ void ge_overlay_bridge_surface_created(void);
+ void ge_overlay_bridge_surface_destroyed(void);
+-- 
+2.51.0
+

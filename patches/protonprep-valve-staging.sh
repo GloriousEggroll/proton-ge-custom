@@ -817,6 +817,15 @@ apply_all_in_dir() {
     echo "WINE: -DDRAW- update the window present rect on display mode changes"
     apply_patch "../patches/wine-hotfixes/pending/ddraw-update-the-present-rect-on-display-mode-changes.patch"
 
+    echo "WINE: -WAYLAND- winewayland: keep the pillarbox of scaled fullscreen windows (stretched emulated display modes)"
+    apply_patch "../patches/wine-hotfixes/pending/winewayland-keep-the-pillarbox-of-scaled-fullscreen-windows.patch"
+
+    echo "WINE: -WAYLAND- win32u: keep window surface padding out of the scaled surface border (garbage in a pillarbox bar)"
+    apply_patch "../patches/wine-hotfixes/pending/win32u-keep-window-surface-padding-out-of-the-scaled-border.patch"
+
+    echo "WINE: -WAYLAND- win32u: place the Steam overlay of OpenGL games on its Xwayland output (fractional scaling)"
+    apply_patch "../patches/wine-hotfixes/pending/win32u-place-the-steam-overlay-on-its-xwayland-output.patch"
+
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
     ./tools/make_requests

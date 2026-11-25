@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Mon, 24 Nov 2026 23:10:00 -0500
+Subject: [PATCH] win32u: Place the Steam overlay on its Xwayland output.
+
+The Steam overlay bridge for Wine-Wayland OpenGL games got the overlay rect
+in raw monitor pixels. Xwayland uses logical coordinates on scaled outputs,
+so at 125% the overlay was 1.25 times too large and offset from the game.
+
+Pass the rect with the raw rect of its monitor to the bridge, which maps it
+onto the X11 output showing that monitor. Bridges without the new entry point
+keep raw coordinates.
+---
+
+--- a/dlls/win32u/opengl.c
++++ b/dlls/win32u/opengl.c
+@@ -1461,11 +1461,15 @@
+ typedef void (*steam_overlay_opengl_attach_func)( void *display, int x, int y,
+                                                    unsigned int width, unsigned int height );
+ typedef void (*steam_overlay_opengl_dispatch_func)( int, int, unsigned int, unsigned int );
++typedef int (*steam_overlay_opengl_map_rect_func)( int monitor_x, int monitor_y,
++                                                   unsigned int monitor_width, unsigned int monitor_height,
++                                                   int *x, int *y, unsigned int *width, unsigned int *height );
+ static void *steam_overlay_opengl_handle;
+ static void *steam_overlay_opengl_display;
+ static BOOL steam_overlay_opengl_attached;
+ static steam_overlay_opengl_attach_func steam_overlay_opengl_attach;
+ static steam_overlay_opengl_dispatch_func steam_overlay_opengl_dispatch_func_ptr;
++static steam_overlay_opengl_map_rect_func steam_overlay_opengl_map_rect;
+ 
+ static BOOL steam_overlay_opengl_enabled(void)
+ {
+@@ -1500,16 +1504,21 @@
+         return FALSE;
+     }
+ 
++    /* optional, older bridges place the overlay in raw coordinates */
++    steam_overlay_opengl_map_rect = (steam_overlay_opengl_map_rect_func)dlsym(
++        steam_overlay_opengl_handle, "ge_overlay_external_wayland_map_rect" );
++
+     TRACE( "Loaded lsteamclient native overlay bridge for OpenGL.\n" );
+     return TRUE;
+ }
+ 
+ static void steam_overlay_opengl_dispatch( struct opengl_drawable *drawable )
+ {
+-    RECT rect, virtual_rect;
++    RECT rect, virtual_rect, monitor_rect;
+     HWND hwnd;
+     UINT width, height;
+     UINT dpi;
++    int x, y;
+ 
+     if (!steam_overlay_opengl_dispatch_func_ptr ||
+         !(hwnd = drawable->client->hwnd))
+@@ -1518,20 +1527,34 @@
+     dpi = get_thread_dpi();
+     if (!get_client_rect_rel( hwnd, COORDS_SCREEN, &rect, dpi )) return;
+     rect = map_rect_virt_to_raw( rect, dpi );
+-    virtual_rect = get_virtual_screen_rect( 0, MDT_RAW_DPI );
+-    OffsetRect( &rect, -virtual_rect.left, -virtual_rect.top );
+     width = max( rect.right - rect.left, 1 );
+     height = max( rect.bottom - rect.top, 1 );
++    x = rect.left;
++    y = rect.top;
++
++    /* Xwayland uses logical coordinates on scaled outputs, let the bridge map
++     * the rect from its monitor onto the host output; otherwise use raw
++     * virtual coordinates. */
++    if (!steam_overlay_opengl_map_rect ||
++        !get_raw_monitor_rect( &rect, &monitor_rect ) ||
++        !steam_overlay_opengl_map_rect( monitor_rect.left, monitor_rect.top,
++                                        monitor_rect.right - monitor_rect.left,
++                                        monitor_rect.bottom - monitor_rect.top,
++                                        &x, &y, &width, &height ))
++    {
++        virtual_rect = get_virtual_screen_rect( 0, MDT_RAW_DPI );
++        x = rect.left - virtual_rect.left;
++        y = rect.top - virtual_rect.top;
++    }
+ 
+     if (!steam_overlay_opengl_attached)
+     {
+         if (!steam_overlay_opengl_display || !steam_overlay_opengl_attach) return;
+-        steam_overlay_opengl_attach( steam_overlay_opengl_display,
+-                                     rect.left, rect.top, width, height );
++        steam_overlay_opengl_attach( steam_overlay_opengl_display, x, y, width, height );
+         steam_overlay_opengl_attached = TRUE;
+     }
+ 
+-    steam_overlay_opengl_dispatch_func_ptr( rect.left, rect.top, width, height );
++    steam_overlay_opengl_dispatch_func_ptr( x, y, width, height );
+ }
+ 
+ static BOOL egl_init( const struct opengl_driver_funcs **driver_funcs )
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -5362,6 +5362,23 @@
+     return info;
+ }
+ 
++/* Get the raw rect of the monitor that a raw rect is on. */
++BOOL get_raw_monitor_rect( const RECT *raw_rect, RECT *monitor_rect )
++{
++    struct monitor *monitor;
++    BOOL ret = FALSE;
++
++    if (!lock_display_devices( FALSE )) return FALSE;
++    if ((monitor = get_monitor_from_rect( *raw_rect, MONITOR_DEFAULTTONEAREST, 0, MDT_RAW_DPI )))
++    {
++        *monitor_rect = monitor_get_rect( monitor, 0, MDT_RAW_DPI );
++        ret = !IsRectEmpty( monitor_rect );
++    }
++    unlock_display_devices();
++
++    return ret;
++}
++
+ UINT monitor_dpi_from_rect( RECT rect, UINT dpi, UINT *raw_dpi )
+ {
+     struct monitor *monitor;
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -195,6 +195,7 @@
+ extern HMONITOR monitor_from_window( HWND hwnd, UINT flags, UINT dpi );
+ extern MONITORINFO monitor_info_from_rect( RECT rect, UINT dpi );
+ extern MONITORINFO monitor_info_from_window( HWND hwnd, UINT flags );
++extern BOOL get_raw_monitor_rect( const RECT *raw_rect, RECT *monitor_rect );
+ extern UINT monitor_dpi_from_rect( RECT rect, UINT dpi, UINT *raw_dpi );
+ extern BOOL update_display_cache( BOOL force );
+ extern void reset_monitor_update_serial(void);
+-- 
+2.51.0
+
