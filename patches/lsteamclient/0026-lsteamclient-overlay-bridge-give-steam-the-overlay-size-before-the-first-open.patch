@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Wed, 25 Nov 2026 17:50:48 -0500
+Subject: [PATCH] lsteamclient: overlay_bridge: Give Steam the overlay size
+ before the first open.
+
+gameoverlayrenderer only learns the size of its window when the overlay
+opens (ValveGetScreenSize( -1, -1 ) until then), so the first overlay of
+Star Wars Galactic Battlegrounds was laid out without its background dimming
+and with a black panel; the next ones were fine. The bridge primes Steam's
+screen size globals, but only found them in the x86_64 build.
+
+Find them in the i386 glXSwapBuffers too, from the GOT base it computes and
+the movq storing the pre-swap dimensions, and prime the requested size: the
+GLX window is now created at 1x1 and resized by the presenter whenever its
+size differs from the requested one.
+
+diff --git a/lsteamclient/overlay_bridge/src/steam_overlay_bridge.c b/lsteamclient/overlay_bridge/src/steam_overlay_bridge.c
+index 18a37db..05dfe92 100644
+--- a/lsteamclient/overlay_bridge/src/steam_overlay_bridge.c
++++ b/lsteamclient/overlay_bridge/src/steam_overlay_bridge.c
+@@ -703,6 +703,7 @@ static void *run_opengl_presenter(void *arg)
+     } prime_state = OVERLAY_PRIME_FIRST_SWAP;
+     uint64_t prime_deadline = 0;
+     unsigned long frame = 0;
++    int window_width = 1, window_height = 1; /* created at 1x1, see init_overlay_bridge */
+     int context_current;
+ 
+     (void)arg;
+@@ -746,8 +747,10 @@ static void *run_opengl_presenter(void *arg)
+         pthread_mutex_unlock(&overlay_glx_mutex);
+         if (stop) break;
+ 
+-        if (geometry_dirty)
++        if (geometry_dirty || width != window_width || height != window_height)
+         {
++            window_width = width;
++            window_height = height;
+             XMoveResizeWindow(overlay_display, overlay_window, x, y,
+                               (unsigned int)width, (unsigned int)height);
+             XRaiseWindow(overlay_display, overlay_window);
+@@ -1148,6 +1151,60 @@ static int resolve_overlay_screen_size_slots(void)
+         return 1;
+     }
+ 
++    overlay_trace("Steam overlay screen-size signature not found\n");
++#elif defined(__i386__)
++    /* The i386 build computes its GOT base at the start of glXSwapBuffers
++     * (call __x86.get_pc_thunk.bx; add $imm32,%ebx) and stores the pre-swap
++     * dimensions as a pair: movd 0x8(%esp),%xmm1; movd 0x4(%esp),%xmm0;
++     * punpckldq %xmm1,%xmm0; movq %xmm0,disp32(%ebx). */
++    static const unsigned char pair_store[] =
++        {0x66, 0x0f, 0x6e, 0x4c, 0x24, 0x08, 0x66, 0x0f, 0x6e, 0x44, 0x24, 0x04,
++         0x66, 0x0f, 0x62, 0xc1, 0x66, 0x0f, 0xd6, 0x83};
++    unsigned char *function, *got = NULL;
++    Dl_info function_info;
++    Dl_info slot_info;
++    int32_t value;
++    unsigned int i;
++
++    if (overlay_screen_width_slot && overlay_screen_height_slot) return 1;
++    if (overlay_screen_size_scanned) return 0;
++    overlay_screen_size_scanned = 1;
++
++    function = (unsigned char *)dlsym(RTLD_DEFAULT, "glXSwapBuffers");
++    if (!function || !dladdr(function, &function_info) ||
++        function_info.dli_fbase != overlay_renderer_base)
++        return 0;
++
++    for (i = 0; i + 11 <= 32; ++i)
++    {
++        if (function[i] != 0xe8 || function[i + 5] != 0x81 || function[i + 6] != 0xc3) continue;
++        memcpy(&value, function + i + 7, sizeof(value));
++        got = function + i + 5 + value;
++        break;
++    }
++    if (!got)
++    {
++        overlay_trace("Steam overlay GOT base not found\n");
++        return 0;
++    }
++
++    for (i = 0; i + sizeof(pair_store) + 4 <= 256; ++i)
++    {
++        int *width;
++
++        if (memcmp(function + i, pair_store, sizeof(pair_store))) continue;
++        memcpy(&value, function + i + sizeof(pair_store), sizeof(value));
++        width = (int *)(got + value);
++        if (!dladdr(width, &slot_info) || slot_info.dli_fbase != overlay_renderer_base ||
++            !dladdr(width + 1, &slot_info) || slot_info.dli_fbase != overlay_renderer_base)
++            continue;
++
++        overlay_screen_width_slot = width;
++        overlay_screen_height_slot = width + 1;
++        overlay_trace("resolved Steam overlay screen-size slots\n");
++        return 1;
++    }
++
+     overlay_trace("Steam overlay screen-size signature not found\n");
+ #endif
+     return 0;
+@@ -1792,11 +1849,15 @@ static int init_overlay_bridge(int force_retry)
+             goto retry;
+         }
+ 
++        /* Create the window at 1x1 and let the presenter resize it: Steam only
++         * learns the drawable size from a resize (or when the overlay opens),
++         * and lays the first overlay out for an unknown size otherwise,
++         * missing its background and some panels until it is opened again. */
+         pthread_mutex_lock(&overlay_glx_mutex);
+         window_x = overlay_glx_requested_x;
+         window_y = overlay_glx_requested_y;
+-        window_width = overlay_glx_requested_width ? overlay_glx_requested_width : 1;
+-        window_height = overlay_glx_requested_height ? overlay_glx_requested_height : 1;
++        window_width = 1;
++        window_height = 1;
+         pthread_mutex_unlock(&overlay_glx_mutex);
+         window_type = InputOutput;
+         window_depth = glx_visual->depth;
+@@ -1948,7 +2009,16 @@ static int init_overlay_bridge(int force_retry)
+     if (overlay_opengl_requested) XRaiseWindow(overlay_display, overlay_window);
+     XSync(overlay_display, False);
+     if (overlay_opengl_requested)
+-        prime_overlay_screen_size(window_width, window_height);
++    {
++        unsigned int prime_width, prime_height;
++
++        /* the window starts at 1x1, prime the size the presenter resizes it to */
++        pthread_mutex_lock(&overlay_glx_mutex);
++        prime_width = overlay_glx_requested_width ? (unsigned int)overlay_glx_requested_width : window_width;
++        prime_height = overlay_glx_requested_height ? (unsigned int)overlay_glx_requested_height : window_height;
++        pthread_mutex_unlock(&overlay_glx_mutex);
++        prime_overlay_screen_size(prime_width, prime_height);
++    }
+     if (overlay_opengl_requested && !start_opengl_presenter())
+     {
+         XSetAfterFunction(overlay_display, previous_after_function);

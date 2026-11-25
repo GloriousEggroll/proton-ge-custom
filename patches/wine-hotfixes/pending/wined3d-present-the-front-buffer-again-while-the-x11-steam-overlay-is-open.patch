@@ -1,0 +1,170 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Wed, 25 Nov 2026 17:50:28 -0500
+Subject: [PATCH] wined3d: Present the front buffer again while the X11
+ Steam overlay is open.
+
+On X11 the Steam overlay draws in the glXSwapBuffers hook of
+gameoverlayrenderer, so it only updates when the game presents. Star Wars
+Galactic Battlegrounds presents 4 frames per second in its menus, so the
+overlay lagged behind the mouse.
+
+While winex11 signals __wine_x11_steam_overlay_present, let the CS thread
+wake up after 16 ms without commands and flush with the front buffer bound,
+which makes win32u present its front buffer again. This uses the game's own
+context: a second context sharing it showed a grey overlay, as Steam's
+objects are per context. WINE_X11_STEAM_OVERLAY_REFRESH=0 disables this.
+
+diff --git a/dlls/wined3d/cs.c b/dlls/wined3d/cs.c
+index add8f8f..9cc84ed 100644
+--- a/dlls/wined3d/cs.c
++++ b/dlls/wined3d/cs.c
+@@ -3447,8 +3447,64 @@ static void poll_queries(struct wined3d_cs *cs)
+     }
+ }
+ 
++static void wined3d_cs_command_lock(const struct wined3d_cs *cs)
++{
++    if (cs->serialize_commands)
++        EnterCriticalSection(&wined3d_command_cs);
++}
++
++static void wined3d_cs_command_unlock(const struct wined3d_cs *cs)
++{
++    if (cs->serialize_commands)
++        LeaveCriticalSection(&wined3d_command_cs);
++}
++
++/* While the Steam overlay is open on X11, where Steam draws it in the present
++ * hooks, wake up regularly to present the front buffer again, see
++ * wined3d_swapchain_refresh_front(). winex11 sets the event. */
++static BOOL wined3d_cs_steam_overlay_open(void)
++{
++    static HANDLE event;
++    static int enabled = -1;
++    static ULONGLONG last_open_attempt;
++
++    if (enabled == -1)
++    {
++        const char *env = getenv("WINE_X11_STEAM_OVERLAY_REFRESH");
++        enabled = !env || atoi(env);
++    }
++    if (!enabled)
++        return FALSE;
++    if (!event)
++    {
++        ULONGLONG now = GetTickCount64();
++        if (now - last_open_attempt < 1000)
++            return FALSE;
++        last_open_attempt = now;
++        if (!(event = OpenEventA(SYNCHRONIZE, FALSE, "__wine_x11_steam_overlay_present")))
++            return FALSE;
++    }
++    return WaitForSingleObject(event, 0) == WAIT_OBJECT_0;
++}
++
++static void wined3d_cs_refresh_steam_overlay(struct wined3d_cs *cs)
++{
++    struct wined3d_device *device = cs->c.device;
++
++    if (!wined3d_cs_queue_is_empty(cs, &cs->queue[WINED3D_CS_QUEUE_DEFAULT])
++            || !wined3d_cs_queue_is_empty(cs, &cs->queue[WINED3D_CS_QUEUE_MAP]))
++        return;
++    if (!device->swapchain_count || !device->swapchains[0])
++        return;
++    wined3d_swapchain_refresh_front(device->swapchains[0]);
++}
++
+ static void wined3d_cs_wait_event(struct wined3d_cs *cs)
+ {
++    static const LARGE_INTEGER overlay_timeout = {.QuadPart = 16 * -10000};
++    BOOL overlay_open = wined3d_cs_steam_overlay_open();
++    NTSTATUS status;
++
+     static const LARGE_INTEGER query_timeout = {.QuadPart = WINED3D_CS_COMMAND_WAIT_WITH_QUERIES_TIMEOUT * -10};
+     const LARGE_INTEGER *timeout = NULL;
+ 
+@@ -3469,22 +3525,20 @@ static void wined3d_cs_wait_event(struct wined3d_cs *cs)
+             && InterlockedCompareExchange(&cs->waiting_for_event, FALSE, TRUE))
+         return;
+ 
++    if (overlay_open && (!timeout || timeout->QuadPart < overlay_timeout.QuadPart))
++        timeout = &overlay_timeout;
++
+     if (pNtWaitForAlertByThreadId)
+-        pNtWaitForAlertByThreadId(NULL, timeout);
++        status = pNtWaitForAlertByThreadId(NULL, timeout);
+     else
+-        NtWaitForSingleObject(cs->event, FALSE, timeout);
+-}
+-
+-static void wined3d_cs_command_lock(const struct wined3d_cs *cs)
+-{
+-    if (cs->serialize_commands)
+-        EnterCriticalSection(&wined3d_command_cs);
+-}
++        status = NtWaitForSingleObject(cs->event, FALSE, timeout);
+ 
+-static void wined3d_cs_command_unlock(const struct wined3d_cs *cs)
+-{
+-    if (cs->serialize_commands)
+-        LeaveCriticalSection(&wined3d_command_cs);
++    if (overlay_open && status == STATUS_TIMEOUT)
++    {
++        wined3d_cs_command_lock(cs);
++        wined3d_cs_refresh_steam_overlay(cs);
++        wined3d_cs_command_unlock(cs);
++    }
+ }
+ 
+ static inline bool wined3d_cs_execute_next(struct wined3d_cs *cs, struct wined3d_cs_queue *queue)
+diff --git a/dlls/wined3d/swapchain.c b/dlls/wined3d/swapchain.c
+index 339d3ae..4cfa20f 100644
+--- a/dlls/wined3d/swapchain.c
++++ b/dlls/wined3d/swapchain.c
+@@ -1442,6 +1442,32 @@ static void swapchain_frontbuffer_updated(struct wined3d_swapchain *swapchain)
+     SetRectEmpty(&swapchain->front_buffer_update);
+ }
+ 
++static const struct wined3d_swapchain_ops swapchain_gl_ops;
++
++/* Present the front buffer again, so that overlays drawn by present hooks
++ * (e.g. the Steam overlay) keep updating while the application presents
++ * rarely. A flush with the front buffer bound presents it without a swap.
++ * Context activation is done here, called from the CS thread. */
++void wined3d_swapchain_refresh_front(struct wined3d_swapchain *swapchain)
++{
++    struct wined3d_texture *front_buffer = swapchain->front_buffer;
++    struct wined3d_context_gl *context_gl;
++    struct wined3d_context *context;
++
++    if (!front_buffer || swapchain->swapchain_ops != &swapchain_gl_ops) return;
++
++    context = context_acquire(swapchain->device, front_buffer, 0);
++    context_gl = wined3d_context_gl(context);
++    if (context_gl->valid)
++    {
++        wined3d_context_gl_apply_fbo_state_explicit(context_gl, GL_DRAW_FRAMEBUFFER,
++                &front_buffer->resource, 0, NULL, 0, WINED3D_LOCATION_DRAWABLE);
++        context_invalidate_state(context, STATE_FRAMEBUFFER);
++        context_gl->gl_info->gl_ops.gl.p_glFlush();
++    }
++    context_release(context);
++}
++
+ static const struct wined3d_swapchain_ops swapchain_gl_ops =
+ {
+     swapchain_gl_present,
+diff --git a/dlls/wined3d/wined3d_private.h b/dlls/wined3d/wined3d_private.h
+index bb0ec03..bd2639e 100644
+--- a/dlls/wined3d/wined3d_private.h
++++ b/dlls/wined3d/wined3d_private.h
+@@ -3692,6 +3692,8 @@ struct wined3d_device_context
+     struct wined3d_state *state;
+ };
+ 
++void wined3d_swapchain_refresh_front(struct wined3d_swapchain *swapchain);
++
+ struct wined3d_cs
+ {
+     struct wined3d_device_context c;

@@ -1,0 +1,321 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Wed, 25 Nov 2026 17:50:28 -0500
+Subject: [PATCH] win32u, winex11: Cover pillarboxed fullscreen windows
+ with their GL drawable.
+
+An exclusive fullscreen window in an emulated display mode is scaled with
+its aspect ratio kept, e.g. 800x600 to 2304x1728 in the middle of a
+3072x1728 monitor. winex11 placed the GL client window at the scaled rect, so
+the Steam overlay, which Steam draws on the GL drawable, did not cover the
+black bars, and Steam laid the overlay out from the GL viewport, which was
+the scaled contents too.
+
+Add a content rect to the client surface. For such windows winex11 now
+creates the client window over the whole window and sets the content rect,
+and win32u clears the drawable and blits the scaled contents at the content
+rect. winex11 also presents with a viewport covering the drawable, and
+restores the client window position after attach_client_window, which
+reparents it at the client area offset.
+
+diff --git a/dlls/win32u/opengl.c b/dlls/win32u/opengl.c
+index 3c375ba..a5b1895 100644
+--- a/dlls/win32u/opengl.c
++++ b/dlls/win32u/opengl.c
+@@ -782,7 +782,9 @@ static void blit_framebuffer_surface( struct framebuffer_surface *surface )
+     struct wgl_context *ctx = NtCurrentTeb()->glContext;
+     const struct opengl_funcs *funcs = &display_funcs;
+     struct client_surface *client;
+-    RECT src, dst;
++    RECT src, dst, content;
++    SIZE drawable_size;
++    int x, y;
+ 
+     typedef void (*state_handler_t)(int mode, struct wgl_context *ctx, struct fs_hack_gl_state *state);
+     static const state_handler_t general_state_handlers[] =
+@@ -811,7 +813,20 @@ static void blit_framebuffer_surface( struct framebuffer_surface *surface )
+     if (!NtUserGetClientRect( client->hwnd, &src, NtUserGetDpiForWindow( client->hwnd ) )) return;
+     if (!NtUserGetClientRect( client->hwnd, &dst, NtUserGetWinMonitorDpi( client->hwnd, MDT_WINE_RAW_DPI ) )) return;
+ 
+-    TRACE( "hwnd %p src %s dst %s fbo %u\n", client->hwnd, wine_dbgstr_rect(&src), wine_dbgstr_rect(&dst), surface->base.read_fbo );
++    /* the driver may make the drawable cover the whole window, around the contents */
++    content = client->content_rect;
++    drawable_size = client->drawable_size;
++    if (IsRectEmpty( &content ) || drawable_size.cy < content.bottom) x = y = 0;
++    else
++    {
++        dst.right = content.right - content.left;
++        dst.bottom = content.bottom - content.top;
++        x = content.left;
++        y = drawable_size.cy - content.bottom; /* GL origin is bottom left */
++    }
++
++    TRACE( "hwnd %p src %s dst %s at %d,%d fbo %u\n", client->hwnd, wine_dbgstr_rect(&src), wine_dbgstr_rect(&dst),
++           x, y, surface->base.read_fbo );
+ 
+     if (!ctx->gamma_program || !ctx->gamma_ramp)
+         ERR( "gamma shader is not initialized.\n" );
+@@ -838,13 +853,26 @@ static void blit_framebuffer_surface( struct framebuffer_surface *surface )
+     /* the target default framebuffer should be swapped after. We are always presenting framebuffer's surface
+      * front while the color attachment textures are swapped on framebuffer surface swap before blit. */
+     funcs->p_glDrawBuffer( GL_BACK );
++    if (x || y || dst.right < drawable_size.cx || dst.bottom < drawable_size.cy)
++    {
++        GLfloat clear_color[4];
++        GLboolean color_mask[4];
++
++        funcs->p_glGetFloatv( GL_COLOR_CLEAR_VALUE, clear_color );
++        funcs->p_glGetBooleanv( GL_COLOR_WRITEMASK, color_mask );
++        funcs->p_glColorMask( GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE );
++        funcs->p_glClearColor( 0.0f, 0.0f, 0.0f, 1.0f );
++        funcs->p_glClear( GL_COLOR_BUFFER_BIT );
++        funcs->p_glClearColor( clear_color[0], clear_color[1], clear_color[2], clear_color[3] );
++        funcs->p_glColorMask( color_mask[0], color_mask[1], color_mask[2], color_mask[3] );
++    }
+     if (surface->base.read_fbo == surface->base.draw_fbo && !needs_gamma)
+     {
+         if (is_srgb_format( surface->internalformat ))
+             funcs->p_glEnable( GL_FRAMEBUFFER_SRGB );
+         funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, surface->base.read_fbo );
+         funcs->p_glReadBuffer( GL_COLOR_ATTACHMENT0 );
+-        funcs->p_glBlitFramebuffer( 0, 0, src.right, src.bottom, 0, 0, dst.right, dst.bottom, GL_COLOR_BUFFER_BIT,
++        funcs->p_glBlitFramebuffer( 0, 0, src.right, src.bottom, x, y, x + dst.right, y + dst.bottom, GL_COLOR_BUFFER_BIT,
+                                     ctx->integer_scaling ? GL_NEAREST : GL_LINEAR );
+     }
+     else
+@@ -860,8 +888,8 @@ static void blit_framebuffer_surface( struct framebuffer_surface *surface )
+         if (is_srgb_format( surface->internalformat ))
+             funcs->p_glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_SRGB_DECODE_EXT, GL_SKIP_DECODE_EXT );
+ 
+-        if (ctx->has_GL_ARB_viewport_array) funcs->p_glViewportIndexedf( 0, 0, 0, dst.right, dst.bottom );
+-        else funcs->p_glViewport( 0, 0, dst.right, dst.bottom );
++        if (ctx->has_GL_ARB_viewport_array) funcs->p_glViewportIndexedf( 0, x, y, dst.right, dst.bottom );
++        else funcs->p_glViewport( x, y, dst.right, dst.bottom );
+ 
+         if (gamma_serial != surface->last_gamma_serial)
+         {
+diff --git a/dlls/winex11.drv/init.c b/dlls/winex11.drv/init.c
+index 30b1316..e009bf5 100644
+--- a/dlls/winex11.drv/init.c
++++ b/dlls/winex11.drv/init.c
+@@ -403,6 +403,7 @@ struct x11drv_client_surface
+     Window window;
+     RECT rect;
+     BOOL raw;
++    BOOL opengl;
+ 
+     HDC hdc_src;
+     HDC hdc_dst;
+@@ -476,10 +477,12 @@ static void client_surface_update_geometry( HWND hwnd, struct x11drv_client_surf
+     HWND origin = hwnd, toplevel = NtUserGetAncestor( hwnd, GA_ROOT );
+     XWindowChanges changes = surface->changes;
+     struct x11drv_win_data *data;
++    RECT rect, content = {0};
++    SIZE size = {0};
++    BOOL present;
+     int mask = 0;
+-    RECT rect;
+ 
+-    if (NtUserGetPresentRect( hwnd, &rect, dpi )) OffsetRect( &rect, -rect.left, -rect.top );
++    if ((present = NtUserGetPresentRect( hwnd, &rect, dpi ))) OffsetRect( &rect, -rect.left, -rect.top );
+     else if (!NtUserGetClientRect( hwnd, &rect, dpi )) return;
+     else NtUserMapWindowPoints( origin, toplevel, (POINT *)&rect, 2, dpi );
+ 
+@@ -487,8 +490,27 @@ static void client_surface_update_geometry( HWND hwnd, struct x11drv_client_surf
+     {
+         OffsetRect( &rect, data->rects.client.left - data->rects.visible.left,
+                     data->rects.client.top - data->rects.visible.top );
++
++        /* An exclusive fullscreen GL window scaled with its aspect ratio kept
++         * leaves a pillarbox or letterbox: cover the whole window and let win32u
++         * draw the scaled contents inside, so that overlays drawn on the GL
++         * drawable (e.g. Steam) cover the whole screen, as with other games. */
++        if (present && surface->opengl && hwnd == toplevel && surface->raw &&
++            (rect.left > 0 || rect.top > 0))
++        {
++            content = rect;
++            size.cx = data->rects.visible.right - data->rects.visible.left;
++            size.cy = data->rects.visible.bottom - data->rects.visible.top;
++            if (size.cx >= content.right && size.cy >= content.bottom) SetRect( &rect, 0, 0, size.cx, size.cy );
++            else SetRectEmpty( &content );
++        }
+         release_win_data( data );
+     }
++    if (!EqualRect( &content, &surface->client.content_rect ))
++        TRACE( "client window %p/%lx, contents %s in %dx%d\n", hwnd, surface->window,
++               wine_dbgstr_rect( &content ), (int)size.cx, (int)size.cy );
++    surface->client.drawable_size = size;
++    surface->client.content_rect = content;
+ 
+     changes.x = rect.left;
+     changes.y = rect.top;
+@@ -504,12 +526,22 @@ static void client_surface_update_geometry( HWND hwnd, struct x11drv_client_surf
+     if (!mask) return;
+ 
+     surface->changes = changes;
++    if (!surface->window) return; /* computing the geometry to create the window with */
+     TRACE( "client window %p/%lx, requesting position %d,%d size %d,%d mask %#x\n", hwnd,
+            surface->window, changes.x, changes.y, changes.width, changes.height, mask );
+     XConfigureWindow( gdi_display, surface->window, mask, &changes );
+     XFlush( gdi_display );
+ }
+ 
++/* attach_client_window reparents the client window at the client area offset,
++ * restore the position computed by client_surface_update_geometry when it
++ * covers the whole window instead */
++static void client_surface_restore_position( struct x11drv_client_surface *surface )
++{
++    if (IsRectEmpty( &surface->client.content_rect )) return;
++    XMoveWindow( gdi_display, surface->window, surface->changes.x, surface->changes.y );
++}
++
+ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_surface *surface )
+ {
+     BOOL offscreen = needs_offscreen_rendering( hwnd );
+@@ -523,6 +555,7 @@ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
+         {
+             attach_client_window( data, surface->window );
+             release_win_data( data );
++            client_surface_restore_position( surface );
+         }
+         return;
+     }
+@@ -564,6 +597,7 @@ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
+         if (offscreen) detach_client_window( data, surface->window );
+         else attach_client_window( data, surface->window );
+         release_win_data( data );
++        if (!offscreen) client_surface_restore_position( surface );
+     }
+ 
+     XFlush( gdi_display );
+@@ -993,6 +1027,8 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
+                     data->rects.client.top - data->rects.visible.top );
+         release_win_data( data );
+     }
++    /* the client window covers the whole window, around its scaled contents */
++    if (!IsRectEmpty( &surface->client.content_rect )) rect_dst = surface->rect;
+ 
+     if (get_dc_drawable( surface->hdc_dst, &rect ) != window || !EqualRect( &rect, &rect_dst ))
+         set_dc_drawable( surface->hdc_dst, window, &rect_dst, IncludeInferiors );
+@@ -1065,6 +1101,7 @@ Window x11drv_client_surface_create( HWND hwnd, BOOL raw, int format, struct cli
+     if (!(surface = client_surface_create( sizeof(*surface), &x11drv_client_surface_funcs, hwnd ))) goto failed;
+     surface->colormap = colormap;
+     surface->raw = raw;
++    surface->opengl = !!format;
+ 
+     if (!get_surface_rect( hwnd, &surface->rect, dpi )) goto failed;
+     hwnd_thread_id = NtUserGetWindowThread(hwnd, &hwnd_pid);
+@@ -1098,7 +1135,20 @@ Window x11drv_client_surface_create( HWND hwnd, BOOL raw, int format, struct cli
+         WARN( "Other process window %p / %#lx.\n", hwnd, surface->window );
+     }
+ 
+-    if (!surface->window && !(surface->window = create_client_window( hwnd, surface->rect, &visual, colormap ))) goto failed;
++    if (!surface->window)
++    {
++        POINT pos;
++
++        /* create a window covering a pillarboxed fullscreen window directly at
++         * its final geometry, the Steam overlay keeps the one it was created with */
++        surface->opengl = !!format;
++        client_surface_update_geometry( hwnd, surface );
++        pos.x = surface->changes.x;
++        pos.y = surface->changes.y;
++        if (!(surface->window = create_client_window( hwnd, surface->rect, &visual, colormap,
++                                                      IsRectEmpty( &surface->client.content_rect ) ? NULL : &pos )))
++            goto failed;
++    }
+ 
+     TRACE( "Created %s for client window %lx\n", debugstr_client_surface( &surface->client ), surface->window );
+     *client = &surface->client;
+diff --git a/dlls/winex11.drv/opengl.c b/dlls/winex11.drv/opengl.c
+index d4ffd38..fa8a1eb 100644
+--- a/dlls/winex11.drv/opengl.c
++++ b/dlls/winex11.drv/opengl.c
+@@ -1491,12 +1491,24 @@ static BOOL x11drv_surface_swap( struct opengl_drawable *base )
+     struct wgl_context *wgl_ctx = NtCurrentTeb()->glContext;
+     INT64 ust, msc, sbc, target_sbc = 0;
+     float viewport_old[4], viewport[4];
+-    BOOL offscreen;
++    GLint full_viewport_old[4];
++    BOOL offscreen, full_viewport = FALSE;
++    RECT content;
+ 
+     TRACE( "drawable %s\n", debugstr_opengl_drawable( base ) );
+ 
+     if (wgl_ctx && wgl_ctx->has_GL_ARB_viewport_array) funcs->p_glGetFloati_v( GL_VIEWPORT, 0, viewport_old );
+ 
++    /* when the drawable covers a whole pillarboxed window, present with a
++     * viewport covering it, swap hooks such as the Steam overlay use it */
++    content = base->client->content_rect;
++    if (ctx && !IsRectEmpty( &content ) && base->client->drawable_size.cx > 0)
++    {
++        funcs->p_glGetIntegerv( GL_VIEWPORT, full_viewport_old );
++        funcs->p_glViewport( 0, 0, base->client->drawable_size.cx, base->client->drawable_size.cy );
++        full_viewport = TRUE;
++    }
++
+     if (!(offscreen = InterlockedCompareExchange( &base->client->offscreen, 0, 0 )) ||
+         !ctx || !pglXSwapBuffersMscOML) pglXSwapBuffers( gdi_display, gl->drawable );
+     else
+@@ -1506,6 +1518,9 @@ static BOOL x11drv_surface_swap( struct opengl_drawable *base )
+         if (pglXWaitForSbcOML) pglXWaitForSbcOML( gdi_display, gl->drawable, target_sbc, &ust, &msc, &sbc );
+     }
+ 
++    if (full_viewport)
++        funcs->p_glViewport( full_viewport_old[0], full_viewport_old[1], full_viewport_old[2], full_viewport_old[3] );
++
+     if (wgl_ctx && wgl_ctx->has_GL_ARB_viewport_array)
+     {
+         /* Avoid setting old viewport when not needed, it may be costly in some cases. */
+diff --git a/dlls/winex11.drv/window.c b/dlls/winex11.drv/window.c
+index 47c3ce5..b5c4f7a 100644
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -2815,7 +2815,8 @@ void destroy_client_window( HWND hwnd, Window client_window )
+ /**********************************************************************
+  *		create_client_window
+  */
+-Window create_client_window( HWND hwnd, RECT client_rect, const XVisualInfo *visual, Colormap colormap )
++Window create_client_window( HWND hwnd, RECT client_rect, const XVisualInfo *visual, Colormap colormap,
++                             const POINT *pos )
+ {
+     struct x11drv_win_data *data = get_win_data( hwnd ), dummy = {0};
+     XSetWindowAttributes attr;
+@@ -2832,8 +2833,8 @@ Window create_client_window( HWND hwnd, RECT client_rect, const XVisualInfo *vis
+     attr.backing_store = NotUseful;
+     attr.border_pixel = 0;
+ 
+-    x = data->rects.client.left - data->rects.visible.left;
+-    y = data->rects.client.top - data->rects.visible.top;
++    x = pos ? pos->x : data->rects.client.left - data->rects.visible.left;
++    y = pos ? pos->y : data->rects.client.top - data->rects.visible.top;
+     cx = min( max( 1, client_rect.right - client_rect.left ), 65535 );
+     cy = min( max( 1, client_rect.bottom - client_rect.top ), 65535 );
+ 
+diff --git a/dlls/winex11.drv/x11drv.h b/dlls/winex11.drv/x11drv.h
+index b25662e..1cbdcb4 100644
+--- a/dlls/winex11.drv/x11drv.h
++++ b/dlls/winex11.drv/x11drv.h
+@@ -765,7 +765,8 @@ extern void window_set_user_time( struct x11drv_win_data *data, Time time, BOOL
+ extern UINT get_window_net_wm_state( Display *display, Window window );
+ extern void get_window_monitors( Display *display, Window window, long *indices );
+ extern void make_window_embedded( struct x11drv_win_data *data );
+-extern Window create_client_window( HWND hwnd, RECT client_rect, const XVisualInfo *visual, Colormap colormap );
++extern Window create_client_window( HWND hwnd, RECT client_rect, const XVisualInfo *visual, Colormap colormap,
++                                    const POINT *pos );
+ extern void detach_client_window( struct x11drv_win_data *data, Window client_window );
+ extern void attach_client_window( struct x11drv_win_data *data, Window client_window );
+ extern void destroy_client_window( HWND hwnd, Window client_window );
+diff --git a/include/wine/gdi_driver.h b/include/wine/gdi_driver.h
+index b67795a..04c20cc 100644
+--- a/include/wine/gdi_driver.h
++++ b/include/wine/gdi_driver.h
+@@ -278,6 +278,8 @@ struct client_surface
+     LONG                               updated;        /* has been moved / resized / reparented */
+     LONG                               offscreen;      /* client window is offscreen */
+     LONG                               presentation_generation; /* invalidates stale presentation waits */
++    RECT                               content_rect;   /* scaled contents rect in the drawable, empty to fill it */
++    SIZE                               drawable_size;  /* drawable size when content_rect is set */
+ };
+ 
+ W32KAPI void *client_surface_create( UINT size, const struct client_surface_funcs *funcs, HWND hwnd );

@@ -96,6 +96,7 @@ apply_all_in_dir() {
         lsteamclient/Makefile.in \
         lsteamclient/overlay_bridge/src/focus_proxy.c \
         lsteamclient/overlay_bridge/src/steam_overlay_bridge.c \
+        lsteamclient/overlay_bridge/src/wayland_input.c \
         lsteamclient/overlay_bridge/include/steam_overlay_bridge.h \
         lsteamclient/gen_wrapper.py \
         lsteamclient/steam_input_manual.c \
@@ -825,6 +826,22 @@ apply_all_in_dir() {
 
     echo "WINE: -WAYLAND- win32u: place the Steam overlay of OpenGL games on its Xwayland output (fractional scaling)"
     apply_patch "../patches/wine-hotfixes/pending/win32u-place-the-steam-overlay-on-its-xwayland-output.patch"
+
+    echo "WINE: -WAYLAND- win32u: cover the whole monitor with the Steam overlay of pillarboxed fullscreen windows"
+    apply_patch "../patches/wine-hotfixes/pending/win32u-cover-the-whole-monitor-with-the-steam-overlay-of-fullscreen-windows.patch"
+
+    # Star Wars Galactic Battlegrounds (no Steam API): Steam overlay input, size, hover, redraw and restore on X11
+    echo "WINE: -X11- winex11: handle the Steam overlay in games without the Steam API"
+    apply_patch "../patches/wine-hotfixes/pending/winex11-handle-the-steam-overlay-in-games-without-the-steam-api.patch"
+
+    echo "WINE: -X11- win32u, winex11: cover pillarboxed fullscreen windows with their GL drawable (Steam overlay over the black bars)"
+    apply_patch "../patches/wine-hotfixes/pending/win32u-winex11-cover-pillarboxed-fullscreen-windows-with-their-gl-drawable.patch"
+
+    echo "WINE: -X11- wined3d: present the front buffer again while the X11 Steam overlay is open (overlay lag)"
+    apply_patch "../patches/wine-hotfixes/pending/wined3d-present-the-front-buffer-again-while-the-x11-steam-overlay-is-open.patch"
+
+    echo "WINE: -WINED3D- defer the activation of minimized device windows (wrong size after restore)"
+    apply_patch "../patches/wine-hotfixes/pending/wined3d-defer-the-activation-of-minimized-device-windows.patch"
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f

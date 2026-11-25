@@ -1,0 +1,775 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Wed, 25 Nov 2026 17:50:48 -0500
+Subject: [PATCH] lsteamclient: overlay_bridge: Make the GLX overlay usable
+ with a locked pointer.
+
+Star Wars Galactic Battlegrounds confines the pointer, and its GLX overlay
+could not be used on Wine-Wayland:
+
+- Keep the relative pointer position inside the overlay window rather than
+  the whole X11 screen, use root coordinates for the X11 events, and map the
+  pointer between the toplevel surface and the overlay window offset.
+- Draw the overlay cursor in an ARGB override-redirect X11 window above the
+  GLX overlay (empty input shape, Xcursor images loaded with dlopen), as a
+  Wayland cursor subsurface was drawn below it; give the cursor subsurface a
+  transparent parent buffer for its position to latch.
+- Dispatch the private Wayland input queue from a thread every 4 ms instead
+  of on game presents only, and request overlay frames from it at up to 120
+  per second while the overlay is open, as the game may present a few times
+  per second.
+- Defer the Wine calls requested from that thread to the next Wine thread
+  dispatching the bridge: threads Wine didn't create crash calling into it.
+
+diff --git a/lsteamclient/overlay_bridge/include/steam_overlay_bridge.h b/lsteamclient/overlay_bridge/include/steam_overlay_bridge.h
+index 19b0a21..a096b39 100644
+--- a/lsteamclient/overlay_bridge/include/steam_overlay_bridge.h
++++ b/lsteamclient/overlay_bridge/include/steam_overlay_bridge.h
+@@ -72,6 +72,11 @@ GE_OVERLAY_API void ge_overlay_wayland_surface_dispatch(struct ge_overlay_waylan
+ void ge_overlay_wayland_set_cursor_shape(uint32_t shape);
+ void ge_overlay_wayland_set_cursor_position(int32_t x, int32_t y);
+ void ge_overlay_wayland_set_overlay_active(int active);
++void ge_overlay_wayland_set_x11_cursor(int in_use);
++/* Set on bridge threads Wine didn't create: they can't call into Wine. */
++extern __thread int ge_overlay_bridge_foreign_thread;
++void ge_overlay_bridge_apply_deferred(void);
++void ge_overlay_bridge_tick_opengl(void);
+ 
+ GE_OVERLAY_API void ge_overlay_external_wayland_attach(
+     struct wl_display *display, int32_t x, int32_t y,
+diff --git a/lsteamclient/overlay_bridge/src/steam_overlay_bridge.c b/lsteamclient/overlay_bridge/src/steam_overlay_bridge.c
+index f8508b1..18a37db 100644
+--- a/lsteamclient/overlay_bridge/src/steam_overlay_bridge.c
++++ b/lsteamclient/overlay_bridge/src/steam_overlay_bridge.c
+@@ -25,6 +25,7 @@
+ #include <X11/cursorfont.h>
+ #include <X11/extensions/Xfixes.h>
+ #include <X11/extensions/Xrandr.h>
++#include <X11/Xcursor/Xcursor.h>
+ #include <X11/extensions/shape.h>
+ #include <X11/Xlib.h>
+ #include <X11/Xutil.h>
+@@ -228,6 +229,10 @@ static double pointer_scale_y = 1.0;
+  * scale), see ge_overlay_external_wayland_map_rect(). */
+ static double overlay_pointer_ratio_x = 1.0;
+ static double overlay_pointer_ratio_y = 1.0;
++/* Position of the GLX overlay window in the game's toplevel surface, which
++ * gets the pointer (Wine's client surfaces have an empty input region). */
++static int overlay_surface_offset_x;
++static int overlay_surface_offset_y;
+ static struct overlay_cursor_entry overlay_cursor_map[GE_CURSOR_MAP_SIZE];
+ static uint32_t overlay_cursor_shape = GE_STEAM_OVERLAY_CURSOR_DEFAULT;
+ static int overlay_cursor_dirty;
+@@ -283,14 +288,37 @@ static void load_wine_cursor_api(void)
+     if (!wine_reapply_cursor && !wine_suppress_cursor) dlclose(module);
+ }
+ 
++__thread int ge_overlay_bridge_foreign_thread;
++
++/* Wine calls requested on a foreign thread, run by the next Wine thread that
++ * dispatches the bridge (-1: nothing pending). */
++static pthread_mutex_t deferred_mutex = PTHREAD_MUTEX_INITIALIZER;
++static int deferred_event_active = -1;
++static int deferred_cursor_suppress = -1;
++static int deferred_cursor_reapply;
++
+ static void suppress_wine_game_cursor(int suppress)
+ {
++    if (ge_overlay_bridge_foreign_thread)
++    {
++        pthread_mutex_lock(&deferred_mutex);
++        deferred_cursor_suppress = suppress;
++        pthread_mutex_unlock(&deferred_mutex);
++        return;
++    }
+     pthread_once(&wine_cursor_api_once, load_wine_cursor_api);
+     if (wine_suppress_cursor) wine_suppress_cursor(suppress);
+ }
+ 
+ static void reapply_wine_game_cursor(void)
+ {
++    if (ge_overlay_bridge_foreign_thread)
++    {
++        pthread_mutex_lock(&deferred_mutex);
++        deferred_cursor_reapply = 1;
++        pthread_mutex_unlock(&deferred_mutex);
++        return;
++    }
+     pthread_once(&wine_cursor_api_once, load_wine_cursor_api);
+     if (!wine_reapply_cursor) return;
+ 
+@@ -388,6 +416,14 @@ static void set_overlay_event_active(int active)
+ {
+     int64_t timeout = 0;
+ 
++    if (ge_overlay_bridge_foreign_thread)
++    {
++        pthread_mutex_lock(&deferred_mutex);
++        deferred_event_active = active;
++        pthread_mutex_unlock(&deferred_mutex);
++        return;
++    }
++
+     pthread_mutex_lock(&overlay_event_mutex);
+     if (!create_overlay_event_locked())
+     {
+@@ -415,6 +451,25 @@ static void set_overlay_event_active(int active)
+     pthread_mutex_unlock(&overlay_event_mutex);
+ }
+ 
++void ge_overlay_bridge_apply_deferred(void)
++{
++    int event_active, cursor_suppress, cursor_reapply;
++
++    if (ge_overlay_bridge_foreign_thread) return;
++
++    pthread_mutex_lock(&deferred_mutex);
++    event_active = deferred_event_active;
++    cursor_suppress = deferred_cursor_suppress;
++    cursor_reapply = deferred_cursor_reapply;
++    deferred_event_active = deferred_cursor_suppress = -1;
++    deferred_cursor_reapply = 0;
++    pthread_mutex_unlock(&deferred_mutex);
++
++    if (event_active != -1) set_overlay_event_active(event_active);
++    if (cursor_suppress != -1) suppress_wine_game_cursor(cursor_suppress);
++    if (cursor_reapply) reapply_wine_game_cursor();
++}
++
+ static void destroy_overlay_event(void)
+ {
+     pthread_mutex_lock(&overlay_event_mutex);
+@@ -577,6 +632,9 @@ int ge_overlay_external_wayland_map_rect(int32_t monitor_x, int32_t monitor_y,
+     pthread_mutex_lock(&overlay_mutex);
+     overlay_pointer_ratio_x = ratio_x;
+     overlay_pointer_ratio_y = ratio_y;
++    /* A fullscreen toplevel starts at the origin of its output. */
++    overlay_surface_offset_x = *x - output.x;
++    overlay_surface_offset_y = *y - output.y;
+     pthread_mutex_unlock(&overlay_mutex);
+     return 1;
+ }
+@@ -899,6 +957,31 @@ void ge_overlay_bridge_present_opengl(int32_t x, int32_t y,
+     pthread_mutex_unlock(&overlay_glx_mutex);
+ }
+ 
++/* The GLX presenter drew a frame when the game presented, so the open overlay
++ * (a dragged window, a hover highlight) followed at the game's frame rate,
++ * which is low in menus that redraw rarely. Let the bridge's own input thread
++ * request frames too while the overlay is open, at most 120 per second. */
++void ge_overlay_bridge_tick_opengl(void)
++{
++    static uint64_t last_tick;
++    uint64_t now = monotonic_msec();
++    int active;
++
++    pthread_mutex_lock(&overlay_mutex);
++    active = overlay_active && overlay_opengl_requested;
++    pthread_mutex_unlock(&overlay_mutex);
++    if (!active || now - last_tick < 8) return;
++    last_tick = now;
++
++    pthread_mutex_lock(&overlay_glx_mutex);
++    if (overlay_glx_thread_running)
++    {
++        ++overlay_glx_frame;
++        pthread_cond_signal(&overlay_glx_cond);
++    }
++    pthread_mutex_unlock(&overlay_glx_mutex);
++}
++
+ static int resolve_overlay_renderer_hook(void)
+ {
+     Dl_info info;
+@@ -1326,6 +1409,205 @@ static int overlay_x11_after_request(Display *display)
+     return 0;
+ }
+ 
++/* Offset of the GLX overlay window in the game's toplevel surface. */
++static int overlay_offset_x(void)
++{
++    return overlay_opengl_requested ? overlay_surface_offset_x : 0;
++}
++
++static int overlay_offset_y(void)
++{
++    return overlay_opengl_requested ? overlay_surface_offset_y : 0;
++}
++
++/* Root coordinates of a position in the GLX overlay window. */
++static int overlay_root_x(int x)
++{
++    return overlay_opengl_requested ? overlay_glx_requested_x + x : x;
++}
++
++static int overlay_root_y(int y)
++{
++    return overlay_opengl_requested ? overlay_glx_requested_y + y : y;
++}
++
++/* The GLX overlay is an X11 window above the native Wayland game, and the
++ * Wayland cursor surface of the game can't be stacked above another client.
++ * Draw the cursor in a small X11 window raised above the overlay instead,
++ * which takes no input and isn't focused when it maps. */
++static Window overlay_cursor_window;
++static GC overlay_cursor_gc;
++static Visual *overlay_cursor_visual;
++static uint32_t overlay_cursor_window_shape = ~0u;
++static int overlay_cursor_hot_x, overlay_cursor_hot_y;
++static int overlay_cursor_window_mapped;
++static int overlay_cursor_window_failed;
++/* X11 doesn't keep the contents of an unmapped window: draw after mapping. */
++static XImage *overlay_cursor_image;
++
++static const char *x11_cursor_name(uint32_t shape)
++{
++    switch (shape)
++    {
++    case GE_STEAM_OVERLAY_CURSOR_POINTER: return "hand2";
++    case GE_STEAM_OVERLAY_CURSOR_TEXT: return "xterm";
++    case GE_STEAM_OVERLAY_CURSOR_WAIT: return "watch";
++    case GE_STEAM_OVERLAY_CURSOR_CROSSHAIR: return "crosshair";
++    case GE_STEAM_OVERLAY_CURSOR_ALL_RESIZE: return "fleur";
++    case GE_STEAM_OVERLAY_CURSOR_EW_RESIZE: return "sb_h_double_arrow";
++    case GE_STEAM_OVERLAY_CURSOR_NS_RESIZE: return "sb_v_double_arrow";
++    case GE_STEAM_OVERLAY_CURSOR_NWSE_RESIZE: return "size_fdiag";
++    case GE_STEAM_OVERLAY_CURSOR_NESW_RESIZE: return "size_bdiag";
++    case GE_STEAM_OVERLAY_CURSOR_NOT_ALLOWED: return "not-allowed";
++    case GE_STEAM_OVERLAY_CURSOR_HELP: return "question_arrow";
++    default: return "left_ptr";
++    }
++}
++
++static void (*destroy_x11_cursor_image)(XcursorImage *);
++
++static XcursorImage *load_x11_cursor_image(uint32_t shape)
++{
++    static XcursorImage *(*load_image)(const char *, const char *, int);
++    static int loaded;
++    const char *size_env = getenv("XCURSOR_SIZE");
++    const char *theme = getenv("XCURSOR_THEME");
++    XcursorImage *image;
++    int size = 24;
++
++    if (!loaded)
++    {
++        void *module = dlopen("libXcursor.so.1", RTLD_NOW | RTLD_LOCAL);
++
++        loaded = 1;
++        if (module)
++        {
++            load_image = (XcursorImage *(*)(const char *, const char *, int))dlsym(module, "XcursorLibraryLoadImage");
++            destroy_x11_cursor_image = (void (*)(XcursorImage *))dlsym(module, "XcursorImageDestroy");
++        }
++        if (!destroy_x11_cursor_image) load_image = NULL;
++        if (!load_image) overlay_trace("cannot load libXcursor, overlay cursor stays a Wayland surface\n");
++    }
++    if (!load_image) return NULL;
++    if (size_env && atoi(size_env) >= 8 && atoi(size_env) <= 256) size = atoi(size_env);
++    if (!(image = load_image(x11_cursor_name(shape), theme && *theme ? theme : NULL, size)))
++        image = load_image("left_ptr", theme && *theme ? theme : NULL, size);
++    return image;
++}
++
++/* overlay_display must be locked */
++static int create_overlay_cursor_window(void)
++{
++    XSetWindowAttributes attributes = {0};
++    XVisualInfo visual_info;
++    XserverRegion empty;
++    Atom window_type, dnd;
++    int screen = DefaultScreen(overlay_display);
++
++    if (overlay_cursor_window) return 1;
++    if (overlay_cursor_window_failed) return 0;
++    if (!XMatchVisualInfo(overlay_display, screen, 32, TrueColor, &visual_info))
++    {
++        overlay_cursor_window_failed = 1;
++        return 0;
++    }
++
++    overlay_cursor_visual = visual_info.visual;
++    attributes.override_redirect = True;
++    attributes.colormap = XCreateColormap(overlay_display, overlay_root, visual_info.visual, AllocNone);
++    attributes.border_pixel = 0;
++    attributes.background_pixel = 0;
++    overlay_cursor_window = XCreateWindow(overlay_display, overlay_root, -64, -64, 1, 1, 0, 32,
++                                          InputOutput, visual_info.visual,
++                                          CWOverrideRedirect | CWColormap | CWBorderPixel | CWBackPixel,
++                                          &attributes);
++    if (!overlay_cursor_window)
++    {
++        overlay_cursor_window_failed = 1;
++        return 0;
++    }
++
++    /* wlroots doesn't focus override-redirect DND windows when they map */
++    window_type = XInternAtom(overlay_display, "_NET_WM_WINDOW_TYPE", False);
++    dnd = XInternAtom(overlay_display, "_NET_WM_WINDOW_TYPE_DND", False);
++    XChangeProperty(overlay_display, overlay_cursor_window, window_type, XA_ATOM, 32,
++                    PropModeReplace, (unsigned char *)&dnd, 1);
++    if ((empty = XFixesCreateRegion(overlay_display, NULL, 0)))
++    {
++        XFixesSetWindowShapeRegion(overlay_display, overlay_cursor_window, ShapeInput, 0, 0, empty);
++        XFixesDestroyRegion(overlay_display, empty);
++    }
++    overlay_cursor_gc = XCreateGC(overlay_display, overlay_cursor_window, 0, NULL);
++    overlay_trace("created X11 overlay cursor window %#lx\n", overlay_cursor_window);
++    return 1;
++}
++
++/* overlay_display must be locked */
++static void set_overlay_cursor_window_shape(uint32_t shape)
++{
++    XcursorImage *cursor;
++    XImage *image;
++    char *data;
++
++    if (shape == overlay_cursor_window_shape) return;
++    if (!(cursor = load_x11_cursor_image(shape))) return;
++
++    if ((data = malloc(cursor->width * cursor->height * 4)))
++    {
++        memcpy(data, cursor->pixels, cursor->width * cursor->height * 4);
++        if ((image = XCreateImage(overlay_display, overlay_cursor_visual, 32, ZPixmap, 0, data,
++                                  cursor->width, cursor->height, 32, 0)))
++        {
++            XResizeWindow(overlay_display, overlay_cursor_window, cursor->width, cursor->height);
++            if (overlay_cursor_image) XDestroyImage(overlay_cursor_image);
++            overlay_cursor_image = image;
++            overlay_cursor_hot_x = (int)cursor->xhot;
++            overlay_cursor_hot_y = (int)cursor->yhot;
++            overlay_cursor_window_shape = shape;
++        }
++        else free(data);
++    }
++    destroy_x11_cursor_image(cursor);
++}
++
++/* Move, show or hide the X11 overlay cursor, at a root position. */
++static void update_overlay_cursor_window(int active, int x, int y, uint32_t shape)
++{
++    if (!overlay_display) return;
++
++    XLockDisplay(overlay_display);
++    if (!active)
++    {
++        if (overlay_cursor_window && overlay_cursor_window_mapped)
++        {
++            XUnmapWindow(overlay_display, overlay_cursor_window);
++            overlay_cursor_window_mapped = 0;
++            XFlush(overlay_display);
++        }
++        XUnlockDisplay(overlay_display);
++        return;
++    }
++    if (!create_overlay_cursor_window())
++    {
++        XUnlockDisplay(overlay_display);
++        ge_overlay_wayland_set_x11_cursor(0);
++        return;
++    }
++    set_overlay_cursor_window_shape(shape);
++    XMoveWindow(overlay_display, overlay_cursor_window, x - overlay_cursor_hot_x, y - overlay_cursor_hot_y);
++    if (!overlay_cursor_window_mapped)
++    {
++        XMapWindow(overlay_display, overlay_cursor_window);
++        overlay_cursor_window_mapped = 1;
++    }
++    XRaiseWindow(overlay_display, overlay_cursor_window);
++    if (overlay_cursor_image)
++        XPutImage(overlay_display, overlay_cursor_window, overlay_cursor_gc, overlay_cursor_image,
++                  0, 0, 0, 0, overlay_cursor_image->width, overlay_cursor_image->height);
++    XFlush(overlay_display);
++    XUnlockDisplay(overlay_display);
++}
++
+ static void apply_overlay_cursor(int force)
+ {
+     uint32_t shape;
+@@ -1340,6 +1622,8 @@ static void apply_overlay_cursor(int force)
+     if (dirty || force)
+     {
+         overlay_trace("applying overlay cursor shape %u\n", shape);
++        if (overlay_opengl_requested && overlay_active)
++            update_overlay_cursor_window(1, overlay_root_x(pointer_x), overlay_root_y(pointer_y), shape);
+         ge_overlay_wayland_set_cursor_shape(shape);
+     }
+ }
+@@ -1368,6 +1652,12 @@ static int update_overlay_active(void)
+             suppress_wine_game_cursor(1);
+             bridge_set_cursor_shape(GE_STEAM_OVERLAY_CURSOR_DEFAULT);
+         }
++        if (overlay_opengl_requested)
++        {
++            ge_overlay_wayland_set_x11_cursor(active);
++            update_overlay_cursor_window(active, overlay_root_x(pointer_x), overlay_root_y(pointer_y),
++                                         GE_STEAM_OVERLAY_CURSOR_DEFAULT);
++        }
+         ge_overlay_wayland_set_overlay_active(active);
+         if (!active)
+         {
+@@ -1897,6 +2187,7 @@ static unsigned int button_to_xbutton(uint32_t button)
+     }
+ }
+ 
++
+ static unsigned int button_to_mask(unsigned int button)
+ {
+     switch (button)
+@@ -1927,8 +2218,8 @@ static int dispatch_button(uint32_t time, unsigned int button, int pressed)
+     event.xbutton.time = time;
+     event.xbutton.x = pointer_x;
+     event.xbutton.y = pointer_y;
+-    event.xbutton.x_root = pointer_x;
+-    event.xbutton.y_root = pointer_y;
++    event.xbutton.x_root = overlay_root_x(pointer_x);
++    event.xbutton.y_root = overlay_root_y(pointer_y);
+     event.xbutton.state = overlay_state;
+     event.xbutton.button = button;
+     event.xbutton.same_screen = True;
+@@ -1991,8 +2282,8 @@ int ge_overlay_bridge_filter_key(uint32_t time, uint32_t key, int pressed,
+     event.xkey.time = time;
+     event.xkey.x = pointer_x;
+     event.xkey.y = pointer_y;
+-    event.xkey.x_root = pointer_x;
+-    event.xkey.y_root = pointer_y;
++    event.xkey.x_root = overlay_root_x(pointer_x);
++    event.xkey.y_root = overlay_root_y(pointer_y);
+     event.xkey.state = overlay_state;
+     event.xkey.keycode = key + 8;
+     event.xkey.same_screen = True;
+@@ -2048,8 +2339,8 @@ int ge_overlay_bridge_filter_pointer_frame(
+         pointer_surface_y = frame->y;
+         pointer_scale_x = scale_x;
+         pointer_scale_y = scale_y;
+-        pointer_x = (int)round(pointer_surface_x * pointer_scale_x);
+-        pointer_y = (int)round(pointer_surface_y * pointer_scale_y);
++        pointer_x = (int)round(pointer_surface_x * pointer_scale_x) - overlay_offset_x();
++        pointer_y = (int)round(pointer_surface_y * pointer_scale_y) - overlay_offset_y();
+         pthread_mutex_unlock(&overlay_mutex);
+     }
+     else if (frame->flags & GE_STEAM_OVERLAY_FRAME_RELATIVE)
+@@ -2059,19 +2350,31 @@ int ge_overlay_bridge_filter_pointer_frame(
+         {
+             pointer_scale_x = scale_x;
+             pointer_scale_y = scale_y;
+-            pointer_x = (int)round(pointer_surface_x * pointer_scale_x);
+-            pointer_y = (int)round(pointer_surface_y * pointer_scale_y);
++            pointer_x = (int)round(pointer_surface_x * pointer_scale_x) - overlay_offset_x();
++            pointer_y = (int)round(pointer_surface_y * pointer_scale_y) - overlay_offset_y();
+         }
+         pointer_surface_x += frame->dx;
+         pointer_surface_y += frame->dy;
+         pointer_x += (int)round(frame->dx * pointer_scale_x);
+         pointer_y += (int)round(frame->dy * pointer_scale_y);
+-        pointer_x = fmax(0, fmin(pointer_x,
+-            DisplayWidth(overlay_display, DefaultScreen(overlay_display)) - 1));
+-        pointer_y = fmax(0, fmin(pointer_y,
+-            DisplayHeight(overlay_display, DefaultScreen(overlay_display)) - 1));
+-        pointer_surface_x = pointer_x / pointer_scale_x;
+-        pointer_surface_y = pointer_y / pointer_scale_y;
++        /* The position is relative to the overlay: keep a locked pointer in
++         * the GLX overlay window rather than in the whole X11 screen, or it
++         * drifts past the game and clicks miss the overlay. */
++        if (overlay_opengl_requested && overlay_glx_requested_width > 1 &&
++            overlay_glx_requested_height > 1)
++        {
++            pointer_x = fmax(0, fmin(pointer_x, overlay_glx_requested_width - 1));
++            pointer_y = fmax(0, fmin(pointer_y, overlay_glx_requested_height - 1));
++        }
++        else
++        {
++            pointer_x = fmax(0, fmin(pointer_x,
++                DisplayWidth(overlay_display, DefaultScreen(overlay_display)) - 1));
++            pointer_y = fmax(0, fmin(pointer_y,
++                DisplayHeight(overlay_display, DefaultScreen(overlay_display)) - 1));
++        }
++        pointer_surface_x = (pointer_x + overlay_offset_x()) / pointer_scale_x;
++        pointer_surface_y = (pointer_y + overlay_offset_y()) / pointer_scale_y;
+         pthread_mutex_unlock(&overlay_mutex);
+     }
+ 
+@@ -2085,8 +2388,8 @@ int ge_overlay_bridge_filter_pointer_frame(
+         event.xmotion.time = frame->time;
+         event.xmotion.x = pointer_x;
+         event.xmotion.y = pointer_y;
+-        event.xmotion.x_root = pointer_x;
+-        event.xmotion.y_root = pointer_y;
++        event.xmotion.x_root = overlay_root_x(pointer_x);
++        event.xmotion.y_root = overlay_root_y(pointer_y);
+         event.xmotion.state = overlay_state;
+         event.xmotion.is_hint = NotifyNormal;
+         event.xmotion.same_screen = True;
+@@ -2095,6 +2398,15 @@ int ge_overlay_bridge_filter_pointer_frame(
+         pthread_mutex_unlock(&overlay_mutex);
+         consumed = dispatch_overlay_event(&event);
+         ge_overlay_wayland_set_cursor_position(motion_x, motion_y);
++        if (overlay_opengl_requested && overlay_active)
++        {
++            uint32_t shape;
++
++            pthread_mutex_lock(&cursor_mutex);
++            shape = overlay_cursor_shape;
++            pthread_mutex_unlock(&cursor_mutex);
++            update_overlay_cursor_window(1, overlay_root_x(pointer_x), overlay_root_y(pointer_y), shape);
++        }
+     }
+ 
+     if (frame->flags & GE_STEAM_OVERLAY_FRAME_DISCRETE_WHEEL)
+diff --git a/lsteamclient/overlay_bridge/src/wayland_input.c b/lsteamclient/overlay_bridge/src/wayland_input.c
+index 3400dc5..b9217f7 100644
+--- a/lsteamclient/overlay_bridge/src/wayland_input.c
++++ b/lsteamclient/overlay_bridge/src/wayland_input.c
+@@ -5,6 +5,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/mman.h>
++#include <time.h>
+ #include <unistd.h>
+ 
+ #include <wayland-client.h>
+@@ -39,6 +40,11 @@ struct ge_overlay_wayland_surface
+     struct wl_cursor_theme *cursor_theme;
+     struct wl_surface *overlay_cursor_surface;
+     struct wl_subsurface *overlay_cursor_subsurface;
++    /* Parent of the cursor surface, owned by the bridge: committing it
++     * applies the cursor position without waiting for the game surface. */
++    struct wl_surface *overlay_cursor_root_surface;
++    struct wl_subsurface *overlay_cursor_root_subsurface;
++    struct wl_buffer *overlay_cursor_root_buffer;
+     struct xkb_context *xkb_context;
+     struct xkb_keymap *xkb_keymap;
+     struct xkb_state *xkb_state;
+@@ -71,6 +77,8 @@ struct ge_overlay_wayland_surface
+ };
+ 
+ static pthread_mutex_t input_surface_mutex = PTHREAD_MUTEX_INITIALIZER;
++/* The GLX overlay draws the cursor in an X11 window above it. */
++static int x11_cursor_in_use;
+ static struct ge_overlay_wayland_surface *process_input_surface;
+ static pthread_mutex_t external_surface_mutex = PTHREAD_MUTEX_INITIALIZER;
+ static struct ge_overlay_wayland_surface *external_input_surface;
+@@ -176,6 +184,57 @@ static void destroy_overlay_cursor(struct ge_overlay_wayland_surface *surface)
+         wl_surface_destroy(surface->overlay_cursor_surface);
+         surface->overlay_cursor_surface = NULL;
+     }
++    if (surface->overlay_cursor_root_subsurface)
++    {
++        wl_subsurface_destroy(surface->overlay_cursor_root_subsurface);
++        surface->overlay_cursor_root_subsurface = NULL;
++    }
++    if (surface->overlay_cursor_root_surface)
++    {
++        wl_surface_destroy(surface->overlay_cursor_root_surface);
++        surface->overlay_cursor_root_surface = NULL;
++    }
++    if (surface->overlay_cursor_root_buffer)
++    {
++        wl_buffer_destroy(surface->overlay_cursor_root_buffer);
++        surface->overlay_cursor_root_buffer = NULL;
++    }
++}
++
++/* A 1x1 transparent buffer, to map the cursor's parent surface. */
++static struct wl_buffer *create_transparent_buffer(struct ge_overlay_wayland_surface *surface)
++{
++    struct wl_shm_pool *pool;
++    struct wl_buffer *buffer;
++    int fd;
++
++    if (!surface->shm) return NULL;
++    if ((fd = memfd_create("ge-overlay-cursor-root", MFD_CLOEXEC)) < 0) return NULL;
++    if (ftruncate(fd, 4) < 0)
++    {
++        close(fd);
++        return NULL;
++    }
++    pool = wl_shm_create_pool(surface->shm, fd, 4);
++    close(fd);
++    if (!pool) return NULL;
++    buffer = wl_shm_pool_create_buffer(pool, 0, 1, 1, 4, WL_SHM_FORMAT_ARGB8888);
++    wl_shm_pool_destroy(pool);
++    if (buffer) wl_proxy_set_queue((struct wl_proxy *)buffer, surface->queue);
++    return buffer;
++}
++
++/* The cursor position is double-buffered state of its parent. Committing the
++ * game's surface is not ours to do, and wlroots compositors (labwc, sway)
++ * only apply it with that commit, which a game that rarely presents doesn't
++ * send: the overlay cursor stayed where it was created. */
++static void commit_overlay_cursor_position(struct ge_overlay_wayland_surface *surface)
++{
++    /* Smithay compositors (niri, COSMIC) latch it with the subsurface's own
++     * commit, committing the unchanged cursor surface works for both. */
++    wl_surface_commit(surface->overlay_cursor_surface);
++    if (surface->overlay_cursor_root_surface)
++        wl_surface_commit(surface->overlay_cursor_root_surface);
+ }
+ 
+ static void fractional_scale_preferred(
+@@ -244,22 +303,54 @@ static int ensure_overlay_cursor(struct ge_overlay_wayland_surface *surface)
+         }
+     }
+ 
+-    surface->overlay_cursor_subsurface = wl_subcompositor_get_subsurface(
+-        surface->subcompositor, surface->overlay_cursor_surface,
++    surface->overlay_cursor_root_surface =
++        wl_compositor_create_surface(surface->compositor);
++    surface->overlay_cursor_root_buffer = create_transparent_buffer(surface);
++    if (!surface->overlay_cursor_root_surface || !surface->overlay_cursor_root_buffer)
++    {
++        destroy_overlay_cursor(surface);
++        return 0;
++    }
++    wl_proxy_set_queue((struct wl_proxy *)surface->overlay_cursor_root_surface,
++                       surface->queue);
++    surface->overlay_cursor_root_subsurface = wl_subcompositor_get_subsurface(
++        surface->subcompositor, surface->overlay_cursor_root_surface,
+         surface->target_surface ? surface->target_surface :
+                                   surface->pointer_surface);
+-    if (!surface->overlay_cursor_subsurface)
++    if (!surface->overlay_cursor_root_subsurface)
+     {
+         destroy_overlay_cursor(surface);
+         return 0;
+     }
+-    wl_proxy_set_queue((struct wl_proxy *)surface->overlay_cursor_subsurface,
++    wl_proxy_set_queue((struct wl_proxy *)surface->overlay_cursor_root_subsurface,
+                        surface->queue);
+-    wl_subsurface_set_desync(surface->overlay_cursor_subsurface);
++    wl_subsurface_set_desync(surface->overlay_cursor_root_subsurface);
+     wl_subsurface_place_above(
+-        surface->overlay_cursor_subsurface,
++        surface->overlay_cursor_root_subsurface,
+         surface->target_surface ? surface->target_surface :
+                                   surface->pointer_surface);
++    if ((empty_region = wl_compositor_create_region(surface->compositor)))
++    {
++        wl_surface_set_input_region(surface->overlay_cursor_root_surface,
++                                    empty_region);
++        wl_region_destroy(empty_region);
++    }
++    wl_surface_attach(surface->overlay_cursor_root_surface,
++                      surface->overlay_cursor_root_buffer, 0, 0);
++    wl_surface_damage(surface->overlay_cursor_root_surface, 0, 0, 1, 1);
++
++    surface->overlay_cursor_subsurface = wl_subcompositor_get_subsurface(
++        surface->subcompositor, surface->overlay_cursor_surface,
++        surface->overlay_cursor_root_surface);
++    if (!surface->overlay_cursor_subsurface)
++    {
++        destroy_overlay_cursor(surface);
++        return 0;
++    }
++    wl_proxy_set_queue((struct wl_proxy *)surface->overlay_cursor_subsurface,
++                       surface->queue);
++    wl_subsurface_set_desync(surface->overlay_cursor_subsurface);
++    wl_surface_commit(surface->overlay_cursor_root_surface);
+ 
+     /* The visual cursor must never become a pointer-focus target itself. */
+     if ((empty_region = wl_compositor_create_region(surface->compositor)))
+@@ -282,9 +373,16 @@ static void apply_overlay_cursor_shape(
+ {
+     struct wl_cursor_image *image;
+ 
+-    if (!ensure_overlay_cursor(surface) ||
+-        !(image = get_cursor_image(surface, shape)))
++    if (!ensure_overlay_cursor(surface)) return;
++    if (x11_cursor_in_use)
++    {
++        /* keep the surface, it hides Wine's cursor, but show nothing */
++        wl_surface_attach(surface->overlay_cursor_surface, NULL, 0, 0);
++        commit_overlay_cursor_position(surface);
++        wl_display_flush(surface->display);
+         return;
++    }
++    if (!(image = get_cursor_image(surface, shape))) return;
+ 
+     surface->cursor_hotspot_x = (int)image->hotspot_x;
+     surface->cursor_hotspot_y = (int)image->hotspot_y;
+@@ -296,10 +394,17 @@ static void apply_overlay_cursor_shape(
+                       wl_cursor_image_get_buffer(image), 0, 0);
+     wl_surface_damage(surface->overlay_cursor_surface, 0, 0,
+                       (int32_t)image->width, (int32_t)image->height);
+-    wl_surface_commit(surface->overlay_cursor_surface);
++    commit_overlay_cursor_position(surface);
+     wl_display_flush(surface->display);
+ }
+ 
++void ge_overlay_wayland_set_x11_cursor(int in_use)
++{
++    pthread_mutex_lock(&focused_pointer_mutex);
++    x11_cursor_in_use = !!in_use;
++    pthread_mutex_unlock(&focused_pointer_mutex);
++}
++
+ void ge_overlay_wayland_set_cursor_shape(uint32_t shape)
+ {
+     if (shape > GE_STEAM_OVERLAY_CURSOR_HELP)
+@@ -325,11 +430,7 @@ void ge_overlay_wayland_set_cursor_position(int32_t x, int32_t y)
+                 focused_pointer->overlay_cursor_subsurface,
+                 x - focused_pointer->cursor_hotspot_x,
+                 y - focused_pointer->cursor_hotspot_y);
+-            /* The protocol applies the position on the parent's next commit,
+-             * but Smithay compositors (niri, COSMIC) latch it with the
+-             * subsurface's own commit. Committing the unchanged cursor
+-             * surface works for both. */
+-            wl_surface_commit(focused_pointer->overlay_cursor_surface);
++            commit_overlay_cursor_position(focused_pointer);
+             wl_display_flush(focused_pointer->display);
+         }
+     }
+@@ -1112,6 +1213,7 @@ void ge_overlay_wayland_surface_dispatch(struct ge_overlay_wayland_surface *surf
+     if (wl_display_dispatch_queue_pending(surface->display, surface->queue) < 0)
+         overlay_trace("failed to dispatch private Wayland input queue");
+     ge_overlay_bridge_pump();
++    ge_overlay_bridge_apply_deferred();
+ }
+ 
+ void ge_overlay_wayland_surface_destroy(struct ge_overlay_wayland_surface *surface)
+@@ -1151,6 +1253,30 @@ void ge_overlay_wayland_surface_destroy(struct ge_overlay_wayland_surface *surfa
+     free(surface);
+ }
+ 
++/* Wine's event thread reads the connection and queues the bridge's events,
++ * but they were only dispatched when the game presented: a game that redraws
++ * its menu rarely made the overlay cursor and input lag. Dispatch them on a
++ * timer as well. */
++static void *external_dispatch_thread(void *arg)
++{
++    struct timespec interval = {0, 4 * 1000 * 1000};
++
++    (void)arg;
++    ge_overlay_bridge_foreign_thread = 1;
++    for (;;)
++    {
++        pthread_mutex_lock(&external_surface_mutex);
++        if (external_input_surface)
++        {
++            ge_overlay_wayland_surface_dispatch(external_input_surface);
++            ge_overlay_bridge_tick_opengl();
++        }
++        pthread_mutex_unlock(&external_surface_mutex);
++        nanosleep(&interval, NULL);
++    }
++    return NULL;
++}
++
+ void ge_overlay_external_wayland_attach(struct wl_display *display,
+                                         int32_t x, int32_t y,
+                                         uint32_t width, uint32_t height)
+@@ -1162,7 +1288,13 @@ void ge_overlay_external_wayland_attach(struct wl_display *display,
+         external_input_surface =
+             ge_overlay_wayland_surface_create(display, NULL);
+         if (external_input_surface)
++        {
++            pthread_t thread;
++
+             overlay_trace("attached external Wayland input bridge");
++            if (!pthread_create(&thread, NULL, external_dispatch_thread, NULL))
++                pthread_detach(thread);
++        }
+     }
+     pthread_mutex_unlock(&external_surface_mutex);
+ }

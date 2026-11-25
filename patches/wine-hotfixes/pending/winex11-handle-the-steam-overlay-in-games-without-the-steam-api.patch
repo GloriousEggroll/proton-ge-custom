@@ -1,0 +1,371 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Wed, 25 Nov 2026 17:50:28 -0500
+Subject: [PATCH] winex11: Handle the Steam overlay in games without the
+ Steam API.
+
+lsteamclient signals __wine_steamclient_GameOverlayActivated from the
+GameOverlayActivated callback, which games that don't use the Steam API
+(e.g. Star Wars Galactic Battlegrounds) never receive. winex11 then kept the
+game's ClipCursor pointer grab and passed the input to the game, so the
+overlay could not be used.
+
+Steam's gameoverlayrenderer interposes XCheckIfEvent and swallows the input
+events while the overlay is open (its IsOverlayEnabled export only tells
+whether the overlay loaded). Probe it every 50 ms with a motion event at the
+pointer position, and while the overlay is open:
+
+- signal the overlay event, unless lsteamclient already did, so that the
+  game input is discarded as for games using the Steam API;
+- release the cursor clipping, and restore it when the overlay closes;
+- move the clip window over the whole window: Steam tracks the game's
+  pointer grab window and maps the hover position relative to it;
+- read the input events from a helper thread, so that Steam gets them while
+  the game only processes its messages a few times per second;
+- set __wine_x11_steam_overlay_present, which wined3d uses to keep the
+  overlay drawn.
+
+WINE_X11_STEAM_OVERLAY_STATE=0 disables this.
+
+diff --git a/dlls/winex11.drv/event.c b/dlls/winex11.drv/event.c
+index b3a1b19..8edd4d9 100644
+--- a/dlls/winex11.drv/event.c
++++ b/dlls/winex11.drv/event.c
+@@ -530,6 +530,13 @@ BOOL X11DRV_ProcessEvents( DWORD mask )
+ 
+     if (!data) return FALSE;
+     if (data->current_event) mask = 0;  /* don't process nested events */
++    else
++    {
++        /* this may signal the overlay for games without the Steam API */
++        update_steam_overlay_state();
++        if (NtWaitForSingleObject(steam_overlay_event, FALSE, &timeout) == WAIT_OBJECT_0)
++            overlay_enabled = TRUE;
++    }
+ 
+     prev_event.type = 0;
+     for (;;)
+diff --git a/dlls/winex11.drv/mouse.c b/dlls/winex11.drv/mouse.c
+index 75e0b07..44796bc 100644
+--- a/dlls/winex11.drv/mouse.c
++++ b/dlls/winex11.drv/mouse.c
+@@ -27,6 +27,7 @@
+ 
+ #include <math.h>
+ #include <dlfcn.h>
++#include <unistd.h>
+ #include <X11/Xlib.h>
+ #include <X11/cursorfont.h>
+ #include <stdarg.h>
+@@ -469,6 +470,13 @@ static BOOL grab_clipping_window( const RECT *clip )
+     if (NtUserGetWindowThread( NtUserGetDesktopWindow(), NULL ) == GetCurrentThreadId()) return TRUE;
+     /* don't clip the cursor if the X input focus is on another process window */
+     if (!is_current_process_focused()) return TRUE;
++    /* the Steam overlay needs the pointer while it is open, clip again when it closes */
++    if (steam_overlay_is_open())
++    {
++        TRACE( "Steam overlay is open, not clipping to %s\n", wine_dbgstr_rect(clip) );
++        if (data) data->steam_overlay_unclipped = TRUE;
++        return FALSE;
++    }
+ 
+     if (!data) return FALSE;
+     if (!(clip_window = init_clip_window())) return TRUE;
+@@ -551,6 +559,276 @@ void ungrab_clipping_window(void)
+     x11drv_xinput2_disable( data->display, DefaultRootWindow( data->display ) );
+ }
+ 
++/* Games without the Steam API never receive GameOverlayActivated, so lsteamclient
++ * never signals the overlay. Steam's overlay renderer interposes XCheckIfEvent and
++ * swallows input events while the overlay is open, so probe it with a motion event
++ * at the current pointer position, as the Wayland overlay bridge does. */
++static int (*p_XPutBackEvent_internal)( Display *display, XEvent *event );
++static pthread_once_t steam_overlay_once = PTHREAD_ONCE_INIT;
++static BOOL steam_overlay_hooked, steam_overlay_open, steam_overlay_set_event;
++static HANDLE steam_overlay_present_event;
++static UINT steam_overlay_last_probe;
++static pthread_mutex_t steam_overlay_mutex = PTHREAD_MUTEX_INITIALIZER;
++
++struct steam_overlay_probe
++{
++    Window window;
++    unsigned long serial;
++    int x, y;
++};
++
++static void init_steam_overlay_state(void)
++{
++    const char *env = getenv( "WINE_X11_STEAM_OVERLAY_STATE" );
++    void *func;
++    Dl_info info;
++
++    if (env && !atoi( env )) return;
++    if (!(func = dlsym( RTLD_DEFAULT, "XCheckIfEvent" ))) return;
++    if (!dladdr( func, &info ) || !info.dli_fname || !strstr( info.dli_fname, "gameoverlayrenderer" )) return;
++    if (!(p_XPutBackEvent_internal = dlsym( RTLD_DEFAULT, "_XPutBackEvent" ))) return;
++    TRACE( "XCheckIfEvent is interposed by %s\n", info.dli_fname );
++    steam_overlay_hooked = TRUE;
++
++    /* tells wined3d to present again while the overlay is open, Steam draws it
++     * in the X11 present hooks; the Wayland overlay bridge draws on its own */
++    {
++        OBJECT_ATTRIBUTES attr;
++        UNICODE_STRING str;
++        WCHAR buffer[MAX_PATH];
++        char path[MAX_PATH];
++        int len = snprintf( path, sizeof(path), "\\Sessions\\%u\\BaseNamedObjects\\__wine_x11_steam_overlay_present",
++                            (int)NtCurrentTeb()->Peb->SessionId );
++
++        ascii_to_unicode( buffer, path, len + 1 );
++        str.Buffer = buffer;
++        str.Length = len * sizeof(WCHAR);
++        str.MaximumLength = (len + 1) * sizeof(WCHAR);
++        InitializeObjectAttributes( &attr, &str, OBJ_CASE_INSENSITIVE | OBJ_OPENIF, 0, NULL );
++        NtCreateEvent( &steam_overlay_present_event, EVENT_ALL_ACCESS, &attr, NotificationEvent, FALSE );
++    }
++}
++
++static Bool match_steam_overlay_probe( Display *display, XEvent *event, XPointer arg )
++{
++    const struct steam_overlay_probe *probe = (const struct steam_overlay_probe *)arg;
++
++    return event->type == MotionNotify && event->xmotion.window == probe->window &&
++           event->xmotion.serial == probe->serial && event->xmotion.x == probe->x &&
++           event->xmotion.y == probe->y;
++}
++
++/* returns TRUE if Steam swallowed the probe event */
++static BOOL probe_steam_overlay( Display *display )
++{
++    struct steam_overlay_probe probe;
++    Window window, root, child;
++    int root_x, root_y, x, y;
++    unsigned int state;
++    XEvent event, returned;
++    HWND hwnd;
++
++    if (!(hwnd = NtUserGetForegroundWindow())) return FALSE;
++    if (!(window = X11DRV_get_whole_window( hwnd ))) return FALSE;
++    if (!XQueryPointer( display, window, &root, &child, &root_x, &root_y, &x, &y, &state )) return FALSE;
++
++    memset( &event, 0, sizeof(event) );
++    event.xmotion.type = MotionNotify;
++    event.xmotion.serial = LastKnownRequestProcessed( display );
++    event.xmotion.send_event = False;
++    event.xmotion.display = display;
++    event.xmotion.window = window;
++    event.xmotion.root = root;
++    event.xmotion.subwindow = None;
++    event.xmotion.time = CurrentTime;
++    event.xmotion.x = x;
++    event.xmotion.y = y;
++    event.xmotion.x_root = root_x;
++    event.xmotion.y_root = root_y;
++    event.xmotion.state = state;
++    event.xmotion.is_hint = NotifyNormal;
++    event.xmotion.same_screen = True;
++
++    probe.window = window;
++    probe.serial = event.xmotion.serial;
++    probe.x = x;
++    probe.y = y;
++
++    /* bypass Steam's XPutBackEvent hook, only its XCheckIfEvent hook decides */
++    XLockDisplay( display );
++    p_XPutBackEvent_internal( display, &event );
++    XUnlockDisplay( display );
++    return !XCheckIfEvent( display, &returned, match_steam_overlay_probe, (XPointer)&probe );
++}
++
++/* whole window whose input the reader thread passes to Steam */
++static Window steam_overlay_input_window;
++
++/* Steam's XCheckIfEvent hook only sees the input events when the window thread
++ * reads its event queue, which games may do only a few times per second. While
++ * the overlay is open, read the queue from a helper thread so that Steam gets
++ * them as they arrive. The helper thread must not call into Wine. */
++static pthread_t steam_overlay_reader;
++static BOOL steam_overlay_reader_stop;
++static Display *steam_overlay_reader_display;
++static Window steam_overlay_reader_window;
++
++static Bool match_steam_overlay_input( Display *display, XEvent *event, XPointer arg )
++{
++    switch (event->type)
++    {
++    case MotionNotify:
++    case ButtonPress:
++    case ButtonRelease:
++        return event->xany.window == steam_overlay_reader_window;
++    }
++    return False;
++}
++
++static void *steam_overlay_reader_thread( void *arg )
++{
++    Display *display = steam_overlay_reader_display;
++    XEvent event;
++
++    while (!__atomic_load_n( &steam_overlay_reader_stop, __ATOMIC_ACQUIRE ))
++    {
++        /* Steam swallows the events for the overlay, give back any it leaves */
++        if (XCheckIfEvent( display, &event, match_steam_overlay_input, NULL ))
++        {
++            XLockDisplay( display );
++            p_XPutBackEvent_internal( display, &event );
++            XUnlockDisplay( display );
++        }
++        usleep( 4000 );
++    }
++    return NULL;
++}
++
++static void steam_overlay_reader_update( Display *display, Window window )
++{
++    if (steam_overlay_reader)
++    {
++        __atomic_store_n( &steam_overlay_reader_stop, TRUE, __ATOMIC_RELEASE );
++        pthread_join( steam_overlay_reader, NULL );
++        steam_overlay_reader = 0;
++        TRACE( "stopped Steam overlay input reader\n" );
++    }
++    if (!window) return;
++    steam_overlay_reader_display = display;
++    steam_overlay_reader_window = window;
++    steam_overlay_reader_stop = FALSE;
++    if (pthread_create( &steam_overlay_reader, NULL, steam_overlay_reader_thread, NULL )) steam_overlay_reader = 0;
++    else TRACE( "started Steam overlay input reader for window %lx\n", window );
++}
++
++static void update_steam_overlay_client_input( struct x11drv_thread_data *thread_data, BOOL open )
++{
++    struct x11drv_win_data *data;
++    Window window = 0;
++    HWND hwnd;
++
++    if (!(hwnd = NtUserGetForegroundWindow()) || !(data = get_win_data( hwnd ))) return;
++    /* only the thread that owns the window uses its display */
++    if (data->display != thread_data->display)
++    {
++        release_win_data( data );
++        return;
++    }
++    if (open) window = data->whole_window;
++    release_win_data( data );
++    if (window == steam_overlay_input_window) return;
++
++    steam_overlay_input_window = window;
++    steam_overlay_reader_update( thread_data->display, window );
++}
++
++/* Steam tracks the pointer grab window of the game (our clip window) and maps
++ * the overlay hover position relative to it, move it over the whole foreground
++ * window while the overlay is open; it is moved back when clipping again */
++static void cover_steam_overlay_grab_window( struct x11drv_thread_data *thread_data )
++{
++    Window clip_window = thread_data->clip_window, whole_window, root, child;
++    unsigned int width, height, border, depth;
++    int x, y;
++    HWND hwnd;
++
++    if (!clip_window || !(hwnd = NtUserGetForegroundWindow())) return;
++    if (!(whole_window = X11DRV_get_whole_window( hwnd ))) return;
++    if (!XGetGeometry( thread_data->display, whole_window, &root, &x, &y, &width, &height, &border, &depth )) return;
++    if (!XTranslateCoordinates( thread_data->display, whole_window, root, 0, 0, &x, &y, &child )) return;
++    TRACE( "moving clip window %lx to %d,%d %ux%u for the Steam overlay\n", clip_window, x, y, width, height );
++    XMoveResizeWindow( thread_data->display, clip_window, x, y, width, height );
++    XFlush( thread_data->display );
++}
++
++BOOL steam_overlay_is_open(void)
++{
++    return steam_overlay_open;
++}
++
++/***********************************************************************
++ *      update_steam_overlay_state
++ *
++ * Release the cursor clipping of this thread while the Steam overlay is open,
++ * so that Steam receives the pointer events, and restore it once it closes.
++ */
++void update_steam_overlay_state(void)
++{
++    struct x11drv_thread_data *data = x11drv_thread_data();
++    LARGE_INTEGER timeout = {0};
++    UINT now = NtGetTickCount();
++    BOOL open;
++
++    pthread_once( &steam_overlay_once, init_steam_overlay_state );
++    if (!steam_overlay_hooked || !data) return;
++
++    pthread_mutex_lock( &steam_overlay_mutex );
++    if (now - steam_overlay_last_probe >= 50 && is_current_process_focused())
++    {
++        steam_overlay_last_probe = now;
++        open = probe_steam_overlay( data->display );
++        if (open != steam_overlay_open)
++        {
++            TRACE( "Steam overlay %s\n", open ? "opened" : "closed" );
++            steam_overlay_open = open;
++            if (steam_overlay_present_event)
++            {
++                if (open) NtSetEvent( steam_overlay_present_event, NULL );
++                else NtResetEvent( steam_overlay_present_event, NULL );
++            }
++            /* signal the overlay like lsteamclient does, unless it already did */
++            if (open && NtWaitForSingleObject( steam_overlay_event, FALSE, &timeout ) != WAIT_OBJECT_0)
++            {
++                NtSetEvent( steam_overlay_event, NULL );
++                steam_overlay_set_event = TRUE;
++            }
++            else if (!open && steam_overlay_set_event)
++            {
++                NtResetEvent( steam_overlay_event, NULL );
++                steam_overlay_set_event = FALSE;
++            }
++        }
++    }
++    open = steam_overlay_open;
++    pthread_mutex_unlock( &steam_overlay_mutex );
++
++    update_steam_overlay_client_input( data, open );
++
++    if (open && data->clipping_cursor)
++    {
++        TRACE( "releasing cursor clipping for the Steam overlay\n" );
++        ungrab_clipping_window();
++        data->steam_overlay_unclipped = TRUE;
++        cover_steam_overlay_grab_window( data );
++    }
++    else if (!open && data->steam_overlay_unclipped)
++    {
++        TRACE( "restoring cursor clipping after the Steam overlay\n" );
++        data->steam_overlay_unclipped = FALSE;
++        reapply_cursor_clipping();
++    }
++}
++
+ /***********************************************************************
+  *      reapply_cursor_clipping
+  */
+diff --git a/dlls/winex11.drv/x11drv.h b/dlls/winex11.drv/x11drv.h
+index 742af20..b25662e 100644
+--- a/dlls/winex11.drv/x11drv.h
++++ b/dlls/winex11.drv/x11drv.h
+@@ -435,6 +435,7 @@ struct x11drv_thread_data
+     unsigned long net_active_window_serial;   /* serial of last pending _NET_ACTIVE_WINDOW request */
+ 
+     UINT ignore_focus_hack : 1;
++    UINT steam_overlay_unclipped : 1; /* clipping released while the Steam overlay is open */
+ };
+ 
+ extern struct x11drv_thread_data *x11drv_init_thread_data(void);
+@@ -495,6 +496,8 @@ extern int xfixes_event_base;
+ extern char *process_name;
+ extern Display *clipboard_display;
+ extern HANDLE steam_overlay_event;
++extern BOOL steam_overlay_is_open(void);
++extern void update_steam_overlay_state(void);
+ 
+ /* atoms */
+ 
