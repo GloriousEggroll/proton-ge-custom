@@ -95,6 +95,8 @@ apply_all_in_dir() {
     git checkout -- \
         lsteamclient/Makefile.in \
         lsteamclient/overlay_bridge/src/focus_proxy.c \
+        lsteamclient/overlay_bridge/src/steam_overlay_bridge.c \
+        lsteamclient/overlay_bridge/include/steam_overlay_bridge.h \
         lsteamclient/gen_wrapper.py \
         lsteamclient/steam_input_manual.c \
         lsteamclient/steam_matchmaking_manual.c \
@@ -809,6 +811,11 @@ apply_all_in_dir() {
     # https://github.com/GloriousEggroll/proton-ge-custom/issues/975
     echo "WINE: -WAYLAND- winewayland: start toplevels at the scale of their output (borderless window clipped at fractional scaling)"
     apply_patch "../patches/wine-hotfixes/pending/winewayland-start-toplevels-at-the-output-scale.patch"
+
+    # Star Wars Galactic Battlegrounds quit after its intro on Wine-Wayland: the window kept the
+    # 3840x2160 present rect of the desktop after switching to 800x600
+    echo "WINE: -DDRAW- update the window present rect on display mode changes"
+    apply_patch "../patches/wine-hotfixes/pending/ddraw-update-the-present-rect-on-display-mode-changes.patch"
 
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f

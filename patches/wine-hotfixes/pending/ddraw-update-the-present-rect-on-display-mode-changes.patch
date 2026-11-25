@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Mon, 24 Nov 2026 23:10:00 -0500
+Subject: [PATCH] ddraw: Update the window present rect on display mode changes.
+
+When the cooperative level makes the window exclusive fullscreen, wined3d
+sets its present rect to the desktop rect, and win32u maps the window to the
+monitor with it. ddraw then changes the display mode separately and only
+resizes the window, so the present rect still covered the old mode. After a
+3840x2160 desktop switched to 800x600, the window visible rect became
+(0,0)-(14304,7776): the stale 3840x2160 rect scaled 3.6 times for the new mode
+and offset by the pillarbox.
+
+On Wine-Wayland this created a 14336x7808 window surface that spilled onto
+the next output. Star Wars Galactic Battlegrounds then lost keyboard focus
+and its display mode, and quit with "Could not initialize graphics system".
+
+Set the present rect to the new desktop rect before resizing the window, as
+wined3d does for its own fullscreen mode changes.
+---
+
+--- a/dlls/ddraw/ddraw.c
++++ b/dlls/ddraw/ddraw.c
+@@ -26,6 +26,7 @@
+ #include "d3dhal.h"
+ 
+ #include "wine/exception.h"
++#include "ddk/d3dkmthk.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(ddraw);
+ 
+@@ -5091,6 +5092,25 @@
+     TRACE("device_parent %p, device %p.\n", device_parent, device);
+ }
+ 
++/* Exclusive fullscreen windows have a present rect, which win32u uses to map
++ * them to the monitor. wined3d sets it to the desktop rect when the window
++ * becomes fullscreen, and updates it on its own mode changes; ddraw changes
++ * the mode separately, so update it here, or the window keeps the size of the
++ * previous mode and gets scaled with the new one (e.g. a 3840x2160 present
++ * rect scaled 3.6x for an 800x600 mode). */
++static void ddraw_set_window_present_rect(HWND window, const RECT *rect)
++{
++    D3DKMT_ESCAPE escape = {0};
++    RECT present_rect = *rect;
++
++    escape.Type = D3DKMT_ESCAPE_SET_PRESENT_RECT_WINE;
++    escape.hContext = HandleToULong(window);
++    escape.pPrivateDriverData = &present_rect;
++    escape.PrivateDriverDataSize = sizeof(present_rect);
++    if (D3DKMTEscape(&escape))
++        WARN("Failed to set the present rect of window %p.\n", window);
++}
++
+ /* This is run from device_process_message() in wined3d, we can't take the
+  * wined3d mutex. */
+ /* FIXME: We only get mode change notifications in exclusive mode, but we
+@@ -5118,6 +5138,10 @@
+     r = &output_desc.desktop_rect;
+     TRACE("Resizing window %p to %s.\n", ddraw->swapchain_window, wine_dbgstr_rect(r));
+ 
++    /* Before resizing: win32u maps the window with its present rect. */
++    if (!ddraw->gf_overlay_window)
++        ddraw_set_window_present_rect(ddraw->swapchain_window, r);
++
+     /* The temporary video window is not the fullscreen device window. */
+     if (!ddraw->gf_overlay_window
+             && !SetWindowPos(ddraw->swapchain_window, HWND_TOP, r->left, r->top,
+-- 
+2.51.0
+
