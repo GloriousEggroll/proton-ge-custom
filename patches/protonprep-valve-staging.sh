@@ -393,6 +393,10 @@ apply_all_in_dir() {
     echo "WINE: -HOTFIX- Reject unsupported NCrypt-only private-key requests"
     apply_patch "../patches/wine-hotfixes/pending/crypt32-reject-ncrypt-only-private-keys.patch"
 
+    # Call of Duty: Black Ops III black screen on HPET clocksource systems (ValveSoftware/Proton#864)
+    echo "WINE: -HOTFIX- Use a coarse monotonic clock for Black Ops III"
+    apply_patch "../patches/wine-hotfixes/pending/ntdll-use-coarse-monotonic-clock-for-bo3.patch"
+
     # Warcraft III 3.0: modern CERT_CHAIN_ENGINE_CONFIG used by ClientSdk login.
     # Upstream Wine fixes for #59531 and the legacy-layout regression #59600.
     apply_patch "../patches/wine-hotfixes/pending/crypt32-wc3-modern-chain-engine-config.patch"
