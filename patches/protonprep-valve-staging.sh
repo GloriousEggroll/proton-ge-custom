@@ -846,6 +846,9 @@ apply_all_in_dir() {
     echo "WINE: -X11- win32u, winex11: draw the child windows of exclusive fullscreen GL windows scaled (Star Wars Galactic Battlegrounds name prompt)"
     apply_patch "../patches/wine-hotfixes/pending/win32u-winex11-draw-the-child-windows-of-exclusive-fullscreen-gl-windows-scaled.patch"
 
+    echo "WINE: -DINPUT- report input lost for devices unacquired by a foreground change (Ducati World Championship crash after restore)"
+    apply_patch "../patches/wine-hotfixes/pending/dinput-report-input-lost-for-devices-unacquired-by-focus-loss.patch"
+
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
     ./tools/make_requests
