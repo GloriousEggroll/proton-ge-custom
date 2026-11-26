@@ -1,0 +1,698 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Alexandre Derumier <aderumier@gmail.com>
+Date: Tue, 24 Nov 2026 11:31:00 +0100
+Subject: [PATCH] mpg4c32: Add a Microsoft MPEG-4 Video for Windows decoder.
+
+Games which play MS-MPEG4 (MP42, MP43) AVIs through AVIFile /
+AVIStreamGetFrame need a Video for Windows codec: Wine has none for
+these formats, ICLocate finds no decompressor and AVIStreamGetFrameOpen
+fails. Powerboat GT's DirectorAVI.dll then dereferences the NULL frame
+and the game crashes at its boat selection videos (MP42, written by
+ffdshow, stream handler "ffds").
+
+Add mpg4c32.dll, the name of Windows' MPEG-4 VCM, on the model of
+ir50_32: the ICM driver decodes through winedmo's WMVideo decoder MFT,
+which already handles MP42 (0102) and MP43 (0066). It is registered
+as vidc.MP42 and vidc.MP43; ICLocate's driver enumeration finds it for
+any stream handler.
+
+The decoder is created through a new winedmo export,
+winedmo_create_wmv_decoder(), as ir50_32 does with
+winedmo_create_video_decoder(). wmvdecod.dll's class factory only
+forwards to CoCreateInstance(), which fails on a game thread that has
+not initialized COM (unless the process already has an MTA).
+
+[GloriousEggroll: create the decoder through a winedmo export instead
+of wmvdecod.dll's COM class factory]
+
+Tested with Powerboat GT: its boat videos play, the game reaches the
+race (tested before the switch to winedmo_create_wmv_decoder()).
+---
+
+diff --git a/configure b/configure
+index d17931d..44c9fc8 100755
+--- a/configure
++++ b/configure
+@@ -23681,6 +23681,7 @@ wine_fn_config_makefile dlls/mountmgr.sys enable_mountmgr_sys
+ wine_fn_config_makefile dlls/mouse.drv16 enable_win16
+ wine_fn_config_makefile dlls/mp3dmod enable_mp3dmod
+ wine_fn_config_makefile dlls/mp3dmod/tests enable_tests
++wine_fn_config_makefile dlls/mpg4c32 enable_mpg4c32
+ wine_fn_config_makefile dlls/mpr enable_mpr
+ wine_fn_config_makefile dlls/mpr/tests enable_tests
+ wine_fn_config_makefile dlls/mprapi enable_mprapi
+diff --git a/configure.ac b/configure.ac
+index b0d38e2..3a7628b 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -2966,6 +2966,7 @@ WINE_CONFIG_MAKEFILE(dlls/mountmgr.sys)
+ WINE_CONFIG_MAKEFILE(dlls/mouse.drv16)
+ WINE_CONFIG_MAKEFILE(dlls/mp3dmod)
+ WINE_CONFIG_MAKEFILE(dlls/mp3dmod/tests)
++WINE_CONFIG_MAKEFILE(dlls/mpg4c32)
+ WINE_CONFIG_MAKEFILE(dlls/mpr)
+ WINE_CONFIG_MAKEFILE(dlls/mpr/tests)
+ WINE_CONFIG_MAKEFILE(dlls/mprapi)
+diff --git a/dlls/mpg4c32/Makefile.in b/dlls/mpg4c32/Makefile.in
+new file mode 100644
+index 0000000..222bbac
+--- /dev/null
++++ b/dlls/mpg4c32/Makefile.in
+@@ -0,0 +1,7 @@
++MODULE       = mpg4c32.dll
++IMPORTS      = uuid user32 mfplat mfuuid
++DELAYIMPORTS = winedmo
++
++SOURCES = \
++	mpg4c32.c \
++	mpg4c32.rc
+diff --git a/dlls/mpg4c32/mpg4c32.c b/dlls/mpg4c32/mpg4c32.c
+new file mode 100644
+index 0000000..842e62e
+--- /dev/null
++++ b/dlls/mpg4c32/mpg4c32.c
+@@ -0,0 +1,490 @@
++/*
++ * Microsoft MPEG-4 (MP42, MP43) Video for Windows decoder
++ *
++ * Based on ir50_32: Copyright 2023 Shaun Ren for CodeWeavers
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ *
++ */
++
++#define COBJMACROS
++#include <stdarg.h>
++#include <stdlib.h>
++#include "windef.h"
++#include "winbase.h"
++#include "wingdi.h"
++#include "winuser.h"
++#include "commdlg.h"
++#include "vfw.h"
++#include "mpg4c32_private.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(mpg4c32);
++
++static HINSTANCE MPG4C32_hModule;
++
++#define MP42_MAGIC mmioFOURCC('M','P','4','2')
++#define MP43_MAGIC mmioFOURCC('M','P','4','3')
++#define compare_fourcc(fcc1, fcc2) (((fcc1)^(fcc2))&~0x20202020)
++
++static const GUID MFVideoFormat_MP42 = {MAKEFOURCC('M','P','4','2'), 0x0000, 0x0010,
++        {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
++
++/* the decoder's input subtype for a stream's compression, NULL when not ours */
++static const GUID *input_subtype( DWORD compression )
++{
++    if (!compare_fourcc( compression, MP42_MAGIC )) return &MFVideoFormat_MP42;
++    if (!compare_fourcc( compression, MP43_MAGIC )) return &MFVideoFormat_MP43;
++    return NULL;
++}
++
++static inline UINT64
++make_uint64( UINT32 high, UINT32 low )
++{
++    return ((UINT64)high << 32) | low;
++}
++
++static LRESULT
++MPG4_Open( const ICINFO *icinfo )
++{
++    IMFTransform *decoder = NULL;
++    HRESULT hr;
++
++    TRACE("DRV_OPEN %p\n", icinfo);
++
++    if ( icinfo && compare_fourcc( icinfo->fccType, ICTYPE_VIDEO ) )
++        return 0;
++
++    /* winedmo's WMV decoder decodes MP42 and MP43; create it directly, as
++     * ir50_32 does, since the calling thread may not have initialized COM */
++    if ( FAILED(hr = winedmo_create_wmv_decoder( &decoder )) )
++    {
++        WARN( "failed to create the decoder, hr %#lx.\n", hr );
++        return 0;
++    }
++
++    return (LRESULT)decoder;
++}
++
++static LRESULT decompress_query( ICDECOMPRESSEX *params )
++{
++    const BITMAPINFO *in = (BITMAPINFO *)params->lpbiSrc, *out = (BITMAPINFO *)params->lpbiDst;
++
++    TRACE("in->planes  = %d\n", in->bmiHeader.biPlanes);
++    TRACE("in->bpp     = %d\n", in->bmiHeader.biBitCount);
++    TRACE("in->height  = %ld\n", in->bmiHeader.biHeight);
++    TRACE("in->width   = %ld\n", in->bmiHeader.biWidth);
++    TRACE("in->compr   = %#lx\n", in->bmiHeader.biCompression);
++    TRACE("in offset (%d,%d), size %dx%d\n", params->xSrc, params->ySrc, params->dxSrc, params->dySrc);
++
++    if (!input_subtype( in->bmiHeader.biCompression ))
++    {
++        TRACE("can't do %#lx compression\n", in->bmiHeader.biCompression);
++        return ICERR_BADFORMAT;
++    }
++
++    if (params->xSrc || params->ySrc || params->dxSrc != in->bmiHeader.biWidth
++            || params->dySrc != in->bmiHeader.biHeight)
++    {
++        TRACE("nontrivial source rect\n");
++        return ICERR_BADFORMAT;
++    }
++
++    /* output must be same dimensions as input */
++    if ( out )
++    {
++        TRACE("out->planes = %d\n", out->bmiHeader.biPlanes);
++        TRACE("out->bpp    = %d\n", out->bmiHeader.biBitCount);
++        TRACE("out->height = %ld\n", out->bmiHeader.biHeight);
++        TRACE("out->width  = %ld\n", out->bmiHeader.biWidth);
++        TRACE("out->compr  = %#lx\n", out->bmiHeader.biCompression);
++        TRACE("out offset (%d,%d), size %dx%d\n", params->xDst, params->yDst, params->dxDst, params->dyDst);
++
++        if (out->bmiHeader.biCompression == BI_RGB)
++        {
++            if (out->bmiHeader.biBitCount != 32 && out->bmiHeader.biBitCount != 24 && out->bmiHeader.biBitCount != 16)
++                return ICERR_BADFORMAT;
++        }
++        else if (out->bmiHeader.biCompression == BI_BITFIELDS)
++        {
++            const DWORD *masks = (const DWORD *)(&out->bmiColors[0]);
++
++            if (out->bmiHeader.biBitCount != 16
++                    || masks[0] != 0xf800 || masks[1] != 0x07e0 || masks[2] != 0x001f)
++                return ICERR_BADFORMAT;
++        }
++        else
++        {
++            return ICERR_BADFORMAT;
++        }
++
++        if (in->bmiHeader.biWidth != params->dxDst || in->bmiHeader.biHeight != params->dyDst)
++        {
++            TRACE("incompatible output dimensions requested\n");
++            return ICERR_BADPARAM;
++        }
++    }
++
++    return ICERR_OK;
++}
++
++static LRESULT
++MPG4_DecompressGetFormat( LPBITMAPINFO in, LPBITMAPINFO out )
++{
++    TRACE("ICM_DECOMPRESS_GETFORMAT %p %p\n", in, out);
++
++    if (!input_subtype( in->bmiHeader.biCompression ))
++        return ICERR_BADFORMAT;
++
++    if ( out )
++    {
++        memset(&out->bmiHeader, 0, sizeof(out->bmiHeader));
++        out->bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
++        out->bmiHeader.biWidth = in->bmiHeader.biWidth;
++        out->bmiHeader.biHeight = abs(in->bmiHeader.biHeight);
++        out->bmiHeader.biCompression = BI_RGB;
++        out->bmiHeader.biPlanes = 1;
++        out->bmiHeader.biBitCount = 24;
++        out->bmiHeader.biSizeImage = out->bmiHeader.biWidth * out->bmiHeader.biHeight * 3;
++        return ICERR_OK;
++    }
++
++    return offsetof(BITMAPINFO, bmiColors[256]);
++}
++
++static LRESULT decompress_begin( IMFTransform *decoder, ICDECOMPRESSEX *params )
++{
++    const BITMAPINFO *in = (BITMAPINFO *)params->lpbiSrc, *out = (BITMAPINFO *)params->lpbiDst;
++    IMFMediaType *input_type, *output_type;
++    const GUID *output_subtype, *subtype;
++    LRESULT r = ICERR_INTERNAL;
++    UINT32 stride;
++    HRESULT hr;
++
++    TRACE( "decoder %p, in %p, out %p.\n", decoder, in, out );
++
++    if ( !decoder )
++        return ICERR_BADPARAM;
++
++    if ( !(subtype = input_subtype( in->bmiHeader.biCompression )) )
++        return ICERR_BADFORMAT;
++
++    if (out->bmiHeader.biCompression == BI_BITFIELDS)
++        output_subtype = &MFVideoFormat_RGB565;
++    else if (out->bmiHeader.biBitCount == 32)
++        output_subtype = &MFVideoFormat_RGB32;
++    else if ( out->bmiHeader.biBitCount == 24 )
++        output_subtype = &MFVideoFormat_RGB24;
++    else if ( out->bmiHeader.biBitCount == 16 )
++        output_subtype = &MFVideoFormat_RGB555;
++    else
++        return ICERR_BADFORMAT;
++
++    stride = (out->bmiHeader.biWidth * out->bmiHeader.biBitCount / 8 + 3) & ~3;
++
++    if ( FAILED(MFCreateMediaType( &input_type )) )
++        return ICERR_INTERNAL;
++
++    if ( FAILED(MFCreateMediaType( &output_type )) )
++    {
++        IMFMediaType_Release( input_type );
++        return ICERR_INTERNAL;
++    }
++
++    if ( FAILED(IMFMediaType_SetGUID( input_type, &MF_MT_MAJOR_TYPE, &MFMediaType_Video )) ||
++         FAILED(IMFMediaType_SetGUID( input_type, &MF_MT_SUBTYPE, subtype )) )
++        goto done;
++    if ( FAILED(IMFMediaType_SetUINT64(
++                    input_type, &MF_MT_FRAME_SIZE,
++                    make_uint64( in->bmiHeader.biWidth, in->bmiHeader.biHeight ) )) )
++        goto done;
++
++    if ( FAILED(IMFMediaType_SetGUID( output_type, &MF_MT_MAJOR_TYPE, &MFMediaType_Video )) ||
++         FAILED(IMFMediaType_SetGUID( output_type, &MF_MT_SUBTYPE, output_subtype )) )
++        goto done;
++    if (FAILED(IMFMediaType_SetUINT64( output_type, &MF_MT_FRAME_SIZE,
++            make_uint64( params->dxDst, params->dyDst ) )))
++        goto done;
++    /* a DIB is bottom-up unless its height is negative */
++    if ( FAILED(IMFMediaType_SetUINT32( output_type, &MF_MT_DEFAULT_STRIDE,
++            out->bmiHeader.biHeight >= 0 ? -(INT)stride : stride )) )
++        goto done;
++
++    if ( FAILED(hr = IMFTransform_SetInputType( decoder, 0, input_type, 0 )) )
++    {
++        WARN( "failed to set the input type, hr %#lx.\n", hr );
++        goto done;
++    }
++    if ( FAILED(hr = IMFTransform_SetOutputType( decoder, 0, output_type, 0 )) )
++    {
++        WARN( "failed to set the output type, hr %#lx.\n", hr );
++        goto done;
++    }
++
++    r = ICERR_OK;
++
++done:
++    IMFMediaType_Release( input_type );
++    IMFMediaType_Release( output_type );
++    return r;
++}
++
++static LRESULT decompress( IMFTransform *decoder, ICDECOMPRESSEX *params )
++{
++    IMFSample *in_sample = NULL, *out_sample = NULL;
++    IMFMediaBuffer *in_buf = NULL, *out_buf = NULL;
++    MFT_OUTPUT_DATA_BUFFER mft_buf;
++    DWORD mft_status;
++    BYTE *data;
++    HRESULT hr;
++    LRESULT r = ICERR_INTERNAL;
++
++    TRACE( "decoder %p, params %p.\n", decoder, params );
++
++    if ( FAILED(MFCreateSample( &in_sample )) )
++        return ICERR_INTERNAL;
++
++    if ( FAILED(MFCreateMemoryBuffer( params->lpbiSrc->biSizeImage, &in_buf )) )
++        goto done;
++
++    if ( FAILED(IMFSample_AddBuffer( in_sample, in_buf )) )
++        goto done;
++
++    if ( FAILED(MFCreateSample( &out_sample )) )
++        goto done;
++
++    if ( FAILED(MFCreateMemoryBuffer( params->lpbiDst->biSizeImage, &out_buf )) )
++        goto done;
++
++    if ( FAILED(IMFSample_AddBuffer( out_sample, out_buf )) )
++        goto done;
++
++    if ( FAILED(IMFMediaBuffer_Lock( in_buf, &data, NULL, NULL )))
++        goto done;
++
++    memcpy( data, params->lpSrc, params->lpbiSrc->biSizeImage );
++
++    if ( FAILED(IMFMediaBuffer_Unlock( in_buf )) )
++        goto done;
++
++    if ( FAILED(IMFMediaBuffer_SetCurrentLength( in_buf, params->lpbiSrc->biSizeImage )) )
++        goto done;
++
++    if ( FAILED(IMFTransform_ProcessInput( decoder, 0, in_sample, 0 )) )
++        goto done;
++
++    memset( &mft_buf, 0, sizeof(mft_buf) );
++    mft_buf.pSample = out_sample;
++
++    hr = IMFTransform_ProcessOutput( decoder, 0, 1, &mft_buf, &mft_status );
++    if ( hr == MF_E_TRANSFORM_STREAM_CHANGE )
++        hr = IMFTransform_ProcessOutput( decoder, 0, 1, &mft_buf, &mft_status );
++
++    if ( SUCCEEDED(hr) )
++    {
++        LONG depth = params->lpbiDst->biBitCount / 8;
++        LONG width = params->lpbiDst->biWidth * depth;
++        LONG stride = (width + 3) & ~3;
++        BYTE *output = params->lpDst;
++
++        if ( FAILED(IMFMediaBuffer_Lock( out_buf, &data, NULL, NULL )))
++            goto done;
++
++        output += params->yDst * stride;
++        output += params->xDst * depth;
++        MFCopyImage( output, stride, data, stride, params->dxDst * depth, params->dyDst );
++
++        IMFMediaBuffer_Unlock( out_buf );
++        r = ICERR_OK;
++    }
++    else if ( hr == MF_E_TRANSFORM_NEED_MORE_INPUT )
++    {
++        TRACE("no output received.\n");
++        r = ICERR_OK;
++    }
++
++done:
++    if ( in_buf )
++        IMFMediaBuffer_Release( in_buf );
++    if ( in_sample )
++        IMFSample_Release( in_sample );
++    if ( out_buf )
++        IMFMediaBuffer_Release( out_buf );
++    if ( out_sample )
++        IMFSample_Release( out_sample );
++
++    return r;
++}
++
++static LRESULT MPG4_GetInfo( ICINFO *icinfo, DWORD dwSize )
++{
++    TRACE("ICM_GETINFO %p %lu\n", icinfo, dwSize);
++
++    if ( !icinfo ) return sizeof(ICINFO);
++    if ( dwSize < sizeof(ICINFO) ) return 0;
++
++    icinfo->dwSize       = sizeof(ICINFO);
++    icinfo->fccType      = ICTYPE_VIDEO;
++    icinfo->fccHandler   = MP42_MAGIC;
++    icinfo->dwFlags      = 0;
++    icinfo->dwVersion    = ICVERSION;
++    icinfo->dwVersionICM = ICVERSION;
++
++    LoadStringW( MPG4C32_hModule, IDS_NAME, icinfo->szName, ARRAY_SIZE(icinfo->szName) );
++    LoadStringW( MPG4C32_hModule, IDS_DESCRIPTION, icinfo->szDescription, ARRAY_SIZE(icinfo->szDescription) );
++    /* msvfw32 will fill icinfo->szDriver for us */
++
++    return sizeof(ICINFO);
++}
++
++static void fill_decompressex_params( ICDECOMPRESSEX *params,
++        BITMAPINFOHEADER *src, BITMAPINFOHEADER *dst )
++{
++    memset( params, 0, sizeof(*params) );
++    params->lpbiSrc = src;
++    params->lpbiDst = dst;
++    params->dxSrc = src->biWidth;
++    params->dySrc = src->biHeight;
++    if (dst)
++    {
++        params->dxDst = dst->biWidth;
++        params->dyDst = abs(dst->biHeight);
++    }
++}
++
++/***********************************************************************
++ *              DriverProc (MPG4C32.@)
++ */
++LRESULT WINAPI MPG4_DriverProc( DWORD_PTR dwDriverId, HDRVR hdrvr, UINT msg,
++                                LPARAM lParam1, LPARAM lParam2 )
++{
++    IMFTransform *decoder = (IMFTransform *) dwDriverId;
++    LRESULT r = ICERR_UNSUPPORTED;
++
++    TRACE("%Id %p %04x %08Ix %08Ix\n", dwDriverId, hdrvr, msg, lParam1, lParam2);
++
++    switch( msg )
++    {
++    case DRV_LOAD:
++        TRACE("DRV_LOAD\n");
++        r = 1;
++        break;
++
++    case DRV_OPEN:
++        r = MPG4_Open((ICINFO *)lParam2);
++        break;
++
++    case DRV_CLOSE:
++        TRACE("DRV_CLOSE\n");
++        if ( decoder )
++            IMFTransform_Release( decoder );
++        r = 1;
++        break;
++
++    case DRV_ENABLE:
++    case DRV_DISABLE:
++    case DRV_FREE:
++        break;
++
++    case ICM_GETINFO:
++        r = MPG4_GetInfo( (ICINFO *) lParam1, (DWORD) lParam2 );
++        break;
++
++    case ICM_DECOMPRESS_QUERY:
++    {
++        ICDECOMPRESSEX params;
++
++        fill_decompressex_params( &params, (BITMAPINFOHEADER *)lParam1, (BITMAPINFOHEADER *)lParam2 );
++        return decompress_query( &params );
++    }
++
++    case ICM_DECOMPRESSEX_QUERY:
++        return decompress_query( (ICDECOMPRESSEX *)lParam1 );
++
++    case ICM_DECOMPRESS_GET_FORMAT:
++        r = MPG4_DecompressGetFormat( (LPBITMAPINFO) lParam1, (LPBITMAPINFO) lParam2 );
++        break;
++
++    case ICM_DECOMPRESS_GET_PALETTE:
++        FIXME("ICM_DECOMPRESS_GET_PALETTE\n");
++        break;
++
++    case ICM_DECOMPRESS:
++    {
++        const ICDECOMPRESS *params = (ICDECOMPRESS *)lParam1;
++        ICDECOMPRESSEX ex_params;
++
++        fill_decompressex_params( &ex_params, params->lpbiInput, params->lpbiOutput );
++        ex_params.dwFlags = params->dwFlags;
++        ex_params.lpSrc = params->lpInput;
++        ex_params.lpDst = params->lpOutput;
++        return decompress( decoder, &ex_params );
++    }
++
++    case ICM_DECOMPRESSEX:
++        return decompress( decoder, (ICDECOMPRESSEX *)lParam1 );
++
++    case ICM_DECOMPRESS_BEGIN:
++    {
++        ICDECOMPRESSEX params;
++
++        fill_decompressex_params( &params, (BITMAPINFOHEADER *)lParam1, (BITMAPINFOHEADER *)lParam2 );
++        return decompress_begin( decoder, &params );
++    }
++
++    case ICM_DECOMPRESSEX_BEGIN:
++        return decompress_begin( decoder, (ICDECOMPRESSEX *)lParam1 );
++
++    case ICM_DECOMPRESS_END:
++    case ICM_DECOMPRESSEX_END:
++        r = ICERR_OK;
++        break;
++
++    case ICM_COMPRESS_QUERY:
++        r = ICERR_BADFORMAT;
++        /* fall through */
++    case ICM_COMPRESS_GET_FORMAT:
++    case ICM_COMPRESS_END:
++    case ICM_COMPRESS:
++        FIXME("compression not implemented\n");
++        break;
++
++    case ICM_CONFIGURE:
++        break;
++
++    default:
++        FIXME("Unknown message: %04x %Id %Id\n", msg, lParam1, lParam2);
++    }
++
++    return r;
++}
++
++/***********************************************************************
++ *              DllMain
++ */
++BOOL WINAPI DllMain(HINSTANCE hModule, DWORD dwReason, LPVOID lpReserved)
++{
++    TRACE("(%p,%lu,%p)\n", hModule, dwReason, lpReserved);
++
++    switch (dwReason)
++    {
++    case DLL_PROCESS_ATTACH:
++        DisableThreadLibraryCalls(hModule);
++        MPG4C32_hModule = hModule;
++        break;
++    }
++    return TRUE;
++}
+diff --git a/dlls/mpg4c32/mpg4c32.rc b/dlls/mpg4c32/mpg4c32.rc
+new file mode 100644
+index 0000000..6532b74
+--- /dev/null
++++ b/dlls/mpg4c32/mpg4c32.rc
+@@ -0,0 +1,29 @@
++/*
++ * Based on ir50_32: Copyright 2023 Shaun Ren for CodeWeavers
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "mpg4c32_private.h"
++
++#pragma makedep po
++
++LANGUAGE LANG_ENGLISH, SUBLANG_DEFAULT
++
++STRINGTABLE
++{
++    IDS_NAME        "MPEG-4"
++    IDS_DESCRIPTION "Microsoft MPEG-4 video codec (MP42, MP43)"
++}
+diff --git a/dlls/mpg4c32/mpg4c32.spec b/dlls/mpg4c32/mpg4c32.spec
+new file mode 100644
+index 0000000..7eaba5e
+--- /dev/null
++++ b/dlls/mpg4c32/mpg4c32.spec
+@@ -0,0 +1 @@
++@ stdcall -private DriverProc(long long long long long) MPG4_DriverProc
+diff --git a/dlls/mpg4c32/mpg4c32_private.h b/dlls/mpg4c32/mpg4c32_private.h
+new file mode 100644
+index 0000000..6b44d5d
+--- /dev/null
++++ b/dlls/mpg4c32/mpg4c32_private.h
+@@ -0,0 +1,35 @@
++/*
++ * Based on ir50_32: Copyright 2023 Shaun Ren for CodeWeavers
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifndef __MPG4C32_PRIVATE_H
++#define __MPG4C32_PRIVATE_H
++
++#include <windef.h>
++
++#include "mfapi.h"
++#include "mferror.h"
++#include "mfobjects.h"
++#include "mfidl.h"
++#include "mftransform.h"
++
++HRESULT WINAPI winedmo_create_wmv_decoder(IMFTransform **out);
++
++#define IDS_NAME        100
++#define IDS_DESCRIPTION 101
++
++#endif /* __MPG4C32_PRIVATE_H */
+diff --git a/dlls/winedmo/video_decoder.c b/dlls/winedmo/video_decoder.c
+index 9967667..cb845bd 100644
+--- a/dlls/winedmo/video_decoder.c
++++ b/dlls/winedmo/video_decoder.c
+@@ -2727,3 +2727,20 @@ HRESULT wmv_decoder_create(IUnknown *outer, IUnknown **out)
+     *out = &decoder->IUnknown_inner;
+     return S_OK;
+ }
++
++/* The WMV decoder MFT without COM, for callers such as mpg4c32's Video for
++ * Windows driver, which runs on application threads that may not have
++ * initialized COM. */
++HRESULT WINAPI winedmo_create_wmv_decoder(IMFTransform **out)
++{
++    IUnknown *unknown;
++    HRESULT hr;
++
++    TRACE("out %p.\n", out);
++
++    if (FAILED(hr = wmv_decoder_create(NULL, &unknown)))
++        return hr;
++    hr = IUnknown_QueryInterface(unknown, &IID_IMFTransform, (void **)out);
++    IUnknown_Release(unknown);
++    return hr;
++}
+diff --git a/dlls/winedmo/winedmo.spec b/dlls/winedmo/winedmo.spec
+index 6d260d9..af9f280 100644
+--- a/dlls/winedmo/winedmo.spec
++++ b/dlls/winedmo/winedmo.spec
+@@ -29,4 +29,5 @@
+ @ stdcall winedmo_create_color_converter(ptr)
+ @ stdcall winedmo_create_wm_sync_reader(ptr ptr)
+ @ stdcall winedmo_create_video_decoder(ptr)
++@ stdcall winedmo_create_wmv_decoder(ptr)
+ @ stdcall winedmo_create_wma_decoder(ptr ptr)
+diff --git a/loader/wine.inf.in b/loader/wine.inf.in
+index 3d6bf40..bbf697a 100644
+--- a/loader/wine.inf.in
++++ b/loader/wine.inf.in
+@@ -1201,6 +1201,8 @@ system.ini, drivers32,,"vidc.mrle=msrle32.dll"
+ system.ini, drivers32,,"vidc.msvc=msvidc32.dll"
+ system.ini, drivers32,,"vidc.cvid=iccvid.dll"
+ system.ini, drivers32,,"vidc.IV50=ir50_32.dll"
++system.ini, drivers32,,"vidc.MP42=mpg4c32.dll"
++system.ini, drivers32,,"vidc.MP43=mpg4c32.dll"
+ system.ini, drivers32,,"vidc.i420=iyuv_32.dll"
+ system.ini, drivers32,,"vidc.iyuv=iyuv_32.dll"
+ system.ini, drivers32,,"; vidc.IV31=ir32_32.dll"
+-- 
+2.51.0
+
