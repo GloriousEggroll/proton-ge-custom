@@ -843,6 +843,9 @@ apply_all_in_dir() {
     echo "WINE: -WINED3D- defer the activation of minimized device windows (wrong size after restore)"
     apply_patch "../patches/wine-hotfixes/pending/wined3d-defer-the-activation-of-minimized-device-windows.patch"
 
+    echo "WINE: -X11- win32u, winex11: draw the child windows of exclusive fullscreen GL windows scaled (Star Wars Galactic Battlegrounds name prompt)"
+    apply_patch "../patches/wine-hotfixes/pending/win32u-winex11-draw-the-child-windows-of-exclusive-fullscreen-gl-windows-scaled.patch"
+
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
     ./tools/make_requests

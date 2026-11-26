@@ -1,0 +1,327 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Thu, 26 Nov 2026 01:51:07 -0500
+Subject: [PATCH] win32u, winex11: Draw the child windows of exclusive
+ fullscreen GL windows scaled.
+
+Star Wars Galactic Battlegrounds shows its name prompt as an edit control
+over its 800x600 DirectDraw (wined3d GL) window. With the display mode
+emulated, the edit control drew directly to the X window, unscaled, and the GL
+drawable covering the whole window painted over it on the next frame.
+
+Keep the scaled window surface of such windows while they show children, let
+the children draw into it, and cut holes in the client window over them,
+except while the Steam overlay is open. Flush the surface clipped by children
+then, and fix its offset for surfaces with a border around scaled contents.
+---
+ dlls/win32u/dce.c            |  3 +-
+ dlls/win32u/win32u_private.h |  1 +
+ dlls/win32u/window.c         | 53 ++++++++++++++++++++++-
+ dlls/winex11.drv/bitblt.c    | 26 +++++++++--
+ dlls/winex11.drv/init.c      | 84 ++++++++++++++++++++++++++++++++++++
+ dlls/winex11.drv/x11drv.h    |  1 +
+ 6 files changed, 163 insertions(+), 5 deletions(-)
+
+diff --git a/dlls/win32u/dce.c b/dlls/win32u/dce.c
+index f5d9755..42901bc 100644
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -1821,7 +1821,8 @@ static void update_visible_region( struct dce *dce )
+     if (!((paint_flags & (SET_WINPOS_PIXEL_FORMAT | SET_WINPOS_CLIP_CLIENT)) && user_driver->dc_funcs.pPutImage) ||
+         (flags & DCX_WINDOW)
+         || (NtUserGetLayeredWindowAttributes( dce->hwnd, NULL, NULL, &layered_flags ) && layered_flags & LWA_COLORKEY)
+-        || force_present_to_surface( &win_rect ))
++        || force_present_to_surface( &win_rect )
++        || (dce->hwnd != top_win && window_keeps_surface_for_children( top_win )))
+     {
+         win = get_win_ptr( top_win );
+         if (win && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
+diff --git a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+index 9412007..6f0e713 100644
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -60,6 +60,7 @@ extern void register_window_surface( struct window_surface *old,
+ extern void *window_surface_get_color( struct window_surface *surface, BITMAPINFO *info );
+ 
+ extern int force_present_to_surface( const RECT *win_rect );
++extern BOOL window_keeps_surface_for_children( HWND hwnd );
+ 
+ /* defwnd.c */
+ extern BOOL adjust_window_rect( RECT *rect, DWORD style, BOOL menu, DWORD ex_style, UINT dpi );
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index d2a9abb..7d1a9c2 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -2094,6 +2094,27 @@ static NTSTATUS get_window_region( HWND hwnd, enum window_region_type type, HRGN
+     return status;
+ }
+ 
++/* the client surface covering the window is punched out of the surface
++ * region, add back the visible children drawn into the surface */
++static void add_surface_children_region( HWND hwnd, HRGN region )
++{
++    HWND child;
++    HRGN child_rgn;
++    RECT rect;
++
++    for (child = NtUserGetWindowRelative( hwnd, GW_CHILD ); child;
++         child = NtUserGetWindowRelative( child, GW_HWNDNEXT ))
++    {
++        if (!(get_window_long( child, GWL_STYLE ) & WS_VISIBLE)) continue;
++        if (!get_window_rect( child, &rect, get_thread_dpi() )) continue;
++        if ((child_rgn = NtGdiCreateRectRgn( rect.left, rect.top, rect.right, rect.bottom )))
++        {
++            NtGdiCombineRgn( region, region, child_rgn, RGN_OR );
++            NtGdiDeleteObjectApp( child_rgn );
++        }
++    }
++}
++
+ /***********************************************************************
+  *           update_surface_region
+  */
+@@ -2128,6 +2149,7 @@ static void update_surface_region( HWND hwnd )
+     if (!region) window_surface_set_clip( surface, shape );
+     else
+     {
++        if (window_keeps_surface_for_children( hwnd )) add_surface_children_region( hwnd, region );
+         NtGdiOffsetRgn( region, -visible.left, -visible.top );
+         if (shape) NtGdiCombineRgn( region, region, shape, RGN_AND );
+         window_surface_set_clip( surface, region );
+@@ -2293,6 +2315,23 @@ static BOOL get_default_window_surface( HWND hwnd, const RECT *surface_rect, str
+     return TRUE;
+ }
+ 
++/* An exclusive fullscreen window keeps its contents scaled in a window
++ * surface; with a client surface covering it, child windows such as an edit
++ * control (Star Wars Galactic Battlegrounds' name prompt) would otherwise be
++ * drawn directly and unscaled. Keep the surface while children are shown, the
++ * driver shows them through the client surface. */
++BOOL window_keeps_surface_for_children( HWND hwnd )
++{
++    RECT present_rect;
++    HWND child;
++
++    if (!get_present_rect( hwnd, &present_rect, get_thread_dpi() )) return FALSE;
++    for (child = NtUserGetWindowRelative( hwnd, GW_CHILD ); child;
++         child = NtUserGetWindowRelative( child, GW_HWNDNEXT ))
++        if (get_window_long( child, GWL_STYLE ) & WS_VISIBLE) return TRUE;
++    return FALSE;
++}
++
+ static BOOL window_clip_client_surfaces( HWND hwnd )
+ {
+     WND *win = get_win_ptr( hwnd );
+@@ -2304,7 +2343,7 @@ static BOOL window_clip_client_surfaces( HWND hwnd )
+     win_rect = win->rects.window;
+     release_win_ptr( win );
+ 
+-    if (ret) return !force_present_to_surface( &win_rect );
++    if (ret) return !force_present_to_surface( &win_rect ) && !window_keeps_surface_for_children( hwnd );
+ 
+     return ret;
+ }
+@@ -4385,6 +4424,18 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
+     }
+     if (surface) window_surface_release( surface );
+ 
++    /* the toplevel may need its window surface back, see window_keeps_surface_for_children */
++    if ((winpos->flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW)) &&
++        (get_window_long( winpos->hwnd, GWL_STYLE ) & WS_CHILD))
++    {
++        HWND parent = NtUserGetAncestor( winpos->hwnd, GA_PARENT );
++        RECT present_rect;
++
++        if (parent && parent == NtUserGetAncestor( winpos->hwnd, GA_ROOT ) &&
++            get_present_rect( parent, &present_rect, get_thread_dpi() ))
++            update_window_state( parent );
++    }
++
+     if (winpos->flags & SWP_HIDEWINDOW)
+     {
+         NtUserNotifyWinEvent( EVENT_OBJECT_HIDE, winpos->hwnd, 0, 0 );
+diff --git a/dlls/winex11.drv/bitblt.c b/dlls/winex11.drv/bitblt.c
+index ad3a863..8684a97 100644
+--- a/dlls/winex11.drv/bitblt.c
++++ b/dlls/winex11.drv/bitblt.c
+@@ -1593,6 +1593,7 @@ struct x11drv_window_surface
+     int                   y_offset;
+     RECT                 *clip_rects;
+     unsigned int          clip_rect_count;
++    BOOL                  clip_by_children;
+ };
+ 
+ static struct x11drv_window_surface *get_x11_surface( struct window_surface *surface )
+@@ -1809,9 +1810,19 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
+     const unsigned char *src = color_bits;
+     unsigned char *dst = (unsigned char *)ximage->data;
+     RECT rect = *surface_rect;
++    BOOL clip_by_children;
+ 
+     OffsetRect( &rect, surface->x_offset, surface->y_offset );
+ 
++    /* The GL drawable of an exclusive fullscreen window has holes over the
++     * children drawn into the surface, don't draw over the rest of it. */
++    clip_by_children = present_window_has_visible_children( window_surface->hwnd );
++    if (clip_by_children != surface->clip_by_children)
++    {
++        XSetSubwindowMode( gdi_display, surface->gc, clip_by_children ? ClipByChildren : IncludeInferiors );
++        surface->clip_by_children = clip_by_children;
++    }
++
+     if (alpha_bits == -1)
+     {
+         if (alpha_mask || color_info->bmiHeader.biBitCount != 32) alpha_bits = 0;
+@@ -1981,7 +1992,8 @@ static BOOL enable_direct_drawing( struct x11drv_win_data *data, BOOL layered )
+ 
+         if (style & WS_VISIBLE && !(style & WS_MINIMIZE)) return FALSE;
+     }
+-    if (data->client_window) return TRUE; /* draw directly to the window */
++    /* an exclusive fullscreen GL window draws its children scaled into its surface */
++    if (data->client_window && !present_window_has_visible_children( data->hwnd )) return TRUE; /* draw directly to the window */
+     if (!client_side_graphics) return TRUE; /* draw directly to the window */
+     return FALSE;
+ }
+@@ -2034,8 +2046,16 @@ void set_surface_window_rects( struct window_surface *window_surface, const stru
+         XRectangle *xrects;
+ 
+         window_surface_lock( window_surface );
+-        surface->x_offset = max( rects->window.left - rects->visible.left, 0 );
+-        surface->y_offset = max( rects->window.top - rects->visible.top, 0 );
++        /* a surface with a border around scaled contents (win32u for scaled
++         * fullscreen windows) covers the visible rect rather than the window */
++        if (window_surface->rect.right - window_surface->rect.left >= rects->visible.right - rects->visible.left &&
++            window_surface->rect.bottom - window_surface->rect.top >= rects->visible.bottom - rects->visible.top)
++            surface->x_offset = surface->y_offset = 0;
++        else
++        {
++            surface->x_offset = max( rects->window.left - rects->visible.left, 0 );
++            surface->y_offset = max( rects->window.top - rects->visible.top, 0 );
++        }
+         window_surface_unlock( window_surface );
+ 
+         if (surface->clip_rects && (xrects = xrectangles_from_rects( surface->clip_rects, surface->clip_rect_count,
+diff --git a/dlls/winex11.drv/init.c b/dlls/winex11.drv/init.c
+index e009bf5..c8fc822 100644
+--- a/dlls/winex11.drv/init.c
++++ b/dlls/winex11.drv/init.c
+@@ -425,6 +425,10 @@ struct x11drv_client_surface
+     BOOL shm_broken;  /* the fast read failed; use XGetImage until resized */
+ #endif
+     DWORD shape_last_sample;
++
++    /* holes cut for the children of an exclusive fullscreen window */
++    XRectangle child_holes[16];
++    unsigned int child_hole_count;
+ };
+ 
+ static struct x11drv_client_surface *impl_from_client_surface( struct client_surface *client )
+@@ -960,6 +964,85 @@ static BOOL update_layered_overlay_shape( struct x11drv_client_surface *surface,
+ #endif
+ }
+ 
++/* whether an exclusive fullscreen window shows child windows over its
++ * client surface, win32u then draws them scaled into its window surface */
++BOOL present_window_has_visible_children( HWND hwnd )
++{
++    RECT rect;
++    HWND child;
++
++    if (!NtUserGetPresentRect( hwnd, &rect, 0 )) return FALSE;
++    for (child = NtUserGetWindowRelative( hwnd, GW_CHILD ); child;
++         child = NtUserGetWindowRelative( child, GW_HWNDNEXT ))
++        if (NtUserGetWindowLongW( child, GWL_STYLE ) & WS_VISIBLE) return TRUE;
++    return FALSE;
++}
++
++/* The GL drawable of an exclusive fullscreen window covers the child windows
++ * drawn into its window surface: cut holes in the client window over them,
++ * except while the Steam overlay is open, which covers them. */
++static void update_client_window_child_holes( HWND hwnd, struct x11drv_client_surface *surface )
++{
++#ifdef HAVE_LIBXSHAPE
++    XRectangle holes[ARRAY_SIZE(surface->child_holes)];
++    unsigned int count = 0;
++    RECT client, src, child_rect;
++    float scale_x, scale_y;
++    HWND child;
++    UINT dpi;
++
++    if (!surface->window || !surface->opengl) return;
++    dpi = NtUserGetDpiForWindow( hwnd );
++    if (NtUserGetAncestor( hwnd, GA_PARENT ) == NtUserGetDesktopWindow() &&
++        NtUserGetPresentRect( hwnd, &src, 0 ) && !steam_overlay_is_open() &&
++        NtUserGetClientRect( hwnd, &client, dpi ) && !IsRectEmpty( &client ))
++    {
++        src = IsRectEmpty( &surface->client.content_rect ) ? surface->rect : surface->client.content_rect;
++        scale_x = (float)(src.right - src.left) / client.right;
++        scale_y = (float)(src.bottom - src.top) / client.bottom;
++        for (child = NtUserGetWindowRelative( hwnd, GW_CHILD ); child && count < ARRAY_SIZE(holes);
++             child = NtUserGetWindowRelative( child, GW_HWNDNEXT ))
++        {
++            int left, top, right, bottom;
++
++            if (!(NtUserGetWindowLongW( child, GWL_STYLE ) & WS_VISIBLE)) continue;
++            if (!NtUserGetWindowRect( child, &child_rect, dpi )) continue;
++            NtUserMapWindowPoints( 0, hwnd, (POINT *)&child_rect, 2, dpi );
++            if (!intersect_rect( &child_rect, &child_rect, &client )) continue;
++            /* win32u scales the surface with HALFTONE, which blends the last
++             * pixels of the child with the surface contents right and below
++             * it, keep those out of the hole */
++            left = src.left + (int)(child_rect.left * scale_x);
++            top = src.top + (int)(child_rect.top * scale_y);
++            right = src.left + (int)((child_rect.right - 1) * scale_x);
++            bottom = src.top + (int)((child_rect.bottom - 1) * scale_y);
++            if (right <= left || bottom <= top) continue;
++            holes[count].x = left;
++            holes[count].y = top;
++            holes[count].width = right - left;
++            holes[count].height = bottom - top;
++            count++;
++        }
++    }
++
++    if (count == surface->child_hole_count &&
++        !memcmp( holes, surface->child_holes, count * sizeof(*holes) )) return;
++
++    TRACE( "client window %p/%lx, %u holes\n", hwnd, surface->window, count );
++    if (!count) XShapeCombineMask( gdi_display, surface->window, ShapeBounding, 0, 0, None, ShapeSet );
++    else
++    {
++        XRectangle all = {0, 0, surface->changes.width, surface->changes.height};
++
++        XShapeCombineRectangles( gdi_display, surface->window, ShapeBounding, 0, 0, &all, 1, ShapeSet, Unsorted );
++        XShapeCombineRectangles( gdi_display, surface->window, ShapeBounding, 0, 0, holes, count, ShapeSubtract, Unsorted );
++    }
++    memcpy( surface->child_holes, holes, count * sizeof(*holes) );
++    surface->child_hole_count = count;
++    XFlush( gdi_display );
++#endif
++}
++
+ static void X11DRV_client_surface_present( struct client_surface *client, HDC hdc )
+ {
+     struct x11drv_client_surface *surface = impl_from_client_surface( client );
+@@ -975,6 +1058,7 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
+ 
+     if (!hdc)
+     {
++        update_client_window_child_holes( hwnd, surface );
+         /* direct present: nothing to copy, but the input shape still follows the pixels */
+         if (layered_overlay_alpha_enabled() && layered_overlay_direct_enabled() &&
+             (NtUserGetWindowLongW( toplevel, GWL_EXSTYLE ) & WS_EX_LAYERED))
+diff --git a/dlls/winex11.drv/x11drv.h b/dlls/winex11.drv/x11drv.h
+index 1cbdcb4..ece7e45 100644
+--- a/dlls/winex11.drv/x11drv.h
++++ b/dlls/winex11.drv/x11drv.h
+@@ -497,6 +497,7 @@ extern char *process_name;
+ extern Display *clipboard_display;
+ extern HANDLE steam_overlay_event;
+ extern BOOL steam_overlay_is_open(void);
++extern BOOL present_window_has_visible_children( HWND hwnd );
+ extern void update_steam_overlay_state(void);
+ 
+ /* atoms */
+-- 
+2.56.0
+
