@@ -1,0 +1,395 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Thu, 26 Nov 2026 13:55:00 -0500
+Subject: [PATCH] winewayland, win32u, opengl32, wined3d: Don't wait for the compositor on every front buffer flush.
+
+winewayland has no front buffer, so opengl32 emulates front buffer drawing
+with a swap per flush, and every swap waits for the compositor to release a
+buffer. Lords of Magic blits to the ddraw primary thousands of times per
+second and runs its logic once per blit, so on Wayland it ran at the refresh
+rate (eglSwapBuffers took ~4 ms at 240 Hz) instead of 2000+ times per second
+on X11: its edge scrolling started late and moved slowly.
+
+- winewayland: skip front buffer swaps while the frame callback of the
+  previous one is pending, at most for 100 ms, and return GL_SWAP_HELD.
+- opengl32: don't copy the front buffer back after a held swap, the drawing
+  is still in the back buffer.
+- wined3d: when the application stops drawing to the front buffer for 10 ms,
+  ask the driver to present a held swap with the new
+  D3DKMT_ESCAPE_FLUSH_FRONT_BUFFER_WINE, which win32u passes to the current
+  drawable as GL_FLUSH_FRONT_PENDING. Nothing is presented if no swap was
+  held: an extra swap shows a stale buffer.
+
+WINE_WAYLAND_FRONT_SWAP_THROTTLE=0 and WINE_FRONT_BUFFER_FLUSH=0 disable
+them.
+---
+diff -ruN a/include/ddk/d3dkmthk.h b/include/ddk/d3dkmthk.h
+--- a/include/ddk/d3dkmthk.h
++++ b/include/ddk/d3dkmthk.h
+@@ -809,6 +809,7 @@
+     /* Wine-specific escape codes */
+     D3DKMT_ESCAPE_UPDATE_RESOURCE_WINE = 0x80000000,
+     D3DKMT_ESCAPE_SET_PRESENT_RECT_WINE = 0x80000001,
++    D3DKMT_ESCAPE_FLUSH_FRONT_BUFFER_WINE = 0x80000002,
+ } D3DKMT_ESCAPETYPE;
+ 
+ typedef struct _D3DKMT_ESCAPE
+diff -ruN a/include/wine/opengl_driver.h b/include/wine/opengl_driver.h
+--- a/include/wine/opengl_driver.h
++++ b/include/wine/opengl_driver.h
+@@ -242,6 +242,12 @@
+ #define GL_FLUSH_UPDATED       0x04
+ #define GL_FLUSH_PRESENT       0x08
+ #define GL_FLUSH_FORCE_SWAP    0x10
++#define GL_FLUSH_FRONT_PENDING 0x20 /* present a front buffer swap skipped earlier */
++
++/* returned by the swap of drivers emulating front buffer drawing with swaps, and by
++ * p_wgl_context_flush, when the front buffer swap was held back: the drawing is still
++ * in the back buffer, which must not be overwritten with the front buffer */
++#define GL_SWAP_HELD 2
+ 
+ /* a driver opengl drawable, either a client surface of a pbuffer */
+ struct opengl_drawable
+diff -ruN a/dlls/win32u/d3dkmt.c b/dlls/win32u/d3dkmt.c
+--- a/dlls/win32u/d3dkmt.c
++++ b/dlls/win32u/d3dkmt.c
+@@ -579,6 +579,11 @@
+         return STATUS_SUCCESS;
+     }
+ 
++    case D3DKMT_ESCAPE_FLUSH_FRONT_BUFFER_WINE:
++        TRACE( "D3DKMT_ESCAPE_FLUSH_FRONT_BUFFER_WINE\n" );
++        opengl_flush_front_buffer();
++        return STATUS_SUCCESS;
++
+     default:
+         FIXME( "(%p): stub\n", desc );
+         return STATUS_NO_MEMORY;
+diff -ruN a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -267,6 +267,7 @@
+ /* opengl.c */
+ 
+ extern BOOL get_opengl_gpus( struct list *gpus );
++extern void opengl_flush_front_buffer(void);
+ 
+ /* winstation.c */
+ 
+diff -ruN a/dlls/win32u/opengl.c b/dlls/win32u/opengl.c
+--- a/dlls/win32u/opengl.c
++++ b/dlls/win32u/opengl.c
+@@ -3193,6 +3193,18 @@
+     return flush_memory_dc( context, draw_hdc, FALSE, flush );
+ }
+ 
++/* present front buffer drawing of the current context that the driver held
++ * back, see D3DKMT_ESCAPE_FLUSH_FRONT_BUFFER_WINE */
++void opengl_flush_front_buffer(void)
++{
++    struct wgl_context *context = NtCurrentTeb()->glContext;
++    struct opengl_drawable *draw;
++
++    if (!context || !(draw = context->draw) || !draw->client) return;
++    TRACE( "context %p, drawable %s\n", context, debugstr_opengl_drawable( draw ) );
++    if (draw->funcs->flush) draw->funcs->flush( draw, GL_FLUSH_FRONT_PENDING );
++}
++
+ static BOOL win32u_wgl_context_flush( struct wgl_context *context, void (*flush)(void), UINT flags )
+ {
+     const struct opengl_funcs *funcs = &display_funcs;
+@@ -3215,7 +3227,7 @@
+     if (flush) flush();
+     if (flush == funcs->p_glFinish) flags |= GL_FLUSH_FINISHED;
+     opengl_drawable_flush( draw, interval, flags );
+-    if (flags & GL_FLUSH_FORCE_SWAP) opengl_drawable_swap( draw );
++    if ((flags & GL_FLUSH_FORCE_SWAP) && opengl_drawable_swap( draw ) == GL_SWAP_HELD) return GL_SWAP_HELD;
+ 
+     return TRUE;
+ }
+diff -ruN a/dlls/opengl32/unix_wgl.c b/dlls/opengl32/unix_wgl.c
+--- a/dlls/opengl32/unix_wgl.c
++++ b/dlls/opengl32/unix_wgl.c
+@@ -1796,11 +1796,12 @@
+     HWND draw_hwnd = ctx && draw && draw->client ? draw->client->hwnd : NULL;
+     const struct opengl_funcs *funcs = teb->glTable;
+     UINT flags = 0;
++    BOOL ret = FALSE;
+ 
+     if (flush && ctx && !ctx->draw_fbo && context_draws_front( ctx ) && draw->client) flags |= GL_FLUSH_PRESENT;
+     if ((flags & GL_FLUSH_PRESENT) && draw->buffer_map[0] == GL_BACK_LEFT) flags |= GL_FLUSH_FORCE_SWAP;
+ 
+-    if (!ctx || !funcs->p_wgl_context_flush( &ctx->base, flush, flags ))
++    if (!ctx || !(ret = funcs->p_wgl_context_flush( &ctx->base, flush, flags )))
+     {
+         /* default implementation: call the functions directly */
+         if (flush) flush();
+@@ -1810,7 +1811,8 @@
+     pop_default_fbo( teb );
+     pop_default_fbo_buffers( teb );
+ 
+-    if (flags & GL_FLUSH_FORCE_SWAP)
++    /* a held back swap leaves the drawing in the back buffer */
++    if ((flags & GL_FLUSH_FORCE_SWAP) && ret != GL_SWAP_HELD)
+     {
+         GLenum mask = GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT;
+         RECT rect;
+diff -ruN a/dlls/winewayland.drv/opengl.c b/dlls/winewayland.drv/opengl.c
+--- a/dlls/winewayland.drv/opengl.c
++++ b/dlls/winewayland.drv/opengl.c
+@@ -120,6 +120,9 @@
+     BOOL present_opaque;
+     BOOL swap_interval_initialized;
+     BOOL manual_frame_throttle;
++    BOOL front_swap;          /* the next swap presents front buffer drawing */
++    BOOL front_skipped;       /* a front buffer swap was skipped */
++    DWORD front_swap_time;    /* tick count of the last front buffer swap */
+ };
+ 
+ static struct wayland_gl_drawable *impl_from_opengl_drawable(struct opengl_drawable *base)
+@@ -277,6 +280,9 @@
+     egl = platform;
+ }
+ 
++static BOOL wayland_drawable_swap(struct opengl_drawable *base);
++static const struct wl_callback_listener gl_throttle_listener;
++
+ static void wayland_drawable_flush(struct opengl_drawable *base, UINT flags)
+ {
+     struct wayland_gl_drawable *gl = impl_from_opengl_drawable(base);
+@@ -286,6 +292,57 @@
+     /* Since context_flush is called from operations that may latch the native size,
+      * perform any pending resizes before calling them. */
+     if (flags & GL_FLUSH_UPDATED) wayland_gl_drawable_sync_size(gl);
++
++    /* Front buffer drawing is emulated with a swap per flush (we have no front
++     * buffer), see wayland_drawable_swap(). */
++    if (flags & GL_FLUSH_FORCE_SWAP) gl->front_swap = TRUE;
++    if ((flags & GL_FLUSH_FRONT_PENDING) && gl->front_skipped)
++    {
++        TRACE("presenting a skipped front buffer swap\n");
++        gl->front_swap = FALSE;
++        gl->front_skipped = FALSE;
++        wayland_drawable_swap(base);
++    }
++}
++
++/* Applications drawing to the front buffer (ddraw games blitting to the
++ * primary) may flush it thousands of times per second, and every swap waits for
++ * the compositor to release a buffer, limiting them to the refresh rate. Skip
++ * front buffer swaps until the compositor shows the previous one, the drawing
++ * stays in the back buffer for the next swap, and wined3d presents a skipped
++ * one when the application stops drawing (Lords of Magic). */
++static BOOL wayland_drawable_skip_front_swap(struct wayland_gl_drawable *gl,
++                                             struct wayland_client_surface *surface)
++{
++    static int enabled = -1;
++    DWORD now = NtGetTickCount();
++
++    if (enabled == -1)
++    {
++        const char *env = getenv("WINE_WAYLAND_FRONT_SWAP_THROTTLE");
++        enabled = !env || atoi(env);
++    }
++    if (!enabled) return FALSE;
++
++    if (ReadPointerAcquire((void * const volatile *)&surface->wl_callback) &&
++        now - gl->front_swap_time < 100)
++    {
++        gl->front_skipped = TRUE;
++        return TRUE;
++    }
++
++    if (!ReadPointerAcquire((void * const volatile *)&surface->wl_callback))
++    {
++        struct wl_callback *callback;
++
++        if (surface->throttle) NtResetEvent(surface->throttle, NULL);
++        callback = wl_surface_frame(surface->wl_surface);
++        wl_callback_add_listener(callback, &gl_throttle_listener, gl->base.client);
++        InterlockedExchangePointer((void **)&surface->wl_callback, callback);
++    }
++    gl->front_swap_time = now;
++    gl->front_skipped = FALSE;
++    return FALSE;
+ }
+ 
+ static void wayland_gl_frame_done(void *data, struct wl_callback *wl_callback, uint32_t callback_data)
+@@ -318,6 +375,13 @@
+     BOOL fallback_bound = FALSE;
+     EGLint error;
+ 
++    if (gl->front_swap)
++    {
++        gl->front_swap = FALSE;
++        if (surface->toplevel && surface->wl_surface && wayland_drawable_skip_front_swap(gl, surface))
++            return GL_SWAP_HELD;
++    }
++
+     client_surface_present(base->client);
+     if (!surface->toplevel && !surface->hwnd_dmabuf_producer)
+         return TRUE;
+diff -ruN a/dlls/wined3d/wined3d_private.h b/dlls/wined3d/wined3d_private.h
+--- a/dlls/wined3d/wined3d_private.h
++++ b/dlls/wined3d/wined3d_private.h
+@@ -3693,6 +3693,7 @@
+ };
+ 
+ void wined3d_swapchain_refresh_front(struct wined3d_swapchain *swapchain);
++void wined3d_swapchain_flush_front(struct wined3d_swapchain *swapchain);
+ 
+ struct wined3d_cs
+ {
+@@ -4119,6 +4120,10 @@
+     struct wined3d_texture *front_buffer;
+     struct wined3d_gamma_ramp orig_gamma;
+     bool reapply_mode;
++    /* the front buffer was drawn to, flush it once the application stops
++     * drawing: the driver may hold front buffer presents back, see
++     * wined3d_swapchain_flush_front() */
++    bool front_flush_pending;
+     const struct wined3d_format *ds_format;
+     struct wined3d_palette *palette;
+     RECT front_buffer_update;
+diff -ruN a/dlls/wined3d/cs.c b/dlls/wined3d/cs.c
+--- a/dlls/wined3d/cs.c
++++ b/dlls/wined3d/cs.c
+@@ -3499,10 +3499,47 @@
+     wined3d_swapchain_refresh_front(device->swapchains[0]);
+ }
+ 
++/* The graphics driver may hold front buffer drawing back to avoid waiting for
++ * the compositor (winewayland), have it presented once the application stops
++ * drawing to the front buffer, so its last contents get to the screen. */
++static struct wined3d_swapchain *wined3d_cs_front_flush_swapchain(struct wined3d_cs *cs)
++{
++    struct wined3d_device *device = cs->c.device;
++
++    if (!device->swapchain_count || !device->swapchains[0])
++        return NULL;
++    return device->swapchains[0]->front_flush_pending ? device->swapchains[0] : NULL;
++}
++
++static void wined3d_cs_flush_front(struct wined3d_cs *cs)
++{
++    static int enabled = -1;
++    struct wined3d_swapchain *swapchain;
++
++    if (enabled == -1)
++    {
++        const char *env = getenv("WINE_FRONT_BUFFER_FLUSH");
++        enabled = !env || atoi(env);
++    }
++    if (!enabled)
++        return;
++
++    if (!wined3d_cs_queue_is_empty(cs, &cs->queue[WINED3D_CS_QUEUE_DEFAULT])
++            || !wined3d_cs_queue_is_empty(cs, &cs->queue[WINED3D_CS_QUEUE_MAP]))
++        return;
++    if (!(swapchain = wined3d_cs_front_flush_swapchain(cs)))
++        return;
++    swapchain->front_flush_pending = false;
++    TRACE_(fps)("Flushing the front buffer of swapchain %p.\n", swapchain);
++    wined3d_swapchain_flush_front(swapchain);
++}
++
+ static void wined3d_cs_wait_event(struct wined3d_cs *cs)
+ {
+     static const LARGE_INTEGER overlay_timeout = {.QuadPart = 16 * -10000};
++    static const LARGE_INTEGER front_timeout = {.QuadPart = 10 * -10000};
+     BOOL overlay_open = wined3d_cs_steam_overlay_open();
++    BOOL front_pending = !!wined3d_cs_front_flush_swapchain(cs);
+     NTSTATUS status;
+ 
+     static const LARGE_INTEGER query_timeout = {.QuadPart = WINED3D_CS_COMMAND_WAIT_WITH_QUERIES_TIMEOUT * -10};
+@@ -3527,6 +3564,8 @@
+ 
+     if (overlay_open && (!timeout || timeout->QuadPart < overlay_timeout.QuadPart))
+         timeout = &overlay_timeout;
++    if (front_pending && (!timeout || timeout->QuadPart < front_timeout.QuadPart))
++        timeout = &front_timeout;
+ 
+     if (pNtWaitForAlertByThreadId)
+         status = pNtWaitForAlertByThreadId(NULL, timeout);
+@@ -3539,6 +3578,12 @@
+         wined3d_cs_refresh_steam_overlay(cs);
+         wined3d_cs_command_unlock(cs);
+     }
++    else if (front_pending && status == STATUS_TIMEOUT)
++    {
++        wined3d_cs_command_lock(cs);
++        wined3d_cs_flush_front(cs);
++        wined3d_cs_command_unlock(cs);
++    }
+ }
+ 
+ static inline bool wined3d_cs_execute_next(struct wined3d_cs *cs, struct wined3d_cs_queue *queue)
+diff -ruN a/dlls/wined3d/swapchain.c b/dlls/wined3d/swapchain.c
+--- a/dlls/wined3d/swapchain.c
++++ b/dlls/wined3d/swapchain.c
+@@ -1468,6 +1468,26 @@
+     context_release(context);
+ }
+ 
++/* Ask the graphics driver to present front buffer drawing it held back, as
++ * winewayland does to avoid waiting for the compositor on every front buffer
++ * flush. Context activation is done here, called from the CS thread. */
++void wined3d_swapchain_flush_front(struct wined3d_swapchain *swapchain)
++{
++    struct wined3d_texture *front_buffer = swapchain->front_buffer;
++    D3DKMT_ESCAPE escape = {0};
++    struct wined3d_context *context;
++
++    if (!front_buffer || swapchain->swapchain_ops != &swapchain_gl_ops) return;
++
++    context = context_acquire(swapchain->device, front_buffer, 0);
++    if (wined3d_context_gl(context)->valid)
++    {
++        escape.Type = D3DKMT_ESCAPE_FLUSH_FRONT_BUFFER_WINE;
++        D3DKMTEscape(&escape);
++    }
++    context_release(context);
++}
++
+ static const struct wined3d_swapchain_ops swapchain_gl_ops =
+ {
+     swapchain_gl_present,
+diff -ruN a/dlls/wined3d/texture_gl.c b/dlls/wined3d/texture_gl.c
+--- a/dlls/wined3d/texture_gl.c
++++ b/dlls/wined3d/texture_gl.c
+@@ -308,7 +308,10 @@
+     checkGLcall("clear");
+ 
+     if (flags & WINED3DCLEAR_TARGET && target->swapchain && target->swapchain->front_buffer == target)
++    {
+         gl_info->gl_ops.gl.p_glFlush();
++        target->swapchain->front_flush_pending = true;
++    }
+ 
+     context_release(context);
+ }
+@@ -885,7 +888,10 @@
+     checkGLcall("glBlitFramebuffer()");
+ 
+     if (dst_location == WINED3D_LOCATION_DRAWABLE && dst_texture->swapchain->front_buffer == dst_texture)
++    {
+         gl_info->gl_ops.gl.p_glFlush();
++        dst_texture->swapchain->front_flush_pending = true;
++    }
+ 
+     if (dst_texture != dst_save_texture)
+     {
+diff -ruN a/dlls/wined3d/glsl_shader.c b/dlls/wined3d/glsl_shader.c
+--- a/dlls/wined3d/glsl_shader.c
++++ b/dlls/wined3d/glsl_shader.c
+@@ -12986,7 +12986,10 @@
+     GL_EXTCALL(glUseProgram(0));
+ 
+     if (dst_texture->swapchain && (dst_texture->swapchain->front_buffer == dst_texture))
++    {
+         gl_info->gl_ops.gl.p_glFlush();
++        dst_texture->swapchain->front_flush_pending = true;
++    }
+ 
+     if (staging_texture)
+         wined3d_texture_decref(staging_texture);

@@ -864,6 +864,9 @@ apply_all_in_dir() {
     echo "WINE: -SERVER- don't send WM_MOUSEMOVE for relative moves that the cursor clip cancels out (Lords of Magic edge scrolling on Wayland)"
     apply_patch "../patches/wine-hotfixes/pending/server-dont-send-wm-mousemove-for-relative-moves-against-the-clip.patch"
 
+    echo "WINE: -WAYLAND- don't wait for the compositor on every front buffer flush (Lords of Magic slow on Wayland)"
+    apply_patch "../patches/wine-hotfixes/pending/winewayland-dont-wait-for-the-compositor-on-every-front-buffer-flush.patch"
+
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
     ./tools/make_requests
