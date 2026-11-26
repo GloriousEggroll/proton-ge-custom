@@ -858,6 +858,12 @@ apply_all_in_dir() {
     echo "WINE: -X11- winex11: keep the clipping window inside a toplevel and grab again when it moves (Age of Wonders edge scrolling after restore)"
     apply_patch "../patches/wine-hotfixes/pending/winex11-keep-the-clipping-window-inside-a-toplevel.patch"
 
+    echo "WINE: -WIN32U- keep cursor positions inside their monitor when mapping them to the display mode (Lords of Magic edge scrolling)"
+    apply_patch "../patches/wine-hotfixes/pending/win32u-keep-cursor-positions-inside-their-monitor.patch"
+
+    echo "WINE: -SERVER- don't send WM_MOUSEMOVE for relative moves that the cursor clip cancels out (Lords of Magic edge scrolling on Wayland)"
+    apply_patch "../patches/wine-hotfixes/pending/server-dont-send-wm-mousemove-for-relative-moves-against-the-clip.patch"
+
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
     ./tools/make_requests

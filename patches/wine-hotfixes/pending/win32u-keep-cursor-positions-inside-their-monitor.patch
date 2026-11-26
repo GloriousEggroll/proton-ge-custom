@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Thu, 26 Nov 2026 13:00:00 -0500
+Subject: [PATCH] win32u: Keep cursor positions inside their monitor when mapping them to the display mode.
+
+Raw cursor positions are mapped to the emulated display mode by rounding, so
+the last pixel of a scaled monitor can map past its edge: a 640x480 mode
+scaled 3.6x maps raw y 1727 to 479.72, which rounds to 480. Windows never
+reports a cursor position outside the screen, and Lords of Magic stopped edge
+scrolling while its mouse messages said the cursor was there. Keep the
+positions of GetCursorPos() and mouse messages inside their monitor.
+---
+diff -ruN a/dlls/win32u/win32u_private.h b/dlls/win32u/win32u_private.h
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -189,6 +189,7 @@
+ extern struct window_rects map_dpi_window_rects( struct window_rects rects, UINT dpi_from, UINT dpi_to );
+ extern RECT map_rect_raw_to_virt( RECT rect, UINT dpi_to );
+ extern RECT map_rect_virt_to_raw( RECT rect, UINT dpi_from );
++extern POINT map_point_raw_to_virt( POINT pt, UINT dpi_to );
+ extern struct window_rects map_window_rects_virt_to_raw( struct window_rects rects, UINT dpi_from );
+ extern POINT point_phys_to_win_dpi( HWND hwnd, POINT pt );
+ extern POINT point_thread_to_win_dpi( HWND hwnd, POINT pt );
+diff -ruN a/dlls/win32u/sysparams.c b/dlls/win32u/sysparams.c
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -3669,6 +3669,35 @@
+     return rect;
+ }
+ 
++/* map a (cursor) point from MDT_RAW_DPI to MDT_DEFAULT coordinates, keeping it
++ * inside its monitor: a 640x480 mode scaled 3.6x maps raw y 1727 to 479.72,
++ * which rounds to 480, below the screen */
++POINT map_point_raw_to_virt( POINT pt, UINT dpi_to )
++{
++    RECT rect = {pt.x, pt.y, pt.x, pt.y}, raw_rect, virt_rect;
++    struct monitor *monitor;
++
++    if (!lock_display_devices( FALSE )) return pt;
++    if ((monitor = get_monitor_from_rect( rect, MONITOR_DEFAULTTONEAREST, 0, MDT_RAW_DPI )))
++    {
++        raw_rect = monitor_get_rect( monitor, 0, MDT_RAW_DPI );
++        rect = map_monitor_rect( monitor, rect, 0, MDT_RAW_DPI, dpi_to, MDT_DEFAULT );
++        if (PtInRect( &raw_rect, pt ))
++        {
++            virt_rect = monitor_get_rect( monitor, dpi_to, MDT_DEFAULT );
++            if (rect.left >= virt_rect.right) rect.left = virt_rect.right - 1;
++            if (rect.top >= virt_rect.bottom) rect.top = virt_rect.bottom - 1;
++            if (rect.left < virt_rect.left) rect.left = virt_rect.left;
++            if (rect.top < virt_rect.top) rect.top = virt_rect.top;
++        }
++    }
++    unlock_display_devices();
++
++    pt.x = rect.left;
++    pt.y = rect.top;
++    return pt;
++}
++
+ /* map a monitor rect from MDT_DEFAULT to MDT_RAW_DPI coordinates */
+ RECT map_rect_virt_to_raw( RECT rect, UINT dpi_from )
+ {
+diff -ruN a/dlls/win32u/input.c b/dlls/win32u/input.c
+--- a/dlls/win32u/input.c
++++ b/dlls/win32u/input.c
+@@ -777,7 +777,6 @@
+ {
+     BOOL ret = TRUE;
+     DWORD last_change = 0;
+-    RECT rect;
+ 
+     if (!pt) return FALSE;
+ 
+@@ -790,9 +789,7 @@
+         if (!ret) return FALSE;
+     }
+ 
+-    SetRect( &rect, pt->x, pt->y, pt->x, pt->y );
+-    rect = map_rect_raw_to_virt( rect, get_thread_dpi() );
+-    *pt = *(POINT *)&rect.left;
++    *pt = map_point_raw_to_virt( *pt, get_thread_dpi() );
+     return ret;
+ }
+ 
+diff -ruN a/dlls/win32u/message.c b/dlls/win32u/message.c
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -2962,7 +2962,6 @@
+                                       HWND hwnd_filter, UINT first, UINT last, BOOL remove )
+ {
+     struct ntuser_thread_info *thread_info = NtUserGetThreadInfo();
+-    RECT rect = {msg->pt.x, msg->pt.y, msg->pt.x, msg->pt.y};
+     UINT context;
+     BOOL ret = FALSE;
+ 
+@@ -2971,9 +2970,7 @@
+ 
+     /* hardware messages are always in raw physical coords */
+     context = set_thread_dpi_awareness_context( NTUSER_DPI_PER_MONITOR_AWARE );
+-    rect = map_rect_raw_to_virt( rect, get_thread_dpi() );
+-    msg->pt.x = rect.left;
+-    msg->pt.y = rect.top;
++    msg->pt = map_point_raw_to_virt( msg->pt, get_thread_dpi() );
+ 
+     if (msg->message == WM_INPUT || msg->message == WM_INPUT_DEVICE_CHANGE)
+         ret = process_rawinput_message( msg, hw_id, msg_data );
