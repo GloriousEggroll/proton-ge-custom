@@ -810,6 +810,11 @@ apply_all_in_dir() {
     echo "WINE: -WAYLAND- winewayland: start toplevels at the scale of their output (borderless window clipped at fractional scaling)"
     apply_patch "../patches/wine-hotfixes/pending/winewayland-start-toplevels-at-the-output-scale.patch"
 
+    # https://bugs.winehq.org/show_bug.cgi?id=60868
+    # By ajsem1337 from a version by neonbyte1, from CachyOS/wine-cachyos (fd66dbca8eb0, #50)
+    echo "WINE: -PERF- server: keep memory views in a tree by base address (apps with tens of thousands of mapped views)"
+    apply_patch "../patches/wine-hotfixes/pending/server-keep-memory-views-in-a-tree.patch"
+
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
     ./tools/make_requests
