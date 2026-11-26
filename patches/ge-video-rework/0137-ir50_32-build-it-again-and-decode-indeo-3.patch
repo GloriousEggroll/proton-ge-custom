@@ -1,0 +1,204 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Thu, 26 Nov 2026 02:29:24 -0500
+Subject: [PATCH] ir50_32: Build it again and decode Indeo 3 through winedmo.
+
+Valve's tree doesn't build ir50_32, so Indeo 5 AVIs (Star Wars Galactic
+Battlegrounds, Ducati World Championship) had no decoder, and the protonfix
+workaround, winetricks icodecs, refuses to install in WoW64 prefixes.
+Ducati then fails to start with "AVIStreamGetFrameOpen failed".
+
+Build ir50_32 again and let it decode Indeo 3 (IV31, IV32) as well,
+through the same winedmo decoder (FFmpeg's indeo3), for Age of Wonders'
+intro, registering it for those formats.
+
+Age of Wonders passes the stream format to ICDecompress, whose image size
+is the uncompressed one: don't read past the memory holding the frame (the
+decoder takes the frame size from the frame header), and compute the output
+size when the caller leaves it as 0.
+
+Depends on 0135 for upright RGB output.
+---
+diff -ruN a/configure b/configure
+--- a/configure	2026-11-26 02:28:35.885621964 -0500
++++ b/configure	2026-11-26 02:28:35.894399620 -0500
+@@ -23605,6 +23605,7 @@
+ wine_fn_config_makefile dlls/iphlpapi enable_iphlpapi
+ wine_fn_config_makefile dlls/iphlpapi/tests enable_tests
+ wine_fn_config_makefile dlls/iprop enable_iprop
++wine_fn_config_makefile dlls/ir50_32 enable_ir50_32
+ wine_fn_config_makefile dlls/ir50_32/tests enable_tests
+ wine_fn_config_makefile dlls/irprops.cpl enable_irprops_cpl
+ wine_fn_config_makefile dlls/itircl enable_itircl
+diff -ruN a/configure.ac b/configure.ac
+--- a/configure.ac	2026-11-26 02:28:35.882848418 -0500
++++ b/configure.ac	2026-11-26 02:28:35.893712038 -0500
+@@ -2889,6 +2889,7 @@
+ WINE_CONFIG_MAKEFILE(dlls/iphlpapi)
+ WINE_CONFIG_MAKEFILE(dlls/iphlpapi/tests)
+ WINE_CONFIG_MAKEFILE(dlls/iprop)
++WINE_CONFIG_MAKEFILE(dlls/ir50_32)
+ WINE_CONFIG_MAKEFILE(dlls/ir50_32/tests)
+ WINE_CONFIG_MAKEFILE(dlls/irprops.cpl)
+ WINE_CONFIG_MAKEFILE(dlls/itircl)
+diff -ruN a/dlls/ir50_32/ir50.c b/dlls/ir50_32/ir50.c
+--- a/dlls/ir50_32/ir50.c	2026-11-26 02:28:35.877945032 -0500
++++ b/dlls/ir50_32/ir50.c	2026-11-26 02:28:35.886664137 -0500
+@@ -39,6 +39,17 @@
+ #define compare_fourcc(fcc1, fcc2) (((fcc1)^(fcc2))&~0x20202020)
+ 
+ DEFINE_MEDIATYPE_GUID(MFVideoFormat_IV50, MAKEFOURCC('I','V','5','0'));
++DEFINE_MEDIATYPE_GUID(MFVideoFormat_IV31, MAKEFOURCC('I','V','3','1'));
++DEFINE_MEDIATYPE_GUID(MFVideoFormat_IV32, MAKEFOURCC('I','V','3','2'));
++
++/* Indeo 3 (ir32_32 on Windows) decodes through the same winedmo decoder */
++static const GUID *get_input_subtype( DWORD compression )
++{
++    if (!compare_fourcc( compression, IV50_MAGIC )) return &MFVideoFormat_IV50;
++    if (!compare_fourcc( compression, mmioFOURCC('I','V','3','1') )) return &MFVideoFormat_IV31;
++    if (!compare_fourcc( compression, mmioFOURCC('I','V','3','2') )) return &MFVideoFormat_IV32;
++    return NULL;
++}
+ 
+ static inline UINT64
+ make_uint64( UINT32 high, UINT32 low )
+@@ -74,7 +85,7 @@
+     TRACE("in->compr   = %#lx\n", in->bmiHeader.biCompression);
+     TRACE("in offset (%d,%d), size %dx%d\n", params->xSrc, params->ySrc, params->dxSrc, params->dySrc);
+ 
+-    if (compare_fourcc(in->bmiHeader.biCompression, IV50_MAGIC))
++    if (!get_input_subtype( in->bmiHeader.biCompression ))
+     {
+         TRACE("can't do %#lx compression\n", in->bmiHeader.biCompression);
+         return ICERR_BADFORMAT;
+@@ -130,7 +141,7 @@
+ {
+     TRACE("ICM_DECOMPRESS_GETFORMAT %p %p\n", in, out);
+ 
+-    if (compare_fourcc(in->bmiHeader.biCompression, IV50_MAGIC))
++    if (!get_input_subtype( in->bmiHeader.biCompression ))
+         return ICERR_BADFORMAT;
+ 
+     if ( out )
+@@ -187,7 +198,8 @@
+     }
+ 
+     if ( FAILED(IMFMediaType_SetGUID( input_type, &MF_MT_MAJOR_TYPE, &MFMediaType_Video )) ||
+-         FAILED(IMFMediaType_SetGUID( input_type, &MF_MT_SUBTYPE, &MFVideoFormat_IV50 )) )
++         !get_input_subtype( in->bmiHeader.biCompression ) ||
++         FAILED(IMFMediaType_SetGUID( input_type, &MF_MT_SUBTYPE, get_input_subtype( in->bmiHeader.biCompression ) )) )
+         goto done;
+     if ( FAILED(IMFMediaType_SetUINT64(
+                     input_type, &MF_MT_FRAME_SIZE,
+@@ -224,13 +236,28 @@
+     BYTE *data;
+     HRESULT hr;
+     LRESULT r = ICERR_INTERNAL;
++    DWORD src_size = params->lpbiSrc->biSizeImage, dst_size = params->lpbiDst->biSizeImage, length;
++    MEMORY_BASIC_INFORMATION info;
++
++    /* Callers of ICDecompress may pass the stream format, whose image size is
++     * the uncompressed one (Age of Wonders' Indeo 3 intro): don't read past
++     * the memory holding the frame, the decoder finds its size in the frame. */
++    if (VirtualQuery( params->lpSrc, &info, sizeof(info) ) && info.State == MEM_COMMIT)
++    {
++        SIZE_T avail = (BYTE *)info.BaseAddress + info.RegionSize - (BYTE *)params->lpSrc;
++        if (avail < src_size) src_size = avail;
++    }
+ 
+-    TRACE( "decoder %p, params %p.\n", decoder, params );
++    /* the size of uncompressed images may be left as 0 */
++    if (!dst_size)
++        dst_size = ((params->lpbiDst->biWidth * params->lpbiDst->biBitCount / 8 + 3) & ~3) * abs( params->lpbiDst->biHeight );
++
++    TRACE( "decoder %p, params %p, src size %lu, dst size %lu.\n", decoder, params, src_size, dst_size );
+ 
+     if ( FAILED(MFCreateSample( &in_sample )) )
+         return ICERR_INTERNAL;
+ 
+-    if ( FAILED(MFCreateMemoryBuffer( params->lpbiSrc->biSizeImage, &in_buf )) )
++    if ( FAILED(MFCreateMemoryBuffer( src_size, &in_buf )) )
+         goto done;
+ 
+     if ( FAILED(IMFSample_AddBuffer( in_sample, in_buf )) )
+@@ -239,7 +266,7 @@
+     if ( FAILED(MFCreateSample( &out_sample )) )
+         goto done;
+ 
+-    if ( FAILED(MFCreateMemoryBuffer( params->lpbiDst->biSizeImage, &out_buf )) )
++    if ( FAILED(MFCreateMemoryBuffer( dst_size, &out_buf )) )
+         goto done;
+ 
+     if ( FAILED(IMFSample_AddBuffer( out_sample, out_buf )) )
+@@ -248,16 +275,19 @@
+     if ( FAILED(IMFMediaBuffer_Lock( in_buf, &data, NULL, NULL )))
+         goto done;
+ 
+-    memcpy( data, params->lpSrc, params->lpbiSrc->biSizeImage );
++    memcpy( data, params->lpSrc, src_size );
+ 
+     if ( FAILED(IMFMediaBuffer_Unlock( in_buf )) )
+         goto done;
+ 
+-    if ( FAILED(IMFMediaBuffer_SetCurrentLength( in_buf, params->lpbiSrc->biSizeImage )) )
++    if ( FAILED(IMFMediaBuffer_SetCurrentLength( in_buf, src_size )) )
+         goto done;
+ 
+-    if ( FAILED(IMFTransform_ProcessInput( decoder, 0, in_sample, 0 )) )
++    if ( FAILED(hr = IMFTransform_ProcessInput( decoder, 0, in_sample, 0 )) )
++    {
++        WARN( "ProcessInput failed, hr %#lx.\n", hr );
+         goto done;
++    }
+ 
+     memset( &mft_buf, 0, sizeof(mft_buf) );
+     mft_buf.pSample = out_sample;
+@@ -273,8 +303,14 @@
+         LONG stride = (width + 3) & ~3;
+         BYTE *output = params->lpDst;
+ 
+-        if ( FAILED(IMFMediaBuffer_Lock( out_buf, &data, NULL, NULL )))
++        if ( FAILED(IMFMediaBuffer_Lock( out_buf, &data, NULL, &length )))
+             goto done;
++        if (length < stride * params->dyDst)
++        {
++            WARN( "output buffer too small, %lu < %ld\n", length, stride * params->dyDst );
++            IMFMediaBuffer_Unlock( out_buf );
++            goto done;
++        }
+ 
+         output += params->yDst * stride;
+         output += params->xDst * depth;
+diff -ruN a/dlls/winedmo/video_decoder.c b/dlls/winedmo/video_decoder.c
+--- a/dlls/winedmo/video_decoder.c	2026-11-26 02:28:35.879757345 -0500
++++ b/dlls/winedmo/video_decoder.c	2026-11-26 02:28:35.887134588 -0500
+@@ -2632,9 +2632,15 @@
+ }
+ 
+ extern GUID MFVideoFormat_IV50;
++static const GUID MFVideoFormat_IV31 = {MAKEFOURCC('I','V','3','1'), 0x0000, 0x0010,
++        {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
++static const GUID MFVideoFormat_IV32 = {MAKEFOURCC('I','V','3','2'), 0x0000, 0x0010,
++        {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+ static const GUID *const iv50_decoder_input_types[] =
+ {
+     &MFVideoFormat_IV50,
++    &MFVideoFormat_IV31,
++    &MFVideoFormat_IV32,
+ };
+ static const GUID *const iv50_decoder_output_types[] =
+ {
+diff -ruN a/loader/wine.inf.in b/loader/wine.inf.in
+--- a/loader/wine.inf.in	2026-11-26 02:28:35.880848380 -0500
++++ b/loader/wine.inf.in	2026-11-26 02:28:35.892848605 -0500
+@@ -1205,8 +1205,8 @@
+ system.ini, drivers32,,"vidc.MP43=mpg4c32.dll"
+ system.ini, drivers32,,"vidc.i420=iyuv_32.dll"
+ system.ini, drivers32,,"vidc.iyuv=iyuv_32.dll"
+-system.ini, drivers32,,"; vidc.IV31=ir32_32.dll"
+-system.ini, drivers32,,"; vidc.IV32=ir32_32.dll"
++system.ini, drivers32,,"vidc.IV31=ir50_32.dll"
++system.ini, drivers32,,"vidc.IV32=ir50_32.dll"
+ 
+ win.ini, mail,,"mapi=1"
+ win.ini, fonts,,"dummy=0"
