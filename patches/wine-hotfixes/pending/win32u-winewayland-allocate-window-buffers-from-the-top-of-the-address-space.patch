@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Thu, 26 Nov 2026 14:50:00 -0500
+Subject: [PATCH] win32u, winewayland: Allocate window buffers from the top of the address space.
+
+Window surfaces and Wayland SHM buffers of a 4K monitor take 32 MB each.
+On Wayland there are several of them, and in a 32-bit process they were
+allocated bottom-up, pushing the memory of Age of Wonders above 256 MB. The
+game loses the high bits of such addresses: its sprite blitter read from
+the address with bit 28 cleared and ran past its back buffer, crashing when
+loading a save.
+
+Allocate DIB sections of 16 MB or more, the foreign GDI SHM slots and the
+winewayland SHM buffers top-down.
+---
+diff -ruN a/dlls/win32u/dib.c b/dlls/win32u/dib.c
+--- a/dlls/win32u/dib.c
++++ b/dlls/win32u/dib.c
+@@ -1568,9 +1568,15 @@
+     else
+     {
+         SIZE_T size = bmp->dib.dsBmih.biSizeImage;
++        /* Window surfaces of high resolution monitors take tens of MB each,
++         * allocate such bitmaps from the top of the address space: old games
++         * may lose the high bits of their own addresses once these push them
++         * above 256 MB (Age of Wonders on Wayland). */
++        ULONG type = MEM_RESERVE | MEM_COMMIT | (size >= 16 * 1024 * 1024 ? MEM_TOP_DOWN : 0);
++
+         offset = 0;
+         if (NtAllocateVirtualMemory( GetCurrentProcess(), &bmp->dib.dsBm.bmBits, zero_bits,
+-                                     &size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE ))
++                                     &size, type, PAGE_READWRITE ))
+             goto error;
+     }
+     bmp->dib.dshSection = section;
+diff -ruN a/dlls/win32u/dce.c b/dlls/win32u/dce.c
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -161,7 +161,7 @@
+     }
+ 
+     status = NtMapViewOfSection( slot->section, GetCurrentProcess(), &slot->bits, 0, 0, NULL,
+-                                 &view_size, ViewUnmap, 0, PAGE_READWRITE );
++                                 &view_size, ViewUnmap, MEM_TOP_DOWN, PAGE_READWRITE );
+     if (status)
+     {
+         WARN( "failed to map foreign GDI shm section status %#x\n", status );
+diff -ruN a/dlls/winewayland.drv/window_surface.c b/dlls/winewayland.drv/window_surface.c
+--- a/dlls/winewayland.drv/window_surface.c
++++ b/dlls/winewayland.drv/window_surface.c
+@@ -149,7 +149,7 @@
+     }
+ 
+     status = NtMapViewOfSection(slot->section, GetCurrentProcess(), &slot->bits, 0, 0, NULL,
+-                                &view_size, ViewUnmap, 0, PAGE_READWRITE);
++                                &view_size, ViewUnmap, MEM_TOP_DOWN, PAGE_READWRITE);
+     if (status)
+     {
+         WARN("failed to map GDI overlay shm section status %#x\n", status);
+diff -ruN a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -4385,9 +4385,12 @@
+         goto err;
+     }
+ 
++    /* top-down: SHM buffers of high resolution monitors take tens of MB
++     * each, keep them away from the addresses of old games, see
++     * NtGdiCreateDIBSection() in win32u */
+     status = NtMapViewOfSection(handle, GetCurrentProcess(),
+                                 (PVOID)&shm_buffer->map_data, 0, 0, NULL,
+-                                &view_size, ViewUnmap, 0, PAGE_READWRITE);
++                                &view_size, ViewUnmap, MEM_TOP_DOWN, PAGE_READWRITE);
+     if (status)
+     {
+         shm_buffer->map_data = NULL;

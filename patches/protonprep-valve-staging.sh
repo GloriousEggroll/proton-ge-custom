@@ -867,6 +867,9 @@ apply_all_in_dir() {
     echo "WINE: -WAYLAND- don't wait for the compositor on every front buffer flush (Lords of Magic slow on Wayland)"
     apply_patch "../patches/wine-hotfixes/pending/winewayland-dont-wait-for-the-compositor-on-every-front-buffer-flush.patch"
 
+    echo "WINE: -WAYLAND- win32u, winewayland: allocate window buffers from the top of the address space (Age of Wonders crash loading a save on Wayland)"
+    apply_patch "../patches/wine-hotfixes/pending/win32u-winewayland-allocate-window-buffers-from-the-top-of-the-address-space.patch"
+
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
     ./tools/make_requests
