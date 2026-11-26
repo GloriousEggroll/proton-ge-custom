@@ -1,0 +1,128 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Thu, 26 Nov 2026 09:30:00 -0500
+Subject: [PATCH] winex11: Keep the clipping window inside a toplevel and grab again when it moves.
+
+Xwayland only confines the pointer to an InputOnly grab window if a toplevel
+fully contains it, and decides it when the grab starts. After a restore, a
+window manager may place the fullscreen window lower than the clip rectangle,
+so the grab doesn't confine the pointer and Age of Wonders' edge scrolling
+moves it onto another monitor. Clamp the clipping window to the toplevel of
+the thread it overlaps most, and grab again after a window of the thread got
+a new geometry while clipping.
+---
+diff -ruN a/dlls/winex11.drv/mouse.c b/dlls/winex11.drv/mouse.c
+--- a/dlls/winex11.drv/mouse.c
++++ b/dlls/winex11.drv/mouse.c
+@@ -453,6 +453,48 @@
+ 
+ #endif /* HAVE_X11_EXTENSIONS_XINPUT2_H */
+ 
++/* Xwayland only confines the pointer to an InputOnly window if a toplevel
++ * contains it, keep the clipping window inside the toplevel of this thread it
++ * overlaps most: a window manager may not put a restored fullscreen window
++ * back at the top of the screen (labwc, Age of Wonders after a minimize). */
++static void clamp_clip_window_to_toplevel( Display *display, POINT *pos, int *width, int *height )
++{
++    Window root, parent, *children = NULL, best = 0;
++    int best_area = 0, x0 = 0, y0 = 0, x1 = 0, y1 = 0;
++    unsigned int i, count = 0;
++    XWindowAttributes attr;
++    HWND hwnd;
++
++    if (!XQueryTree( display, DefaultRootWindow( display ), &root, &parent, &children, &count )) return;
++    for (i = 0; i < count; i++)
++    {
++        int left, top, right, bottom, area;
++
++        if (XFindContext( display, children[i], winContext, (char **)&hwnd )) continue;
++        if (!XGetWindowAttributes( display, children[i], &attr )) continue;
++        if (attr.map_state != IsViewable || attr.class != InputOutput) continue;
++        left = max( pos->x, attr.x );
++        top = max( pos->y, attr.y );
++        right = min( pos->x + *width, attr.x + attr.width );
++        bottom = min( pos->y + *height, attr.y + attr.height );
++        if (right <= left || bottom <= top) continue;
++        area = (right - left) * (bottom - top);
++        if (area <= best_area) continue;
++        best_area = area;
++        best = children[i];
++        x0 = left; y0 = top; x1 = right; y1 = bottom;
++    }
++    if (children) XFree( children );
++    if (!best || (x0 == pos->x && y0 == pos->y && x1 - x0 == *width && y1 - y0 == *height)) return;
++
++    TRACE( "keeping the clipping window inside %lx: %d,%d %dx%d -> %d,%d %dx%d\n", best, (int)pos->x, (int)pos->y,
++           *width, *height, x0, y0, x1 - x0, y1 - y0 );
++    pos->x = x0;
++    pos->y = y0;
++    *width = x1 - x0;
++    *height = y1 - y0;
++}
++
+ /***********************************************************************
+  *		grab_clipping_window
+  *
+@@ -464,6 +506,7 @@
+     struct x11drv_thread_data *data = x11drv_thread_data();
+     Window clip_window;
+     HCURSOR cursor;
++    int width, height;
+     POINT pos;
+ 
+     /* don't clip in the desktop process */
+@@ -500,8 +543,10 @@
+ 
+     if (!data->clipping_cursor) XUnmapWindow( data->display, clip_window );
+     pos = virtual_screen_to_root( clip->left, clip->top );
+-    XMoveResizeWindow( data->display, clip_window, pos.x, pos.y,
+-                       max( 1, clip->right - clip->left ), max( 1, clip->bottom - clip->top ) );
++    width = max( 1, clip->right - clip->left );
++    height = max( 1, clip->bottom - clip->top );
++    clamp_clip_window_to_toplevel( data->display, &pos, &width, &height );
++    XMoveResizeWindow( data->display, clip_window, pos.x, pos.y, width, height );
+     XMapWindow( data->display, clip_window );
+ 
+     /* if the rectangle is shrinking we may get a pointer warp */
+diff -ruN a/dlls/winex11.drv/window.c b/dlls/winex11.drv/window.c
+--- a/dlls/winex11.drv/window.c
++++ b/dlls/winex11.drv/window.c
+@@ -2377,6 +2377,11 @@
+         return;
+     data->pending_state.above = FALSE; /* allow requesting it again */
+ 
++    /* Xwayland confines the pointer to the window containing the clipping
++     * window when grabbing, grab again once the window got its geometry back
++     * (e.g. after a restore) */
++    if (x11drv_thread_data()->clipping_cursor) x11drv_thread_data()->clip_regrab = TRUE;
++
+     /* send any pending changes from the desired state */
+     window_request_desired_state( data );
+ }
+diff -ruN a/dlls/winex11.drv/event.c b/dlls/winex11.drv/event.c
+--- a/dlls/winex11.drv/event.c
++++ b/dlls/winex11.drv/event.c
+@@ -534,6 +534,12 @@
+     {
+         /* this may signal the overlay for games without the Steam API */
+         update_steam_overlay_state();
++        if (data->clip_regrab)
++        {
++            data->clip_regrab = FALSE;
++            TRACE( "a window moved while clipping, grabbing again\n" );
++            reapply_cursor_clipping();
++        }
+         if (NtWaitForSingleObject(steam_overlay_event, FALSE, &timeout) == WAIT_OBJECT_0)
+             overlay_enabled = TRUE;
+     }
+diff -ruN a/dlls/winex11.drv/x11drv.h b/dlls/winex11.drv/x11drv.h
+--- a/dlls/winex11.drv/x11drv.h
++++ b/dlls/winex11.drv/x11drv.h
+@@ -436,6 +436,7 @@
+ 
+     UINT ignore_focus_hack : 1;
+     UINT steam_overlay_unclipped : 1; /* clipping released while the Steam overlay is open */
++    UINT clip_regrab : 1;        /* a window moved while clipping, grab again */
+ };
+ 
+ extern struct x11drv_thread_data *x11drv_init_thread_data(void);

@@ -849,6 +849,15 @@ apply_all_in_dir() {
     echo "WINE: -DINPUT- report input lost for devices unacquired by a foreground change (Ducati World Championship crash after restore)"
     apply_patch "../patches/wine-hotfixes/pending/dinput-report-input-lost-for-devices-unacquired-by-focus-loss.patch"
 
+    echo "WINE: -DDRAW- clip the cursor to the display mode again when an exclusive window is activated (Age of Wonders edge scrolling after restore)"
+    apply_patch "../patches/wine-hotfixes/pending/ddraw-clip-the-cursor-again-when-an-exclusive-window-is-activated.patch"
+
+    echo "WINE: -WIN32U- defer ClipCursor while the desktop is foreground (Age of Wonders edge scrolling after restore)"
+    apply_patch "../patches/wine-hotfixes/pending/win32u-defer-clipcursor-while-the-desktop-is-foreground.patch"
+
+    echo "WINE: -X11- winex11: keep the clipping window inside a toplevel and grab again when it moves (Age of Wonders edge scrolling after restore)"
+    apply_patch "../patches/wine-hotfixes/pending/winex11-keep-the-clipping-window-inside-a-toplevel.patch"
+
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
     ./tools/make_requests

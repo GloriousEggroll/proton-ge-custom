@@ -1,0 +1,155 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Thu, 26 Nov 2026 09:30:00 -0500
+Subject: [PATCH] win32u: Defer ClipCursor() while the desktop is foreground.
+
+Proton ignores ClipCursor() while the desktop window is foreground
+(CW-Bug-Id #21879). Age of Wonders is activated while the desktop is still
+foreground when it is restored, so the clip ddraw sets for the display mode
+is dropped, and winex11 later restores a stale clip it saved with
+GetClipCursor(). Keep the rectangle instead, report it from GetClipCursor(),
+and apply it once a window of the process is foreground again.
+---
+diff -ruN a/dlls/win32u/input.c b/dlls/win32u/input.c
+--- a/dlls/win32u/input.c
++++ b/dlls/win32u/input.c
+@@ -2340,6 +2340,8 @@
+ /*******************************************************************
+  *		set_foreground_window
+  */
++static void apply_deferred_clip( HWND foreground );
++
+ BOOL set_foreground_window( HWND hwnd, BOOL mouse, BOOL internal )
+ {
+     BOOL ret, send_msg_old = FALSE, send_msg_new = FALSE;
+@@ -2367,6 +2369,8 @@
+         TRACE_(focus)( "foreground %p -> %p (thread %04x), mouse %u, internal %u, ret %u, error %u\n", previous, hwnd,
+                        (int)new_thread_id, mouse, internal, ret, ret ? 0 : (int)RtlGetLastWin32Error() );
+ 
++    if (ret) apply_deferred_clip( hwnd );
++
+     if (ret && previous != hwnd)
+     {
+         if (send_msg_old)  /* old window belongs to other thread */
+@@ -2914,6 +2918,62 @@
+     return FALSE;
+ }
+ 
++/* ClipCursor() calls made while the desktop is foreground are deferred until a
++ * window of the process is foreground again, raw coordinates */
++static pthread_mutex_t deferred_clip_lock = PTHREAD_MUTEX_INITIALIZER;
++static RECT deferred_clip;
++static BOOL deferred_clip_set;
++
++static void set_deferred_clip( const RECT *raw_rect )
++{
++    pthread_mutex_lock( &deferred_clip_lock );
++    if ((deferred_clip_set = !!raw_rect)) deferred_clip = *raw_rect;
++    pthread_mutex_unlock( &deferred_clip_lock );
++}
++
++static BOOL get_deferred_clip( RECT *raw_rect, BOOL take )
++{
++    BOOL ret;
++
++    pthread_mutex_lock( &deferred_clip_lock );
++    if ((ret = deferred_clip_set)) *raw_rect = deferred_clip;
++    if (take) deferred_clip_set = FALSE;
++    pthread_mutex_unlock( &deferred_clip_lock );
++    return ret;
++}
++
++static BOOL set_clip_cursor_rect( const RECT *raw_rect )
++{
++    BOOL ret;
++
++    SERVER_START_REQ( set_cursor )
++    {
++        if (raw_rect)
++        {
++            req->flags       = SET_CURSOR_CLIP;
++            req->clip        = wine_server_rectangle( *raw_rect );
++        }
++        else req->flags = SET_CURSOR_NOCLIP;
++
++        ret = !wine_server_call( req );
++    }
++    SERVER_END_REQ;
++
++    return ret;
++}
++
++/* apply a clip deferred while the desktop was foreground */
++static void apply_deferred_clip( HWND foreground )
++{
++    DWORD pid;
++    RECT rect;
++
++    if (!foreground || !get_window_thread( foreground, &pid ) || pid != GetCurrentProcessId()) return;
++    if (!get_deferred_clip( &rect, TRUE )) return;
++    TRACE( "applying the clip %s deferred while the desktop was foreground\n", wine_dbgstr_rect( &rect ) );
++    set_clip_cursor_rect( &rect );
++}
++
+ static BOOL get_clip_cursor( RECT *rect, UINT dpi, MONITOR_DPI_TYPE type )
+ {
+     struct object_lock lock = OBJECT_LOCK_INIT;
+@@ -2970,6 +3030,13 @@
+  */
+ BOOL WINAPI NtUserGetClipCursor( RECT *rect )
+ {
++    RECT raw;
++
++    if (rect && get_deferred_clip( &raw, FALSE ))
++    {
++        *rect = map_rect_raw_to_virt( raw, get_thread_dpi() );
++        return TRUE;
++    }
+     return get_clip_cursor( rect, get_thread_dpi(), MDT_DEFAULT );
+ }
+ 
+@@ -2982,15 +3049,20 @@
+     HWND foreground = NtUserGetForegroundWindow();
+     UINT dpi = get_thread_dpi();
+     RECT new_rect, full_rect;
+-    BOOL ret;
+ 
+     TRACE( "Clipping to %s\n", wine_dbgstr_rect(rect) );
+ 
+     if (foreground == NtUserGetDesktopWindow())
+     {
+-        WARN( "desktop is foreground, ignoring ClipCursor\n" );
++        /* keep it for when a window of the process is foreground again, the
++         * graphics driver may save and restore it meanwhile (Age of Wonders:
++         * ddraw's clip to the display mode on restore) */
++        if (rect) new_rect = map_rect_virt_to_raw( *rect, dpi );
++        set_deferred_clip( rect ? &new_rect : NULL );
++        WARN( "desktop is foreground, deferring ClipCursor\n" );
+         rect = NULL;
+     }
++    else set_deferred_clip( NULL );
+ 
+     if (rect)
+     {
+@@ -3024,20 +3096,7 @@
+         rect = &new_rect;
+     }
+ 
+-    SERVER_START_REQ( set_cursor )
+-    {
+-        if (rect)
+-        {
+-            req->flags       = SET_CURSOR_CLIP;
+-            req->clip        = wine_server_rectangle( *rect );
+-        }
+-        else req->flags = SET_CURSOR_NOCLIP;
+-
+-        ret = !wine_server_call( req );
+-    }
+-    SERVER_END_REQ;
+-
+-    return ret;
++    return set_clip_cursor_rect( rect );
+ }
+ 
+ /**********************************************************************
