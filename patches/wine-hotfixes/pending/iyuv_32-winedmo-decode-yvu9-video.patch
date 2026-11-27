@@ -1,0 +1,124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Fri, 27 Nov 2026 00:30:00 -0500
+Subject: [PATCH] iyuv_32, winedmo: Decode YVU9 video.
+
+Close Combat plays YVU9 AVIs through Video for Windows and registers
+Intel's Indeo 4.1 driver (ir41_32.ax) for them, which only icodecs
+installs. YVU9 isn't compressed: it is planar YUV 4:1:0, a full size Y
+plane followed by V and U planes subsampled 4x4.
+
+Let iyuv_32, which already converts planar I420 through winedmo's color
+converter, accept YVU9 too, and register it as vidc.yvu9. winedmo maps
+YVU9 to AV_PIX_FMT_YUV410P and swaps the chroma planes on input, as YVU9
+stores V before U.
+
+The registration is lowercase on purpose: Close Combat enumerates codecs
+with ICInfo() and compares fccHandler with 'yvu9' exactly, as the Indeo
+installer registers it, and ICInfo() keeps the case of the name.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff -ruN a/dlls/winedmo/unix_transform.c b/dlls/winedmo/unix_transform.c
+--- a/dlls/winedmo/unix_transform.c
++++ b/dlls/winedmo/unix_transform.c
+@@ -89,6 +89,7 @@
+     AVFrame            *sws_frame;       /* padded scaler output, copied to the caller's buffer */
+     enum AVPixelFormat  out_pix_fmt;     /* AV_PIX_FMT_NONE = native */
+     DWORD               out_video_fourcc;
++    DWORD               in_video_fourcc;
+     enum AVPixelFormat  in_pix_fmt;
+     int                 input_fps_num, input_fps_den;
+     int                 out_width, out_height;
+@@ -249,6 +250,7 @@
+     case MAKEFOURCC('I','4','2','0'): return AV_PIX_FMT_YUV420P;
+     case MAKEFOURCC('I','Y','U','V'): return AV_PIX_FMT_YUV420P;
+     case MAKEFOURCC('Y','V','1','2'): return AV_PIX_FMT_YUV420P;
++    case MAKEFOURCC('Y','V','U','9'): return AV_PIX_FMT_YUV410P; /* V plane before U */
+     case MAKEFOURCC('Y','U','Y','2'): return AV_PIX_FMT_YUYV422;
+     case MAKEFOURCC('U','Y','V','Y'): return AV_PIX_FMT_UYVY422;
+     case MAKEFOURCC('P','0','1','0'): return AV_PIX_FMT_P010LE;
+@@ -880,6 +882,7 @@
+         t->out_bottom_up = out_fmt && params->output_format_size >= sizeof(MFVIDEOFORMAT)
+                            && (out_fmt->video.videoInfo.VideoFlags & MFVideoFlag_BottomUpLinearRep);
+         t->in_pix_fmt = pix_fmt_from_mf_fourcc( mfvf->guidFormat.Data1 );
++        t->in_video_fourcc = mfvf->guidFormat.Data1;
+         t->input_fps_num = mfvf->videoInfo.FramesPerSecond.Numerator;
+         t->input_fps_den = mfvf->videoInfo.FramesPerSecond.Denominator;
+     }
+@@ -1346,6 +1349,13 @@
+         if (av_image_fill_arrays( frame.data, frame.linesize, t->video_buf, t->in_pix_fmt,
+                                   t->last_width, input_height, 1 ) < 0)
+             return STATUS_UNSUCCESSFUL;
++        if (t->in_video_fourcc == MAKEFOURCC('Y','V','U','9'))
++        {
++            /* YVU9 stores the V plane before the U plane. */
++            uint8_t *plane = frame.data[1];
++            frame.data[1] = frame.data[2];
++            frame.data[2] = plane;
++        }
+ 
+         frame.width = t->last_width;
+         frame.height = input_height;
+diff -ruN a/dlls/iyuv_32/iyuv.c b/dlls/iyuv_32/iyuv.c
+--- a/dlls/iyuv_32/iyuv.c
++++ b/dlls/iyuv_32/iyuv.c
+@@ -42,9 +42,18 @@
+ 
+ #define FOURCC_I420 mmioFOURCC('I', '4', '2', '0')
+ #define FOURCC_IYUV mmioFOURCC('I', 'Y', 'U', 'V')
++#define FOURCC_YVU9 mmioFOURCC('Y', 'V', 'U', '9')
+ 
+ #define compare_fourcc(fcc1, fcc2) (((fcc1) ^ (fcc2)) & ~0x20202020)
+ 
++/* YVU9 is planar like I420, with 4x4 subsampled chroma and the V plane first
++ * (Close Combat's videos). */
++static BOOL is_supported_fourcc(DWORD fourcc)
++{
++    return !compare_fourcc(fourcc, FOURCC_I420) || !compare_fourcc(fourcc, FOURCC_IYUV) ||
++           !compare_fourcc(fourcc, FOURCC_YVU9);
++}
++
+ static inline UINT64 make_uint64(UINT32 high, UINT32 low)
+ {
+     return ((UINT64)high << 32) | low;
+@@ -73,7 +82,7 @@
+     TRACE("in->width   = %ld\n", in->biWidth);
+     TRACE("in->compr   = %#lx\n", in->biCompression);
+ 
+-    if (compare_fourcc(in->biCompression, FOURCC_I420) && compare_fourcc(in->biCompression, FOURCC_IYUV))
++    if (!is_supported_fourcc(in->biCompression))
+     {
+         TRACE("can't do %#lx decompression\n", in->biCompression);
+         return ICERR_BADFORMAT;
+@@ -108,7 +117,7 @@
+ {
+     TRACE("ICM_DECOMPRESS_GETFORMAT %p %p\n", in, out);
+ 
+-    if (compare_fourcc(in->biCompression, FOURCC_I420) && compare_fourcc(in->biCompression, FOURCC_IYUV))
++    if (!is_supported_fourcc(in->biCompression))
+         return ICERR_BADFORMAT;
+ 
+     if (out)
+@@ -167,7 +176,9 @@
+     }
+ 
+     if (FAILED(IMFMediaType_SetGUID(input_type, &MF_MT_MAJOR_TYPE, &MFMediaType_Video)) ||
+-        FAILED(IMFMediaType_SetGUID(input_type, &MF_MT_SUBTYPE, &MFVideoFormat_I420)))
++        FAILED(IMFMediaType_SetGUID(input_type, &MF_MT_SUBTYPE,
++                                    compare_fourcc(in->biCompression, FOURCC_YVU9) ? &MFVideoFormat_I420
++                                                                                   : &MFVideoFormat_YVU9)))
+         goto done;
+     if (FAILED(IMFMediaType_SetUINT64(input_type, &MF_MT_FRAME_SIZE, make_uint64(in->biWidth, in->biHeight))))
+         goto done;
+diff -ruN a/loader/wine.inf.in b/loader/wine.inf.in
+--- a/loader/wine.inf.in
++++ b/loader/wine.inf.in
+@@ -1205,6 +1205,7 @@
+ system.ini, drivers32,,"vidc.MP43=mpg4c32.dll"
+ system.ini, drivers32,,"vidc.i420=iyuv_32.dll"
+ system.ini, drivers32,,"vidc.iyuv=iyuv_32.dll"
++system.ini, drivers32,,"vidc.yvu9=iyuv_32.dll"
+ system.ini, drivers32,,"vidc.IV31=ir50_32.dll"
+ system.ini, drivers32,,"vidc.IV32=ir50_32.dll"
+ 

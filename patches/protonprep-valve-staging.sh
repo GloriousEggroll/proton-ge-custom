@@ -880,6 +880,9 @@ apply_all_in_dir() {
     echo "WINE: -MCIAVI32- don't resize the window if the width and height are zero"
     apply_patch "../patches/wine-hotfixes/pending/mciavi32-dont-resize-window-if-width-height-are-zero.patch"
 
+    echo "WINE: -VIDEO- iyuv_32, winedmo: decode YVU9 video (Close Combat videos without icodecs)"
+    apply_patch "../patches/wine-hotfixes/pending/iyuv_32-winedmo-decode-yvu9-video.patch"
+
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
     ./tools/make_requests
