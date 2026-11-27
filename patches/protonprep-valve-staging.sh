@@ -873,6 +873,9 @@ apply_all_in_dir() {
     echo "WINE: -WAYLAND- winewayland: restore compositor-maximized windows that can't be maximized (Guild Wars 2 launcher blank on Umbriel, #1007)"
     apply_patch "../patches/wine-hotfixes/pending/winewayland-restore-compositor-maximized-windows-that-cant-be-maximized.patch"
 
+    echo "WINE: -NTDLL- continue after the thread name exception for Skyrim Together (exits with code 136, #981)"
+    apply_patch "../patches/wine-hotfixes/pending/ntdll-optionally-continue-after-the-thread-name-exception.patch"
+
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
     ./tools/make_requests

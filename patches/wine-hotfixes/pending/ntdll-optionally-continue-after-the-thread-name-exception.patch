@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Fri, 27 Nov 2026 00:30:00 -0500
+Subject: [PATCH] ntdll: Continue after the thread name exception for Skyrim Together.
+
+MinGW's winpthreads registers a vectored handler that continues execution
+for the MSVC thread name exception (0x406d1388), and every DLL that links
+it statically does that for the whole process. DXVK did until Proton 11's
+toolchain, which builds it with the win32 thread model. Skyrim Together
+raises the exception from code Wine finds no unwind information for, so
+since then it exits with code 136, the low byte of 0x406d1388 (#981).
+
+For SkyrimTogether.exe, continue execution after the application's own
+vectored handlers, once Wine has named the thread, as winpthreads did. The
+mod runs as its own executable, also as a child of a mod manager, so this
+leaves Skyrim itself alone. WINE_CONTINUE_THREAD_NAME_EXCEPTION=1 or 0
+forces it on or off for any process.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff -ruN a/dlls/ntdll/exception.c b/dlls/ntdll/exception.c
+--- a/dlls/ntdll/exception.c
++++ b/dlls/ntdll/exception.c
+@@ -191,6 +191,41 @@
+ }
+ 
+ 
++/* MinGW's winpthreads registers a vectored handler that continues execution
++ * for the MSVC thread name exception, and every DLL statically linking it
++ * (DXVK before Proton 11's toolchain) did that for the whole process. Some
++ * applications came to rely on it: Skyrim Together raises the exception from
++ * code Wine can't unwind, so without it the process exits with 0x406d1388.
++ * Do the same for it, after the application's own vectored handlers, once the
++ * thread is named. WINE_CONTINUE_THREAD_NAME_EXCEPTION=1 or 0 forces it on or
++ * off for any process. */
++static BOOL continue_thread_name_exception( const EXCEPTION_RECORD *rec )
++{
++    static int enabled = -1;
++
++    if (rec->ExceptionCode != EXCEPTION_WINE_NAME_THREAD) return FALSE;
++    if (rec->NumberParameters < 1 || rec->ExceptionInformation[0] != 0x1000) return FALSE;
++
++    if (enabled == -1)
++    {
++        UNICODE_STRING name = RTL_CONSTANT_STRING( L"WINE_CONTINUE_THREAD_NAME_EXCEPTION" );
++        WCHAR buffer[8];
++        UNICODE_STRING value = { 0, sizeof(buffer), buffer };
++
++        if (!RtlQueryEnvironmentVariable_U( NULL, &name, &value ) && value.Length)
++            enabled = buffer[0] != '0';
++        else
++        {
++            const WCHAR *app = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer, *p;
++
++            if (app && (p = wcsrchr( app, '\\' ))) app = p + 1;
++            if (app && (p = wcsrchr( app, '/' ))) app = p + 1;
++            enabled = app && !wcsicmp( app, L"SkyrimTogether.exe" );
++        }
++    }
++    return enabled;
++}
++
+ /*******************************************************************
+  *		dispatch_exception
+  */
+@@ -268,6 +303,12 @@
+     if (call_vectored_handlers( rec, context ) == EXCEPTION_CONTINUE_EXECUTION)
+         NtContinue( context, FALSE );
+ 
++    if (continue_thread_name_exception( rec ))
++    {
++        TRACE( "continuing after the thread name exception\n" );
++        NtContinue( context, FALSE );
++    }
++
+     if ((status = call_seh_handlers( rec, context )) == STATUS_SUCCESS)
+         NtContinue( context, FALSE );
+ 
