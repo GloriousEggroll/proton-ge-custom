@@ -876,6 +876,10 @@ apply_all_in_dir() {
     echo "WINE: -NTDLL- continue after the thread name exception for Skyrim Together (exits with code 136, #981)"
     apply_patch "../patches/wine-hotfixes/pending/ntdll-optionally-continue-after-the-thread-name-exception.patch"
 
+    # https://bugs.winehq.org/show_bug.cgi?id=60864 https://bugs.winehq.org/show_bug.cgi?id=60863
+    echo "WINE: -MCIAVI32- don't resize the window if the width and height are zero"
+    apply_patch "../patches/wine-hotfixes/pending/mciavi32-dont-resize-window-if-width-height-are-zero.patch"
+
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
     ./tools/make_requests
