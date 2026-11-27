@@ -870,6 +870,9 @@ apply_all_in_dir() {
     echo "WINE: -WAYLAND- win32u, winewayland: allocate window buffers from the top of the address space (Age of Wonders crash loading a save on Wayland)"
     apply_patch "../patches/wine-hotfixes/pending/win32u-winewayland-allocate-window-buffers-from-the-top-of-the-address-space.patch"
 
+    echo "WINE: -WAYLAND- winewayland: restore compositor-maximized windows that can't be maximized (Guild Wars 2 launcher blank on Umbriel, #1007)"
+    apply_patch "../patches/wine-hotfixes/pending/winewayland-restore-compositor-maximized-windows-that-cant-be-maximized.patch"
+
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
     ./tools/make_requests
