@@ -1,0 +1,96 @@
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Subject: [PATCH] ntdll: Load extra DLLs listed in PROTON_PRELOAD_DLLS.
+
+Some games only load DLLs from the system directory, so mods such as
+ReShade or upscaler injectors for Monster Hunter World's DX12 mode need
+an injector that calls LoadLibrary inside the game process. Wine has no
+built-in way to do that (LoadAppInitDlls is a stub), and
+WINEDLLOVERRIDES only changes how DLLs the game already loads are found.
+
+Load each DLL listed in PROTON_PRELOAD_DLLS once the process's own
+imports are initialized, before its entry point runs. Entries are
+separated by ';'. An "app.exe=" prefix limits that entry and the ones
+after it to processes running app.exe, and "*=" applies them to every
+process again, so the helper processes Proton starts in the prefix are
+left alone:
+
+  PROTON_PRELOAD_DLLS="MonsterHunterWorld.exe=C:\mods\ReShade64.dll;C:\mods\mhwss.dll"
+
+A DLL that fails to load is reported and skipped.
+
+(#1021)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -5036,6 +5036,60 @@
+ #endif
+ }
+ 
++/***********************************************************************
++ *           load_preload_dlls
++ *
++ * PROTON_PRELOAD_DLLS loads extra DLLs into a process after its own imports
++ * are initialized and before its entry point runs, like a DLL injector would.
++ * Entries are separated by ';'. An "app.exe=" prefix on an entry limits it,
++ * and the entries after it, to processes running app.exe ("*=" applies them
++ * to every process again). Without a prefix, an entry applies to every
++ * process. Paths are Windows paths, or names found through the normal DLL
++ * search order.
++ *
++ * PROTON_PRELOAD_DLLS="MonsterHunterWorld.exe=C:\mods\a.dll;C:\mods\b.dll"
++ */
++static void load_preload_dlls(void)
++{
++    const WCHAR *app = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer, *p;
++    UNICODE_STRING value, name;
++    WCHAR *entry, *next, *end, *eq;
++    BOOL applies = TRUE;
++    HMODULE module;
++    NTSTATUS status;
++
++    if (get_env_var( L"PROTON_PRELOAD_DLLS", 0, &value )) return;
++
++    if (app && (p = wcsrchr( app, '\\' ))) app = p + 1;
++    if (app && (p = wcsrchr( app, '/' ))) app = p + 1;
++
++    for (entry = value.Buffer; entry; entry = next)
++    {
++        if ((next = wcschr( entry, ';' ))) *next++ = 0;
++        while (*entry == ' ') entry++;
++
++        if ((eq = wcschr( entry, '=' )))
++        {
++            *eq = 0;
++            for (end = eq; end > entry && end[-1] == ' '; end--) end[-1] = 0;
++            applies = !wcscmp( entry, L"*" ) || (app && !wcsicmp( entry, app ));
++            for (entry = eq + 1; *entry == ' '; entry++) ;
++        }
++        for (end = entry + wcslen( entry ); end > entry && end[-1] == ' '; end--) end[-1] = 0;
++        if (!*entry || !applies) continue;
++
++        RtlInitUnicodeString( &name, entry );
++        if ((status = LdrLoadDll( NULL, 0, &name, &module )))
++            ERR( "PROTON_PRELOAD_DLLS: failed to load %s into %s, status %#lx\n",
++                 debugstr_w(entry), debugstr_w(app), status );
++        else
++            MESSAGE( "wine: PROTON_PRELOAD_DLLS: loaded %s into %s\n", debugstr_w(entry), debugstr_w(app) );
++    }
++
++    RtlFreeHeap( GetProcessHeap(), 0, value.Buffer );
++}
++
++
+ /******************************************************************
+  *		loader_init
+  *
+@@ -5220,6 +5274,8 @@
+         if (wm->ldr.TlsIndex == -1) call_tls_callbacks( wm->ldr.DllBase, DLL_PROCESS_ATTACH );
+         if (wm->ldr.ActivationContext) RtlDeactivateActivationContext( 0, cookie );
+ 
++        load_preload_dlls();
++
+         NtQueryInformationProcess( GetCurrentProcess(), ProcessDebugPort, &port, sizeof(port), NULL );
+         if (port) process_breakpoint();
+     }

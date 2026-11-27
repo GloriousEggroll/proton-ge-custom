@@ -883,6 +883,9 @@ apply_all_in_dir() {
     echo "WINE: -VIDEO- iyuv_32, winedmo: decode YVU9 video (Close Combat videos without icodecs)"
     apply_patch "../patches/wine-hotfixes/pending/iyuv_32-winedmo-decode-yvu9-video.patch"
 
+    echo "WINE: -NTDLL- load extra DLLs listed in PROTON_PRELOAD_DLLS (mod injection, #1021)"
+    apply_patch "../patches/wine-hotfixes/pending/ntdll-load-dlls-from-proton-preload-dlls.patch"
+
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
     ./tools/make_requests
