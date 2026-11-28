@@ -160,12 +160,11 @@ Steam's own focus update still needs runtime validation.
 
 ## Integration candidate
 
-- `patches/lsteamclient/0010-lsteamclient-maintain-wayland-overlay-controller-focus.patch`
-  creates `lsteamclient/steam_overlay_focus.h` and hooks it into `unixlib.cpp`
-  after native callback retrieval. The prep reset list includes `unixlib.cpp`
-  and removes the generated adapter header before reapplying the patches.
-  Only the custom `overlay_bridge/` sources are maintained directly in the
-  repository and left untouched by prep. The callback's existing Steam pipe
+- `lsteamclient/steam_overlay_focus.h` is maintained directly in the
+  repository, like the `overlay_bridge/` sources, and prep leaves both alone.
+  `patches/lsteamclient/0010-lsteamclient-maintain-wayland-overlay-controller-focus.patch`
+  only hooks it into Valve's `unixlib.cpp` after native callback retrieval;
+  the prep reset list includes `unixlib.cpp` before reapplying the patches. The callback's existing Steam pipe
   is reused and no worker or additional pipe is introduced.
 - `ge_overlay_bridge_needs_controller_focus()` uses a trylocked native-focus
   check, then queries current X11 focus and proxy selection ownership. It

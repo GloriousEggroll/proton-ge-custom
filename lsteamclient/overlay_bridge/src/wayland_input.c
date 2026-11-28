@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <wayland-client.h>
@@ -39,6 +40,11 @@ struct ge_overlay_wayland_surface
     struct wl_cursor_theme *cursor_theme;
     struct wl_surface *overlay_cursor_surface;
     struct wl_subsurface *overlay_cursor_subsurface;
+    /* Parent of the cursor surface, owned by the bridge: committing it
+     * applies the cursor position without waiting for the game surface. */
+    struct wl_surface *overlay_cursor_root_surface;
+    struct wl_subsurface *overlay_cursor_root_subsurface;
+    struct wl_buffer *overlay_cursor_root_buffer;
     struct xkb_context *xkb_context;
     struct xkb_keymap *xkb_keymap;
     struct xkb_state *xkb_state;
@@ -71,6 +77,8 @@ struct ge_overlay_wayland_surface
 };
 
 static pthread_mutex_t input_surface_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* The GLX overlay draws the cursor in an X11 window above it. */
+static int x11_cursor_in_use;
 static struct ge_overlay_wayland_surface *process_input_surface;
 static pthread_mutex_t external_surface_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct ge_overlay_wayland_surface *external_input_surface;
@@ -176,6 +184,57 @@ static void destroy_overlay_cursor(struct ge_overlay_wayland_surface *surface)
         wl_surface_destroy(surface->overlay_cursor_surface);
         surface->overlay_cursor_surface = NULL;
     }
+    if (surface->overlay_cursor_root_subsurface)
+    {
+        wl_subsurface_destroy(surface->overlay_cursor_root_subsurface);
+        surface->overlay_cursor_root_subsurface = NULL;
+    }
+    if (surface->overlay_cursor_root_surface)
+    {
+        wl_surface_destroy(surface->overlay_cursor_root_surface);
+        surface->overlay_cursor_root_surface = NULL;
+    }
+    if (surface->overlay_cursor_root_buffer)
+    {
+        wl_buffer_destroy(surface->overlay_cursor_root_buffer);
+        surface->overlay_cursor_root_buffer = NULL;
+    }
+}
+
+/* A 1x1 transparent buffer, to map the cursor's parent surface. */
+static struct wl_buffer *create_transparent_buffer(struct ge_overlay_wayland_surface *surface)
+{
+    struct wl_shm_pool *pool;
+    struct wl_buffer *buffer;
+    int fd;
+
+    if (!surface->shm) return NULL;
+    if ((fd = memfd_create("ge-overlay-cursor-root", MFD_CLOEXEC)) < 0) return NULL;
+    if (ftruncate(fd, 4) < 0)
+    {
+        close(fd);
+        return NULL;
+    }
+    pool = wl_shm_create_pool(surface->shm, fd, 4);
+    close(fd);
+    if (!pool) return NULL;
+    buffer = wl_shm_pool_create_buffer(pool, 0, 1, 1, 4, WL_SHM_FORMAT_ARGB8888);
+    wl_shm_pool_destroy(pool);
+    if (buffer) wl_proxy_set_queue((struct wl_proxy *)buffer, surface->queue);
+    return buffer;
+}
+
+/* The cursor position is double-buffered state of its parent. Committing the
+ * game's surface is not ours to do, and wlroots compositors (labwc, sway)
+ * only apply it with that commit, which a game that rarely presents doesn't
+ * send: the overlay cursor stayed where it was created. */
+static void commit_overlay_cursor_position(struct ge_overlay_wayland_surface *surface)
+{
+    /* Smithay compositors (niri, COSMIC) latch it with the subsurface's own
+     * commit, committing the unchanged cursor surface works for both. */
+    wl_surface_commit(surface->overlay_cursor_surface);
+    if (surface->overlay_cursor_root_surface)
+        wl_surface_commit(surface->overlay_cursor_root_surface);
 }
 
 static void fractional_scale_preferred(
@@ -244,10 +303,45 @@ static int ensure_overlay_cursor(struct ge_overlay_wayland_surface *surface)
         }
     }
 
-    surface->overlay_cursor_subsurface = wl_subcompositor_get_subsurface(
-        surface->subcompositor, surface->overlay_cursor_surface,
+    surface->overlay_cursor_root_surface =
+        wl_compositor_create_surface(surface->compositor);
+    surface->overlay_cursor_root_buffer = create_transparent_buffer(surface);
+    if (!surface->overlay_cursor_root_surface || !surface->overlay_cursor_root_buffer)
+    {
+        destroy_overlay_cursor(surface);
+        return 0;
+    }
+    wl_proxy_set_queue((struct wl_proxy *)surface->overlay_cursor_root_surface,
+                       surface->queue);
+    surface->overlay_cursor_root_subsurface = wl_subcompositor_get_subsurface(
+        surface->subcompositor, surface->overlay_cursor_root_surface,
         surface->target_surface ? surface->target_surface :
                                   surface->pointer_surface);
+    if (!surface->overlay_cursor_root_subsurface)
+    {
+        destroy_overlay_cursor(surface);
+        return 0;
+    }
+    wl_proxy_set_queue((struct wl_proxy *)surface->overlay_cursor_root_subsurface,
+                       surface->queue);
+    wl_subsurface_set_desync(surface->overlay_cursor_root_subsurface);
+    wl_subsurface_place_above(
+        surface->overlay_cursor_root_subsurface,
+        surface->target_surface ? surface->target_surface :
+                                  surface->pointer_surface);
+    if ((empty_region = wl_compositor_create_region(surface->compositor)))
+    {
+        wl_surface_set_input_region(surface->overlay_cursor_root_surface,
+                                    empty_region);
+        wl_region_destroy(empty_region);
+    }
+    wl_surface_attach(surface->overlay_cursor_root_surface,
+                      surface->overlay_cursor_root_buffer, 0, 0);
+    wl_surface_damage(surface->overlay_cursor_root_surface, 0, 0, 1, 1);
+
+    surface->overlay_cursor_subsurface = wl_subcompositor_get_subsurface(
+        surface->subcompositor, surface->overlay_cursor_surface,
+        surface->overlay_cursor_root_surface);
     if (!surface->overlay_cursor_subsurface)
     {
         destroy_overlay_cursor(surface);
@@ -256,10 +350,7 @@ static int ensure_overlay_cursor(struct ge_overlay_wayland_surface *surface)
     wl_proxy_set_queue((struct wl_proxy *)surface->overlay_cursor_subsurface,
                        surface->queue);
     wl_subsurface_set_desync(surface->overlay_cursor_subsurface);
-    wl_subsurface_place_above(
-        surface->overlay_cursor_subsurface,
-        surface->target_surface ? surface->target_surface :
-                                  surface->pointer_surface);
+    wl_surface_commit(surface->overlay_cursor_root_surface);
 
     /* The visual cursor must never become a pointer-focus target itself. */
     if ((empty_region = wl_compositor_create_region(surface->compositor)))
@@ -282,9 +373,16 @@ static void apply_overlay_cursor_shape(
 {
     struct wl_cursor_image *image;
 
-    if (!ensure_overlay_cursor(surface) ||
-        !(image = get_cursor_image(surface, shape)))
+    if (!ensure_overlay_cursor(surface)) return;
+    if (x11_cursor_in_use)
+    {
+        /* keep the surface, it hides Wine's cursor, but show nothing */
+        wl_surface_attach(surface->overlay_cursor_surface, NULL, 0, 0);
+        commit_overlay_cursor_position(surface);
+        wl_display_flush(surface->display);
         return;
+    }
+    if (!(image = get_cursor_image(surface, shape))) return;
 
     surface->cursor_hotspot_x = (int)image->hotspot_x;
     surface->cursor_hotspot_y = (int)image->hotspot_y;
@@ -296,8 +394,15 @@ static void apply_overlay_cursor_shape(
                       wl_cursor_image_get_buffer(image), 0, 0);
     wl_surface_damage(surface->overlay_cursor_surface, 0, 0,
                       (int32_t)image->width, (int32_t)image->height);
-    wl_surface_commit(surface->overlay_cursor_surface);
+    commit_overlay_cursor_position(surface);
     wl_display_flush(surface->display);
+}
+
+void ge_overlay_wayland_set_x11_cursor(int in_use)
+{
+    pthread_mutex_lock(&focused_pointer_mutex);
+    x11_cursor_in_use = !!in_use;
+    pthread_mutex_unlock(&focused_pointer_mutex);
 }
 
 void ge_overlay_wayland_set_cursor_shape(uint32_t shape)
@@ -325,11 +430,7 @@ void ge_overlay_wayland_set_cursor_position(int32_t x, int32_t y)
                 focused_pointer->overlay_cursor_subsurface,
                 x - focused_pointer->cursor_hotspot_x,
                 y - focused_pointer->cursor_hotspot_y);
-            /* The protocol applies the position on the parent's next commit,
-             * but Smithay compositors (niri, COSMIC) latch it with the
-             * subsurface's own commit. Committing the unchanged cursor
-             * surface works for both. */
-            wl_surface_commit(focused_pointer->overlay_cursor_surface);
+            commit_overlay_cursor_position(focused_pointer);
             wl_display_flush(focused_pointer->display);
         }
     }
@@ -1112,6 +1213,7 @@ void ge_overlay_wayland_surface_dispatch(struct ge_overlay_wayland_surface *surf
     if (wl_display_dispatch_queue_pending(surface->display, surface->queue) < 0)
         overlay_trace("failed to dispatch private Wayland input queue");
     ge_overlay_bridge_pump();
+    ge_overlay_bridge_apply_deferred();
 }
 
 void ge_overlay_wayland_surface_destroy(struct ge_overlay_wayland_surface *surface)
@@ -1151,6 +1253,30 @@ void ge_overlay_wayland_surface_destroy(struct ge_overlay_wayland_surface *surfa
     free(surface);
 }
 
+/* Wine's event thread reads the connection and queues the bridge's events,
+ * but they were only dispatched when the game presented: a game that redraws
+ * its menu rarely made the overlay cursor and input lag. Dispatch them on a
+ * timer as well. */
+static void *external_dispatch_thread(void *arg)
+{
+    struct timespec interval = {0, 4 * 1000 * 1000};
+
+    (void)arg;
+    ge_overlay_bridge_foreign_thread = 1;
+    for (;;)
+    {
+        pthread_mutex_lock(&external_surface_mutex);
+        if (external_input_surface)
+        {
+            ge_overlay_wayland_surface_dispatch(external_input_surface);
+            ge_overlay_bridge_tick_opengl();
+        }
+        pthread_mutex_unlock(&external_surface_mutex);
+        nanosleep(&interval, NULL);
+    }
+    return NULL;
+}
+
 void ge_overlay_external_wayland_attach(struct wl_display *display,
                                         int32_t x, int32_t y,
                                         uint32_t width, uint32_t height)
@@ -1162,7 +1288,13 @@ void ge_overlay_external_wayland_attach(struct wl_display *display,
         external_input_surface =
             ge_overlay_wayland_surface_create(display, NULL);
         if (external_input_surface)
+        {
+            pthread_t thread;
+
             overlay_trace("attached external Wayland input bridge");
+            if (!pthread_create(&thread, NULL, external_dispatch_thread, NULL))
+                pthread_detach(thread);
+        }
     }
     pthread_mutex_unlock(&external_surface_mutex);
 }

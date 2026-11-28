@@ -72,12 +72,22 @@ GE_OVERLAY_API void ge_overlay_wayland_surface_dispatch(struct ge_overlay_waylan
 void ge_overlay_wayland_set_cursor_shape(uint32_t shape);
 void ge_overlay_wayland_set_cursor_position(int32_t x, int32_t y);
 void ge_overlay_wayland_set_overlay_active(int active);
+void ge_overlay_wayland_set_x11_cursor(int in_use);
+/* Set on bridge threads Wine didn't create: they can't call into Wine. */
+extern __thread int ge_overlay_bridge_foreign_thread;
+void ge_overlay_bridge_apply_deferred(void);
+void ge_overlay_bridge_tick_opengl(void);
 
 GE_OVERLAY_API void ge_overlay_external_wayland_attach(
     struct wl_display *display, int32_t x, int32_t y,
     uint32_t width, uint32_t height);
 GE_OVERLAY_API void ge_overlay_external_wayland_dispatch(
     int32_t x, int32_t y, uint32_t width, uint32_t height);
+/* Maps a rect in raw monitor pixels onto the X11 output showing that monitor. */
+GE_OVERLAY_API int ge_overlay_external_wayland_map_rect(
+    int32_t monitor_x, int32_t monitor_y,
+    uint32_t monitor_width, uint32_t monitor_height,
+    int32_t *x, int32_t *y, uint32_t *width, uint32_t *height);
 
 void ge_overlay_bridge_surface_created(void);
 void ge_overlay_bridge_surface_destroyed(void);
