@@ -889,6 +889,10 @@ apply_all_in_dir() {
     echo "WINE: -VULKAN- use linear images for cross-process producers on NVK (Battle.net black login area, #1020)"
     apply_patch "../patches/wine-hotfixes/pending/win32u-use-linear-images-for-cross-process-producers-on-nvk.patch"
 
+    # DXVK enables VK_KHR_swapchain_maintenance1 and not the EXT extension, so the release for #837 never ran for it
+    echo "WINE: -WIN32U- release the images of presents to hidden windows with VK_KHR_swapchain_maintenance1 too (D3D11 through DXVK hangs with vsync without wp_fifo_v1)"
+    apply_patch "../patches/wine-hotfixes/pending/win32u-release-images-of-hidden-presents-with-khr-swapchain-maintenance1.patch"
+
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
     ./tools/make_requests
