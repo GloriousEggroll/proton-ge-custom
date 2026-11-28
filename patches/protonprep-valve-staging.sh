@@ -21,6 +21,8 @@ apply_all_in_dir() {
     pushd dxvk
     git reset --hard HEAD
     git clean -xdf
+    # Some patches touch the dxbc-spirv subproject, so reset it too.
+    git submodule foreach --recursive 'git reset --hard HEAD && git clean -xdf'
     patch -Np1 < ../patches/dxvk/layered-overlay-dxvk.patch
     # Keep child-rendering backpressure from repeatedly recreating launcher swapchains.
     apply_patch "../patches/dxvk/dxvk-preserve-swapchain-on-acquire-backpressure.patch"
@@ -39,6 +41,8 @@ apply_all_in_dir() {
     apply_patch "../patches/dxvk/dxgi-auto-detect-hdr.patch"
     # StarCraft II: avoid GPU hangs with D3D9 constant buffer streaming on Navi 10 (#790, #845).
     apply_patch "../patches/dxvk/starcraft2-disable-constant-buffer-streaming-on-navi10.patch"
+    # Black Desert: the dxbc-spirv condition pass never finishes on some shaders (#1008).
+    apply_patch "../patches/dxvk/dxbc-spirv-cache-condition-pass-bool-evaluation.patch"
     popd
 
     pushd d7vk
@@ -55,9 +59,12 @@ apply_all_in_dir() {
     pushd vkd3d-proton
     git reset --hard HEAD
     git clean -xdf
+    # Some patches touch the nested dxbc-spirv subproject, so reset it too.
+    git submodule foreach --recursive 'git reset --hard HEAD && git clean -xdf'
     echo "VKD3D-PROTON: prevent stalled present waits from deadlocking swapchain teardown"
     echo "VKD3D-PROTON: don't map the parent process image for engine detection (EAC untrusted file, Star Citizen/Hunt)"
     echo "VKD3D-PROTON: clamp wave size for Silent Hill: Townfall (GPU hang on wave64-only AMD GPUs, #1014)"
+    echo "VKD3D-PROTON: dxbc-spirv: cache condition pass results (Black Desert shader compile hang, #1008)"
     apply_all_in_dir "../patches/vkd3d-proton/"
     popd
 

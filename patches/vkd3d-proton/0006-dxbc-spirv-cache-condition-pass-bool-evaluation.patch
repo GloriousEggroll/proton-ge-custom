@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: GloriousEggroll <gloriouseggroll@gmail.com>
+Date: Sat, 28 Nov 2026 00:00:00 +0000
+Subject: [PATCH] ir: Cache boolean evaluation results in the condition pass.
+
+evaluateBoolExpression() recurses into both operands of every and / or /
+eq / ne op, up to a depth of 64, without remembering any results. Boolean
+expressions are a DAG, so a chain of ops that reuse earlier results is
+walked once per path, which is exponential in the chain length. Black
+Desert has shaders where this never finishes, and the game hangs while
+loading (seen with both DXVK and vkd3d-proton).
+
+Cache results per top-level evaluation, keyed by the instruction. The
+conditions are fixed for the whole evaluation, and a result computed with
+at least as much remaining recursion depth is at least as precise, so it
+can be reused. Flipped and implied comparison lookups reuse the
+instruction's definition with a different opcode; they are evaluated at
+the recursion limit and are not cached.
+
+Tested with 5724 shaders taken from Black Desert: the four that did not
+finish now compile in about 0.1 s and pass spirv-val, and the SPIR-V for
+all 3228 other shaders that compile is unchanged byte for byte. With
+the fix, Black Desert no longer hangs when joining a server.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/subprojects/dxil-spirv/subprojects/dxbc-spirv/ir/passes/ir_pass_conditions.h
++++ b/subprojects/dxil-spirv/subprojects/dxbc-spirv/ir/passes/ir_pass_conditions.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <optional>
++#include <unordered_map>
+ 
+ #include "../ir.h"
+ #include "../ir_builder.h"
+@@ -47,10 +48,21 @@
+     std::optional<CompareRange> merge(const CompareRange& other) const;
+   };
+ 
++  struct EvaluatedBool {
++    size_t              depth = 0u;
++    std::optional<bool> value = std::nullopt;
++  };
++
+   Builder& m_builder;
+ 
++  /* Results of evaluateBoolExpression for the current top-level evaluation,
++   * so that expressions shared by multiple operands are only walked once. */
++  std::unordered_map<SsaDef, EvaluatedBool> m_evaluatedBools;
++
+   std::optional<bool> evaluateBoolExpression(const Op& expr, size_t count, const Condition* conditions, size_t depth);
+ 
++  std::optional<bool> evaluateBoolExpressionUncached(const Op& expr, size_t count, const Condition* conditions, size_t depth);
++
+   SsaDef evaluateBool(const Op& expr, size_t count, const Condition* conditions);
+ 
+   SsaDef evaluateSelect(const Op& expr, size_t count, const Condition* conditions, size_t depth);
+--- a/subprojects/dxil-spirv/subprojects/dxbc-spirv/ir/passes/ir_pass_conditions.cpp
++++ b/subprojects/dxil-spirv/subprojects/dxbc-spirv/ir/passes/ir_pass_conditions.cpp
+@@ -91,6 +91,28 @@
+ 
+ 
+ std::optional<bool> ConditionPass::evaluateBoolExpression(const Op& expr, size_t count, const Condition* conditions, size_t depth) {
++  /* Lookups of flipped or implied comparisons are evaluated at the recursion
++   * limit and use the original definition with a different opcode, so they
++   * must not be cached. Every other call evaluates an actual instruction. */
++  if (depth + 1u >= MaxRecursionDepth)
++    return evaluateBoolExpressionUncached(expr, count, conditions, depth);
++
++  /* Boolean expressions form a DAG. Without caching, a chain of and / or /
++   * eq / ne ops that reuse previous results is walked once per path, which
++   * is exponential in the chain length. A result computed with at least as
++   * much remaining recursion depth is at least as precise, so reuse it. */
++  auto entry = m_evaluatedBools.find(expr.getDef());
++
++  if (entry != m_evaluatedBools.end() && entry->second.depth <= depth)
++    return entry->second.value;
++
++  auto value = evaluateBoolExpressionUncached(expr, count, conditions, depth);
++  m_evaluatedBools[expr.getDef()] = { depth, value };
++  return value;
++}
++
++
++std::optional<bool> ConditionPass::evaluateBoolExpressionUncached(const Op& expr, size_t count, const Condition* conditions, size_t depth) {
+   if (expr.getType() != ScalarType::eBool)
+     return std::nullopt;
+ 
+@@ -225,6 +247,8 @@
+ 
+ 
+ SsaDef ConditionPass::evaluateBool(const Op& expr, size_t count, const Condition* conditions) {
++  m_evaluatedBools.clear();
++
+   auto value = evaluateBoolExpression(expr, count, conditions, 0);
+ 
+   if (value.has_value())
+@@ -237,6 +261,8 @@
+ SsaDef ConditionPass::evaluateSelect(const Op& expr, size_t count, const Condition* conditions, size_t depth) {
+   const auto& cond = m_builder.getOpForOperand(expr, 0);
+ 
++  m_evaluatedBools.clear();
++
+   auto selector = evaluateBoolExpression(cond, count, conditions, 0);
+ 
+   if (selector.has_value()) {
