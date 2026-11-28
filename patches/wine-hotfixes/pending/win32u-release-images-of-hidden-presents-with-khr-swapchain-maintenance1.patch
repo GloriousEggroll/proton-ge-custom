@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jason Eggleston <eggnet@gmail.com>
+Date: Fri, 27 Nov 2026 21:48:51 -0800
+Subject: [PATCH] win32u: Release images of hidden presents with
+ VK_KHR_swapchain_maintenance1.
+
+"Release swapchain images presented to hidden windows" skips the host
+present for a window that is not visible and releases the image instead,
+which takes swapchainMaintenance1 on the host device. It looks for the
+feature under the EXT name of the extension only.
+VK_KHR_swapchain_maintenance1 is the same extension under its new name,
+and DXVK (seen with 3.1.1) enables that one where the host has it,
+without the EXT one. release_swapchain_images then stays unset, and the
+presents of a Direct3D 11 program to a hidden window still reach the
+host.
+
+With sync interval 1 such a present never returns on a compositor
+without wp_fifo_v1 (sway 1.12, KWin 5.27): Mesa waits for a frame
+callback there, and the surface of a hidden window gets none.
+
+Take the feature from either extension, and release the image with the
+command of the extension that the device has enabled.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ dlls/win32u/vulkan.c | 27 +++++++++++++++++++++------
+ 1 file changed, 21 insertions(+), 6 deletions(-)
+
+diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+index 5e4657d2a16..735d5d828ea 100644
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -1712,7 +1712,9 @@ static BOOL host_supports_swapchain_maintenance1( struct vulkan_physical_device
+         {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT};
+     VkPhysicalDeviceFeatures2 features = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &maintenance};
+ 
+-    if (!physical_device->extensions.has_VK_EXT_swapchain_maintenance1 || !instance->p_vkGetPhysicalDeviceFeatures2KHR)
++    if ((!physical_device->extensions.has_VK_EXT_swapchain_maintenance1 &&
++         !physical_device->extensions.has_VK_KHR_swapchain_maintenance1) ||
++        !instance->p_vkGetPhysicalDeviceFeatures2KHR)
+         return FALSE;
+ 
+     instance->p_vkGetPhysicalDeviceFeatures2KHR( physical_device->host.physical_device, &features );
+@@ -1790,8 +1792,11 @@ static VkResult convert_device_create_info( struct vulkan_physical_device *physi
+     }
+ 
+     /* Presents to hidden windows release their images instead of reaching the
+-     * host compositor, see win32u_vkQueuePresentKHR. That needs the feature. */
+-    if (device->extensions.has_VK_EXT_swapchain_maintenance1 && host_supports_swapchain_maintenance1( physical_device ))
++     * host compositor, see win32u_vkQueuePresentKHR. That needs the feature,
++     * which VK_KHR_swapchain_maintenance1 has under the same name: DXVK enables
++     * that one where the host has it, and not the EXT extension then. */
++    if ((device->extensions.has_VK_EXT_swapchain_maintenance1 || device->extensions.has_VK_KHR_swapchain_maintenance1) &&
++        host_supports_swapchain_maintenance1( physical_device ))
+     {
+         VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT *maintenance;
+ 
+@@ -6613,6 +6618,16 @@ static void *win32u_vk_find_struct_(void *s, VkStructureType t)
+     return NULL;
+ }
+ 
++/* The host command that releases swapchain images, under the name of the
++ * extension the device has it from, or NULL if the device cannot release them. */
++static PFN_vkReleaseSwapchainImagesKHR get_host_release_swapchain_images( const struct vulkan_device *device )
++{
++    if (!device->release_swapchain_images) return NULL;
++    if (device->extensions.has_VK_KHR_swapchain_maintenance1 && device->p_vkReleaseSwapchainImagesKHR)
++        return device->p_vkReleaseSwapchainImagesKHR;
++    return device->p_vkReleaseSwapchainImagesEXT;
++}
++
+ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentInfoKHR *client_present_info )
+ {
+     VkPresentInfoKHR present_info_data = *client_present_info;
+@@ -6630,6 +6645,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
+     uint32_t host_count = 0, hidden_count = 0;
+     BOOL skip_managed = FALSE;
+     BOOL managed_present_waits_consumed = FALSE;
++    PFN_vkReleaseSwapchainImagesKHR release_images = get_host_release_swapchain_images( device );
+     VkCommandBuffer *blit_cmds;
+     struct mempool pool = {0};
+     uint32_t blit_count = 0;
+@@ -6697,8 +6713,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
+          * role, so the compositor never sends the frame callbacks a FIFO present
+          * waits for (NVIDIA blocks forever). Release the image instead, like the
+          * presentation engine discards it on Windows. */
+-        if (device->release_swapchain_images && device->p_vkReleaseSwapchainImagesEXT &&
+-            !is_window_visible( swapchain->surface->hwnd ))
++        if (release_images && !is_window_visible( swapchain->surface->hwnd ))
+         {
+             hidden_indices[hidden_count++] = i;
+             continue;
+@@ -6851,7 +6866,7 @@ host_present_done:
+             if (image_res == VK_SUCCESS)
+             {
+                 pthread_mutex_lock( &producer_device_lock );
+-                image_res = device->p_vkReleaseSwapchainImagesEXT( device->host.device, &release );
++                image_res = release_images( device->host.device, &release );
+                 /* No host present will signal this fence. */
+                 if (present_fence_info && i < present_fence_info->swapchainCount && present_fence_info->pFences[i])
+                     device->p_vkQueueSubmit( queue->host.queue, 0, NULL, present_fence_info->pFences[i] );
