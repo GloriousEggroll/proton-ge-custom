@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: BobTheBot988 <197279563+BobTheBot988@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 16:00:00 +0100
+Subject: [PATCH] HACK: ntdll: Use a coarse monotonic clock for Black Ops III.
+
+When the kernel cannot use the TSC (e.g. "Marking TSC unstable" on some
+Ryzen laptops) it falls back to the HPET clocksource, and every
+CLOCK_MONOTONIC_RAW read costs ~1.5 us instead of ~20 ns.
+
+Call of Duty: Black Ops III enumerates its image assets with a 30 ms budget
+and calls timeGetTime() after every asset; when the budget runs out it
+sleeps and restarts the pass. With HPET a pass never finishes, so the game
+stays on a black screen after the intro video with its "Database" thread
+spinning.
+
+Make monotonic_counter() read CLOCK_MONOTONIC_COARSE (when its resolution
+is 1 ms or better), offset once to stay on the previous time base. Doing it
+here rather than only in timeGetTime() keeps QueryPerformanceCounter(),
+timeGetTime() and wait timeouts consistent with each other: making only
+timeGetTime() coarse lets the game's anti-tamper timing checks see the two
+clocks disagree, and it crashes once it goes online.
+
+Only enabled for SteamGameId 311210. WINE_COARSE_MONOTONIC_CLOCK=1 enables
+it for any game, WINE_COARSE_MONOTONIC_CLOCK=0 disables it.
+
+https://github.com/ValveSoftware/Proton/issues/864
+---
+  dlls/ntdll/unix/loader.c       |  3 +++
+  dlls/ntdll/unix/sync.c         | 42 ++++++++++++++++++++++++++++++++++++++++++
+  dlls/ntdll/unix/unix_private.h |  1 +
+  3 files changed, 46 insertions(+)
+
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index 2cc53c36bf5..2ab124fdab8 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -2248,6 +2248,9 @@ static void hacks_init(void)
+ {
+     const char *sgi = getenv( "SteamGameId" );
+     const char *env_str;
++
++    init_coarse_monotonic_clock();
++
+     if ((env_str = getenv("WINE_RAM_REPORTING_BIAS")))
+     {
+         ram_reporting_bias = atoll(env_str) * 1024 * 1024;
+diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+index 5b1ed88dc20..38f8ce7b7b3 100644
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -87,6 +87,9 @@ static const char *debugstr_timeout( const LARGE_INTEGER *timeout )
+ }
+ 
+ 
++static BOOL coarse_monotonic_enabled;
++static LONGLONG coarse_monotonic_offset;
++
+ /* return a monotonic time counter, in Win32 ticks */
+ static inline ULONGLONG monotonic_counter(void)
+ {
+@@ -98,6 +101,10 @@ static inline ULONGLONG monotonic_counter(void)
+     return mach_continuous_time() * timebase.numer / timebase.denom / 100;
+ #elif defined(HAVE_CLOCK_GETTIME)
+     struct timespec ts;
++#ifdef CLOCK_MONOTONIC_COARSE
++    if (coarse_monotonic_enabled && !clock_gettime( CLOCK_MONOTONIC_COARSE, &ts ))
++        return ts.tv_sec * (ULONGLONG)TICKSPERSEC + ts.tv_nsec / 100 + coarse_monotonic_offset;
++#endif
+ #ifdef CLOCK_MONOTONIC_RAW
+     if (!clock_gettime( CLOCK_MONOTONIC_RAW, &ts ))
+         return ts.tv_sec * (ULONGLONG)TICKSPERSEC + ts.tv_nsec / 100;
+@@ -109,6 +116,41 @@ static inline ULONGLONG monotonic_counter(void)
+     return ticks_from_time_t( now.tv_sec ) + now.tv_usec * 10 - server_start_time;
+ }
+ 
++/* Reading the precise monotonic clock can cost microseconds on slow clocksources such as
++ * HPET, and Black Ops III calls timeGetTime() for every asset it loads with a 30 ms budget.
++ * Use a coarse clock for all time queries so that QueryPerformanceCounter, timeGetTime and
++ * wait timeouts stay consistent with each other. */
++void init_coarse_monotonic_clock(void)
++{
++    const char *env_str, *sgi;
++    struct timespec res, ts;
++
++    if ((env_str = getenv( "WINE_COARSE_MONOTONIC_CLOCK" )))
++    {
++        if (!atoi( env_str )) return;
++    }
++    else
++    {
++        /* Call of Duty: Black Ops III */
++        sgi = getenv( "SteamGameId" );
++        if (!sgi || strcmp( sgi, "311210" )) return;
++    }
++
++#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC_COARSE)
++    if (clock_getres( CLOCK_MONOTONIC_COARSE, &res )) return;
++    /* only use it if it is at least as precise as Windows' 1 ms timer */
++    if (res.tv_sec || res.tv_nsec > 1000000) return;
++    if (clock_gettime( CLOCK_MONOTONIC_COARSE, &ts )) return;
++
++    /* keep the same time base as before, and add one coarse tick of resolution so that the
++     * counter never goes backwards when switching clocks */
++    coarse_monotonic_offset = monotonic_counter() - (ts.tv_sec * (LONGLONG)TICKSPERSEC + ts.tv_nsec / 100)
++                              + res.tv_nsec / 100;
++    coarse_monotonic_enabled = TRUE;
++    ERR( "HACK: Using CLOCK_MONOTONIC_COARSE for the monotonic clock.\n" );
++#endif
++}
++
+ #ifdef __linux__
+ 
+ #define USE_FUTEX
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index fe0c0cb5940..35616b036a7 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -295,6 +295,7 @@ extern NTSTATUS get_thread_context( HANDLE handle, void *context, BOOL *self, US
+ extern unsigned int alloc_object_attributes( const OBJECT_ATTRIBUTES *attr, struct object_attributes **ret,
+                                              data_size_t *ret_len );
+ extern NTSTATUS system_time_precise( void *args );
++extern void init_coarse_monotonic_clock(void);
+ 
+ extern void *steamclient_handle_fault( LPCVOID addr, DWORD err );
+ extern void *anon_mmap_fixed( void *start, size_t size, int prot, int flags );
