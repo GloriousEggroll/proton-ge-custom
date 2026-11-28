@@ -886,6 +886,9 @@ apply_all_in_dir() {
     echo "WINE: -NTDLL- load extra DLLs listed in PROTON_PRELOAD_DLLS (mod injection, #1021)"
     apply_patch "../patches/wine-hotfixes/pending/ntdll-load-dlls-from-proton-preload-dlls.patch"
 
+    echo "WINE: -VULKAN- use linear images for cross-process producers on NVK (Battle.net black login area, #1020)"
+    apply_patch "../patches/wine-hotfixes/pending/win32u-use-linear-images-for-cross-process-producers-on-nvk.patch"
+
     echo "WINE: RUN AUTOCONF TOOLS/MAKE_REQUESTS"
     autoreconf -f
     ./tools/make_requests
